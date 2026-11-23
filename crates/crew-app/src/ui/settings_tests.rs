@@ -745,18 +745,26 @@ fn slow_runtimes_fill_in_later(cx: &mut TestAppContext) {
     let claude = tmp.path().join("claude-slow.sh");
     std::fs::write(
         &claude,
-        "#!/bin/sh\nsleep 2\ncase \"$1\" in\n  --version) echo '9.9.9 (Claude Code)';;\nesac\nexit 0\n",
+        "#!/bin/sh\nsleep 4\ncase \"$1\" in\n  --version) echo '9.9.9 (Claude Code)';;\nesac\nexit 0\n",
     )
     .unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = short_home();
-    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    // crewd answers with what it found after 100 ms; each CLI call takes 4 s.
+    let _daemon = Daemon::start_with_options(
+        home.path().to_path_buf(),
+        crewd::ServeOptions {
+            claude_bin: Some(claude),
+            runtimes_wait: Some(std::time::Duration::from_millis(100)),
+            ..Default::default()
+        },
+    );
     let (window, ws) = open_tall(cx, home.path());
     wait_to_show(cx, window, "Welcome to Crew");
     let started = std::time::Instant::now();
     wait_to_show(cx, window, "Claude Code Installed");
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(1900),
+        started.elapsed() < std::time::Duration::from_millis(3500),
         "found before the CLI answered: {:?}",
         started.elapsed()
     );

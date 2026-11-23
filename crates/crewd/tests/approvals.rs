@@ -22,19 +22,20 @@ const WAIT: Duration = Duration::from_secs(10);
 /// A fake claude. It logs its arguments to `args.log` (each argument ends
 /// with byte 0x1e, each call with 0x1f). A prompt that ends with `WAIT`
 /// waits until the file `go` exists and then replies with the text in
-/// `reply`, if there is one. `STUBBORN` does the same but ignores SIGINT,
-/// so a stop takes until SIGTERM. Any other prompt replies "ok" at once.
+/// `reply`, if there is one. `STUBBORN` does the same but ignores SIGINT
+/// and SIGTERM from before its call is logged, so a stop takes until
+/// SIGKILL. Any other prompt replies "ok" at once.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude-fake.sh");
     let script = format!(
         r#"#!/bin/sh
+for last in "$@"; do :; done
+case "$last" in *STUBBORN) trap '' INT TERM ;; esac
 for a in "$@"; do printf '%s\036' "$a" >> '{dir}/args.log'; done
 printf '\037' >> '{dir}/args.log'
-for last in "$@"; do :; done
 reply=ok
 case "$last" in
   *STUBBORN)
-    trap '' INT
     while [ ! -e '{dir}/go' ]; do sleep 0.02; done
     ;;
   *WAIT)
@@ -374,7 +375,16 @@ async fn thread_row(c: &mut Client, chat: &Chat) -> StoredThread {
 
 /// Waits for a run of `agent` to reach `status`.
 async fn until_run(c: &mut Client, agent: AgentId, status: RunStatus) -> StoredRun {
-    timeout(WAIT, async {
+    until_run_within(WAIT, c, agent, status).await
+}
+
+async fn until_run_within(
+    wait: Duration,
+    c: &mut Client,
+    agent: AgentId,
+    status: RunStatus,
+) -> StoredRun {
+    timeout(wait, async {
         loop {
             let runs: Vec<StoredRun> = c
                 .ok(Request::ListRuns {
@@ -959,7 +969,14 @@ async fn stopping_run_refuses_handoffs_and_asks() {
     let listed: Vec<StoredApproval> = c.ok(Request::ListApprovals { thread: None }).await;
     assert!(listed.is_empty());
     assert_eq!(thread_row(&mut c, &chat).await.handoffs_used, 0);
-    until_run(&mut c, chat.forge, RunStatus::Stopped).await;
+    // Only SIGKILL, 8 s after the stop, ends it.
+    until_run_within(
+        Duration::from_secs(30),
+        &mut c,
+        chat.forge,
+        RunStatus::Stopped,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -987,7 +1004,7 @@ async fn stop_thread_drops_queued_handoff() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn waiting_on_approval_counts_toward_limit() {
-    let d = Daemon::start(Duration::from_secs(4)).await;
+    let d = Daemon::start(Duration::from_secs(6)).await;
     let mut c = d.client().await;
     let chat = setup(&d, &mut c, 1).await;
     let run = start_forge(&mut c, chat.thread).await;
