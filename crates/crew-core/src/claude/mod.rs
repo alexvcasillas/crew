@@ -3,5 +3,7 @@
 pub mod command;
 pub mod parse;
 
-pub use command::{ClaudeInvocation, SessionArg, build_claude, claude_bin_from};
+pub use command::{
+    APPROVE_TOOL, ClaudeInvocation, McpWiring, SessionArg, build_claude, claude_bin_from,
+};
 pub use parse::parse_line;

@@ -199,6 +199,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew-mcp"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crew-core",
+ "crew-proto",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "crew-proto"
 version = "0.1.0"
 dependencies = [

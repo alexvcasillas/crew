@@ -107,6 +107,14 @@ struct Daemon {
 
 impl Daemon {
     async fn start(max_runs: usize, claude_bin: PathBuf) -> Daemon {
+        Daemon::start_with(max_runs, claude_bin, None).await
+    }
+
+    async fn start_with(
+        max_runs: usize,
+        claude_bin: PathBuf,
+        crew_mcp_bin: Option<PathBuf>,
+    ) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
         std::fs::create_dir(&home).unwrap();
@@ -116,6 +124,7 @@ impl Daemon {
             let opts = ServeOptions {
                 max_runs,
                 claude_bin: Some(claude_bin),
+                crew_mcp_bin,
             };
             if let Err(e) = serve(&path, opts).await {
                 panic!("serve failed: {e:#}");
@@ -750,6 +759,82 @@ async fn reply_in_thread_resumes_agent_session() {
     let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
     assert_eq!(runs.len(), 2);
     assert!(runs.iter().all(|r| r.session_id == session));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_get_crew_mcp_when_it_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let mcp_bin = dir.path().join("crew-mcp");
+    std::fs::write(&mcp_bin, "").unwrap();
+    let d = Daemon::start_with(4, script, Some(mcp_bin.clone())).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, &dir.path().join("repo"), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge look".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Done)).await;
+
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 1);
+    let args = &calls[0];
+    let config: serde_json::Value =
+        serde_json::from_str(&arg_after(args, "--mcp-config").expect("--mcp-config")).unwrap();
+    let crew = &config["mcpServers"]["crew"];
+    assert_eq!(crew["type"], "stdio");
+    assert_eq!(
+        crew["command"],
+        std::fs::canonicalize(&mcp_bin).unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        crew["args"],
+        serde_json::json!(["--run", runs[0].id.to_string()])
+    );
+    assert_eq!(
+        crew["env"]["CREW_HOME"],
+        std::fs::canonicalize(&d.home).unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        arg_after(args, "--permission-prompt-tool").as_deref(),
+        Some("mcp__crew__approve")
+    );
+    assert_eq!(
+        arg_after(args, "--permission-mode").as_deref(),
+        Some("default")
+    );
+    assert!(!args.iter().any(|a| a == "--permission-prompts"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_go_without_crew_mcp_when_it_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let d = Daemon::start_with(4, script, Some(dir.path().join("no-such-crew-mcp"))).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, &dir.path().join("repo"), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge look".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Done)).await;
+
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(arg_after(&calls[0], "--mcp-config"), None);
+    assert_eq!(
+        arg_after(&calls[0], "--permission-prompts").as_deref(),
+        Some("none")
+    );
 }
 
 fn is_status(m: &ServerMsg, want: RunStatus) -> bool {
