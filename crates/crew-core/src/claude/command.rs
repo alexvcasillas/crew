@@ -24,6 +24,15 @@ const EDIT_TOOLS: [&str; 4] = [
     "NotebookEdit(./**)",
 ];
 
+/// The `(./**)` form of a bare edit tool, else `tool` as it is.
+fn scoped_edit(tool: &str) -> &str {
+    EDIT_TOOLS
+        .iter()
+        .find(|scoped| scoped.strip_suffix("(./**)") == Some(tool))
+        .copied()
+        .unwrap_or(tool)
+}
+
 /// What a run needs to reach crewd through crew-mcp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpWiring {
@@ -155,11 +164,13 @@ pub fn build_claude(
     let mut allowed = agent.allowed_tools.clone();
     if mcp.is_some() {
         // The agent's own list first, then what wiring adds, each once.
+        // A bare edit rule reaches outside the working folder, so it is
+        // scoped like the ones wiring adds.
         let extra: &[&str] = if edits { &EDIT_TOOLS } else { &[] };
         let mut merged: Vec<String> = Vec::new();
         for tool in allowed
             .iter()
-            .map(String::as_str)
+            .map(|t| scoped_edit(t))
             .chain(extra.iter().copied())
             .chain([HANDOFF_TOOL])
         {
@@ -328,7 +339,7 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.",
                 "--allowedTools",
-                "Read,Write,Grep,Edit(./**),Write(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff",
+                "Read,Write(./**),Grep,Edit(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff",
                 "--mcp-config",
                 &config,
                 "--permission-prompt-tool",
@@ -379,6 +390,51 @@ mod tests {
                 "--",
                 "go",
             ])
+        );
+    }
+
+    #[test]
+    fn wiring_scopes_an_agents_own_edit_rules() {
+        let mut a = agent(PermissionMode::ReadOnly);
+        a.allowed_tools = [
+            "Read",
+            "Edit",
+            "Write(src/**)",
+            "MultiEdit",
+            "Edit(./**)",
+            "NotebookEdit",
+        ]
+        .map(String::from)
+        .to_vec();
+        let inv = build_claude(
+            &a,
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            Some(wiring(RunId::new())),
+        );
+        let allowed = inv
+            .args
+            .iter()
+            .skip_while(|a| *a != "--allowedTools")
+            .nth(1)
+            .unwrap();
+        assert_eq!(
+            allowed,
+            "Read,Edit(./**),Write(src/**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff"
+        );
+
+        // Without wiring the agent's list is passed as it is.
+        let inv = build_claude(
+            &a,
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            None,
+        );
+        assert!(
+            inv.args
+                .contains(&"Read,Edit,Write(src/**),MultiEdit,Edit(./**),NotebookEdit".to_string())
         );
     }
 
