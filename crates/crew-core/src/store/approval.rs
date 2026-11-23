@@ -62,6 +62,51 @@ pub struct StoredApproval {
     pub decided_at: Option<i64>,
 }
 
+/// Longest tool input shown in a permission ask.
+const SHORT_INPUT: usize = 80;
+
+/// A short, one-line view of a tool's input: its command or path if it
+/// has one, else its JSON.
+pub fn short_input(input: &serde_json::Value) -> String {
+    let text = ["command", "file_path", "path", "url", "pattern"]
+        .iter()
+        .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
+        .map(String::from)
+        .unwrap_or_else(|| match input {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Object(map) if map.is_empty() => String::new(),
+            other => other.to_string(),
+        });
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let cut: String = first.chars().take(SHORT_INPUT).collect();
+    if cut.len() < first.len() || lines.next().is_some() {
+        format!("{cut}...")
+    } else {
+        cut
+    }
+}
+
+/// The thread note for a permission ask of `agent`.
+pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
+    let shown = short_input(input);
+    if shown.is_empty() {
+        format!("{agent} wants to run {tool}.")
+    } else {
+        format!("{agent} wants to run {tool}: {shown}")
+    }
+}
+
+/// The thread note for a handoff ask.
+pub fn handoff_ask_text(from: &str, to: &str) -> String {
+    format!("{from} wants to bring in {to}.")
+}
+
+/// The thread note for a handoff held back by a used-up budget.
+pub fn paused_text(budget: u32) -> String {
+    format!("Paused. This thread used its {budget} handoffs.")
+}
+
 const APPROVAL_COLUMNS: &str =
     "SELECT id, thread_id, run_id, payload_json, status, created_at, decided_at FROM approvals";
 
@@ -190,5 +235,28 @@ impl Store {
                 enum_text(&ApprovalStatus::Pending)?
             ],
         )?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn short_input_picks_the_command_and_cuts_it() {
+        assert_eq!(short_input(&json!({"command": "ls -la"})), "ls -la");
+        assert_eq!(
+            short_input(&json!({"file_path": "/work/demo/a"})),
+            "/work/demo/a"
+        );
+        assert_eq!(short_input(&json!({})), "");
+        assert_eq!(short_input(&json!({"n": 1})), r#"{"n":1}"#);
+        assert_eq!(short_input(&json!({"command": "a\nb"})), "a...");
+        let long = "x".repeat(100);
+        assert_eq!(
+            short_input(&json!({ "command": long })),
+            format!("{}...", "x".repeat(80))
+        );
     }
 }

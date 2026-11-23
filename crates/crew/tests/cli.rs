@@ -416,16 +416,39 @@ fn approve_runs_the_handoff_and_watch_shows_the_decision() {
     let s = setup();
     stdout_of(s.crew().args(["say", &s.thread, "@Forge", "go"]));
 
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("crew"))
-        .env("CREW_HOME", &s.home)
-        .args(["watch", &s.thread, "--until-idle"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    /// Kills the child when the test ends, however it ends.
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Kill(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("crew"))
+            .env("CREW_HOME", &s.home)
+            .args(["watch", &s.thread, "--until-idle"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // Read on a thread so the wait for the lines can time out.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = child.0.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = |rx: &std::sync::mpsc::Receiver<String>| {
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("watch printed nothing in time")
+    };
     let mut seen = Vec::new();
     let id8 = loop {
-        let line = lines.next().expect("watch ended early").unwrap();
+        let line = next(&rx);
         seen.push(line.clone());
         if let Some(rest) = line.strip_prefix("[?] ") {
             assert!(rest.starts_with("Forge wants to bring in Sentinel.  (crew approve "));
@@ -447,8 +470,11 @@ fn approve_runs_the_handoff_and_watch_shows_the_decision() {
     assert!(listed.contains("Forge wants to bring in Sentinel."));
 
     stdout_of(s.crew().args(["approve", &id8]));
-    seen.extend(lines.map(Result::unwrap));
-    let status = child.wait().unwrap();
+    // Watch exits by itself once the thread is idle, which ends the stream.
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(20)) {
+        seen.push(line);
+    }
+    let status = child.0.wait().unwrap();
     let out = seen.join("\n");
     assert!(status.success(), "watch failed:\n{out}");
     for want in [
