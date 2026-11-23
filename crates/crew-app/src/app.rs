@@ -26,6 +26,8 @@ actions!(
         ShowThreads,
         /// Show what is running now (⌘2).
         ShowRunning,
+        /// Approve the newest request in the open thread (⌘↵).
+        ApproveLatest,
     ]
 );
 
@@ -57,6 +59,7 @@ pub fn bindings() -> Vec<Shortcut> {
         shortcut("cmd-,", OpenSettings, "Settings"),
         shortcut("cmd-1", ShowThreads, "Threads"),
         shortcut("cmd-2", ShowRunning, "Running now"),
+        shortcut("cmd-enter", ApproveLatest, "Approve the newest request"),
     ]
 }
 
@@ -150,7 +153,8 @@ mod tests {
                 "cmd-shift-.",
                 "cmd-,",
                 "cmd-1",
-                "cmd-2"
+                "cmd-2",
+                "cmd-enter"
             ]
         );
         let labels: Vec<&str> = bindings().iter().map(|s| s.label).collect();

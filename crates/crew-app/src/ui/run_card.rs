@@ -178,7 +178,7 @@ fn verb(kind: &ToolKind, name: &str, ongoing: bool) -> String {
 }
 
 /// Lines an edit or a new file adds and removes.
-fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Option<(u32, u32)> {
+pub(super) fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Option<(u32, u32)> {
     let lines = |v: &serde_json::Value| {
         v.as_str()
             .map_or(0, |s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX))
@@ -199,7 +199,7 @@ fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Option<(u32, u32
 }
 
 /// `path` relative to the run's folder, if it is inside it.
-fn relative(path: &str, cwd: &str) -> String {
+pub(super) fn relative(path: &str, cwd: &str) -> String {
     if cwd.is_empty() {
         return path.to_string();
     }

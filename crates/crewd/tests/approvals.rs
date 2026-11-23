@@ -1179,3 +1179,95 @@ async fn channel_policy_applies_when_thread_and_agent_have_none() {
     assert_eq!(err, "channel not found");
     c.call(Request::StopAll).await.unwrap();
 }
+
+/// The thread as the next `ThreadChanged` for it says, read from an app
+/// connection that subscribed to everything.
+async fn next_thread_change(app: &mut Client, thread: ThreadId) -> StoredThread {
+    let seen = app
+        .until(|m| matches!(m, ServerMsg::ThreadChanged { thread: t } if t.id == thread))
+        .await;
+    match seen.last() {
+        Some(ServerMsg::ThreadChanged { thread }) => thread.clone(),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handoffs_used_and_worktree_changes_are_broadcast() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    let mut app = d.client().await;
+    app.call(Request::SubscribeAll).await.unwrap();
+
+    // Forge edits files, so the thread gets its worktree first.
+    let run = start_forge(&mut c, chat.thread).await;
+    let mut row = next_thread_change(&mut app, chat.thread).await;
+    while !row.worktree.as_ref().is_some_and(|wt| wt.ready) {
+        row = next_thread_change(&mut app, chat.thread).await;
+    }
+    assert!(row.worktree.unwrap().branch.starts_with("crew/"));
+
+    // A handoff the budget lets run.
+    set_budget(&mut c, chat.thread, 2).await;
+    next_thread_change(&mut app, chat.thread).await;
+    let mut mcp = d.client().await;
+    handoff(&mut mcp, run, "Scout", "look").await.unwrap();
+    assert_eq!(
+        next_thread_change(&mut app, chat.thread)
+            .await
+            .handoffs_used,
+        1
+    );
+
+    // An approved one.
+    c.call(Request::SetThreadHandoff {
+        thread: chat.thread,
+        policy: Some(HandoffPolicy::AskFirst),
+        budget: None,
+    })
+    .await
+    .unwrap();
+    next_thread_change(&mut app, chat.thread).await;
+    handoff(&mut mcp, run, "Triage", "sort").await.unwrap();
+    let seen = until_system(&mut c, "Forge wants to bring in Triage.").await;
+    let ask = approvals(&seen).pop().unwrap();
+    c.call(Request::Decide {
+        approval: ask.id,
+        approve: true,
+        brief: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        next_thread_change(&mut app, chat.thread)
+            .await
+            .handoffs_used,
+        2
+    );
+
+    // Discarding clears the worktree.
+    c.call(Request::StopThread {
+        thread: chat.thread,
+    })
+    .await
+    .unwrap();
+    until_run(&mut c, chat.forge, RunStatus::Stopped).await;
+    timeout(WAIT, async {
+        while c
+            .call(Request::Discard {
+                thread: chat.thread,
+            })
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("discard went through");
+    let mut row = next_thread_change(&mut app, chat.thread).await;
+    while row.worktree.is_some() {
+        row = next_thread_change(&mut app, chat.thread).await;
+    }
+}

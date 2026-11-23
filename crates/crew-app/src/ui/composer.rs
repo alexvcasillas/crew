@@ -84,7 +84,11 @@ impl Composer {
         });
         let events = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
             InputEvent::Change => this.text_changed(cx),
-            InputEvent::PressEnter { shift: false, .. } => this.enter(window, cx),
+            InputEvent::PressEnter {
+                shift: false,
+                secondary: false,
+            } => this.enter(window, cx),
+
             _ => {}
         });
         Self {
@@ -331,7 +335,12 @@ impl Render for Composer {
                         Button::new("composer-attach")
                             .ghost()
                             .small()
-                            .icon(Icon::default().data(PAPERCLIP))
+                            .icon(
+                                Icon::default()
+                                    .data(PAPERCLIP)
+                                    .size(px(14.))
+                                    .text_color(color("text-secondary")),
+                            )
                             .disabled(true)
                             .tooltip("Attachments are coming soon."),
                     )

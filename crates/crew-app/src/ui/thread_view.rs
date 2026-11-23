@@ -1,17 +1,19 @@
 //! A thread: its header, messages, live run cards and the composer.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{AgentId, ChannelId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, ThreadId};
 use crew_core::policy::HandoffPolicy;
-use crew_core::store::{ApprovalKind, Author, StoredApproval, StoredMessage, StoredRun};
+use crew_core::store::{Author, StoredMessage, StoredRun};
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{chip, clock, elapsed, monogram, runtime_chip};
 use super::run_card::summarize;
+use super::thread_settings::policy_name;
 use super::workspace::Workspace;
 use crate::fonts::{mono_font, ui_font};
 use crate::theme::color;
@@ -35,7 +37,16 @@ impl Workspace {
         let names: Vec<String> = state.agents().iter().map(|a| a.spec.name.clone()).collect();
 
         let mut items: Vec<AnyElement> = Vec::new();
+        // An approval's card stands where it was asked; later notes about
+        // it fold into the card's line.
+        let mut carded: HashSet<ApprovalId> = HashSet::new();
         for message in state.messages(thread) {
+            if let Some(approval) = message.approval.and_then(|a| state.approval(a)) {
+                if carded.insert(approval.id) {
+                    items.push(self.render_approval(approval, cx));
+                }
+                continue;
+            }
             items.push(self.render_message(message, &names).into_any_element());
             if let (Author::Agent(_), Some(run)) = (&message.author, message.run)
                 && state.run(run).is_some_and(|r| r.status == RunStatus::Done)
@@ -47,7 +58,9 @@ impl Workspace {
             }
         }
         for approval in state.pending_approvals(thread) {
-            items.push(self.render_approval_line(approval).into_any_element());
+            if !carded.contains(&approval.id) {
+                items.push(self.render_approval(approval, cx));
+            }
         }
         for run in state.live_runs(thread) {
             items.push(self.render_live_run(run, cx).into_any_element());
@@ -92,13 +105,20 @@ impl Workspace {
                             ),
                     )
                     .child(self.render_participants(thread))
-                    .child(
+                    .child({
+                        let handoffs = format!(
+                            "Handoffs: {}",
+                            policy_name(policy.unwrap_or(HandoffPolicy::AskFirst))
+                        );
                         div()
+                            .id("thread-handoffs")
                             .flex_none()
                             .text_size(px(12.))
                             .text_color(color("text-secondary"))
-                            .child(format!("Handoffs: {}", policy_name(policy))),
-                    ),
+                            .aria_label(handoffs.clone())
+                            .child(handoffs)
+                            .test_support()
+                    }),
             )
             .child(
                 div()
@@ -321,55 +341,6 @@ impl Workspace {
             )
     }
 
-    /// A pending approval. Its card, with the buttons to decide, comes in
-    /// a later step.
-    fn render_approval_line(&self, approval: &StoredApproval) -> impl IntoElement + use<> {
-        let state = self.state();
-        let name_of = |agent: AgentId| {
-            state
-                .agent(agent)
-                .map_or_else(|| "An agent".to_string(), |a| a.spec.name.clone())
-        };
-        let asker = state
-            .run(approval.run)
-            .map_or_else(|| "An agent".to_string(), |r| name_of(r.agent));
-        let wants = match &approval.kind {
-            ApprovalKind::Handoff { from, to, .. } => {
-                format!("{} wants to bring in {}", name_of(*from), name_of(*to))
-            }
-            ApprovalKind::Permission { tool, .. } => format!("{asker} wants to run {tool}"),
-        };
-        let text = format!("Needs you · {wants}");
-        indented(
-            div()
-                .id(format!("approval-{}", approval.id))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .max_w(px(560.))
-                .px(px(12.))
-                .py(px(8.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(color("warning-border"))
-                .bg(color("warning-subtle"))
-                .text_size(px(12.))
-                .aria_label(text)
-                .child(
-                    Icon::new(IconName::TriangleAlert)
-                        .size(px(14.))
-                        .text_color(color("warning")),
-                )
-                .child(div().text_color(color("warning")).child("Needs you"))
-                .child(
-                    div()
-                        .text_color(color("text-primary"))
-                        .child(format!("· {wants}")),
-                )
-                .test_support(),
-        )
-    }
-
     /// Overlapping monograms of the agents in the thread.
     fn render_participants(&self, thread: ThreadId) -> impl IntoElement + use<> {
         let state = self.state();
@@ -403,7 +374,7 @@ impl Workspace {
 }
 
 /// Lines up with a message's text, past the avatar.
-fn indented(child: impl IntoElement) -> Div {
+pub(super) fn indented(child: impl IntoElement) -> Div {
     div().pl(px(24. + 32. + 12.)).pr(px(24.)).child(child)
 }
 
@@ -419,14 +390,6 @@ fn you_avatar() -> Div {
         .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
         .child("Y")
-}
-
-fn policy_name(policy: Option<HandoffPolicy>) -> &'static str {
-    match policy {
-        None | Some(HandoffPolicy::AskFirst) => "Ask first",
-        Some(HandoffPolicy::Budget) => "Run with budget",
-        Some(HandoffPolicy::PerAgent) => "Per agent",
-    }
 }
 
 /// How a stretch of a message body is drawn.
