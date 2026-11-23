@@ -52,7 +52,7 @@ pub enum ConnectionState {
     NotRunning,
     /// crewd answered but refused this app's protocol version.
     VersionMismatch {
-        theirs: Option<u32>,
+        theirs: u32,
         ours: u32,
     },
 }
@@ -75,13 +75,27 @@ pub fn probe(conn: &ConnectionConfig) -> ConnectionState {
             .unwrap_or(Ok(None))
             .map_or(ConnectionState::NotRunning, |answer| match answer {
                 Some(Ok(())) => ConnectionState::Connected,
-                Some(Err(_)) => ConnectionState::VersionMismatch {
-                    theirs: None,
-                    ours: PROTO_VERSION,
+                Some(Err(e)) => match their_version(&e) {
+                    Some(theirs) => ConnectionState::VersionMismatch {
+                        theirs,
+                        ours: PROTO_VERSION,
+                    },
+                    None => {
+                        eprintln!("crew: crewd refused hello: {e}");
+                        ConnectionState::NotRunning
+                    }
                 },
                 None => ConnectionState::NotRunning,
             })
     })
+}
+
+/// The version in crewd's refusal of `Hello`:
+/// `crewd speaks protocol 2, client speaks 3. Restart crewd.`
+fn their_version(refusal: &str) -> Option<u32> {
+    let rest = refusal.strip_prefix("crewd speaks protocol ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// crewd's answer to `Hello`, or `None` if it hung up first.
@@ -213,41 +227,28 @@ mod tests {
 
     #[test]
     fn probe_treats_a_refused_hello_as_a_version_mismatch() {
-        let dir = tempfile::Builder::new()
-            .prefix("crew")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = crate::test_support::short_home();
         let conn = ConnectionConfig {
             crew_home: dir.path().to_path_buf(),
         };
-        let listener = std::os::unix::net::UnixListener::bind(conn.socket()).unwrap();
-        let server = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                listener.set_nonblocking(true).unwrap();
-                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let Some(ClientMsg::Request { id, .. }) = read_frame(&mut stream).await.unwrap()
-                else {
-                    panic!("no hello");
-                };
-                let refused = ServerMsg::Response {
-                    id,
-                    result: Err("crewd speaks protocol 99, client speaks 3. Restart crewd.".into()),
-                };
-                write_frame(&mut stream, &refused).await.unwrap();
-            });
-        });
+        let server = crate::test_support::refuse_hello(&conn.socket(), 99);
         assert_eq!(
             probe(&conn),
             ConnectionState::VersionMismatch {
-                theirs: None,
+                theirs: 99,
                 ours: PROTO_VERSION
             }
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn only_a_version_refusal_is_a_mismatch() {
+        assert_eq!(
+            their_version("crewd speaks protocol 2, client speaks 3. Restart crewd."),
+            Some(2)
+        );
+        assert_eq!(their_version("Send Hello first."), None);
+        assert_eq!(their_version("crewd speaks protocol x"), None);
     }
 }

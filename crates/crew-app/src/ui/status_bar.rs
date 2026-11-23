@@ -27,7 +27,8 @@ fn connection_line(state: Option<&ConnectionState>) -> (&'static str, &'static s
     match state {
         None => ("text-tertiary", "Connecting…"),
         Some(ConnectionState::Connected) => ("success", "Connected to crewd"),
-        Some(_) => ("text-tertiary", "Not connected"),
+        Some(ConnectionState::VersionMismatch { .. }) => ("warning", "Service out of date"),
+        Some(ConnectionState::NotRunning) => ("text-tertiary", "Not connected"),
     }
 }
 

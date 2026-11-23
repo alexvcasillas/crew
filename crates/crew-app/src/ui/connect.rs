@@ -94,10 +94,7 @@ mod tests {
 
     #[test]
     fn out_of_date_service_offers_a_restart() {
-        let mismatch = ConnectionState::VersionMismatch {
-            theirs: None,
-            ours: 3,
-        };
+        let mismatch = ConnectionState::VersionMismatch { theirs: 2, ours: 3 };
         assert_eq!(wording(&mismatch).button, "Restart service");
         assert!(wording(&mismatch).restart);
         assert_eq!(
