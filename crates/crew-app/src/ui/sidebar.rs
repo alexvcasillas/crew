@@ -186,7 +186,7 @@ impl Workspace {
     pub(super) fn channel_badge(&self, channel: ChannelId) -> ChannelBadge {
         let state = self.state();
         match state.channel_status(channel) {
-            ThreadStatus::Idle => {}
+            ThreadStatus::Idle | ThreadStatus::Queued => {}
             status => return ChannelBadge::Status(status),
         }
         if self.nav.channel == Some(channel) {
@@ -287,9 +287,10 @@ fn section_header(
         )
 }
 
+/// A dot for urgent states only: queued runs get none.
 fn status_dot(status: ThreadStatus) -> Option<Div> {
     match status {
-        ThreadStatus::Idle => None,
+        ThreadStatus::Idle | ThreadStatus::Queued => None,
         status => Some(dot(status_word(status).1)),
     }
 }

@@ -168,11 +168,14 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
         .child(chip(agent.chip.clone()))
         .child(
             div()
+                .id(("mention-status", ix))
                 .w(px(64.))
                 .flex_none()
                 .text_size(px(11.))
                 .text_color(color(token))
-                .child(word),
+                .aria_label(word)
+                .child(word)
+                .test_support(),
         )
 }
 

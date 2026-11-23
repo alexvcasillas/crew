@@ -32,6 +32,8 @@ pub enum ConnectionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ThreadStatus {
     Idle,
+    /// Runs wait for a free slot, none works yet.
+    Queued,
     Working,
     NeedsYou,
 }
@@ -324,7 +326,7 @@ impl State {
         self.status_of(|t| threads.contains(&t))
     }
 
-    /// Whether the agent waits on you, works, or neither.
+    /// Whether the agent waits on you, works, waits for a slot, or none.
     pub fn agent_status(&self, agent: AgentId) -> ThreadStatus {
         let asks = self.approvals.values().any(|a| {
             a.status == ApprovalStatus::Pending
@@ -333,15 +335,7 @@ impl State {
         if asks {
             return ThreadStatus::NeedsYou;
         }
-        let working = self
-            .runs
-            .values()
-            .any(|r| r.agent == agent && is_live(&r.status));
-        if working {
-            ThreadStatus::Working
-        } else {
-            ThreadStatus::Idle
-        }
+        run_status(self.runs.values().filter(|r| r.agent == agent))
     }
 
     /// Messages in the channel's threads after `since` (Unix ms) that you
@@ -512,16 +506,20 @@ impl State {
         if asks {
             return ThreadStatus::NeedsYou;
         }
-        let working = self
-            .runs
-            .values()
-            .any(|r| is_live(&r.status) && matches(r.thread));
-        if working {
-            ThreadStatus::Working
-        } else {
-            ThreadStatus::Idle
-        }
+        run_status(self.runs.values().filter(|r| matches(r.thread)))
     }
+}
+
+/// Working if any of `runs` works, else Queued if any waits, else Idle.
+fn run_status<'a>(runs: impl Iterator<Item = &'a StoredRun>) -> ThreadStatus {
+    runs.fold(ThreadStatus::Idle, |most, run| {
+        let this = match run.status {
+            RunStatus::Working => ThreadStatus::Working,
+            RunStatus::Queued => ThreadStatus::Queued,
+            _ => ThreadStatus::Idle,
+        };
+        most.max(this)
+    })
 }
 
 /// How far along a run is. Statuses never move back a stage.
@@ -741,10 +739,11 @@ mod tests {
         let (mut state, _, _, t) = one_thread();
         let queued = run(t.id, RunStatus::Queued, 5);
         state.apply(status(&queued));
-        assert_eq!(state.thread_status(t.id), ThreadStatus::Working);
+        assert_eq!(state.thread_status(t.id), ThreadStatus::Queued);
         let working = moved(&queued, RunStatus::Working);
         state.apply(status(&working));
         assert_eq!(state.running(), [&working]);
+        assert_eq!(state.thread_status(t.id), ThreadStatus::Working);
         let done = moved(&working, RunStatus::Done);
         state.apply(status(&done));
         assert!(state.running().is_empty());
@@ -869,6 +868,9 @@ mod tests {
             });
         }
         assert_eq!(state.project_status(p.id), ThreadStatus::Idle);
+        state.apply(status(&run(busy.id, RunStatus::Queued, 5)));
+        assert_eq!(state.project_status(p.id), ThreadStatus::Queued);
+        assert_eq!(state.thread_status(busy.id), ThreadStatus::Queued);
         state.apply(status(&run(busy.id, RunStatus::Working, 1)));
         assert_eq!(state.project_status(p.id), ThreadStatus::Working);
         state.apply(ServerMsg::Approval {
@@ -981,6 +983,10 @@ mod tests {
             agent: forge.clone(),
         });
         assert_eq!(state.agent_status(forge.id), ThreadStatus::Idle);
+        let mut queued = run(t.id, RunStatus::Queued, 1);
+        queued.agent = forge.id;
+        state.apply(status(&queued));
+        assert_eq!(state.agent_status(forge.id), ThreadStatus::Queued);
         let mut working = run(t.id, RunStatus::Working, 1);
         working.agent = forge.id;
         state.apply(status(&working));
