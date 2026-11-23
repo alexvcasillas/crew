@@ -234,7 +234,13 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
         lines[i + 1].clone()
     };
     assert_eq!(after("--model"), "opus");
-    assert_eq!(after("--append-system-prompt"), "Keep answers short.");
+    // The instructions follow crewd's Crew block in the same argument.
+    assert!(after("--append-system-prompt").starts_with("You are Forge, "));
+    let logged = std::fs::read_to_string(&args).unwrap();
+    assert!(
+        logged.contains("\n\nKeep answers short.\n--allowedTools\n"),
+        "{logged}"
+    );
     assert!(after("--allowedTools").contains("Bash(cargo test:*)"));
 
     press(cx, window, "escape");
