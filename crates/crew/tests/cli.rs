@@ -222,3 +222,38 @@ fn unknown_and_too_short_ids_are_refused() {
         assert!(err.contains(want), "got: {err}");
     }
 }
+
+#[test]
+fn status_lists_queued_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    start_crewd(
+        &home,
+        manifest_dir().join("../crewd/tests/fake/claude_sleeps.sh"),
+    );
+    let (thread, _) = start_sleeping_run(&home, tmp.path());
+    // One run per thread: the second one waits.
+    stdout_of(crew(&home, tmp.path()).args(["say", &thread, "@Scout next"]));
+
+    let status = stdout_of(crew(&home, tmp.path()).arg("status"));
+    let states: Vec<&str> = status
+        .lines()
+        .map(|l| l.split_whitespace().nth(2).unwrap_or(""))
+        .collect();
+    assert_eq!(states, vec!["Working", "Queued"], "got:\n{status}");
+
+    stdout_of(crew(&home, tmp.path()).args(["stop", "--all"]));
+    let started = std::time::Instant::now();
+    let out = stdout_of(crew(&home, tmp.path()).args(["watch", &thread, "--until-idle"]));
+    assert!(
+        out.contains("system: Stopped before starting."),
+        "got:\n{out}"
+    );
+    // A run that never started gets no "stopped" message to wait for.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "watch waited {:?} for a message that never comes",
+        started.elapsed()
+    );
+}

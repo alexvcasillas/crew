@@ -210,6 +210,9 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
+/// How much of a raw line `watch` prints.
+const RAW_CHARS: usize = 120;
+
 /// The line to print for an event, without the agent prefix.
 fn event_line(event: &Event) -> Option<String> {
     let with_target = |verb: &str, target: &Option<String>| match target {
@@ -230,7 +233,18 @@ fn event_line(event: &Event) -> Option<String> {
         Event::SessionStarted { model, .. } => Some(format!("started ({model})")),
         Event::Thinking { .. } => Some("thinking…".into()),
         Event::Message { text } => Some(format!("says: {}", first_line(text))),
-        _ => None,
+        Event::PermissionDenied { tool, .. } => Some(format!("denied {tool}")),
+        Event::Error { message } => Some(format!("error: {message}")),
+        Event::Raw { line } => Some(format!(
+            "raw: {}",
+            line.chars().take(RAW_CHARS).collect::<String>()
+        )),
+        Event::ToolResult {
+            is_error: true,
+            output,
+            ..
+        } => Some(format!("tool failed: {}", first_line(output))),
+        Event::ToolResult { .. } | Event::TurnEnd { .. } => None,
     }
 }
 
@@ -390,7 +404,11 @@ async fn watch(home: &std::path::Path, thread: ThreadId, until_idle: bool) -> Re
                             }
                         }
                         RunStatus::Failed => followups.expect(format!("failed:{name}")),
-                        RunStatus::Stopped => followups.expect(format!("stopped:{name}")),
+                        // A run stopped before it started gets no message
+                        // of its own, only the thread-wide one.
+                        RunStatus::Stopped if started(&mut ctl, run).await? => {
+                            followups.expect(format!("stopped:{name}"))
+                        }
                         _ => {}
                     }
                     if until_idle && idle_since.is_none() && idle(&mut ctl, thread).await? {
@@ -421,6 +439,12 @@ async fn watch(home: &std::path::Path, thread: ThreadId, until_idle: bool) -> Re
             ServerMsg::Response { .. } => {}
         }
     }
+}
+
+/// True when the run got as far as starting `claude`.
+async fn started(ctl: &mut Client, run: RunId) -> Result<bool> {
+    let runs: Vec<StoredRun> = ctl.ask(Request::ListRuns { status: None }).await?;
+    Ok(runs.iter().any(|r| r.id == run && !r.session_id.is_empty()))
 }
 
 /// True when the thread has no queued or working run.
@@ -490,5 +514,48 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_shows_denials_errors_raw_lines_and_failed_tools() {
+        let denied = Event::PermissionDenied {
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "rm -rf x"}),
+        };
+        assert_eq!(event_line(&denied).as_deref(), Some("denied Bash"));
+
+        let error = Event::Error {
+            message: "rate limited".into(),
+        };
+        assert_eq!(event_line(&error).as_deref(), Some("error: rate limited"));
+
+        let long = "x".repeat(130);
+        let raw = Event::Raw { line: long };
+        assert_eq!(event_line(&raw), Some(format!("raw: {}", "x".repeat(120))));
+        let short_raw = Event::Raw {
+            line: "é-not json".into(),
+        };
+        assert_eq!(event_line(&short_raw).as_deref(), Some("raw: é-not json"));
+
+        let failed = Event::ToolResult {
+            id: "t1".into(),
+            is_error: true,
+            output: "No such file\nmore detail".into(),
+        };
+        assert_eq!(
+            event_line(&failed).as_deref(),
+            Some("tool failed: No such file")
+        );
+        let ok = Event::ToolResult {
+            id: "t1".into(),
+            is_error: false,
+            output: "fine".into(),
+        };
+        assert_eq!(event_line(&ok), None);
     }
 }
