@@ -96,9 +96,9 @@ async fn stop_escalates_to_kill() {
     handle.stop();
     handle.stop();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(9), join)
+    let outcome = tokio::time::timeout(Duration::from_secs(12), join)
         .await
-        .expect("outcome within 9 s")
+        .expect("outcome within 12 s")
         .unwrap();
     assert_eq!(outcome, RunOutcome::Stopped);
     assert!(
@@ -198,4 +198,83 @@ async fn nonzero_exit_without_stderr_reports_code() {
         join.await.unwrap(),
         RunOutcome::Failed("`claude` exited with code 3.".into())
     );
+}
+
+/// Kills the leaked process whose pid the fake wrote to `pid_file`.
+struct Leaked(PathBuf);
+
+impl Drop for Leaked {
+    fn drop(&mut self) {
+        if let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            let _ = kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+async fn wait_for_pid_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while std::fs::read_to_string(path).map_or(true, |s| s.trim().is_empty()) {
+        assert!(Instant::now() < deadline, "fake never wrote its pid");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn held_stdout_does_not_hang_the_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("leaked.pid");
+    let _leaked = Leaked(pid_file.clone());
+    let inv = invocation(
+        fake("claude_leaks_stdout.sh"),
+        vec![pid_file.to_string_lossy().into_owned()],
+    );
+    let (handle, mut rx, join) = spawn_run(inv);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(4), join)
+        .await
+        .expect("outcome within 4 s")
+        .unwrap();
+    assert_eq!(
+        outcome,
+        RunOutcome::Failed("`claude` exited before finishing the turn.".into())
+    );
+    // The event channel is closed too, so a watcher can finish.
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "event channel still open");
+    wait_for_pid_file(&pid_file).await;
+    handle.stop();
+}
+
+#[tokio::test]
+async fn stop_with_held_stdout_closes_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("leaked.pid");
+    let _leaked = Leaked(pid_file.clone());
+    let inv = invocation(
+        fake("claude_leaks_stdout.sh"),
+        vec![pid_file.to_string_lossy().into_owned(), "wait".into()],
+    );
+    let (handle, mut rx, join) = spawn_run(inv);
+    wait_for_pid_file(&pid_file).await;
+
+    handle.stop();
+    // At most the 3 s + 5 s escalation plus the 2 s reader grace, while the
+    // leaked child holds the pipes for 60 s.
+    let outcome = tokio::time::timeout(Duration::from_secs(12), join)
+        .await
+        .expect("outcome within 12 s")
+        .unwrap();
+    assert_eq!(outcome, RunOutcome::Stopped);
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "event channel still open after stop");
+    handle.stop();
 }

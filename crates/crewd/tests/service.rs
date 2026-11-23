@@ -89,6 +89,16 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
+/// The prompt: the one argument after `--`, which must come last.
+fn prompt_of(args: &[String]) -> String {
+    let n = args.len();
+    assert!(
+        n >= 2 && args[n - 2] == "--",
+        "prompt is not last: {args:?}"
+    );
+    args[n - 1].clone()
+}
+
 struct Daemon {
     _tmp: TempDir,
     /// The crew home. It starts out as mode 0755 so tests see crewd fix it.
@@ -506,16 +516,16 @@ async fn stop_all_stops_running_and_queued() {
         serde_json::Value::Null
     );
 
-    let mut stopped_status: Option<RunId> = None;
+    let mut stopped: Vec<RunId> = Vec::new();
     let mut t1_msg = None;
     let mut t2_msg = None;
-    while stopped_status.is_none() || t1_msg.is_none() || t2_msg.is_none() {
+    while stopped.len() < 2 || t1_msg.is_none() || t2_msg.is_none() {
         match c.recv().await.expect("connection closed") {
             ServerMsg::RunStatus {
                 run,
                 status: RunStatus::Stopped,
                 ..
-            } => stopped_status = Some(run),
+            } => stopped.push(run),
             ServerMsg::Message { thread, message } if message.author == Author::System => {
                 if thread == t1 {
                     t1_msg = Some(message.body);
@@ -526,13 +536,15 @@ async fn stop_all_stops_running_and_queued() {
             _ => {}
         }
     }
-    assert_eq!(stopped_status, Some(run));
+    assert!(stopped.contains(&run), "the live run was not stopped");
     assert_eq!(t1_msg.as_deref(), Some("Forge stopped."));
     assert_eq!(t2_msg.as_deref(), Some("Stopped before starting."));
 
     let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
-    assert_eq!(runs.len(), 1, "the queued job never got a run");
-    assert_eq!(runs[0].status, RunStatus::Stopped);
+    assert_eq!(runs.len(), 2, "the queued job has a run row too");
+    assert!(runs.iter().all(|r| r.status == RunStatus::Stopped));
+    let queued = runs.iter().find(|r| r.thread == t2).unwrap();
+    assert_eq!(queued.session_id, "", "the queued run never started");
 
     // Nothing starts later from the dropped queue.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -650,7 +662,7 @@ async fn failed_spawn_does_not_get_resumed() {
     assert_eq!(calls.len(), 1);
     assert!(arg_after(&calls[0], "--session-id").is_some());
     assert!(arg_after(&calls[0], "--resume").is_none());
-    let prompt = arg_after(&calls[0], "-p").unwrap();
+    let prompt = prompt_of(&calls[0]);
     assert!(
         prompt.starts_with("You: @Forge first\n"),
         "prompt: {prompt}"
@@ -696,14 +708,114 @@ async fn reply_in_thread_resumes_agent_session() {
     let calls = logged_calls(&log);
     assert_eq!(calls.len(), 2);
     let session = arg_after(&calls[0], "--session-id").expect("new session id");
-    assert_eq!(
-        arg_after(&calls[0], "-p").unwrap(),
-        "You: hello\n\n@Forge look at it"
-    );
+    assert_eq!(prompt_of(&calls[0]), "You: hello\n\n@Forge look at it");
     assert_eq!(arg_after(&calls[1], "--resume"), Some(session.clone()));
-    assert_eq!(arg_after(&calls[1], "-p").unwrap(), "@Forge and again");
+    assert_eq!(prompt_of(&calls[1]), "@Forge and again");
 
     let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
     assert_eq!(runs.len(), 2);
     assert!(runs.iter().all(|r| r.session_id == session));
+}
+
+fn is_status(m: &ServerMsg, want: RunStatus) -> bool {
+    matches!(m, ServerMsg::RunStatus { status, .. } if *status == want)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_run_is_listed_and_can_be_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(1, fake("claude_sleeps.sh")).await;
+    let mut c = d.client().await;
+    let (agent, threads) = setup(&mut c, dir.path(), 2).await;
+    let (t1, t2) = (threads[0], threads[1]);
+    c.call(Request::Subscribe { thread: t1 }).await.unwrap();
+    c.call(Request::Subscribe { thread: t2 }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread: t1,
+        body: "@Forge wait".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Working)).await;
+
+    c.call(Request::PostMessage {
+        thread: t2,
+        body: "@Forge later".into(),
+    })
+    .await
+    .unwrap();
+    let seen = c.until(|m| is_status(m, RunStatus::Queued)).await;
+    let Some(ServerMsg::RunStatus { thread, run, .. }) = seen.last().cloned() else {
+        unreachable!()
+    };
+    assert_eq!(thread, t2);
+
+    let queued: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Queued),
+        })
+        .await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, run);
+    assert_eq!(queued[0].thread, t2);
+    assert_eq!(queued[0].agent, agent);
+    assert_eq!(queued[0].session_id, "");
+
+    assert_eq!(
+        c.call(Request::StopRun { run }).await.unwrap(),
+        serde_json::Value::Null
+    );
+    let seen = c.until(|m| is_status(m, RunStatus::Stopped)).await;
+    assert!(matches!(seen.last(), Some(ServerMsg::RunStatus { run: r, .. }) if *r == run));
+
+    // Free the slot: the stopped run must not start.
+    c.call(Request::StopThread { thread: t1 }).await.unwrap();
+    c.until(|m| is_status(m, RunStatus::Stopped)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs.len(), 2);
+    let stopped = runs.iter().find(|r| r.id == run).unwrap();
+    assert_eq!(stopped.status, RunStatus::Stopped);
+    assert_eq!(stopped.session_id, "", "the stopped run never started");
+    assert!(stopped.ended_at.is_some());
+    assert!(runs.iter().all(|r| r.status == RunStatus::Stopped));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_agent_hears_what_it_missed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let d = Daemon::start(4, script).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let mut triage = forge();
+    triage.name = "Triage".into();
+    let _: AgentId = c.ok(Request::CreateAgent { spec: triage }).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+
+    for body in ["@Forge look at it", "@Triage check it", "@Forge and again"] {
+        c.call(Request::PostMessage {
+            thread,
+            body: body.into(),
+        })
+        .await
+        .unwrap();
+        c.until(|m| is_status(m, RunStatus::Done)).await;
+    }
+
+    let summary = fixture_summary("read_file.jsonl");
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(prompt_of(&calls[0]), "@Forge look at it");
+    assert_eq!(
+        prompt_of(&calls[1]),
+        format!("You: @Forge look at it\nForge: {summary}\n\n@Triage check it")
+    );
+    let session = arg_after(&calls[0], "--session-id").unwrap();
+    assert_eq!(arg_after(&calls[2], "--resume"), Some(session));
+    assert_eq!(
+        prompt_of(&calls[2]),
+        format!("You: @Triage check it\nTriage: {summary}\n\n@Forge and again")
+    );
 }

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::service::Service;
@@ -48,8 +50,29 @@ fn log(msg: impl std::fmt::Display) {
     eprintln!("crewd: {msg}");
 }
 
-/// Serves clients on `home/crewd.sock`. Runs until accepting fails for good.
+/// Serves clients on `home/crewd.sock` until SIGINT, SIGTERM or SIGHUP.
+/// Then stops every run, marks them `Interrupted` and returns.
 pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
+    let mut sigint = signal(SignalKind::interrupt()).context("handling SIGINT")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("handling SIGTERM")?;
+    let mut sighup = signal(SignalKind::hangup()).context("handling SIGHUP")?;
+    let signals = async move {
+        tokio::select! {
+            _ = sigint.recv() => log("got SIGINT"),
+            _ = sigterm.recv() => log("got SIGTERM"),
+            _ = sighup.recv() => log("got SIGHUP"),
+        }
+    };
+    serve_until(home, opts, signals).await
+}
+
+/// Like [`serve`], but shuts down when `shutdown` completes instead of on
+/// a signal.
+pub async fn serve_until(
+    home: &Path,
+    opts: ServeOptions,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -69,7 +92,7 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
     let _lock = lock_home(home, &sock)?;
 
     let store = Store::open(&home.join(DB_NAME)).context("opening the database")?;
-    let interrupted = store.mark_working_runs_interrupted()?;
+    let interrupted = store.mark_unfinished_runs_interrupted()?;
     if interrupted > 0 {
         log(format!(
             "marked {interrupted} unfinished runs as interrupted"
@@ -86,8 +109,13 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
     log(format!("listening on {}", sock.display()));
 
     let service = Service::new(store, opts.max_runs, opts.claude_bin);
+    let mut shutdown = std::pin::pin!(shutdown);
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((stream, _)) => {
                 let service = service.clone();
                 tokio::spawn(async move {
@@ -102,6 +130,16 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
             }
         }
     }
+
+    log("shutting down, stopping all runs");
+    drop(listener);
+    // We still hold the lock, so the socket is ours to remove.
+    if let Err(e) = std::fs::remove_file(&sock) {
+        log(format!("couldn't remove {}: {e}", sock.display()));
+    }
+    service.shutdown().await;
+    log("stopped");
+    Ok(())
 }
 
 /// Takes the exclusive lock on `home/crewd.lock`, or fails if another
