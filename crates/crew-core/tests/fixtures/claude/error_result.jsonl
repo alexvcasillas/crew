@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-haiku-4-5","tools":["Read","Edit","Bash"]}
+{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":5000,"num_turns":10,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"rm -rf /work/demo/tmp"}}],"session_id":"00000000-0000-4000-8000-000000000001"}
