@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crew_core::claude::{ClaudeInvocation, parse_line};
 use crew_core::event::Event;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -38,6 +39,9 @@ pub enum RunOutcome {
 }
 
 /// Controls a running process.
+///
+/// Dropping the handle stops the run, the same as calling [`RunHandle::stop`].
+/// Keep it alive for as long as the run should go on.
 pub struct RunHandle {
     pid: Option<u32>,
     stop_tx: watch::Sender<bool>,
@@ -57,12 +61,19 @@ impl RunHandle {
 
 /// Spawns `claude` in its own process group and streams its events.
 ///
-/// Must be called inside a tokio runtime.
+/// Must be called inside a tokio runtime. Dropping the returned
+/// [`RunHandle`] stops the run.
 pub fn spawn_run(
     inv: ClaudeInvocation,
 ) -> (RunHandle, mpsc::Receiver<Event>, JoinHandle<RunOutcome>) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let (stop_tx, stop_rx) = watch::channel(false);
+
+    if !inv.cwd.is_dir() {
+        let msg = format!("Working folder {} doesn't exist.", inv.cwd.display());
+        let handle = RunHandle { pid: None, stop_tx };
+        return (handle, rx, tokio::spawn(async { RunOutcome::Failed(msg) }));
+    }
 
     let spawned = Command::new(&inv.bin)
         .args(&inv.args)
@@ -101,10 +112,10 @@ pub fn spawn_run(
 /// Keeps reading to the end even if the receiver is gone, so the child
 /// never blocks on a full pipe.
 async fn read_events(stdout: impl AsyncRead + Unpin, tx: mpsc::Sender<Event>) -> bool {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
     let mut turn_ok = false;
     let mut receiver_alive = true;
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Some(line) = next_line(&mut reader).await {
         for event in parse_line(&line) {
             if let Event::TurnEnd { ok, .. } = &event {
                 turn_ok = *ok;
@@ -119,15 +130,28 @@ async fn read_events(stdout: impl AsyncRead + Unpin, tx: mpsc::Sender<Event>) ->
 
 /// Keeps the last stderr lines.
 async fn read_tail(stderr: impl AsyncRead + Unpin) -> VecDeque<String> {
-    let mut lines = BufReader::new(stderr).lines();
+    let mut reader = BufReader::new(stderr);
     let mut tail = VecDeque::with_capacity(STDERR_TAIL);
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Some(line) = next_line(&mut reader).await {
         if tail.len() == STDERR_TAIL {
             tail.pop_front();
         }
         tail.push_back(line);
     }
     tail
+}
+
+/// Reads one line, replacing bad UTF-8. Returns `None` at end of input or
+/// on a read error.
+async fn next_line(reader: &mut (impl AsyncBufRead + Unpin)) -> Option<String> {
+    let mut buf = Vec::new();
+    match reader.read_until(b'\n', &mut buf).await {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let line = String::from_utf8_lossy(&buf);
+            Some(line.trim_end_matches(['\n', '\r']).to_string())
+        }
+    }
 }
 
 async fn supervise(
@@ -141,7 +165,11 @@ async fn supervise(
 
     let exited = tokio::select! {
         status = child.wait() => Some(status),
-        _ = stop_rx.wait_for(|stop| *stop) => None,
+        stop = stop_rx.wait_for(|stop| *stop) => match stop {
+            Ok(_) => None,
+            // The handle was dropped: stop the run so it can't outlive its owner.
+            Err(_) => None,
+        },
     };
 
     let status = match exited {
@@ -160,6 +188,9 @@ async fn supervise(
     let tail = stderr_task.await.unwrap_or_default();
     match status {
         Ok(s) if s.success() && turn_ok => RunOutcome::Done,
+        Ok(s) if s.success() => {
+            RunOutcome::Failed("`claude` exited before finishing the turn.".to_string())
+        }
         Ok(s) => RunOutcome::Failed(failure_message(s, tail)),
         Err(e) => RunOutcome::Failed(format!("Lost track of `claude`: {e}")),
     }
@@ -187,9 +218,12 @@ fn signal_group(pgid: Option<Pid>, signal: Signal) {
 }
 
 fn failure_message(status: ExitStatus, tail: VecDeque<String>) -> String {
-    if tail.is_empty() {
-        format!("`claude` exited with {status}")
-    } else {
-        Vec::from(tail).join("\n")
+    if !tail.is_empty() {
+        return Vec::from(tail).join("\n");
+    }
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("`claude` exited with code {code}."),
+        (None, Some(sig)) => format!("`claude` was ended by signal {sig}."),
+        (None, None) => format!("`claude` exited: {status}."),
     }
 }
