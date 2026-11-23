@@ -98,6 +98,9 @@ pub struct ThreadWorktree {
     pub branch: String,
     /// Sha of the main branch when the worktree was made.
     pub base: String,
+    /// Set once files were copied in and the setup command succeeded.
+    #[serde(default)]
+    pub ready: bool,
 }
 
 /// A thread as saved in the store.
@@ -390,13 +393,14 @@ impl Store {
     /// Sets or clears the thread's worktree.
     pub fn set_thread_worktree(&self, t: ThreadId, wt: Option<&ThreadWorktree>) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE threads SET worktree_path = ?2, worktree_branch = ?3, worktree_base = ?4
-             WHERE id = ?1",
+            "UPDATE threads SET worktree_path = ?2, worktree_branch = ?3, worktree_base = ?4,
+             worktree_ready = ?5 WHERE id = ?1",
             params![
                 t.to_string(),
                 wt.map(|w| w.path.to_string_lossy().into_owned()),
                 wt.map(|w| &w.branch),
-                wt.map(|w| &w.base)
+                wt.map(|w| &w.base),
+                wt.is_some_and(|w| w.ready)
             ],
         )?;
         if changed == 0 {
@@ -649,7 +653,8 @@ fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
 }
 
 const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,
-     worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used FROM threads";
+     worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used,
+     worktree_ready FROM threads";
 
 fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
     let path: Option<String> = r.get(4)?;
@@ -660,6 +665,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
             path: PathBuf::from(path),
             branch,
             base,
+            ready: r.get(10)?,
         }),
         _ => None,
     };

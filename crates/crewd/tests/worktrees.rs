@@ -45,6 +45,28 @@ fn writing_script(dir: &Path) -> PathBuf {
     path
 }
 
+/// A fake claude that starts a session, then waits until it is stopped.
+fn session_then_sleep_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-session-sleeps.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nhead -n 1 '{}'\nsleep 60\n",
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn is_setup_call(m: &ServerMsg) -> bool {
+    matches!(
+        m,
+        ServerMsg::Event { event: Event::ToolCall { name, .. }, .. } if name == "Setup"
+    )
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -436,11 +458,113 @@ async fn setup_failure_fails_run_and_keeps_worktree() {
         "only the last 20 lines: {failure}"
     );
 
-    // The worktree stays, and claude never ran in it.
+    // The last setup event says how it ended.
+    let last_setup = seen
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Event {
+                event: e @ Event::ToolResult { .. },
+                ..
+            } => Some(e.clone()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(
+        last_setup,
+        Event::ToolResult {
+            id: "setup".into(),
+            is_error: true,
+            output: "The setup command exited with code 3.".into(),
+        }
+    );
+
+    // The worktree stays, not ready, and claude never ran in it.
     let wt_path = d.home.join("worktrees/demo/fix-login");
     assert!(wt_path.is_dir());
     assert!(!wt_path.join("file.txt").exists());
-    assert!(thread_of(&mut c, &s).await.worktree.is_some());
+    let wt = thread_of(&mut c, &s).await.worktree.unwrap();
+    assert!(!wt.ready);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_setup_runs_again_next_time() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    std::fs::write(d.root().join(".env"), "KEY=1\n").unwrap();
+    // Fails the first time, works after that.
+    let marker = scripts.path().join("tried");
+    c.call(Request::UpdateProject {
+        project: s.project,
+        setup_command: Some(format!(
+            "if [ -f '{m}' ]; then echo second try; else touch '{m}'; exit 1; fi",
+            m = marker.display()
+        )),
+        copy_files: vec![".env".into()],
+    })
+    .await
+    .unwrap();
+
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Failed).await;
+    let wt_path = d.home.join("worktrees/demo/fix-login");
+    std::fs::remove_file(wt_path.join(".env")).unwrap();
+
+    post(&mut c, s.thread, "@Forge try again").await;
+    let seen = c.until_status(RunStatus::Done).await;
+    assert!(seen.iter().any(is_setup_call), "setup should run again");
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        ServerMsg::Event { event: Event::ToolResult { output, .. }, .. } if output == "second try"
+    )));
+    // Same worktree, files copied again, and now ready.
+    let wt = thread_of(&mut c, &s).await.worktree.unwrap();
+    assert_eq!(wt.path, wt_path);
+    assert!(wt.ready);
+    assert!(wt_path.join(".env").is_file());
+    assert!(wt_path.join("file.txt").is_file());
+
+    // Ready: no setup on later runs.
+    post(&mut c, s.thread, "@Forge once more").await;
+    let seen = c.until_status(RunStatus::Done).await;
+    assert!(!seen.iter().any(is_setup_call));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_files_stay_out_of_commits() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    std::fs::write(d.root().join(".env.local"), "SECRET=1\n").unwrap();
+    c.call(Request::UpdateProject {
+        project: s.project,
+        setup_command: None,
+        copy_files: vec![".env.local".into()],
+    })
+    .await
+    .unwrap();
+
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let wt_path = d.home.join("worktrees/demo/fix-login");
+    assert!(wt_path.join(".env.local").is_file());
+
+    let diff: Diff = c.ok(Request::ThreadDiff { thread: s.thread }).await;
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["file.txt"]);
+
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+    let committed = git(&wt_path, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(committed, "file.txt");
+    assert!(wt_path.join(".env.local").is_file());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,6 +604,21 @@ async fn stop_during_setup_kills_it() {
     assert!(system_messages(&seen).contains(&"Forge stopped.".into()));
     let wt_path = d.home.join("worktrees/demo/fix-login");
     assert!(!wt_path.join("file.txt").exists());
+    assert!(!thread_of(&mut c, &s).await.worktree.unwrap().ready);
+
+    // The stopped setup runs again on the next writing run.
+    c.call(Request::UpdateProject {
+        project: s.project,
+        setup_command: Some("echo quick".into()),
+        copy_files: vec![],
+    })
+    .await
+    .unwrap();
+    post(&mut c, s.thread, "@Forge again").await;
+    let seen = c.until_status(RunStatus::Done).await;
+    assert!(seen.iter().any(is_setup_call));
+    assert!(wt_path.join("file.txt").is_file());
+    assert!(thread_of(&mut c, &s).await.worktree.unwrap().ready);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -568,13 +707,23 @@ async fn discard_removes_worktree() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_refused_while_running() {
-    let d = Daemon::start(fake("claude_sleeps.sh")).await;
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(session_then_sleep_script(scripts.path())).await;
     let mut c = d.client().await;
     let s = setup(&d, &mut c).await;
 
     post(&mut c, s.thread, "@Forge wait").await;
-    // Working comes before the run's first event, and the run is live by then.
-    c.until_status(RunStatus::Working).await;
+    // Claude itself is running, past setup.
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::Event {
+                event: Event::SessionStarted { .. },
+                ..
+            }
+        )
+    })
+    .await;
 
     let wait = "Wait for Forge to finish, or stop it.";
     let err = c
@@ -590,15 +739,8 @@ async fn commit_refused_while_running() {
         .await
         .unwrap_err();
     assert_eq!(err, wait);
-    // Discard was refused, so the worktree is made and stays.
-    let wt_path = d.home.join("worktrees/demo/fix-login");
-    timeout(WAIT, async {
-        while !wt_path.is_dir() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the worktree was never made");
+    // Discard was refused, so the worktree stays.
+    assert!(d.home.join("worktrees/demo/fix-login").is_dir());
 
     c.call(Request::StopThread { thread: s.thread })
         .await
