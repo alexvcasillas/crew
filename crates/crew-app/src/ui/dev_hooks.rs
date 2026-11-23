@@ -13,6 +13,8 @@ pub struct DevHooks {
     /// `CREW_APP_SHOW=diff:<thread>`: the thread's changes, opened once
     /// the thread is known.
     pub review: Option<ThreadId>,
+    /// `CREW_APP_SHOW=running`: Running now.
+    pub running: bool,
 }
 
 /// Reads the hooks through `var`, logging values it can't use.
@@ -25,11 +27,11 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         id
     });
     let mut review = None;
+    let mut running = false;
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
-            "running" | "settings" => {
-                eprintln!("crew: CREW_APP_SHOW={v} has no view yet, ignored")
-            }
+            "running" => running = true,
+            "settings" => eprintln!("crew: CREW_APP_SHOW={v} has no view yet, ignored"),
             _ => match v.strip_prefix("diff:").map(|id| id.trim().parse()) {
                 Some(Ok(id)) => review = Some(ThreadId(id)),
                 Some(Err(_)) => eprintln!("crew: CREW_APP_SHOW={v} is not diff:<thread id>"),
@@ -49,6 +51,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         open_thread,
         show,
         review,
+        running,
     }
 }
 
@@ -71,11 +74,13 @@ mod tests {
                 open_thread: Some(id),
                 show: Some("running".into()),
                 review: None,
+                running: true,
             }
         );
         let diff = format!("diff:{id}");
         let review = read(|k| (k == "CREW_APP_SHOW").then(|| diff.clone()));
         assert_eq!(review.review, Some(id));
+        assert!(!review.running);
         assert_eq!(read(|_| Some("diff:nope".into())).review, None);
         assert_eq!(read(|_| None), DevHooks::default());
         let bad = read(|k| (k == "CREW_APP_OPEN_THREAD").then(|| "nope".to_string()));

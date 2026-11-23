@@ -882,6 +882,7 @@ impl Workspace {
                     .label("Open in editor")
                     .on_click(cx.listener(|this, _, window, cx| this.open_in_editor(window, cx))),
             )
+            .children(self.render_title_actions(cx))
             .into_any_element();
         Some((left, right))
     }

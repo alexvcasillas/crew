@@ -91,6 +91,7 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(bindings().into_iter().map(|s| s.binding));
     cx.bind_keys(crate::ui::composer::bindings());
     cx.bind_keys(crate::ui::diff_view::bindings());
+    cx.bind_keys(crate::ui::running_view::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
 }

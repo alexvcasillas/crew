@@ -11,6 +11,7 @@ pub mod diff_view;
 mod inspector;
 mod mention_menu;
 mod run_card;
+pub mod running_view;
 mod service_control;
 mod sidebar;
 mod status_bar;
@@ -24,6 +25,8 @@ pub mod workspace;
 mod diff_tests;
 #[cfg(test)]
 mod inspector_tests;
+#[cfg(test)]
+mod running_tests;
 #[cfg(test)]
 mod test_ui;
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
-use crew_proto::Request;
+use crew_proto::{Request, RuntimeInfo};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::component::WindowExt as _;
@@ -20,8 +20,8 @@ use super::composer::{Composer, ComposerEvent};
 use super::diff_view::{Review, SavedMessage};
 use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
-use super::status_bar::StatusBar;
-use crate::app::{ApproveLatest, NewThread};
+use super::running_view::RunningView;
+use crate::app::{ApproveLatest, NewThread, ShowRunning, ShowThreads, StopAll};
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
@@ -61,6 +61,9 @@ pub(super) enum DraftKey {
     NewThread(ChannelId),
 }
 
+/// How often the status bar asks which agent CLIs are ready.
+const RUNTIMES_EVERY: Duration = Duration::from_secs(10 * 60);
+
 /// How close to the end, in px, still counts as reading the end.
 const NEAR_BOTTOM: f32 = 40.;
 
@@ -73,7 +76,6 @@ pub struct Workspace {
     _client_events: Task<()>,
     /// Starting (or restarting) crewd.
     pub(super) starting: bool,
-    status_bar: Entity<StatusBar>,
     pub(super) composer: Entity<Composer>,
     _composer_events: Subscription,
     focus: FocusHandle,
@@ -116,6 +118,14 @@ pub struct Workspace {
     pub(super) commit_messages: HashMap<ThreadId, SavedMessage>,
     /// Numbers the thread diff reads, so only the latest lands.
     pub(super) diff_seq: u64,
+    /// Running now, shown in place of the body.
+    pub(super) running: Option<RunningView>,
+    /// A Stop all request is waiting for its answer.
+    pub(super) stopping_all: bool,
+    /// The agent CLIs crewd found, as last asked.
+    pub(super) runtimes: Vec<RuntimeInfo>,
+    /// Asks crewd for the runtimes now and every [`RUNTIMES_EVERY`].
+    runtimes_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -131,16 +141,23 @@ impl Workspace {
                 },
             );
         let hooks = dev_hooks();
+        // Window-wide shortcuts such as Stop all need a focused element
+        // inside the workspace, even before anything is clicked.
+        let focus = cx.focus_handle();
+        let running = hooks.running.then(|| RunningView::new(cx.focus_handle()));
+        running
+            .as_ref()
+            .map_or(&focus, |r| &r.focus)
+            .focus(window, cx);
         Self {
             conn,
             state: State::default(),
             client,
             _client_events: Self::take_in_events(events, window, cx),
             starting: false,
-            status_bar: cx.new(|_| StatusBar::default()),
             composer,
             _composer_events: composer_events,
-            focus: cx.focus_handle(),
+            focus,
             nav: Nav::default(),
             drafts: HashMap::new(),
             creating: None,
@@ -161,6 +178,10 @@ impl Workspace {
             review_pending: hooks.review,
             commit_messages: HashMap::new(),
             diff_seq: 0,
+            running,
+            stopping_all: false,
+            runtimes: Vec::new(),
+            runtimes_task: None,
         }
     }
 
@@ -225,12 +246,14 @@ impl Workspace {
     }
 
     fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut connected = false;
         for event in events {
+            connected |= event == ClientEvent::Connected;
             event.apply_to(&mut self.state);
         }
-        let connection = self.state.connection().cloned();
-        self.status_bar
-            .update(cx, |bar, cx| bar.set_connection(connection, cx));
+        if connected {
+            self.watch_runtimes(cx);
+        }
         self.sync(cx);
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
@@ -240,7 +263,7 @@ impl Workspace {
 
     /// Brings the composer, the timer and the scroll position in line
     /// with what is known and open.
-    fn sync(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn sync(&mut self, cx: &mut Context<Self>) {
         let project = self
             .nav
             .channel
@@ -276,7 +299,13 @@ impl Workspace {
             composer.set_busy(busy, cx);
         });
 
-        if working.is_empty() {
+        let running_ticks = self.running.is_some()
+            && self
+                .state
+                .running()
+                .iter()
+                .any(|r| r.status == RunStatus::Working);
+        if working.is_empty() && !running_ticks {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -521,6 +550,55 @@ impl Workspace {
         self.request(Request::StopRun { run }, window, cx);
     }
 
+    /// Stops every run in every project. Sent once until crewd answers.
+    pub(super) fn stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stopping_all {
+            return;
+        }
+        self.stopping_all = true;
+        let answer = self.client.request(Request::StopAll);
+        self.spawn_request(window, cx, async move |this, cx| {
+            let result = answer.await.map(drop);
+            this.update(cx, |this, cx| {
+                this.stopping_all = false;
+                cx.notify();
+            })
+            .ok();
+            result.map_err(|e| (e, None))
+        });
+        cx.notify();
+    }
+
+    /// Asks crewd which agent CLIs are ready, now and every
+    /// [`RUNTIMES_EVERY`] after. A new connection starts over.
+    fn watch_runtimes(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.runtimes_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let answer = client.request(Request::Runtimes).await;
+                let runtimes = answer.and_then(|v| {
+                    serde_json::from_value::<Vec<RuntimeInfo>>(v).map_err(|e| e.to_string())
+                });
+                // A failed ask keeps what was known; the next one may work.
+                if let Ok(runtimes) = runtimes {
+                    let kept = this.update(cx, |this, cx| {
+                        this.runtimes = runtimes;
+                        cx.notify();
+                    });
+                    if kept.is_err() {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(RUNTIMES_EVERY).await;
+            }
+        }));
+    }
+
+    /// Gives the workspace itself focus, so its shortcuts work.
+    pub(super) fn focus_workspace(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+    }
+
     /// Sends `req`, showing its error if it fails.
     pub(super) fn request(&mut self, req: Request, window: &mut Window, cx: &mut Context<Self>) {
         let answer = self.client.request(req);
@@ -588,15 +666,16 @@ pub(super) fn near_bottom(offset: f32, max: f32) -> bool {
     -offset >= max - NEAR_BOTTOM
 }
 
-/// What to open at startup: a thread and a review.
+/// What to open at startup: a thread, a review or Running now.
 #[derive(Default)]
 struct StartupHooks {
     open_thread: Option<ThreadId>,
     review: Option<ThreadId>,
+    running: bool,
 }
 
-/// `CREW_APP_OPEN_THREAD` and `CREW_APP_SHOW=diff:<thread>`, in debug
-/// builds only.
+/// `CREW_APP_OPEN_THREAD` and `CREW_APP_SHOW=diff:<thread>|running`, in
+/// debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
     {
@@ -604,6 +683,7 @@ fn dev_hooks() -> StartupHooks {
         StartupHooks {
             open_thread: hooks.open_thread,
             review: hooks.review,
+            running: hooks.running,
         }
     }
     #[cfg(not(debug_assertions))]
@@ -638,6 +718,13 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ApproveLatest, window, cx| this.approve_latest(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &StopAll, window, cx| this.stop_all(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowRunning, window, cx| this.show_running(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowThreads, window, cx| this.close_running(window, cx)),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -646,12 +733,14 @@ impl Render for Workspace {
             .font_family(ui_font())
             .text_size(px(13.))
             .child(self.render_title_bar(cx))
-            .child(if self.review.is_some() {
+            .child(if self.running.is_some() {
+                self.render_running(cx)
+            } else if self.review.is_some() {
                 self.render_review(cx)
             } else {
                 self.render_body(cx)
             })
-            .child(self.status_bar.clone())
+            .child(self.render_status_bar(cx))
     }
 }
 
@@ -783,7 +872,18 @@ mod gpui_tests {
     use crate::test_support::{Daemon, refuse_hello, short_home};
     use crew_core::ids::{ChannelId, ProjectId, ThreadId};
     use crew_proto::Request;
-    use gpui_kit::TestAppContext;
+    use gpui_kit::{Entity, TestAppContext};
+
+    use super::Workspace;
+    use crate::connection::ConnectionState;
+
+    fn wait_connected(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
+        wait_until(cx, "the connection", |cx| {
+            ws.read_with(cx, |ws, _| {
+                ws.state().connection() == Some(&ConnectionState::Connected)
+            })
+        });
+    }
 
     #[gpui_kit::test]
     fn window_opens_with_title_bar_and_status_bar(cx: &mut TestAppContext) {
@@ -849,10 +949,14 @@ mod gpui_tests {
     fn connected_daemon_shows_the_workspace(cx: &mut TestAppContext) {
         let home = short_home();
         let _daemon = Daemon::start(home.path().to_path_buf());
-        let (window, _) = open(cx, home.path());
-        wait_to_show(cx, window, "Connected to crewd");
+        let (window, ws) = open(cx, home.path());
+        wait_connected(cx, &ws);
         assert!(shows(cx, window, "Nothing selected"));
         assert!(!has(cx, window, "connect-start"));
+        assert!(
+            !has(cx, window, "status-connection"),
+            "connected says nothing"
+        );
     }
 
     /// crewd goes away and something on its socket never answers: the
@@ -861,8 +965,8 @@ mod gpui_tests {
     fn a_lost_connection_keeps_the_workspace_while_reconnecting(cx: &mut TestAppContext) {
         let home = short_home();
         let daemon = Daemon::start(home.path().to_path_buf());
-        let (window, _) = open(cx, home.path());
-        wait_to_show(cx, window, "Connected to crewd");
+        let (window, ws) = open(cx, home.path());
+        wait_connected(cx, &ws);
 
         drop(daemon);
         let _silent =
@@ -881,8 +985,8 @@ mod gpui_tests {
     fn workspace_reflects_a_thread_another_client_creates(cx: &mut TestAppContext) {
         let home = short_home();
         let _daemon = Daemon::start(home.path().to_path_buf());
-        let (window, ws) = open(cx, home.path());
-        wait_to_show(cx, window, "Connected to crewd");
+        let (_, ws) = open(cx, home.path());
+        wait_connected(cx, &ws);
 
         // Another app or the CLI, on its own connection.
         let (other, _other_events) = client::spawn(ConnectionConfig {
