@@ -18,12 +18,13 @@ const SLASH: u32 = 0x3a3a3a;
 const SEARCH_WIDTH: f32 = 320.;
 /// Widest the project path chip gets before its start is cut.
 const PATH_MAX_WIDTH: f32 = 220.;
-/// Longest path shown whole, in characters.
-const PATH_MAX_CHARS: usize = 28;
+/// The path chip's padding and border, left and right.
+const CHIP_INSET: f32 = 14.;
+const PATH_FONT_SIZE: f32 = 11.;
 const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 
 impl Workspace {
-    pub(super) fn render_title_bar(&self) -> impl IntoElement + use<> {
+    pub(super) fn render_title_bar(&self, cx: &App) -> impl IntoElement + use<> {
         TitleBar::new()
             .h(px(TITLE_BAR_HEIGHT))
             .bg(color("bg-100"))
@@ -50,7 +51,7 @@ impl Workspace {
                             .child("Crew")
                             .test_support(),
                     )
-                    .children(self.render_breadcrumb()),
+                    .children(self.render_breadcrumb(cx)),
             )
             .child(render_search_button())
             .child(
@@ -69,7 +70,7 @@ impl Workspace {
 impl Workspace {
     /// `/ project / #channel` and the project's folder, for the selected
     /// channel.
-    fn render_breadcrumb(&self) -> Vec<AnyElement> {
+    fn render_breadcrumb(&self, cx: &App) -> Vec<AnyElement> {
         let state = self.state();
         let Some(channel) = self.nav.channel.and_then(|c| state.channel(c)) else {
             return Vec::new();
@@ -78,7 +79,15 @@ impl Workspace {
             return Vec::new();
         };
         let full = home_relative(&project.root);
-        let path = cut_start(&full, PATH_MAX_CHARS);
+        let text = cx.text_system();
+        let font_id = text.resolve_font(&font(mono_font()));
+        let width = |s: &str| -> f32 {
+            s.chars()
+                .filter_map(|c| text.advance(font_id, px(PATH_FONT_SIZE), c).ok())
+                .map(|size| size.width.as_f32())
+                .sum()
+        };
+        let path = cut_start(&full, PATH_MAX_WIDTH - CHIP_INSET, width);
         let slash = || div().flex_none().text_color(rgb(SLASH)).child("/");
         vec![
             slash().into_any_element(),
@@ -107,8 +116,11 @@ impl Workspace {
                 .child(channel.name.clone())
                 .test_support()
                 .into_any_element(),
-            chip(path)
+            // When even the cut path doesn't fit, its start is clipped.
+            chip(div().flex_none().child(path))
                 .id("title-path")
+                .flex()
+                .justify_end()
                 .flex_shrink(1.)
                 .min_w_0()
                 .max_w(px(PATH_MAX_WIDTH))
@@ -121,29 +133,19 @@ impl Workspace {
     }
 }
 
-/// `path` cut from its start to at most `max` characters, keeping whole
-/// trailing folders where it can: `…/demo/repo`.
-pub(super) fn cut_start(path: &str, max: usize) -> String {
-    if path.chars().count() <= max {
+/// `path` cut from its start until `width` says it fits in `max`,
+/// keeping whole trailing folders where it can: `…/demo/repo`.
+pub(super) fn cut_start(path: &str, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(path) <= max {
         return path.to_string();
     }
-    let mut kept = String::new();
-    for part in path.rsplit('/').filter(|p| !p.is_empty()) {
-        let next = if kept.is_empty() {
-            part.to_string()
-        } else {
-            format!("{part}/{kept}")
-        };
-        if next.chars().count() + 2 > max {
-            break;
-        }
-        kept = next;
-    }
-    if kept.is_empty() {
-        let tail: Vec<char> = path.chars().rev().take(max.saturating_sub(1)).collect();
-        return format!("…{}", tail.into_iter().rev().collect::<String>());
-    }
-    format!("…/{kept}")
+    let folders = path.match_indices('/').map(|(i, _)| i);
+    let chars = path.char_indices().map(|(i, _)| i).skip(1);
+    folders
+        .chain(chars)
+        .map(|i| format!("…{}", &path[i..]))
+        .find(|cut| width(cut) <= max)
+        .unwrap_or_else(|| "…".to_string())
 }
 
 /// `path` with the home folder written as `~`.
@@ -201,15 +203,17 @@ mod tests {
 
     #[test]
     fn long_paths_lose_their_start() {
-        assert_eq!(cut_start("~/demo/repo", 28), "~/demo/repo");
+        // Every character 7 px wide, as in a mono font.
+        let width = |s: &str| s.chars().count() as f32 * 7.;
+        assert_eq!(cut_start("~/demo/repo", 200., width), "~/demo/repo");
         assert_eq!(
-            cut_start("/private/var/folders/xy/work/demo/repo", 12),
+            cut_start("/private/var/folders/xy/work/demo/repo", 84., width),
             "…/demo/repo"
         );
         assert_eq!(
-            cut_start("/a/averyveryverylongfoldername", 10),
+            cut_start("/a/averyveryverylongfoldername", 70., width),
             "…oldername"
         );
-        assert!(cut_start(&"x/".repeat(40), 28).chars().count() <= 28);
+        assert_eq!(cut_start("/abc", 3., width), "…");
     }
 }

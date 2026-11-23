@@ -1,7 +1,7 @@
 //! The right-hand column of an open thread: what a run is doing, what
 //! the thread changed and the thread's settings.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crew_core::event::RunStatus;
@@ -44,9 +44,13 @@ pub(super) struct Inspector {
     /// The shown run's activity.
     pub(super) rows: Vec<ActivityRow>,
     /// The run and event count `rows` were made from.
-    rows_from: Option<(RunId, usize)>,
-    /// Tool calls whose whole output is shown.
-    pub(super) expanded: HashSet<String>,
+    pub(super) rows_from: Option<(RunId, usize)>,
+    /// Tool calls, by run and call id, whose whole output is shown.
+    pub(super) expanded: HashSet<(RunId, String)>,
+    /// Each run's changed files and the event count they were made from.
+    run_files: HashMap<RunId, (usize, Vec<FileChange>)>,
+    /// The thread's changed files, all runs merged.
+    pub(super) changes: Vec<FileChange>,
     /// The run picker, once the thread has several runs.
     select: Option<(Entity<RunSelect>, Subscription)>,
     /// The picker's runs and their labels, oldest first.
@@ -67,6 +71,8 @@ impl Default for Inspector {
             rows: Vec::new(),
             rows_from: None,
             expanded: HashSet::new(),
+            run_files: HashMap::new(),
+            changes: Vec::new(),
             select: None,
             choices: Vec::new(),
             diff: None,
@@ -112,28 +118,32 @@ fn run_labels(runs: &[(RunId, String, i64)]) -> Vec<(RunId, SharedString)> {
         .collect()
 }
 
-/// Files the thread's runs edited or created, with lines added and
-/// removed, merged across runs.
-pub fn thread_changes(events: &[LoggedEvent]) -> Vec<FileChange> {
-    let mut runs: Vec<RunId> = Vec::new();
-    for e in events {
-        if !runs.contains(&e.run) {
-            runs.push(e.run);
-        }
-    }
+/// Files changed by several runs, merged by path in the order first
+/// touched.
+pub fn merge_changes<'a>(runs: impl IntoIterator<Item = &'a [FileChange]>) -> Vec<FileChange> {
     let mut files: Vec<FileChange> = Vec::new();
-    for run in runs {
-        for f in summarize(events, run).files {
-            match files.iter_mut().find(|known| known.path == f.path) {
-                Some(known) => {
-                    known.added += f.added;
-                    known.removed += f.removed;
-                }
-                None => files.push(f),
+    for f in runs.into_iter().flatten() {
+        match files.iter_mut().find(|known| known.path == f.path) {
+            Some(known) => {
+                known.added += f.added;
+                known.removed += f.removed;
             }
+            None => files.push(f.clone()),
         }
     }
     files
+}
+
+/// How many events each run has, runs in the order first seen.
+fn events_per_run(events: &[LoggedEvent]) -> Vec<(RunId, usize)> {
+    let mut counts: Vec<(RunId, usize)> = Vec::new();
+    for e in events {
+        match counts.iter_mut().find(|(r, _)| *r == e.run) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((e.run, 1)),
+        }
+    }
+    counts
 }
 
 /// Where a run is, as a word, its colour token and how long it took.
@@ -189,7 +199,8 @@ impl Workspace {
             .collect();
         let choices = run_labels(&runs);
         let shown = self.shown_run(thread).map(|r| r.id);
-        let events_len = state.events(thread).len();
+        let counts = events_per_run(state.events(thread));
+        let count_of = |run: RunId| counts.iter().find(|(r, _)| *r == run).map_or(0, |c| c.1);
         let worktree = state
             .thread(thread)
             .and_then(|t| t.worktree.as_ref())
@@ -203,7 +214,7 @@ impl Workspace {
         self.sync_picker(choices, shown, window, cx);
 
         match shown {
-            Some(run) if self.inspector.rows_from != Some((run, events_len)) => {
+            Some(run) if self.inspector.rows_from != Some((run, count_of(run))) => {
                 let rows = activity_rows(self.state().events(thread), run);
                 let same_run = self.inspector.rows_from.map(|(r, _)| r) == Some(run);
                 let old = std::mem::replace(&mut self.inspector.rows, rows);
@@ -218,7 +229,7 @@ impl Workspace {
                 } else {
                     list.reset(self.inspector.rows.len());
                 }
-                self.inspector.rows_from = Some((run, events_len));
+                self.inspector.rows_from = Some((run, count_of(run)));
             }
             Some(_) => {}
             None => {
@@ -228,6 +239,23 @@ impl Workspace {
                     self.inspector.rows_from = None;
                 }
             }
+        }
+
+        let mut changed = false;
+        for (run, n) in &counts {
+            if self.inspector.run_files.get(run).map(|f| f.0) != Some(*n) {
+                let files = summarize(self.state().events(thread), *run).files;
+                self.inspector.run_files.insert(*run, (*n, files));
+                changed = true;
+            }
+        }
+        if changed {
+            let files = &self.inspector.run_files;
+            self.inspector.changes = merge_changes(
+                counts
+                    .iter()
+                    .filter_map(|(run, _)| files.get(run).map(|f| f.1.as_slice())),
+            );
         }
 
         if self.inspector.tab == InspectorTab::Thread {
@@ -334,6 +362,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.inspector.tab = tab;
+        if tab == InspectorTab::Thread {
+            // Opening the tab always reads the working copy afresh.
+            self.inspector.diff_for = None;
+        }
         self.sync_inspector(window, cx);
         cx.notify();
     }
@@ -346,7 +378,7 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let body = match self.inspector.tab {
             InspectorTab::Activity => self.render_activity(thread, cx).into_any_element(),
-            InspectorTab::Changes => self.render_changes(thread).into_any_element(),
+            InspectorTab::Changes => self.render_changes().into_any_element(),
             InspectorTab::Thread => self.render_thread_tab(thread, cx).into_any_element(),
         };
         div()
@@ -359,7 +391,7 @@ impl Workspace {
             .border_l_1()
             .border_color(color("border-100"))
             .child(self.render_inspector_header(thread, cx))
-            .child(self.render_tabs(thread, cx))
+            .child(self.render_tabs(cx))
             .child(div().flex().flex_col().flex_1().min_h_0().child(body))
             .test_support()
     }
@@ -433,8 +465,8 @@ impl Workspace {
             })
     }
 
-    fn render_tabs(&self, thread: ThreadId, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let changes = thread_changes(self.state().events(thread)).len();
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let changes = self.inspector.changes.len();
         let tab = |id: &'static str, label: &'static str, which: InspectorTab| {
             let selected = self.inspector.tab == which;
             div()
@@ -530,6 +562,7 @@ impl Workspace {
             } else {
                 div()
                     .id("activity-list")
+                    .w_full()
                     .flex_1()
                     .min_h_0()
                     .child(
@@ -574,8 +607,8 @@ impl Workspace {
             )
     }
 
-    fn render_changes(&self, thread: ThreadId) -> impl IntoElement + use<> {
-        let files = thread_changes(self.state().events(thread));
+    fn render_changes(&self) -> impl IntoElement + use<> {
+        let files = self.inspector.changes.clone();
         let added: u32 = files.iter().map(|f| f.added).sum();
         let removed: u32 = files.iter().map(|f| f.removed).sum();
         let n = files.len();
@@ -669,7 +702,35 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::run_labels;
+    use super::{events_per_run, merge_changes, run_labels};
+    use crate::model::LoggedEvent;
+    use crate::ui::run_card::FileChange;
+    use crew_core::event::Event;
+
+    #[test]
+    fn changes_merge_by_path_and_events_count_per_run() {
+        let file = |path: &str, added, removed| FileChange {
+            path: path.into(),
+            added,
+            removed,
+        };
+        let a = [file("a.rs", 1, 2), file("b.rs", 3, 0)];
+        let b = [file("b.rs", 1, 1)];
+        assert_eq!(
+            merge_changes([&a[..], &b[..]]),
+            [file("a.rs", 1, 2), file("b.rs", 4, 1)]
+        );
+        let (r1, r2) = (RunId::new(), RunId::new());
+        let at = |run, seq| LoggedEvent {
+            run,
+            seq,
+            event: Event::Raw {
+                line: String::new(),
+            },
+        };
+        let events = [at(r1, 1), at(r2, 1), at(r1, 2)];
+        assert_eq!(events_per_run(&events), [(r1, 2), (r2, 1)]);
+    }
     use crew_core::ids::RunId;
 
     #[test]

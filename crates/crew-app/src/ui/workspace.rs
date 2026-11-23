@@ -28,6 +28,8 @@ use crate::model::State;
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
+/// Narrower windows hide the inspector until you show it.
+pub const INSPECTOR_MIN_WINDOW: f32 = 1200.;
 /// Longest thread title taken from a first message.
 pub const TITLE_MAX: usize = 80;
 
@@ -97,6 +99,11 @@ pub struct Workspace {
     pub(super) open_inputs: HashSet<ApprovalId>,
     /// Approvals whose answer was sent.
     pub(super) deciding: HashSet<ApprovalId>,
+    /// Whether you showed or hid the inspector. Until you do, it follows
+    /// the window's width.
+    inspector_open: Option<bool>,
+    /// Whether the inspector is shown, as last drawn.
+    pub(super) inspector_shown: bool,
 }
 
 impl Workspace {
@@ -134,6 +141,8 @@ impl Workspace {
             editing: None,
             open_inputs: HashSet::new(),
             deciding: HashSet::new(),
+            inspector_open: None,
+            inspector_shown: false,
         }
     }
 
@@ -582,7 +591,9 @@ fn working_hint(names: &[String]) -> Option<String> {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wide = window.viewport_size().width >= px(INSPECTOR_MIN_WINDOW);
+        self.inspector_shown = self.inspector_open.unwrap_or(wide);
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -598,7 +609,7 @@ impl Render for Workspace {
             .text_color(color("text-primary"))
             .font_family(ui_font())
             .text_size(px(13.))
-            .child(self.render_title_bar())
+            .child(self.render_title_bar(cx))
             .child(
                 div()
                     .flex()
@@ -615,6 +626,7 @@ impl Render for Workspace {
                     )
                     .children(
                         self.inspector_thread()
+                            .filter(|_| self.inspector_shown)
                             .map(|t| self.render_inspector(t, cx)),
                     ),
             )
@@ -623,6 +635,12 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// Shows the inspector if it is hidden, or hides it.
+    pub(super) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_open = Some(!self.inspector_shown);
+        cx.notify();
+    }
+
     /// The thread the inspector shows: the open one, while connected.
     fn inspector_thread(&self) -> Option<ThreadId> {
         let shown = matches!(

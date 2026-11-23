@@ -90,7 +90,7 @@ pub fn monogram(name: &str, size: f32) -> Div {
 }
 
 /// Mono text on a chip, for runtimes and paths.
-pub fn chip(text: impl Into<SharedString>) -> Div {
+pub fn chip(text: impl IntoElement) -> Div {
     div()
         .flex_none()
         .px(px(6.))
@@ -102,7 +102,7 @@ pub fn chip(text: impl Into<SharedString>) -> Div {
         .font_family(mono_font())
         .text_size(px(11.))
         .text_color(color("text-secondary"))
-        .child(text.into())
+        .child(text)
 }
 
 /// A small round dot in the colour token `token`.

@@ -27,6 +27,8 @@ const MENU_CONTEXT: &str = "Mentioning";
 const COMPOSER_CONTEXT: &str = "Composer";
 /// A paperclip outline, drawn for Crew.
 const PAPERCLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 8v8.5a4 4 0 0 1-8 0V6.5a2.5 2.5 0 0 1 5 0V16a1 1 0 0 1-2 0V8"/></svg>"#;
+/// Width of the @ and attach buttons, so they match.
+const FOOTER_BUTTON: f32 = 28.;
 const REPLY_PLACEHOLDER: &str = "Reply in thread. Type @ to bring in an agent.";
 const FIRST_PLACEHOLDER: &str = "Describe the task. The first line becomes the title.";
 
@@ -88,7 +90,6 @@ impl Composer {
                 shift: false,
                 secondary: false,
             } => this.enter(window, cx),
-
             _ => {}
         });
         Self {
@@ -325,6 +326,7 @@ impl Render for Composer {
                         Button::new("composer-at")
                             .ghost()
                             .small()
+                            .w(px(FOOTER_BUTTON))
                             .label("@")
                             .tooltip("Mention an agent")
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -332,16 +334,13 @@ impl Render for Composer {
                             })),
                     )
                     .child(
+                        // Same size and colour as @. Not disabled, which
+                        // would fade it; it only says what is coming.
                         Button::new("composer-attach")
                             .ghost()
                             .small()
-                            .icon(
-                                Icon::default()
-                                    .data(PAPERCLIP)
-                                    .size(px(14.))
-                                    .text_color(color("text-secondary")),
-                            )
-                            .disabled(true)
+                            .w(px(FOOTER_BUTTON))
+                            .icon(Icon::default().data(PAPERCLIP).size(px(14.)))
                             .tooltip("Attachments are coming soon."),
                     )
                     .child(

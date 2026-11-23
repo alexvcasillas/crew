@@ -8,7 +8,7 @@ use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval};
 use crew_proto::Request;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{Icon, IconName, Sizable as _};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -402,6 +402,7 @@ impl Workspace {
             })
             .unwrap_or_default();
         let text = crew_core::store::paused_text(budget);
+        let deciding = self.deciding.contains(&id);
         indented(
             div()
                 .id(format!("approval-{id}"))
@@ -435,16 +436,22 @@ impl Workspace {
                                 .outline()
                                 .small()
                                 .label(format!("Allow {MORE_HANDOFFS} more"))
+                                .disabled(deciding)
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    if this.deciding.contains(&id) {
+                                        return;
+                                    }
+                                    // Approving the held-back handoff raises
+                                    // the budget by one more, so it is the
+                                    // first of the three.
                                     this.request(
                                         Request::AllowMoreHandoffs {
                                             thread,
-                                            n: MORE_HANDOFFS,
+                                            n: MORE_HANDOFFS - 1,
                                         },
                                         window,
                                         cx,
                                     );
-                                    // The held-back handoff is the first of them.
                                     this.decide(id, true, None, window, cx);
                                 })),
                         )
@@ -453,7 +460,11 @@ impl Workspace {
                                 .ghost()
                                 .small()
                                 .label("End thread")
+                                .disabled(deciding)
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    if this.deciding.contains(&id) {
+                                        return;
+                                    }
                                     this.decide(id, false, None, window, cx);
                                     this.request(Request::StopThread { thread }, window, cx);
                                 })),
