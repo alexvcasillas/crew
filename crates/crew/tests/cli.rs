@@ -405,10 +405,14 @@ fn ask<T: serde::de::DeserializeOwned>(home: &Path, req: crew_proto::Request) ->
 #[test]
 fn agent_add_defaults_to_read_only() {
     let s = setup();
-    let agents: Vec<(crew_core::ids::AgentId, crew_core::agent::AgentSpec)> =
-        ask(&s.home, crew_proto::Request::ListAgents);
+    let agents: Vec<crew_core::store::StoredAgent> = ask(
+        &s.home,
+        crew_proto::Request::ListAgents {
+            include_deleted: false,
+        },
+    );
     use crew_core::agent::{PermissionMode, Runtime};
-    let spec = |name: &str| &agents.iter().find(|(_, a)| a.name == name).unwrap().1;
+    let spec = |name: &str| &agents.iter().find(|a| a.spec.name == name).unwrap().spec;
     assert_eq!(spec("Sentinel").permission_mode, PermissionMode::ReadOnly);
     assert_eq!(spec("Sentinel").runtime, Runtime::ClaudeCode);
     assert_eq!(spec("Sentinel").max_run_minutes, 20);

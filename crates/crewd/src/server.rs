@@ -20,7 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::approvals::stopped_answer;
-use crate::service::{Notice, Reply, Service};
+use crate::service::{CliBins, Notice, Reply, Service};
 
 /// Socket file name inside the crew home.
 pub const SOCKET_NAME: &str = "crewd.sock";
@@ -38,6 +38,8 @@ pub struct ServeOptions {
     pub max_runs: usize,
     /// Overrides the `claude` binary for every run.
     pub claude_bin: Option<PathBuf>,
+    /// Overrides the `codex` binary that `Runtimes` looks for.
+    pub codex_bin: Option<PathBuf>,
     /// The crew-mcp binary passed to every run, so agents can hand off
     /// and ask for permission. Runs go without it if it is `None` or
     /// missing.
@@ -55,6 +57,7 @@ impl Default for ServeOptions {
         Self {
             max_runs: 4,
             claude_bin: None,
+            codex_bin: None,
             crew_mcp_bin: default_crew_mcp_bin(),
             minute: Duration::from_secs(60),
             notice_buffer: 4096,
@@ -152,7 +155,10 @@ pub async fn serve_until(
     let service = Service::new(
         store,
         opts.max_runs,
-        opts.claude_bin,
+        CliBins {
+            claude: opts.claude_bin,
+            codex: opts.codex_bin,
+        },
         abs_home.join(WORKTREES_DIR),
         usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),
         opts.minute,

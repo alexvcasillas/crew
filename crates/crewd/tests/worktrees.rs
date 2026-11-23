@@ -914,7 +914,11 @@ async fn lagging_subscriber_is_told_to_resync() {
         post(&mut poster, s.thread, &big).await;
     }
     // A connection that never subscribed never falls behind.
-    let _: serde_json::Value = poster.ok(Request::ListAgents).await;
+    let _: serde_json::Value = poster
+        .ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
 
     loop {
         if matches!(c.recv().await, ServerMsg::Resync) {

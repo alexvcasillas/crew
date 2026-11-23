@@ -7,7 +7,8 @@ use std::time::Duration;
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
-use crew_core::store::{Author, StoredThread};
+use crew_core::policy::HandoffPolicy;
+use crew_core::store::{Author, StoredAgent, StoredThread};
 use crew_proto::{
     ClientMsg, PROTO_VERSION, Request, RuntimeInfo, ServerMsg, read_frame, write_frame,
 };
@@ -61,12 +62,18 @@ struct Daemon {
 
 impl Daemon {
     async fn start(claude_bin: PathBuf) -> Daemon {
+        // Never the real codex.
+        Daemon::start_with(claude_bin, PathBuf::from("/nonexistent/codex")).await
+    }
+
+    async fn start_with(claude_bin: PathBuf, codex_bin: PathBuf) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
                 claude_bin: Some(claude_bin),
+                codex_bin: Some(codex_bin),
                 crew_mcp_bin: None,
                 ..Default::default()
             };
@@ -331,6 +338,10 @@ async fn thread_created_is_broadcast() {
     })
     .await
     .unwrap();
+    let ServerMsg::ThreadChanged { thread } = app.recv().await else {
+        panic!("expected ThreadChanged");
+    };
+    assert_eq!((thread.id, thread.title.as_str()), (id, "renamed"));
     let threads: Vec<StoredThread> = cli.ok(Request::ListThreads { channel }).await;
     assert_eq!(threads[0].title, "renamed");
     assert_eq!(
@@ -342,6 +353,81 @@ async fn thread_created_is_broadcast() {
         .unwrap_err(),
         "Give the thread a title."
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_channel_and_thread_changes_are_broadcast() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake("claude_sleeps.sh")).await;
+    let mut app = d.client().await;
+    let mut cli = d.client().await;
+    app.call(Request::SubscribeAll).await.unwrap();
+    assert!(matches!(app.recv().await, ServerMsg::Snapshot { .. }));
+
+    let project: ProjectId = cli
+        .ok(Request::CreateProject {
+            name: "demo".into(),
+            root: dir.path().to_string_lossy().into_owned(),
+            main_branch: "main".into(),
+        })
+        .await;
+    let ServerMsg::ProjectChanged { project: got } = app.recv().await else {
+        panic!("expected ProjectChanged");
+    };
+    assert_eq!((got.id, got.name.as_str()), (project, "demo"));
+    cli.call(Request::UpdateProject {
+        project,
+        setup_command: Some("make".into()),
+        copy_files: vec![".env".into()],
+    })
+    .await
+    .unwrap();
+    let ServerMsg::ProjectChanged { project: got } = app.recv().await else {
+        panic!("expected ProjectChanged");
+    };
+    assert_eq!(got.setup_command.as_deref(), Some("make"));
+    assert_eq!(got.copy_files, vec![".env".to_string()]);
+
+    let channel: ChannelId = cli
+        .ok(Request::CreateChannel {
+            project,
+            name: "general".into(),
+        })
+        .await;
+    let ServerMsg::ChannelChanged { channel: got } = app.recv().await else {
+        panic!("expected ChannelChanged");
+    };
+    assert_eq!(
+        (got.id, got.project, got.name.as_str()),
+        (channel, project, "general")
+    );
+    cli.call(Request::SetChannelHandoff {
+        channel,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(2),
+    })
+    .await
+    .unwrap();
+    let ServerMsg::ChannelChanged { channel: got } = app.recv().await else {
+        panic!("expected ChannelChanged");
+    };
+    assert_eq!(got.handoff_policy, Some(HandoffPolicy::Budget));
+    assert_eq!(got.handoff_budget, Some(2));
+
+    let t = thread(&mut cli, channel, "first").await;
+    assert!(matches!(app.recv().await, ServerMsg::ThreadCreated { .. }));
+    cli.call(Request::SetThreadHandoff {
+        thread: t,
+        policy: Some(HandoffPolicy::PerAgent),
+        budget: None,
+    })
+    .await
+    .unwrap();
+    let ServerMsg::ThreadChanged { thread: got } = app.recv().await else {
+        panic!("expected ThreadChanged");
+    };
+    assert_eq!(got.id, t);
+    assert_eq!(got.handoff_policy, Some(HandoffPolicy::PerAgent));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -363,8 +449,12 @@ async fn update_agent_changes_next_run_args() {
     c.call(Request::UpdateAgent { agent, spec }).await.unwrap();
     assert_eq!(app.recv().await, ServerMsg::AgentChanged { agent });
 
-    let agents: Vec<(AgentId, AgentSpec)> = c.ok(Request::ListAgents).await;
-    assert_eq!(agents[0].1.model, "claude-opus-4-5");
+    let agents: Vec<StoredAgent> = c
+        .ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
+    assert_eq!(agents[0].spec.model, "claude-opus-4-5");
 
     c.call(Request::PostMessage {
         thread: t,
@@ -441,8 +531,23 @@ async fn delete_agent_refused_while_running() {
     c.call(Request::DeleteAgent { agent }).await.unwrap();
     app.until(|m| *m == ServerMsg::AgentChanged { agent }).await;
 
-    let agents: Vec<(AgentId, AgentSpec)> = c.ok(Request::ListAgents).await;
+    let agents: Vec<StoredAgent> = c
+        .ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
     assert!(agents.is_empty());
+    let agents: Vec<StoredAgent> = c
+        .ok(Request::ListAgents {
+            include_deleted: true,
+        })
+        .await;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(
+        (agents[0].id, agents[0].spec.name.as_str()),
+        (agent, "Forge")
+    );
+    assert!(agents[0].deleted_at.is_some());
 
     // A mention of the deleted agent starts nothing.
     c.call(Request::PostMessage {
@@ -485,7 +590,11 @@ async fn runtimes_reports_fake_claude_version() {
          *) exit 2 ;;\n\
          esac\n",
     );
-    let d = Daemon::start(bin.clone()).await;
+    let codex = script(
+        &dir.path().join("codex-fake.sh"),
+        "[ \"$1\" = --version ] && echo 'codex-cli 0.9.1' && exit 0\nexit 1\n",
+    );
+    let d = Daemon::start_with(bin.clone(), codex.clone()).await;
     let mut c = d.client().await;
     let list: Vec<RuntimeInfo> = c.ok(Request::Runtimes).await;
     let claude = list
@@ -496,7 +605,14 @@ async fn runtimes_reports_fake_claude_version() {
     assert_eq!(claude.version.as_deref(), Some("9.8.7"));
     assert_eq!(claude.signed_in, Some(true));
     assert_eq!(claude.path.as_deref(), Some(bin.to_str().unwrap()));
-    assert!(list.iter().any(|r| r.runtime == Runtime::Codex));
+    let codex_info = list
+        .iter()
+        .find(|r| r.runtime == Runtime::Codex)
+        .expect("codex in the list");
+    assert!(codex_info.installed);
+    assert_eq!(codex_info.version.as_deref(), Some("0.9.1"));
+    assert_eq!(codex_info.signed_in, None);
+    assert_eq!(codex_info.path.as_deref(), Some(codex.to_str().unwrap()));
 
     // Signed out: the status command fails and says so.
     let bin = script(
@@ -531,4 +647,5 @@ async fn runtimes_reports_fake_claude_version() {
     assert_eq!(list[0].version, None);
     assert_eq!(list[0].signed_in, None);
     assert_eq!(list[0].path, None);
+    assert!(!list[1].installed, "the default test daemon has no codex");
 }

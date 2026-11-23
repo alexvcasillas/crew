@@ -36,8 +36,9 @@ const SETUP_ID: &str = "setup";
 /// How long finished runs stay in a `SubscribeAll` snapshot.
 const RECENT_RUNS_MS: i64 = 60 * 60 * 1000;
 
-/// A notification for subscribers of `thread`, or for `SubscribeAll`
-/// clients only if it has none.
+/// A notification. With a `thread`, its subscribers get it, and so do
+/// `SubscribeAll` clients unless it is an `Event`. Without one, only
+/// `SubscribeAll` clients get it.
 ///
 /// `serial` grows by one per notification and lets a subscriber skip what
 /// its backlog already covered.
@@ -92,7 +93,7 @@ struct Inner {
     db: Mutex<Db>,
     state: Mutex<State>,
     tx: broadcast::Sender<Notice>,
-    claude_bin: Option<PathBuf>,
+    bins: CliBins,
     /// Where thread worktrees go, one folder per project.
     worktrees: PathBuf,
     /// The crew-mcp binary and the crew home it is given, if runs get it.
@@ -118,8 +119,18 @@ pub(crate) fn log(msg: impl std::fmt::Display) {
     eprintln!("crewd: {msg}");
 }
 
+/// Overrides for the agent CLIs crewd runs or looks for. `None` means the
+/// default: `CREW_CLAUDE_BIN` or `claude`, and `codex`.
+#[derive(Debug, Clone, Default)]
+pub struct CliBins {
+    /// Used for every run.
+    pub claude: Option<PathBuf>,
+    /// Only looked for, by `Runtimes`.
+    pub codex: Option<PathBuf>,
+}
+
 impl Service {
-    /// Wraps an open store. `claude_bin` overrides the binary for every run.
+    /// Wraps an open store. `bins` overrides the agent CLIs.
     /// Thread worktrees are made under `worktrees`. `crew_mcp` is the
     /// crew-mcp binary and crew home passed to every run, if any. A run's
     /// time limit counts in units of `minute`. A subscriber may fall up to
@@ -127,7 +138,7 @@ impl Service {
     pub fn new(
         store: Store,
         max_runs: usize,
-        claude_bin: Option<PathBuf>,
+        bins: CliBins,
         worktrees: PathBuf,
         crew_mcp: Option<(PathBuf, PathBuf)>,
         minute: Duration,
@@ -152,7 +163,7 @@ impl Service {
                 timed_out: HashMap::new(),
             }),
             tx,
-            claude_bin,
+            bins,
             worktrees,
             crew_mcp,
             slugs: Mutex::new(()),
@@ -182,7 +193,7 @@ impl Service {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
             Request::Discard { thread } => self.discard(thread).await,
-            Request::Runtimes => json(crate::runtimes::detect(self.0.claude_bin.clone()).await),
+            Request::Runtimes => json(crate::runtimes::detect(&self.0.bins).await),
             other => self.handle_now(other),
         }
     }
@@ -200,18 +211,24 @@ impl Service {
                 name,
                 root,
                 main_branch,
-            } => json(
-                self.db()
+            } => {
+                let mut db = self.db();
+                let project = db
                     .store
                     .create_project(&name, Path::new(&root), &main_branch)
-                    .map_err(|e| e.to_string())?,
-            ),
-            Request::CreateChannel { project, name } => json(
-                self.db()
+                    .map_err(|e| e.to_string())?;
+                self.project_changed(&mut db, project)?;
+                json(project)
+            }
+            Request::CreateChannel { project, name } => {
+                let mut db = self.db();
+                let channel = db
                     .store
                     .create_channel(project, &name)
-                    .map_err(|e| e.to_string())?,
-            ),
+                    .map_err(|e| e.to_string())?;
+                self.channel_changed(&mut db, channel)?;
+                json(channel)
+            }
             Request::CreateAgent { spec } => {
                 supported(&spec)?;
                 let mut db = self.db();
@@ -241,10 +258,11 @@ impl Service {
                 if title.is_empty() {
                     return Err("Give the thread a title.".into());
                 }
-                self.db()
-                    .store
+                let mut db = self.db();
+                db.store
                     .rename_thread(thread, title)
                     .map_err(|e| e.to_string())?;
+                self.thread_changed(&mut db, thread)?;
                 Ok(serde_json::Value::Null)
             }
             Request::PostMessage { thread, body } => json(
@@ -270,7 +288,15 @@ impl Service {
                 };
                 json(self.db().store.runs(filter).map_err(|e| e.to_string())?)
             }
-            Request::ListAgents => json(self.db().store.agents().map_err(|e| e.to_string())?),
+            Request::ListAgents { include_deleted } => {
+                let agents = self.db().store.all_agents().map_err(|e| e.to_string())?;
+                json(
+                    agents
+                        .into_iter()
+                        .filter(|a| include_deleted || a.deleted_at.is_none())
+                        .collect::<Vec<_>>(),
+                )
+            }
             Request::ListProjects => json(self.db().store.projects().map_err(|e| e.to_string())?),
             Request::ListChannels { project } => json(
                 self.db()
@@ -289,10 +315,11 @@ impl Service {
                 setup_command,
                 copy_files,
             } => {
-                self.db()
-                    .store
+                let mut db = self.db();
+                db.store
                     .set_project_setup(project, setup_command.as_deref(), &copy_files)
                     .map_err(|e| e.to_string())?;
+                self.project_changed(&mut db, project)?;
                 Ok(serde_json::Value::Null)
             }
             Request::ThreadDiff { .. }
@@ -324,10 +351,11 @@ impl Service {
                 policy,
                 budget,
             } => {
-                self.db()
-                    .store
+                let mut db = self.db();
+                db.store
                     .set_thread_handoff(thread, policy, budget)
                     .map_err(|e| e.to_string())?;
+                self.thread_changed(&mut db, thread)?;
                 Ok(serde_json::Value::Null)
             }
             Request::SetChannelHandoff {
@@ -335,13 +363,35 @@ impl Service {
                 policy,
                 budget,
             } => {
-                self.db()
-                    .store
+                let mut db = self.db();
+                db.store
                     .set_channel_handoff(channel, policy, budget)
                     .map_err(|e| e.to_string())?;
+                self.channel_changed(&mut db, channel)?;
                 Ok(serde_json::Value::Null)
             }
         }
+    }
+
+    /// Tells `SubscribeAll` clients the project as it is now.
+    fn project_changed(&self, db: &mut Db, project: ProjectId) -> Result<(), String> {
+        let project = db.store.project(project).map_err(|e| e.to_string())?;
+        self.publish_global(db, ServerMsg::ProjectChanged { project });
+        Ok(())
+    }
+
+    /// Tells `SubscribeAll` clients the channel as it is now.
+    fn channel_changed(&self, db: &mut Db, channel: ChannelId) -> Result<(), String> {
+        let channel = db.store.channel(channel).map_err(|e| e.to_string())?;
+        self.publish_global(db, ServerMsg::ChannelChanged { channel });
+        Ok(())
+    }
+
+    /// Tells `SubscribeAll` clients the thread as it is now.
+    fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
+        let thread = db.store.thread(thread).map_err(|e| e.to_string())?;
+        self.publish_global(db, ServerMsg::ThreadChanged { thread });
+        Ok(())
     }
 
     /// Saves a thread and tells `SubscribeAll` clients.
@@ -1145,7 +1195,7 @@ impl Service {
             crew_home: home.clone(),
         });
         let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring);
-        if let Some(bin) = &self.0.claude_bin {
+        if let Some(bin) = &self.0.bins.claude {
             inv.bin = bin.clone();
         }
         Ok((spec.name, inv))
@@ -1326,7 +1376,7 @@ impl Service {
     }
 
     /// Notifies `SubscribeAll` clients only.
-    fn publish_global(&self, db: &mut Db, msg: ServerMsg) {
+    pub(crate) fn publish_global(&self, db: &mut Db, msg: ServerMsg) {
         self.send_notice(db, None, msg);
     }
 

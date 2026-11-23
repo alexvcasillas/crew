@@ -12,17 +12,22 @@ use crew_core::claude::claude_bin_from;
 use crew_proto::RuntimeInfo;
 use tokio::process::Command;
 
+use crate::service::CliBins;
+
 /// How long one CLI command may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Claude Code, then Codex. `claude_bin` overrides the `claude` binary as
-/// it does for runs.
-pub async fn detect(claude_bin: Option<PathBuf>) -> Vec<RuntimeInfo> {
-    let claude = claude_bin.unwrap_or_else(|| claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")));
+/// Claude Code, then Codex. The `claude` binary is the one runs use.
+pub async fn detect(bins: &CliBins) -> Vec<RuntimeInfo> {
+    let claude = bins
+        .claude
+        .clone()
+        .unwrap_or_else(|| claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")));
+    let codex = bins.codex.clone().unwrap_or_else(|| PathBuf::from("codex"));
     let (claude, codex) = tokio::join!(
         probe(Runtime::ClaudeCode, &claude, Some(&["auth", "status"])),
         // No adapter yet, so its sign-in state doesn't matter.
-        probe(Runtime::Codex, Path::new("codex"), None),
+        probe(Runtime::Codex, &codex, None),
     );
     vec![claude, codex]
 }
@@ -33,7 +38,9 @@ struct Ran {
     stdout: String,
 }
 
-async fn run(bin: &Path, args: &[&str]) -> Option<Ran> {
+/// Runs `bin args` with a time limit. With `keep_success` false, the
+/// output of a command that succeeds is dropped unread.
+async fn run(bin: &Path, args: &[&str], keep_success: bool) -> Option<Ran> {
     let child = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
@@ -42,10 +49,13 @@ async fn run(bin: &Path, args: &[&str]) -> Option<Ran> {
         .kill_on_drop(true)
         .output();
     let out = tokio::time::timeout(TIMEOUT, child).await.ok()?.ok()?;
-    Some(Ran {
-        ok: out.status.success(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-    })
+    let ok = out.status.success();
+    let stdout = if ok && !keep_success {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    Some(Ran { ok, stdout })
 }
 
 async fn probe(runtime: Runtime, bin: &Path, status: Option<&[&str]>) -> RuntimeInfo {
@@ -59,13 +69,16 @@ async fn probe(runtime: Runtime, bin: &Path, status: Option<&[&str]>) -> Runtime
     let Some(path) = find(bin) else {
         return missing;
     };
-    let version = match run(&path, &["--version"]).await {
+    // Both at once, so a slow CLI takes one time limit, not two.
+    let (version, signed_in) = tokio::join!(run(&path, &["--version"], true), async {
+        match status {
+            Some(args) => run(&path, args, false).await.and_then(signed_in),
+            None => None,
+        }
+    });
+    let version = match version {
         Some(ran) if ran.ok => parse_version(&ran.stdout),
         _ => return missing,
-    };
-    let signed_in = match status {
-        Some(args) => run(&path, args).await.and_then(signed_in),
-        None => None,
     };
     RuntimeInfo {
         runtime,
@@ -131,6 +144,22 @@ mod tests {
         );
         assert_eq!(parse_version("dev build\n").as_deref(), Some("dev build"));
         assert_eq!(parse_version(""), None);
+    }
+
+    #[tokio::test]
+    async fn output_of_a_success_is_kept_only_when_asked() {
+        let echo = Path::new("/bin/echo");
+        let kept = run(echo, &["hi"], true).await.unwrap();
+        assert!(kept.ok);
+        assert_eq!(kept.stdout, "hi\n");
+        let dropped = run(echo, &["hi"], false).await.unwrap();
+        assert!(dropped.ok);
+        assert_eq!(dropped.stdout, "");
+        let failed = run(Path::new("/bin/sh"), &["-c", "echo no; exit 1"], false)
+            .await
+            .unwrap();
+        assert!(!failed.ok);
+        assert_eq!(failed.stdout, "no\n");
     }
 
     #[test]
