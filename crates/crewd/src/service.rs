@@ -24,7 +24,7 @@ use crate::runner::{RunHandle, RunOutcome, spawn_run};
 /// Capacity of the notification channel.
 const NOTICE_BUFFER: usize = 4096;
 /// Name used for the user's messages in a new session's context.
-const YOU_NAME: &str = "Alex";
+const YOU_NAME: &str = "You";
 
 /// A notification for subscribers of `thread`.
 ///
@@ -358,12 +358,23 @@ impl Service {
             status: None,
             thread: Some(job.thread),
         };
-        let previous = db
-            .store
-            .runs(filter)?
-            .into_iter()
-            .rev()
-            .find(|r| r.agent == job.agent && !r.session_id.is_empty());
+        // Resume the agent's latest run here that really started a session.
+        // A run that failed before `claude` came up has nothing to resume.
+        let mut previous = None;
+        for run in db.store.runs(filter)?.into_iter().rev() {
+            if run.agent != job.agent || run.session_id.is_empty() {
+                continue;
+            }
+            let started = db
+                .store
+                .events(run.id, 0)?
+                .iter()
+                .any(|(_, e)| matches!(e, Event::SessionStarted { .. }));
+            if started {
+                previous = Some(run);
+                break;
+            }
+        }
         let (session_id, session, prompt) = match previous {
             Some(run) => (
                 run.session_id.clone(),
