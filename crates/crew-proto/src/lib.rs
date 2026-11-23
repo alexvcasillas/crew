@@ -221,6 +221,8 @@ pub enum ServerMsg {
         thread: ThreadId,
         run: RunId,
         status: RunStatus,
+        /// The run as saved after the change.
+        details: StoredRun,
     },
     /// A message was added to a thread.
     Message {
@@ -255,8 +257,9 @@ pub enum ServerMsg {
     },
     /// A thread was renamed or its settings changed.
     ThreadChanged { thread: StoredThread },
-    /// An agent was created, changed or deleted.
-    AgentChanged { agent: AgentId },
+    /// An agent was created, changed or deleted. Deleted agents have
+    /// `deleted_at` set.
+    AgentChanged { agent: StoredAgent },
     /// This connection fell behind and missed notifications. crewd closes
     /// it next; connect and subscribe again to catch up.
     Resync,

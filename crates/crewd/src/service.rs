@@ -233,7 +233,7 @@ impl Service {
                 supported(&spec)?;
                 let mut db = self.db();
                 let agent = db.store.create_agent(&spec).map_err(|e| e.to_string())?;
-                self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+                self.agent_changed(&mut db, agent)?;
                 json(agent)
             }
             Request::UpdateAgent { agent, spec } => {
@@ -242,7 +242,7 @@ impl Service {
                 db.store
                     .update_agent(agent, &spec)
                     .map_err(|e| e.to_string())?;
-                self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+                self.agent_changed(&mut db, agent)?;
                 Ok(serde_json::Value::Null)
             }
             Request::DeleteAgent { agent } => {
@@ -387,6 +387,13 @@ impl Service {
         Ok(())
     }
 
+    /// Tells `SubscribeAll` clients the agent as it is now.
+    fn agent_changed(&self, db: &mut Db, agent: AgentId) -> Result<(), String> {
+        let agent = db.store.agent(agent).map_err(|e| e.to_string())?;
+        self.publish_global(db, ServerMsg::AgentChanged { agent });
+        Ok(())
+    }
+
     /// Tells `SubscribeAll` clients the thread as it is now.
     fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
         let thread = db.store.thread(thread).map_err(|e| e.to_string())?;
@@ -421,7 +428,7 @@ impl Service {
             return Err(format!("Stop {}'s runs first.", stored.spec.name));
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
-        self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+        self.agent_changed(&mut db, agent)?;
         Ok(())
     }
 
@@ -572,7 +579,8 @@ impl Service {
             msgs.push(ServerMsg::RunStatus {
                 thread,
                 run: run.id,
-                status: run.status,
+                status: run.status.clone(),
+                details: run,
             });
         }
         // Each approval comes just before the first message about it, as
@@ -1308,6 +1316,8 @@ impl Service {
         }
     }
 
+    /// Tells the thread's subscribers that `run` is now `status`. The run
+    /// must be saved with that status first.
     pub(crate) fn publish_status(
         &self,
         db: &mut Db,
@@ -1315,6 +1325,13 @@ impl Service {
         run: RunId,
         status: RunStatus,
     ) {
+        let details = match db.store.run(run) {
+            Ok(details) => details,
+            Err(e) => {
+                log(format!("couldn't read run {run}: {e}"));
+                return;
+            }
+        };
         self.publish(
             db,
             thread,
@@ -1322,6 +1339,7 @@ impl Service {
                 thread,
                 run,
                 status,
+                details,
             },
         );
     }

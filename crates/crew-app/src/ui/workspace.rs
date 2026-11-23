@@ -1,14 +1,11 @@
 //! The window's root view: title bar, sidebar, main area and status bar.
 
-use crew_core::event::RunStatus;
-use crew_core::store::{StoredAgent, StoredRun};
-use crew_proto::Request;
+use crew_core::ids::ThreadId;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
-use serde::de::DeserializeOwned;
 
 use super::status_bar::StatusBar;
 use crate::client::{self, ClientEvent, ClientHandle};
@@ -26,16 +23,12 @@ pub struct Workspace {
     pub(super) client: ClientHandle,
     /// Takes in what the client reports.
     _client_events: Task<()>,
-    /// Asks for the agents after one changed.
-    agents_fetch: Option<Task<()>>,
-    /// Asks for the details of runs known only by their status.
-    runs_fetch: Option<Task<()>>,
     /// Starting (or restarting) crewd.
     pub(super) starting: bool,
     status_bar: Entity<StatusBar>,
     focus: FocusHandle,
     /// Starting crewd and waiting for it to answer.
-    pub(super) probe: Option<Task<()>>,
+    pub(super) service_task: Option<Task<()>>,
     /// The last error shown as a notification.
     pub(super) last_error: Option<SharedString>,
 }
@@ -48,12 +41,10 @@ impl Workspace {
             state: State::default(),
             client,
             _client_events: Self::take_in_events(events, window, cx),
-            agents_fetch: None,
-            runs_fetch: None,
             starting: false,
             status_bar: cx.new(|_| StatusBar::default()),
             focus: cx.focus_handle(),
-            probe: None,
+            service_task: None,
             last_error: None,
         }
     }
@@ -93,51 +84,20 @@ impl Workspace {
         let connection = self.state.connection().cloned();
         self.status_bar
             .update(cx, |bar, cx| bar.set_connection(connection, cx));
-        self.fetch_wanted(cx);
         cx.notify();
     }
 
-    /// Asks crewd for the details its notices leave out. A newer fetch
-    /// replaces an older one still running.
-    fn fetch_wanted(&mut self, cx: &mut Context<Self>) {
-        let wants = self.state.take_wants();
-        if wants.agents {
-            let agents = self.client.request(Request::ListAgents {
-                include_deleted: true,
-            });
-            self.agents_fetch = Some(cx.spawn(async move |this, cx| {
-                let Some(agents) = decode::<Vec<StoredAgent>>(agents.await) else {
-                    return;
-                };
-                this.update(cx, |this, cx| {
-                    this.state.set_agents(agents);
-                    cx.notify();
-                })
-                .ok();
-            }));
-        }
-        if wants.runs {
-            // A new run is queued or working by the time crewd answers,
-            // unless it already ended. Asked in this order, it can't slip
-            // between the two.
-            let queued = self.client.request(Request::ListRuns {
-                status: Some(RunStatus::Queued),
-            });
-            let working = self.client.request(Request::ListRuns {
-                status: Some(RunStatus::Working),
-            });
-            self.runs_fetch = Some(cx.spawn(async move |this, cx| {
-                let mut runs = Vec::new();
-                for answer in [queued.await, working.await] {
-                    runs.extend(decode::<Vec<StoredRun>>(answer).unwrap_or_default());
-                }
-                this.update(cx, |this, cx| {
-                    this.state.merge_runs(runs);
-                    cx.notify();
-                })
-                .ok();
-            }));
-        }
+    /// Shows `thread`'s events live: its log fills from crewd's backlog,
+    /// now and after every reconnect.
+    pub fn watch_thread(&mut self, thread: ThreadId) {
+        self.state.watch(thread);
+        self.client.watch_thread(thread);
+    }
+
+    /// Stops keeping `thread`'s events.
+    pub fn unwatch_thread(&mut self, thread: ThreadId) {
+        self.state.unwatch(thread);
+        self.client.unwatch_thread(thread);
     }
 
     /// Shows `error` as a notification.
@@ -150,14 +110,6 @@ impl Workspace {
         self.last_error = Some(error.clone().into());
         window.push_notification(Notification::error(error), cx);
     }
-}
-
-/// crewd's answer as `T`, or `None` after logging why not.
-fn decode<T: DeserializeOwned>(answer: Result<serde_json::Value, String>) -> Option<T> {
-    let decoded = answer.and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()));
-    decoded
-        .inspect_err(|e| eprintln!("crew: couldn't refresh from crewd: {e}"))
-        .ok()
 }
 
 impl Render for Workspace {
@@ -198,7 +150,10 @@ impl Workspace {
         match self.state.connection() {
             // Checking: nothing to show yet.
             None => div().into_any_element(),
-            Some(ConnectionState::Connected) => render_nothing_selected().into_any_element(),
+            // Reconnecting keeps what is known on screen.
+            Some(ConnectionState::Connected | ConnectionState::Reconnecting) => {
+                render_nothing_selected().into_any_element()
+            }
             Some(state) => self.render_connect(state, cx).into_any_element(),
         }
     }
@@ -411,6 +366,28 @@ mod gpui_tests {
         wait_to_show(cx, window, "Connected to crewd");
         assert!(shows(cx, window, "Nothing selected"));
         assert!(!has(cx, window, "connect-start"));
+    }
+
+    /// crewd goes away and something on its socket never answers: the
+    /// client keeps trying, and the workspace stays up meanwhile.
+    #[gpui_kit::test]
+    fn a_lost_connection_keeps_the_workspace_while_reconnecting(cx: &mut TestAppContext) {
+        let home = short_home();
+        let daemon = Daemon::start(home.path().to_path_buf());
+        let (window, _) = open(cx, home.path());
+        wait_to_show(cx, window, "Connected to crewd");
+
+        drop(daemon);
+        let _silent =
+            std::os::unix::net::UnixListener::bind(home.path().join("crewd.sock")).unwrap();
+        wait_to_show(cx, window, "Reconnecting…");
+        assert!(shows(cx, window, "Nothing selected"));
+        assert!(!has(cx, window, "connect-start"));
+        assert!(!shows(
+            cx,
+            window,
+            "Crew's background service isn't running."
+        ));
     }
 
     #[gpui_kit::test]

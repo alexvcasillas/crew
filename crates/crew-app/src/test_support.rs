@@ -32,17 +32,28 @@ impl Daemon {
 
     /// Like [`Daemon::start`], running agents with the fake `claude_bin`.
     pub fn start_with(home: PathBuf, claude_bin: PathBuf) -> Self {
+        Self::start_with_options(
+            home,
+            crewd::ServeOptions {
+                claude_bin: Some(claude_bin),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`Daemon::start_with`], with more settings. Codex and
+    /// crew-mcp are always off.
+    pub fn start_with_options(home: PathBuf, opts: crewd::ServeOptions) -> Self {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serve_home = home.clone();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let opts = crewd::ServeOptions {
-                    claude_bin: Some(claude_bin),
                     // Never the real codex.
                     codex_bin: Some(PathBuf::from("/nonexistent/codex")),
                     crew_mcp_bin: None,
-                    ..Default::default()
+                    ..opts
                 };
                 let shutdown = async move {
                     let _ = stopped.await;
@@ -100,4 +111,36 @@ pub fn refuse_hello(socket: &Path, theirs: u32) -> JoinHandle<()> {
             write_frame(&mut stream, &refused).await.unwrap();
         });
     })
+}
+
+/// Like [`refuse_hello`], for every client, for as long as the test
+/// process runs. Used by `tests/client.rs`.
+#[allow(dead_code)]
+pub fn always_refuse_hello(socket: &Path, theirs: u32) {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(Some(ClientMsg::Request { id, .. })) = read_frame(&mut stream).await
+                    else {
+                        return;
+                    };
+                    let refused = ServerMsg::Response {
+                        id,
+                        result: Err(format!(
+                            "crewd speaks protocol {theirs}, client speaks {PROTO_VERSION}. Restart crewd."
+                        )),
+                    };
+                    let _ = write_frame(&mut stream, &refused).await;
+                });
+            }
+        });
+    });
 }

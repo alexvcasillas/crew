@@ -32,7 +32,7 @@ impl Workspace {
         cx.notify();
         let conn = self.conn.clone();
         let executor = cx.background_executor().clone();
-        self.probe = Some(cx.spawn_in(window, async move |this, cx| {
+        self.service_task = Some(cx.spawn_in(window, async move |this, cx| {
             let start_conn = conn.clone();
             let started = executor
                 .spawn(async move {
