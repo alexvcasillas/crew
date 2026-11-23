@@ -136,12 +136,14 @@ fn remove_deletes_dir_and_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let (root, dest, _base) = setup(tmp.path());
     fs::write(dest.join("a.txt"), "unsaved\n").unwrap();
+    assert!(worktree::branch_exists(&root, "crew/t").unwrap());
 
     worktree::remove(&root, &dest, "crew/t", true).unwrap();
 
     assert!(!dest.exists());
     assert_eq!(git(&root, &["branch", "--list", "crew/t"]), "");
-    assert!(!git(&root, &["worktree", "list"]).contains("worktrees/demo/t"));
+    assert!(!worktree::branch_exists(&root, "crew/t").unwrap());
+    assert!(!git(&root, &["worktree", "list"]).contains("worktrees/demo/t "));
 
     // Keeping the branch, and a directory that is already gone.
     let dest2 = tmp.path().join("worktrees/demo/t2");
@@ -149,7 +151,7 @@ fn remove_deletes_dir_and_branch() {
     fs::remove_dir_all(&dest2).unwrap();
     worktree::remove(&root, &dest2, "crew/t2", false).unwrap();
     assert_eq!(git(&root, &["branch", "--list", "crew/t2"]), "crew/t2");
-    assert!(!git(&root, &["worktree", "list"]).contains("t2"));
+    assert!(!git(&root, &["worktree", "list"]).contains("worktrees/demo/t2"));
 }
 
 #[test]

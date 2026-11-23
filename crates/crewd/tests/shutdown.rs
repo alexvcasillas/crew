@@ -78,8 +78,41 @@ impl Client {
     }
 }
 
-/// Creates a project, the Forge agent and a thread, then asks Forge to work.
-async fn start_long_run(c: &mut Client, root: &Path) -> ThreadId {
+/// Makes `dir` a git repo on `main` with one empty commit, so writing
+/// agents can get a worktree there.
+fn git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+}
+
+/// Creates a project in a new repo under `dir`, the Forge agent and a
+/// thread, then asks Forge to work.
+async fn start_long_run(c: &mut Client, dir: &Path) -> ThreadId {
+    let root = dir.join("root");
+    git_repo(&root);
     let project: ProjectId = c
         .ok(Request::CreateProject {
             name: "demo".into(),

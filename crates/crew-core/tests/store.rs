@@ -376,7 +376,9 @@ fn threads_keep_worktree_and_handoff_settings() {
         branch: "crew/first".into(),
         base: "abc123".into(),
     };
+    let root = store.thread_cwd(t).unwrap();
     store.set_thread_worktree(t, Some(&wt)).unwrap();
+    assert_eq!(store.thread_cwd(t).unwrap(), wt.path);
     store
         .set_thread_handoff(t, Some(HandoffPolicy::Budget), Some(5))
         .unwrap();
@@ -391,6 +393,7 @@ fn threads_keep_worktree_and_handoff_settings() {
 
     store.set_thread_worktree(t, None).unwrap();
     assert_eq!(store.thread(t).unwrap().worktree, None);
+    assert_eq!(store.thread_cwd(t).unwrap(), root);
 
     store
         .set_project_setup(p, Some("make setup"), &[".env".into()])

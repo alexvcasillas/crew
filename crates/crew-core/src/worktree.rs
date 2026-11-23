@@ -104,9 +104,18 @@ pub fn diff(dest: &Path, base: &str) -> Result<Diff> {
         "-z",
         "--name-status",
         base,
+        "--",
     ])?;
-    let counts = index.git(["diff", "--cached", "--no-renames", "-z", "--numstat", base])?;
-    let patch = index.git(["diff", "--cached", "--no-renames", base])?;
+    let counts = index.git([
+        "diff",
+        "--cached",
+        "--no-renames",
+        "-z",
+        "--numstat",
+        base,
+        "--",
+    ])?;
+    let patch = index.git(["diff", "--cached", "--no-renames", base, "--"])?;
 
     let mut files = Vec::new();
     let mut fields = names.split('\0').filter(|s| !s.is_empty());
@@ -167,6 +176,18 @@ pub fn remove(root: &Path, dest: &Path, branch: &str, delete_branch: bool) -> Re
         git(root, ["branch", "-q", "-D", branch])?;
     }
     Ok(())
+}
+
+/// Whether the repo at `root` has a local branch named `branch`.
+pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
+    let refname = format!("refs/heads/{branch}");
+    let args = ["show-ref", "--verify", "--quiet", refname.as_str()];
+    let out = command(root).args(args).output()?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_error(args, &out.stderr)),
+    }
 }
 
 fn head(dir: &Path) -> Result<String> {
