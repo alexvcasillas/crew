@@ -41,6 +41,22 @@ pub struct NeedsYou<'a> {
     pub approval: &'a StoredApproval,
 }
 
+/// How far back Running now lists finished runs.
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
+/// Running now's groups.
+#[derive(Debug, Default)]
+pub struct RunningNow<'a> {
+    /// Pending approvals, oldest first.
+    pub needs_you: Vec<&'a StoredApproval>,
+    /// Working runs that don't wait on you, by start time.
+    pub working: Vec<&'a StoredRun>,
+    /// Queued runs, by start time.
+    pub queued: Vec<&'a StoredRun>,
+    /// Runs that ended in the last hour, newest first.
+    pub finished: Vec<&'a StoredRun>,
+}
+
 /// One event of a run, in a watched thread.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoggedEvent {
@@ -391,6 +407,50 @@ impl State {
     /// The thread's newest known message.
     pub fn last_message(&self, thread: ThreadId) -> Option<&StoredMessage> {
         self.messages(thread).last()
+    }
+
+    /// The project `thread` belongs to.
+    pub fn thread_project(&self, thread: ThreadId) -> Option<ProjectId> {
+        let channel = self.threads.get(&thread)?.channel;
+        self.channels.get(&channel).map(|c| c.project)
+    }
+
+    /// What Running now lists, in `project` or everywhere, at `now`
+    /// (Unix ms).
+    pub fn running_now(&self, project: Option<ProjectId>, now: i64) -> RunningNow<'_> {
+        let here = |thread: ThreadId| project.is_none() || self.thread_project(thread) == project;
+        let needs_you: Vec<&StoredApproval> = self
+            .needs_you()
+            .into_iter()
+            .map(|n| n.approval)
+            .filter(|a| here(a.thread))
+            .collect();
+        let waits = |run: RunId| needs_you.iter().any(|a| a.run == run);
+        let live = self.running();
+        let working = live
+            .iter()
+            .copied()
+            .filter(|r| r.status == RunStatus::Working && here(r.thread) && !waits(r.id))
+            .collect();
+        let queued = live
+            .iter()
+            .copied()
+            .filter(|r| r.status == RunStatus::Queued && here(r.thread))
+            .collect();
+        let since = now - HOUR_MS;
+        let mut finished: Vec<&StoredRun> = self
+            .runs
+            .values()
+            .filter(|r| stage(&r.status) == 2 && here(r.thread))
+            .filter(|r| r.ended_at.is_some_and(|end| end >= since))
+            .collect();
+        finished.sort_by_key(|r| (std::cmp::Reverse(r.ended_at), r.id.0));
+        RunningNow {
+            needs_you,
+            working,
+            queued,
+            finished,
+        }
     }
 
     /// Threads whose channel `matches` accepts.
@@ -1005,5 +1065,71 @@ mod tests {
         assert_eq!(state.connection(), None);
         state.set_connection(ConnectionState::Connected);
         assert_eq!(state.connection(), Some(&ConnectionState::Connected));
+    }
+
+    #[test]
+    fn running_now_groups_runs_across_projects() {
+        let (mut state, p, _, t) = one_thread();
+        let other_p = project(2);
+        let other_c = channel(other_p.id);
+        let other_t = thread(other_c.id, "add search", 2);
+        state.apply(ServerMsg::ProjectChanged {
+            project: other_p.clone(),
+        });
+        state.apply(ServerMsg::ChannelChanged {
+            channel: other_c.clone(),
+        });
+        state.apply(ServerMsg::ThreadCreated {
+            channel: other_c.id,
+            thread: other_t.clone(),
+        });
+        let now = 10_000_000;
+        let working = run(t.id, RunStatus::Working, now - 50);
+        let asking = run(other_t.id, RunStatus::Working, now - 40);
+        let queued = run(t.id, RunStatus::Queued, now - 30);
+        let mut done = run(other_t.id, RunStatus::Done, now - 600_000);
+        done.ended_at = Some(now - 500_000);
+        let mut stopped = run(t.id, RunStatus::Stopped, now - 400_000);
+        stopped.ended_at = Some(now - 100_000);
+        let mut old = run(t.id, RunStatus::Done, now - 5_000_000);
+        old.ended_at = Some(now - 4_000_000);
+        for r in [&working, &asking, &queued, &done, &stopped, &old] {
+            state.apply(status(r));
+        }
+        let mut ask = approval(other_t.id, now - 10);
+        ask.run = asking.id;
+        state.apply(ServerMsg::Approval {
+            thread: other_t.id,
+            approval: ask.clone(),
+        });
+
+        let ids = |runs: &[&StoredRun]| runs.iter().map(|r| r.id).collect::<Vec<_>>();
+        let all = state.running_now(None, now);
+        assert_eq!(
+            all.needs_you.iter().map(|a| a.id).collect::<Vec<_>>(),
+            [ask.id]
+        );
+        assert_eq!(
+            ids(&all.working),
+            [working.id],
+            "the asking run waits on you"
+        );
+        assert_eq!(ids(&all.queued), [queued.id]);
+        assert_eq!(
+            ids(&all.finished),
+            [stopped.id, done.id],
+            "newest first, last hour only"
+        );
+
+        let mine = state.running_now(Some(p.id), now);
+        assert!(mine.needs_you.is_empty());
+        assert_eq!(ids(&mine.working), [working.id]);
+        assert_eq!(ids(&mine.finished), [stopped.id]);
+        let theirs = state.running_now(Some(other_p.id), now);
+        assert_eq!(theirs.needs_you.len(), 1);
+        assert!(theirs.working.is_empty() && theirs.queued.is_empty());
+        assert_eq!(ids(&theirs.finished), [done.id]);
+        assert_eq!(state.thread_project(t.id), Some(p.id));
+        assert_eq!(state.thread_project(other_t.id), Some(other_p.id));
     }
 }

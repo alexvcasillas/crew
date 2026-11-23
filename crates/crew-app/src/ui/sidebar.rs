@@ -2,7 +2,6 @@
 
 use crew_core::ids::{ChannelId, ProjectId};
 use crew_core::store::{StoredAgent, StoredChannel, StoredProject};
-use crew_proto::Request;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -79,7 +78,7 @@ impl Workspace {
                     .children(agents),
             )
             .when(running > 0, |sidebar| {
-                sidebar.child(render_footer(running, cx))
+                sidebar.child(render_footer(running, self.stopping_all, cx))
             })
             .test_support()
     }
@@ -221,10 +220,6 @@ impl Workspace {
         }
         cx.notify();
     }
-
-    fn stop_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.request(Request::StopAll, window, cx);
-    }
 }
 
 /// A 28 px sidebar row.
@@ -296,7 +291,7 @@ fn render_badge(channel: ChannelId, badge: &ChannelBadge) -> impl IntoElement {
 }
 
 /// "N agents running" and Stop all.
-fn render_footer(running: usize, cx: &mut Context<Workspace>) -> impl IntoElement {
+fn render_footer(running: usize, stopping: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
     let agents = if running == 1 { "agent" } else { "agents" };
     div()
         .flex()
@@ -325,6 +320,7 @@ fn render_footer(running: usize, cx: &mut Context<Workspace>) -> impl IntoElemen
                 .text_color(color("danger"))
                 .icon(IconName::Square)
                 .label("Stop all")
+                .disabled(stopping)
                 .on_click(cx.listener(|this, _, window, cx| this.stop_all(window, cx))),
         )
 }

@@ -102,7 +102,7 @@ fn hand_off(w: &World, run: RunId, to: &str, brief: &str) -> String {
 
 /// Asks to use Bash on its own thread, as crew-mcp would. The answer
 /// comes once someone decides.
-fn ask_permission(
+pub(super) fn ask_permission(
     w: &World,
     run: RunId,
     input: serde_json::Value,
@@ -122,7 +122,10 @@ fn ask_permission(
     rx
 }
 
-fn answer_of(cx: &mut TestAppContext, rx: &mpsc::Receiver<PermissionAnswer>) -> PermissionAnswer {
+pub(super) fn answer_of(
+    cx: &mut TestAppContext,
+    rx: &mpsc::Receiver<PermissionAnswer>,
+) -> PermissionAnswer {
     let mut got = None;
     wait_until(cx, "the permission answer", |_| {
         got = rx.try_recv().ok();

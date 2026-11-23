@@ -1,11 +1,13 @@
-//! The title bar: the app name, the search button and (later) run counts.
+//! The title bar: the app name, the search button, run counts and
+//! settings.
 
-use gpui_kit::component::TitleBar;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{Disableable as _, IconName, Sizable as _, TitleBar};
 use gpui_kit::*;
 
 use std::path::{Path, PathBuf};
 
-use super::common::chip;
+use super::common::{chip, dot};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -25,7 +27,10 @@ const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 
 impl Workspace {
     pub(super) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        if let Some((left, right)) = self.render_review_title(cx) {
+        let special = self
+            .render_running_title(cx)
+            .or_else(|| self.render_review_title(cx));
+        if let Some((left, right)) = special {
             return TitleBar::new()
                 .h(px(TITLE_BAR_HEIGHT))
                 .bg(color("bg-100"))
@@ -78,9 +83,60 @@ impl Workspace {
                     .flex()
                     .justify_end()
                     // Mirrors the traffic-light inset on the left.
+                    .items_center()
+                    .gap(px(8.))
                     .pl(px(TRAFFIC_LIGHTS_INSET))
-                    .pr(px(12.)),
+                    .pr(px(12.))
+                    .children(self.render_title_actions(cx)),
             )
+    }
+
+    /// "● N running · ● M need you", when anything runs or waits, and
+    /// the settings button. Every view's title bar ends with them.
+    pub(super) fn render_title_actions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (running, needs) = self.run_counts();
+        let mut actions = Vec::new();
+        if running + needs > 0 {
+            let label = format!("{running} running · {needs} need you");
+            actions.push(
+                div()
+                    .id("title-running")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .border_1()
+                    .border_color(color("border-200"))
+                    .rounded(px(6.))
+                    .text_size(px(12.))
+                    .text_color(color("text-secondary"))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(color("surface-100")))
+                    .role(Role::Button)
+                    .aria_label(label)
+                    .child(dot("accent-blue"))
+                    .child(format!("{running} running"))
+                    .child(div().text_color(color("text-tertiary")).child("·"))
+                    .child(dot("warning"))
+                    .child(format!("{needs} need you"))
+                    .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx)))
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        actions.push(
+            Button::new("title-settings")
+                .ghost()
+                .small()
+                .icon(IconName::Settings)
+                .accessibility_label("Settings")
+                .disabled(true)
+                .tooltip("Coming soon.")
+                .into_any_element(),
+        );
+        actions
     }
 }
 
