@@ -19,7 +19,7 @@ fn commit_without_identity_uses_crew() {
     fs::write(dest.join("a.txt"), "changed\n").unwrap();
 
     // Hide any global or system identity for this test's git calls.
-    let sha = temp_env(&home, || worktree::commit(&dest, "chore: anon")).unwrap();
+    let sha = temp_env(&home, || worktree::commit(&dest, "chore: anon", &[])).unwrap();
 
     assert_eq!(
         git(&dest, &["log", "-1", "--format=%an <%ae>", &sha]),
