@@ -11,6 +11,9 @@ pub fn parse_line(line: &str) -> Vec<Event> {
             line: line.to_string(),
         }]
     };
+    if line.trim().is_empty() {
+        return vec![];
+    }
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return raw();
     };
@@ -21,7 +24,8 @@ pub fn parse_line(line: &str) -> Vec<Event> {
                 model: str_at(&v, "model").to_string(),
                 cwd: str_at(&v, "cwd").to_string(),
             }],
-            _ => vec![],
+            "hook_started" | "hook_response" => vec![],
+            _ => raw(),
         },
         "rate_limit_event" => vec![],
         "assistant" => blocks(&v).iter().filter_map(assistant_block).collect(),
@@ -121,7 +125,11 @@ fn result_events(v: &Value) -> Vec<Event> {
         ok: str_at(v, "subtype") == "success" && !is_error,
         summary: str_at(v, "result").to_string(),
         duration_ms: v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
-        num_turns: v.get("num_turns").and_then(Value::as_u64).unwrap_or(0) as u32,
+        num_turns: v
+            .get("num_turns")
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .unwrap_or(0),
     });
     events
 }

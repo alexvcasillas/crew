@@ -148,6 +148,9 @@ fn noise() {
             Event::Raw {
                 line: r#"{"type":"brand_new","x":1}"#.into()
             },
+            Event::Raw {
+                line: r#"{"type":"system","subtype":"brand_new_subtype"}"#.into()
+            },
         ]
     );
 }
@@ -176,4 +179,29 @@ fn tool_result_output_truncates_at_8192_bytes() {
         panic!()
     };
     assert_eq!(output.len(), 8192);
+}
+
+#[test]
+fn blank_line_yields_nothing() {
+    assert!(parse_line("").is_empty());
+    assert!(parse_line("  \t ").is_empty());
+}
+
+#[test]
+fn tool_target_falls_back_to_pattern_then_url_then_none() {
+    let target = |input: serde_json::Value| {
+        let line = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"t","name":"Grep","input":input}]}})
+        .to_string();
+        let Event::ToolCall { target, .. } = parse_line(&line).remove(0) else {
+            panic!("expected tool call");
+        };
+        target
+    };
+    assert_eq!(target(json!({"pattern": "foo"})), Some("foo".into()));
+    assert_eq!(
+        target(json!({"url": "https://example.com"})),
+        Some("https://example.com".into())
+    );
+    assert_eq!(target(json!({"other": 1})), None);
 }
