@@ -167,6 +167,7 @@ impl Service {
                 };
                 json(self.db().store.runs(filter).map_err(|e| e.to_string())?)
             }
+            Request::ListAgents => json(self.db().store.agents().map_err(|e| e.to_string())?),
         }
     }
 

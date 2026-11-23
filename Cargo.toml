@@ -17,3 +17,5 @@ tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["process", "io-util", "sync", "rt", "macros", "time"] }
 nix = { version = "0.32.0", features = ["signal", "process", "user", "fs"] }
 anyhow = "1.0.105"
+clap = { version = "4.6.9", features = ["derive"] }
+assert_cmd = "2.2.2"
