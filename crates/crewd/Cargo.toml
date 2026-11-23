@@ -6,8 +6,13 @@ license.workspace = true
 
 [dependencies]
 crew-core = { path = "../crew-core" }
-tokio = { workspace = true }
+crew-proto = { path = "../crew-proto" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 nix = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tempfile = { workspace = true }
