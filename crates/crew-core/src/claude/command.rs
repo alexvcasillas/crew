@@ -32,6 +32,7 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
     }
 }
 
+/// Builds the command line. The prompt goes last, after `--`.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
@@ -44,7 +45,6 @@ pub fn build_claude(
     };
     let mut args: Vec<String> = [
         "-p",
-        prompt,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -76,6 +76,9 @@ pub fn build_claude(
         args.push("--allowedTools".into());
         args.push(agent.allowed_tools.join(","));
     }
+    // Last, after `--`, so a prompt that starts with `-` is never a flag.
+    args.push("--".into());
+    args.push(prompt.to_string());
     ClaudeInvocation {
         bin: claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")),
         args,
@@ -100,75 +103,76 @@ mod tests {
         }
     }
 
-    fn has_pair(args: &[String], k: &str, v: &str) -> bool {
-        args.windows(2).any(|w| w[0] == k && w[1] == v)
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn read_only_agent_runs_in_plan_mode() {
+    fn read_only_new_session_args_in_order() {
+        let id = Uuid::new_v4();
         let inv = build_claude(
             &agent(PermissionMode::ReadOnly),
-            "hi",
+            "- hi",
             Path::new("/work/demo"),
-            SessionArg::New(Uuid::new_v4()),
+            SessionArg::New(id),
         );
-        assert!(has_pair(&inv.args, "--permission-mode", "plan"));
-        assert!(has_pair(&inv.args, "--permission-prompts", "none"));
-        assert_eq!(&inv.args[..2], ["-p", "hi"]);
+        let id = id.to_string();
+        assert_eq!(
+            inv.args,
+            args(&[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-haiku-4-5",
+                "--permission-mode",
+                "plan",
+                "--permission-prompts",
+                "none",
+                "--session-id",
+                &id,
+                "--append-system-prompt",
+                "Be brief.",
+                "--allowedTools",
+                "Read,Grep",
+                "--",
+                "- hi",
+            ])
+        );
         assert_eq!(inv.cwd, Path::new("/work/demo"));
     }
 
     #[test]
-    fn edit_agent_accepts_edits() {
-        let inv = build_claude(
-            &agent(PermissionMode::EditFiles),
-            "hi",
-            Path::new("/work/demo"),
-            SessionArg::New(Uuid::new_v4()),
-        );
-        assert!(has_pair(&inv.args, "--permission-mode", "acceptEdits"));
-        assert!(has_pair(&inv.args, "--allowedTools", "Read,Grep"));
-        assert!(has_pair(&inv.args, "--append-system-prompt", "Be brief."));
-    }
-
-    #[test]
-    fn new_session_passes_crew_chosen_id() {
-        let id = Uuid::new_v4();
-        let inv = build_claude(
-            &agent(PermissionMode::ReadOnly),
-            "hi",
-            Path::new("/work/demo"),
-            SessionArg::New(id),
-        );
-        assert!(has_pair(&inv.args, "--session-id", &id.to_string()));
-        assert!(!inv.args.contains(&"--resume".to_string()));
-    }
-
-    #[test]
-    fn resume_uses_resume_flag_not_session_id() {
-        let inv = build_claude(
-            &agent(PermissionMode::ReadOnly),
-            "hi",
-            Path::new("/work/demo"),
-            SessionArg::Resume("abc".into()),
-        );
-        assert!(has_pair(&inv.args, "--resume", "abc"));
-        assert!(!inv.args.contains(&"--session-id".to_string()));
-    }
-
-    #[test]
-    fn empty_instructions_and_tools_are_omitted() {
-        let mut a = agent(PermissionMode::ReadOnly);
+    fn edit_agent_resumes_with_bare_args_in_order() {
+        let mut a = agent(PermissionMode::EditFiles);
         a.instructions.clear();
         a.allowed_tools.clear();
         let inv = build_claude(
             &a,
-            "hi",
+            "--help",
             Path::new("/work/demo"),
-            SessionArg::New(Uuid::new_v4()),
+            SessionArg::Resume("abc".into()),
         );
-        assert!(!inv.args.contains(&"--append-system-prompt".to_string()));
-        assert!(!inv.args.contains(&"--allowedTools".to_string()));
+        assert_eq!(
+            inv.args,
+            args(&[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-haiku-4-5",
+                "--permission-mode",
+                "acceptEdits",
+                "--permission-prompts",
+                "none",
+                "--resume",
+                "abc",
+                "--",
+                "--help",
+            ])
+        );
     }
 
     #[test]

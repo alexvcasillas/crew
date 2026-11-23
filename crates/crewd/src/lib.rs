@@ -4,4 +4,4 @@ pub mod runner;
 pub mod server;
 pub mod service;
 
-pub use server::{ServeOptions, serve};
+pub use server::{ServeOptions, serve, serve_until};

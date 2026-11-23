@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 
 /// Which CLI runs the agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Runtime {
     ClaudeCode,
 }
 
 /// How much the agent may do without asking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     ReadOnly,
     EditFiles,

@@ -2,11 +2,12 @@
 
 use std::collections::HashSet;
 
-use crate::ids::{AgentId, ThreadId};
+use crate::ids::{AgentId, RunId, ThreadId};
 
 /// A queued agent run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
+    pub run: RunId,
     pub thread: ThreadId,
     pub agent: AgentId,
     pub prompt: String,
@@ -54,6 +55,12 @@ impl Scheduler {
         self.active.remove(&thread);
     }
 
+    /// Takes the queued job of `run` out of the queue, if it is there.
+    pub fn remove(&mut self, run: RunId) -> Option<Job> {
+        let pos = self.queue.iter().position(|j| j.run == run)?;
+        Some(self.queue.remove(pos))
+    }
+
     /// Drops all queued jobs and returns them in enqueue order.
     /// Active runs are not touched.
     pub fn clear(&mut self) -> Vec<Job> {
@@ -67,6 +74,7 @@ mod tests {
 
     fn job(thread: ThreadId, prompt: &str) -> Job {
         Job {
+            run: RunId::new(),
             thread,
             agent: AgentId::new(),
             prompt: prompt.into(),
@@ -146,6 +154,21 @@ mod tests {
         s.finished(t);
         s.enqueue(job(t, "a"));
         assert_eq!(s.next_ready().unwrap().prompt, "a");
+    }
+
+    #[test]
+    fn remove_takes_one_queued_job() {
+        let mut s = Scheduler::new(1);
+        let (t1, t2) = (ThreadId::new(), ThreadId::new());
+        s.enqueue(job(t1, "a"));
+        let b = job(t2, "b");
+        s.enqueue(b.clone());
+        s.enqueue(job(t2, "c"));
+        assert_eq!(s.remove(b.run), Some(b.clone()));
+        assert_eq!(s.remove(b.run), None);
+        assert_eq!(s.next_ready().unwrap().prompt, "a");
+        s.finished(t1);
+        assert_eq!(s.next_ready().unwrap().prompt, "c");
     }
 
     #[test]

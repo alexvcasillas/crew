@@ -2,7 +2,7 @@
 //!
 //! Lock order: `state` before `db`. Neither lock is held across an `.await`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -16,7 +16,7 @@ use crew_core::store::{Author, RunFilter, Store, StoreError};
 use crew_proto::{Request, ServerMsg};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::runner::{RunHandle, RunOutcome, spawn_run};
@@ -51,12 +51,22 @@ struct Db {
     serial: u64,
 }
 
+/// What a queued run needs besides its job.
+struct Pending {
+    /// The message that asked for the run.
+    message: MessageId,
+    /// The prompt to use if the run starts a new session.
+    fresh: String,
+}
+
 struct State {
     scheduler: Scheduler,
     live: HashMap<RunId, (ThreadId, RunHandle)>,
-    /// Prompts for queued jobs in case they start a new session, in the
-    /// same order the scheduler hands out jobs of each thread and agent.
-    fresh_prompts: HashMap<(ThreadId, AgentId), VecDeque<String>>,
+    pending: HashMap<RunId, Pending>,
+    /// One task per started run, so shutdown can wait for them.
+    watchers: JoinSet<()>,
+    /// Set once crewd is shutting down. Nothing starts after that.
+    shutting_down: bool,
 }
 
 struct Inner {
@@ -89,7 +99,9 @@ impl Service {
             state: Mutex::new(State {
                 scheduler: Scheduler::new(max_runs),
                 live: HashMap::new(),
-                fresh_prompts: HashMap::new(),
+                pending: HashMap::new(),
+                watchers: JoinSet::new(),
+                shutting_down: false,
             }),
             tx,
             claude_bin,
@@ -225,16 +237,21 @@ impl Service {
                 let Some((agent, _)) = agents.iter().find(|(_, a)| a.name == name) else {
                     continue;
                 };
+                let run = db.store.create_run(thread, *agent)?;
+                self.publish_status(&mut db, thread, run, RunStatus::Queued);
                 state.scheduler.enqueue(Job {
+                    run,
                     thread,
                     agent: *agent,
                     prompt: body.to_string(),
                 });
-                state
-                    .fresh_prompts
-                    .entry((thread, *agent))
-                    .or_default()
-                    .push_back(fresh.clone());
+                state.pending.insert(
+                    run,
+                    Pending {
+                        message: id,
+                        fresh: fresh.clone(),
+                    },
+                );
             }
             for name in unknown {
                 self.add_message(
@@ -250,13 +267,20 @@ impl Service {
         Ok(id)
     }
 
+    /// Stops a live run, or takes a queued one out of the queue.
     fn stop_run(&self, run: RunId) -> Result<(), String> {
-        match self.state().live.get(&run) {
-            Some((_, handle)) => {
-                handle.stop();
-                Ok(())
+        let mut state = self.state();
+        if let Some((_, handle)) = state.live.get(&run) {
+            handle.stop();
+            return Ok(());
+        }
+        match state.scheduler.remove(run) {
+            Some(job) => {
+                state.pending.remove(&run);
+                self.note_dropped(&[job], RunStatus::Stopped)
+                    .map_err(|e| e.to_string())
             }
-            None => Err(format!("Run {run} isn't running.")),
+            None => Err(format!("Run {run} isn't queued or running.")),
         }
     }
 
@@ -274,8 +298,10 @@ impl Service {
         for job in kept {
             state.scheduler.enqueue(job);
         }
-        state.fresh_prompts.retain(|(t, _), _| *t != thread);
-        self.note_dropped(&dropped)
+        for job in &dropped {
+            state.pending.remove(&job.run);
+        }
+        self.note_dropped(&dropped, RunStatus::Stopped)
     }
 
     /// Stops every live run and drops the whole queue.
@@ -285,21 +311,46 @@ impl Service {
             handle.stop();
         }
         let dropped = state.scheduler.clear();
-        state.fresh_prompts.clear();
-        self.note_dropped(&dropped)
+        state.pending.clear();
+        self.note_dropped(&dropped, RunStatus::Stopped)
     }
 
-    /// Tells each thread that lost queued jobs. Queued jobs have no run yet.
-    fn note_dropped(&self, dropped: &[Job]) -> Result<(), StoreError> {
+    /// Stops every run for good and waits until all of them have ended.
+    /// Live runs end as `Interrupted`, and so do queued ones. Runs stop
+    /// at the same time, so this takes at most one stop escalation.
+    pub async fn shutdown(&self) {
+        let mut watchers = {
+            let mut state = self.state();
+            state.shutting_down = true;
+            for (_, handle) in state.live.values() {
+                handle.stop();
+            }
+            let dropped = state.scheduler.clear();
+            state.pending.clear();
+            if let Err(e) = self.note_dropped(&dropped, RunStatus::Interrupted) {
+                log(format!("couldn't record the queued runs: {e}"));
+            }
+            std::mem::take(&mut state.watchers)
+        };
+        while watchers.join_next().await.is_some() {}
+    }
+
+    /// Records queued runs that will never start, and tells each thread.
+    /// Callers hold the state lock.
+    fn note_dropped(&self, dropped: &[Job], status: RunStatus) -> Result<(), StoreError> {
+        let mut db = self.db();
         let mut threads: Vec<ThreadId> = Vec::new();
         for job in dropped {
+            db.store.set_run_status(job.run, status.clone())?;
+            self.publish_status(&mut db, job.thread, job.run, status.clone());
             if !threads.contains(&job.thread) {
                 threads.push(job.thread);
             }
         }
-        let mut db = self.db();
-        for thread in threads {
-            self.add_message(&mut db, thread, Author::System, "Stopped before starting.")?;
+        if status == RunStatus::Stopped {
+            for thread in threads {
+                self.add_message(&mut db, thread, Author::System, "Stopped before starting.")?;
+            }
         }
         Ok(())
     }
@@ -307,23 +358,23 @@ impl Service {
     /// Starts queued jobs while the scheduler allows.
     fn start_ready(&self) {
         let mut state = self.state();
+        if state.shutting_down {
+            return;
+        }
         while let Some(job) = state.scheduler.next_ready() {
-            let key = (job.thread, job.agent);
-            let fresh = state
-                .fresh_prompts
-                .get_mut(&key)
-                .and_then(|q| q.pop_front());
-            if state.fresh_prompts.get(&key).is_some_and(|q| q.is_empty()) {
-                state.fresh_prompts.remove(&key);
-            }
+            let pending = state.pending.remove(&job.run);
             let mut db = self.db();
-            match self.prepare(&mut db, &job, fresh) {
-                Ok((run, name, inv)) => {
+            match self.prepare(&mut db, &job, pending) {
+                Ok((name, inv)) => {
                     drop(db);
                     let (handle, rx, join) = spawn_run(inv);
-                    state.live.insert(run, (job.thread, handle));
+                    state.live.insert(job.run, (job.thread, handle));
+                    // Forget watchers that are done, so the set stays small.
+                    while state.watchers.try_join_next().is_some() {}
                     let svc = self.clone();
-                    tokio::spawn(svc.watch(job.thread, run, job.agent, name, rx, join));
+                    state
+                        .watchers
+                        .spawn(svc.watch(job.thread, job.run, job.agent, name, rx, join));
                 }
                 Err(e) => {
                     log(format!(
@@ -331,6 +382,12 @@ impl Service {
                         job.thread
                     ));
                     state.scheduler.finished(job.thread);
+                    match db.store.set_run_status(job.run, RunStatus::Failed) {
+                        Ok(()) => {
+                            self.publish_status(&mut db, job.thread, job.run, RunStatus::Failed)
+                        }
+                        Err(e) => log(e),
+                    }
                     let body = format!("Couldn't start the run: {e}");
                     if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
                         log(e);
@@ -340,19 +397,19 @@ impl Service {
         }
     }
 
-    /// Creates the run row and builds the command line for a job.
+    /// Picks the session and prompt for a job, marks its run `Working` and
+    /// builds the command line.
     fn prepare(
         &self,
         db: &mut Db,
         job: &Job,
-        fresh: Option<String>,
-    ) -> Result<(RunId, String, ClaudeInvocation), StoreError> {
-        let spec = db
-            .store
-            .agents()?
-            .into_iter()
+        pending: Option<Pending>,
+    ) -> Result<(String, ClaudeInvocation), StoreError> {
+        let agents = db.store.agents()?;
+        let spec = agents
+            .iter()
             .find(|(id, _)| *id == job.agent)
-            .map(|(_, spec)| spec)
+            .map(|(_, spec)| spec.clone())
             .ok_or(StoreError::NotFound("agent"))?;
         let cwd = db.store.thread_cwd(job.thread)?;
         let filter = RunFilter {
@@ -377,32 +434,39 @@ impl Service {
             }
         }
         let (session_id, session, prompt) = match previous {
-            Some(run) => (
-                run.session_id.clone(),
-                SessionArg::Resume(run.session_id),
-                job.prompt.clone(),
-            ),
+            Some(run) => {
+                let messages = db.store.messages(job.thread)?;
+                let missed = missed_messages(
+                    &messages,
+                    run.started_at,
+                    pending.as_ref().map(|p| p.message),
+                    job.agent,
+                );
+                let context = render_context(&missed, &agents);
+                let prompt = if context.is_empty() {
+                    job.prompt.clone()
+                } else {
+                    format!("{context}\n\n{}", job.prompt)
+                };
+                (
+                    run.session_id.clone(),
+                    SessionArg::Resume(run.session_id),
+                    prompt,
+                )
+            }
             None => {
                 let id = Uuid::new_v4();
-                let prompt = fresh.unwrap_or_else(|| job.prompt.clone());
+                let prompt = pending.map_or_else(|| job.prompt.clone(), |p| p.fresh);
                 (id.to_string(), SessionArg::New(id), prompt)
             }
         };
-        let run = db.store.create_run(job.thread, job.agent, &session_id)?;
-        self.publish(
-            db,
-            job.thread,
-            ServerMsg::RunStatus {
-                thread: job.thread,
-                run,
-                status: RunStatus::Working,
-            },
-        );
+        db.store.start_run(job.run, &session_id)?;
+        self.publish_status(db, job.thread, job.run, RunStatus::Working);
         let mut inv = build_claude(&spec, &prompt, &cwd, session);
         if let Some(bin) = &self.0.claude_bin {
             inv.bin = bin.clone();
         }
-        Ok((run, spec.name, inv))
+        Ok((spec.name, inv))
     }
 
     /// Saves and forwards a run's events, then records how it ended.
@@ -467,6 +531,11 @@ impl Service {
         state.scheduler.finished(thread);
         let mut db = self.db();
         let (status, author, body) = match outcome {
+            RunOutcome::Stopped if state.shutting_down => (
+                RunStatus::Interrupted,
+                Author::System,
+                format!("{name} was interrupted because crewd stopped."),
+            ),
             RunOutcome::Done => (RunStatus::Done, Author::Agent(agent), reply),
             RunOutcome::Failed(msg) => (
                 RunStatus::Failed,
@@ -483,8 +552,13 @@ impl Service {
         if !body.is_empty() {
             self.add_message(&mut db, thread, author, &body)?;
         }
+        self.publish_status(&mut db, thread, run, status);
+        Ok(())
+    }
+
+    fn publish_status(&self, db: &mut Db, thread: ThreadId, run: RunId, status: RunStatus) {
         self.publish(
-            &mut db,
+            db,
             thread,
             ServerMsg::RunStatus {
                 thread,
@@ -492,7 +566,6 @@ impl Service {
                 status,
             },
         );
-        Ok(())
     }
 
     /// Saves a message and notifies the thread.
@@ -526,7 +599,24 @@ impl Service {
     }
 }
 
-/// Earlier messages as plain text, one per line.
+/// Messages an agent hasn't seen since its last run started: those after
+/// `since` (Unix ms) and before the one that asked for this run, minus the
+/// agent's own.
+fn missed_messages(
+    messages: &[crew_core::store::StoredMessage],
+    since: i64,
+    asked_by: Option<MessageId>,
+    agent: AgentId,
+) -> Vec<crew_core::store::StoredMessage> {
+    messages
+        .iter()
+        .take_while(|m| Some(m.id) != asked_by)
+        .filter(|m| m.created_at > since && m.author != Author::Agent(agent))
+        .cloned()
+        .collect()
+}
+
+/// Messages as plain text, one per line.
 fn render_context(
     messages: &[crew_core::store::StoredMessage],
     agents: &[(AgentId, AgentSpec)],

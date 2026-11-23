@@ -26,6 +26,9 @@ const KILL_AFTER: Duration = Duration::from_secs(5);
 const STDERR_TAIL: usize = 20;
 /// Capacity of the event channel.
 const EVENT_BUFFER: usize = 1024;
+/// How long the output readers may run on after the process is gone. A
+/// leftover child that holds the pipes would otherwise keep them open.
+const READERS_GRACE: Duration = Duration::from_secs(2);
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +180,8 @@ async fn supervise(
         None => {
             escalate(&mut child, pgid).await;
             signal_group(pgid, Signal::SIGKILL);
+            // Ends the readers, which closes the event channel.
+            finish_readers(stdout_task, stderr_task).await;
             return RunOutcome::Stopped;
         }
     };
@@ -184,8 +189,7 @@ async fn supervise(
     // Clear anything the process left behind in its group.
     signal_group(pgid, Signal::SIGKILL);
 
-    let turn_ok = stdout_task.await.unwrap_or(false);
-    let tail = stderr_task.await.unwrap_or_default();
+    let (turn_ok, tail) = finish_readers(stdout_task, stderr_task).await;
     match status {
         Ok(s) if s.success() && turn_ok => RunOutcome::Done,
         Ok(s) if s.success() => {
@@ -193,6 +197,34 @@ async fn supervise(
         }
         Ok(s) => RunOutcome::Failed(failure_message(s, tail)),
         Err(e) => RunOutcome::Failed(format!("Lost track of `claude`: {e}")),
+    }
+}
+
+/// Waits up to [`READERS_GRACE`] for the readers, then aborts them. Either
+/// way the stdout reader's sender is dropped, so the event channel closes.
+async fn finish_readers(
+    stdout_task: JoinHandle<bool>,
+    stderr_task: JoinHandle<VecDeque<String>>,
+) -> (bool, VecDeque<String>) {
+    let deadline = tokio::time::Instant::now() + READERS_GRACE;
+    let turn_ok = join_until(stdout_task, deadline).await.unwrap_or(false);
+    let tail = join_until(stderr_task, deadline).await.unwrap_or_default();
+    (turn_ok, tail)
+}
+
+async fn join_until<T>(mut task: JoinHandle<T>, deadline: tokio::time::Instant) -> Option<T> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(result) => result.ok(),
+        Err(_) => {
+            // After a stall the timer can fire before a reader that already
+            // hit end of input gets polled. Let it run once before giving up.
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                return task.await.ok();
+            }
+            task.abort();
+            None
+        }
     }
 }
 

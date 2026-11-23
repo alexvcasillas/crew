@@ -26,12 +26,16 @@ pub enum StoreError {
     NotFound(&'static str),
     #[error("an agent named {0:?} already exists")]
     DuplicateAgentName(String),
+    #[error("This database was written by a newer Crew.")]
+    NewerSchema,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Who wrote a message.
+/// Who wrote a message. On the wire: `{"kind":"you"}`,
+/// `{"kind":"agent","id":"<uuid>"}` or `{"kind":"system"}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Author {
     You,
     Agent(AgentId),
@@ -124,6 +128,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::NewerSchema);
+        }
         if version == 0 {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(SCHEMA)?;
@@ -261,22 +268,38 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Starts a run in the `Working` state.
-    pub fn create_run(&self, t: ThreadId, a: AgentId, session_id: &str) -> Result<RunId> {
+    /// Adds a run in the `Queued` state, with no session yet.
+    pub fn create_run(&self, t: ThreadId, a: AgentId) -> Result<RunId> {
         let id = RunId::new();
         self.conn.execute(
             "INSERT INTO runs (id, thread_id, agent_id, session_id, status, started_at, ord)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(ord) + 1, 0) FROM runs))",
+             VALUES (?1, ?2, ?3, '', ?4, ?5, (SELECT COALESCE(MAX(ord) + 1, 0) FROM runs))",
             params![
                 id.to_string(),
                 t.to_string(),
                 a.to_string(),
+                status_text(&RunStatus::Queued)?,
+                now_ms()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Moves a run to `Working` with its session id. `started_at` becomes now.
+    pub fn start_run(&self, r: RunId, session_id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET session_id = ?2, status = ?3, started_at = ?4 WHERE id = ?1",
+            params![
+                r.to_string(),
                 session_id,
                 status_text(&RunStatus::Working)?,
                 now_ms()
             ],
         )?;
-        Ok(id)
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
     }
 
     /// Sets the status. A terminal status also sets `ended_at`.
@@ -342,13 +365,15 @@ impl Store {
         Ok(out)
     }
 
-    /// Marks every `Working` run as `Interrupted`. Returns how many changed.
-    pub fn mark_working_runs_interrupted(&self) -> Result<usize> {
+    /// Marks every `Queued` or `Working` run as `Interrupted`. Returns how
+    /// many changed.
+    pub fn mark_unfinished_runs_interrupted(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE runs SET status = ?1, ended_at = ?2 WHERE status = ?3",
+            "UPDATE runs SET status = ?1, ended_at = ?2 WHERE status IN (?3, ?4)",
             params![
                 status_text(&RunStatus::Interrupted)?,
                 now_ms(),
+                status_text(&RunStatus::Queued)?,
                 status_text(&RunStatus::Working)?
             ],
         )?)
