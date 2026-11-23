@@ -5,5 +5,8 @@ pub mod claude;
 pub mod event;
 pub mod ids;
 pub mod mention;
+pub mod policy;
 pub mod scheduler;
+pub mod slug;
 pub mod store;
+pub mod worktree;

@@ -100,6 +100,9 @@ mod tests {
             instructions: "Be brief.".into(),
             permission_mode: mode,
             allowed_tools: vec!["Read".into(), "Grep".into()],
+            handoff_policy: None,
+            handoff_budget: None,
+            max_run_minutes: 20,
         }
     }
 

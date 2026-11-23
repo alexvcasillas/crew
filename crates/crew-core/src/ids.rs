@@ -55,6 +55,10 @@ id_type!(
     /// Identifies an agent run.
     RunId
 );
+id_type!(
+    /// Identifies an approval request.
+    ApprovalId
+);
 
 #[cfg(test)]
 mod tests {

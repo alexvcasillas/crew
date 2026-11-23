@@ -224,6 +224,9 @@ fn forge() -> AgentSpec {
         instructions: String::new(),
         permission_mode: PermissionMode::EditFiles,
         allowed_tools: vec![],
+        handoff_policy: None,
+        handoff_budget: None,
+        max_run_minutes: 20,
     }
 }
 
