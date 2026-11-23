@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
-use crew_core::claude::{ClaudeInvocation, McpWiring, SessionArg, build_claude};
+use crew_core::claude::{
+    ClaudeInvocation, CrewContext, McpWiring, SessionArg, Teammate, build_claude,
+};
 use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
@@ -1249,7 +1251,21 @@ impl Service {
             run: job.run,
             crew_home: home.clone(),
         });
-        let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring);
+        let context = CrewContext {
+            project: db.store.project_of_thread(job.thread)?.name,
+            team: db
+                .store
+                .agents()?
+                .into_iter()
+                .filter(|(id, _)| *id != job.agent)
+                .map(|(_, a)| Teammate {
+                    edits: a.permission_mode == PermissionMode::EditFiles,
+                    name: a.name,
+                    role: a.role,
+                })
+                .collect(),
+        };
+        let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring, Some(&context));
         if let Some(bin) = &self.0.bins.claude {
             inv.bin = bin.clone();
         }

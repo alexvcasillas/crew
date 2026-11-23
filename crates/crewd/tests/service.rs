@@ -833,6 +833,61 @@ async fn runs_get_crew_mcp_when_it_exists() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn runs_hear_their_crew_context_in_one_system_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let mcp_bin = dir.path().join("crew-mcp");
+    std::fs::write(&mcp_bin, "").unwrap();
+    let d = Daemon::start_with(4, script, Some(mcp_bin)).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, &dir.path().join("repo"), 1).await;
+    let scout = AgentSpec {
+        name: "Scout".into(),
+        role: "Reviews code".into(),
+        instructions: "Be brief.".into(),
+        permission_mode: PermissionMode::ReadOnly,
+        ..forge()
+    };
+    let _: AgentId = c.ok(Request::CreateAgent { spec: scout }).await;
+    let gone: AgentId = c
+        .ok(Request::CreateAgent {
+            spec: AgentSpec {
+                name: "Gone".into(),
+                ..forge()
+            },
+        })
+        .await;
+    c.call(Request::DeleteAgent { agent: gone }).await.unwrap();
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Scout look".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Done)).await;
+
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 1);
+    let prompts: Vec<&[String]> = calls[0]
+        .windows(2)
+        .filter(|w| w[0] == "--append-system-prompt")
+        .collect();
+    assert_eq!(prompts.len(), 1, "{:?}", calls[0]);
+    assert_eq!(
+        prompts[0][1],
+        "You are Scout, Reviews code, working in Crew with other agents in project demo.\n\
+         You are read-only: review and report, don't change files.\n\
+         Other agents here:\n\
+         - Forge (Builds things, edits files)\n\
+         To bring in another agent, call the mcp__crew__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
+         \n\
+         Be brief."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn read_only_runs_get_handoff_but_no_prompt_tool() {
     let dir = tempfile::tempdir().unwrap();
     let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");

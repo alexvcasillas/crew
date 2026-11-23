@@ -86,6 +86,64 @@ impl McpWiring {
     }
 }
 
+/// Another agent the running agent can bring in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Teammate {
+    pub name: String,
+    pub role: String,
+    pub edits: bool,
+}
+
+/// Where the agent works and with whom. Told to it in the system prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrewContext {
+    pub project: String,
+    /// Live agents other than the one running.
+    pub team: Vec<Teammate>,
+}
+
+impl CrewContext {
+    /// The plain text block for `agent`. `wired` adds how to hand off.
+    pub fn render(&self, agent: &AgentSpec, wired: bool) -> String {
+        let who = if agent.role.trim().is_empty() {
+            agent.name.clone()
+        } else {
+            format!("{}, {}", agent.name, agent.role.trim())
+        };
+        let mut lines = vec![format!(
+            "You are {who}, working in Crew with other agents in project {}.",
+            self.project
+        )];
+        lines.push(match agent.permission_mode {
+            PermissionMode::EditFiles => "You can edit files in this thread's worktree.".into(),
+            PermissionMode::ReadOnly => {
+                "You are read-only: review and report, don't change files.".into()
+            }
+        });
+        if !self.team.is_empty() {
+            lines.push("Other agents here:".into());
+            for mate in &self.team {
+                let access = if mate.edits {
+                    "edits files"
+                } else {
+                    "read-only"
+                };
+                lines.push(if mate.role.trim().is_empty() {
+                    format!("- {} ({access})", mate.name)
+                } else {
+                    format!("- {} ({}, {access})", mate.name, mate.role.trim())
+                });
+            }
+        }
+        if wired {
+            lines.push(format!(
+                "To bring in another agent, call the {HANDOFF_TOOL} tool with the agent's name and a short brief. Writing @Name in your final reply also works."
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
 /// How the run attaches to a Claude session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionArg {
@@ -117,12 +175,16 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 /// agent then runs in `default` mode and asks crewd through
 /// `mcp__crew__approve` before anything but file edits under its working
 /// folder. Every wired agent may use `mcp__crew__handoff` without asking.
+///
+/// With `context`, the Crew block goes before the agent's own instructions
+/// in one `--append-system-prompt`.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
     cwd: &Path,
     session: SessionArg,
     mcp: Option<McpWiring>,
+    context: Option<&CrewContext>,
 ) -> ClaudeInvocation {
     let edits = agent.permission_mode == PermissionMode::EditFiles;
     let mode = match (&agent.permission_mode, &mcp) {
@@ -157,9 +219,18 @@ pub fn build_claude(
             args.push(id);
         }
     }
-    if !agent.instructions.is_empty() {
+    let system = [
+        context.map(|c| c.render(agent, mcp.is_some())),
+        Some(agent.instructions.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    if !system.is_empty() {
         args.push("--append-system-prompt".into());
-        args.push(agent.instructions.clone());
+        args.push(system);
     }
     let mut allowed = agent.allowed_tools.clone();
     if mcp.is_some() {
@@ -235,6 +306,7 @@ mod tests {
             Path::new("/work/demo"),
             SessionArg::New(id),
             None,
+            None,
         );
         let id = id.to_string();
         assert_eq!(
@@ -273,6 +345,7 @@ mod tests {
             "--help",
             Path::new("/work/demo"),
             SessionArg::Resume("abc".into()),
+            None,
             None,
         );
         assert_eq!(
@@ -321,6 +394,7 @@ mod tests {
             Path::new("/work/demo"),
             SessionArg::Resume("abc".into()),
             Some(wiring(run)),
+            None,
         );
         let config = expected_mcp_config(run);
         assert_eq!(
@@ -366,6 +440,7 @@ mod tests {
             Path::new("/work/demo"),
             SessionArg::Resume("abc".into()),
             Some(wiring(run)),
+            None,
         );
         let config = expected_mcp_config(run);
         assert_eq!(
@@ -412,6 +487,7 @@ mod tests {
             Path::new("/work/demo"),
             SessionArg::Resume("abc".into()),
             Some(wiring(RunId::new())),
+            None,
         );
         let allowed = inv
             .args
@@ -431,10 +507,87 @@ mod tests {
             Path::new("/work/demo"),
             SessionArg::Resume("abc".into()),
             None,
+            None,
         );
         assert!(
             inv.args
                 .contains(&"Read,Edit,Write(src/**),MultiEdit,Edit(./**),NotebookEdit".to_string())
+        );
+    }
+
+    fn context() -> CrewContext {
+        CrewContext {
+            project: "demo".into(),
+            team: vec![
+                Teammate {
+                    name: "Forge".into(),
+                    role: "Builds features".into(),
+                    edits: true,
+                },
+                Teammate {
+                    name: "Scout".into(),
+                    role: String::new(),
+                    edits: false,
+                },
+            ],
+        }
+    }
+
+    fn system_prompt(inv: &ClaudeInvocation) -> Vec<&String> {
+        inv.args
+            .windows(2)
+            .filter(|w| w[0] == "--append-system-prompt")
+            .map(|w| &w[1])
+            .collect()
+    }
+
+    #[test]
+    fn crew_context_joins_instructions_in_one_system_prompt() {
+        let inv = build_claude(
+            &agent(PermissionMode::ReadOnly),
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            Some(wiring(RunId::new())),
+            Some(&context()),
+        );
+        assert_eq!(
+            system_prompt(&inv),
+            vec![
+                "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
+                 You are read-only: review and report, don't change files.\n\
+                 Other agents here:\n\
+                 - Forge (Builds features, edits files)\n\
+                 - Scout (read-only)\n\
+                 To bring in another agent, call the mcp__crew__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
+                 \n\
+                 Be brief."
+            ]
+        );
+    }
+
+    #[test]
+    fn crew_context_without_wiring_or_instructions() {
+        let mut a = agent(PermissionMode::EditFiles);
+        a.instructions.clear();
+        let ctx = CrewContext {
+            project: "demo".into(),
+            team: vec![],
+        };
+        let inv = build_claude(
+            &a,
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            None,
+            Some(&ctx),
+        );
+        assert_eq!(
+            system_prompt(&inv),
+            vec![
+                "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
+                 You can edit files in this thread's worktree."
+            ]
         );
     }
 
