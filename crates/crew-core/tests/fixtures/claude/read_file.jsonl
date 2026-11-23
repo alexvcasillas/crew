@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-haiku-4-5","tools":["Read","Edit","Bash"]}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/work/demo/a.txt"}}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"1\thello\n"}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"result","subtype":"success","is_error":false,"result":"hello","duration_ms":1200,"num_turns":2,"permission_denials":[],"session_id":"00000000-0000-4000-8000-000000000001"}
