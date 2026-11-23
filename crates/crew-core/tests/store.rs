@@ -375,10 +375,19 @@ fn threads_keep_worktree_and_handoff_settings() {
         path: PathBuf::from("/work/crew/worktrees/demo/first"),
         branch: "crew/first".into(),
         base: "abc123".into(),
+        ready: false,
     };
     let root = store.thread_cwd(t).unwrap();
     store.set_thread_worktree(t, Some(&wt)).unwrap();
     assert_eq!(store.thread_cwd(t).unwrap(), wt.path);
+    assert!(!store.thread(t).unwrap().worktree.unwrap().ready);
+    let ready = ThreadWorktree {
+        ready: true,
+        ..wt.clone()
+    };
+    store.set_thread_worktree(t, Some(&ready)).unwrap();
+    assert!(store.thread(t).unwrap().worktree.unwrap().ready);
+    store.set_thread_worktree(t, Some(&wt)).unwrap();
     store
         .set_thread_handoff(t, Some(HandoffPolicy::Budget), Some(5))
         .unwrap();

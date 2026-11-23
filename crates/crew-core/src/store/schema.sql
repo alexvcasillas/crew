@@ -32,6 +32,7 @@ CREATE TABLE threads (
     worktree_path TEXT,
     worktree_branch TEXT,
     worktree_base TEXT,
+    worktree_ready INTEGER NOT NULL DEFAULT 0,
     handoff_policy TEXT,
     handoff_budget INTEGER,
     handoffs_used INTEGER NOT NULL DEFAULT 0

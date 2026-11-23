@@ -82,6 +82,9 @@ impl RunHandle {
 /// Runs `command` with `sh -lc` in `cwd`, in its own process group, and
 /// streams its output lines, stdout and stderr together in order. A stop on
 /// `stop_rx` ends it the same way as a run. A failure holds the last lines.
+///
+/// When the command exits, its whole process group is killed, so anything
+/// it started in the background is stopped too.
 pub fn spawn_setup(
     command: &str,
     cwd: &Path,

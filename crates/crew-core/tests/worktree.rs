@@ -187,3 +187,33 @@ fn copy_files_skips_missing() {
         ));
     }
 }
+
+#[test]
+fn excluded_files_stay_out_of_diff_and_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_root, dest, base) = setup(tmp.path());
+    fs::write(dest.join(".env.local"), "SECRET=1\n").unwrap();
+    fs::create_dir_all(dest.join("config")).unwrap();
+    fs::write(dest.join("config/dev.toml"), "x = 1\n").unwrap();
+    fs::write(dest.join("new.txt"), "new\n").unwrap();
+
+    let files = vec![".env.local".to_string(), "config/dev.toml".to_string()];
+    worktree::exclude(&dest, &files).unwrap();
+    // A second call adds nothing.
+    worktree::exclude(&dest, &files).unwrap();
+
+    let exclude = git(&dest, &["rev-parse", "--git-path", "info/exclude"]);
+    let text = fs::read_to_string(dest.join(exclude)).unwrap();
+    assert_eq!(text.matches("/.env.local\n").count(), 1);
+    assert_eq!(text.matches("/config/dev.toml\n").count(), 1);
+
+    let diff = worktree::diff(&dest, &base).unwrap();
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["new.txt"]);
+    worktree::commit(&dest, "Add new").unwrap();
+    assert_eq!(
+        git(&dest, &["show", "--name-only", "--format=", "HEAD"]),
+        "new.txt"
+    );
+    assert!(dest.join(".env.local").is_file());
+}

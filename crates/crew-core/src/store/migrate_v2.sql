@@ -8,6 +8,7 @@ ALTER TABLE channels ADD COLUMN handoff_budget INTEGER;
 ALTER TABLE threads ADD COLUMN worktree_path TEXT;
 ALTER TABLE threads ADD COLUMN worktree_branch TEXT;
 ALTER TABLE threads ADD COLUMN worktree_base TEXT;
+ALTER TABLE threads ADD COLUMN worktree_ready INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE threads ADD COLUMN handoff_policy TEXT;
 ALTER TABLE threads ADD COLUMN handoff_budget INTEGER;
 ALTER TABLE threads ADD COLUMN handoffs_used INTEGER NOT NULL DEFAULT 0;

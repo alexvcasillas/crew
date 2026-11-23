@@ -83,6 +83,43 @@ pub fn copy_files(root: &Path, dest: &Path, files: &[String]) -> Result<Vec<Stri
     Ok(skipped)
 }
 
+/// Adds `files` (paths relative to the worktree) to the repo's
+/// `info/exclude`, so `diff` and `commit` leave them out. Paths already
+/// listed are not added again. The file is shared by all worktrees of
+/// the repo.
+pub fn exclude(dest: &Path, files: &[String]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let path = PathBuf::from(git(dest, ["rev-parse", "--git-path", "info/exclude"])?.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        dest.join(path)
+    };
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    let mut changed = false;
+    for file in files {
+        let line = format!("/{}", file.trim_start_matches("./"));
+        if text.lines().any(|l| l == line) {
+            continue;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&line);
+        text.push('\n');
+        changed = true;
+    }
+    if changed {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, text)?;
+    }
+    Ok(())
+}
+
 fn is_plain_relative(path: &str) -> bool {
     let path = Path::new(path);
     !path.as_os_str().is_empty()

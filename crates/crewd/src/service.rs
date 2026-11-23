@@ -526,7 +526,8 @@ impl Service {
         }
     }
 
-    /// Whether the job's agent may write and the thread has no worktree yet.
+    /// Whether the job's agent may write and the thread has no worktree,
+    /// or one whose setup didn't finish.
     /// Store errors say no, so `prepare` reports them.
     fn needs_worktree(&self, job: &Job) -> bool {
         let db = self.db();
@@ -539,7 +540,7 @@ impl Service {
             && db
                 .store
                 .thread(job.thread)
-                .is_ok_and(|t| t.worktree.is_none())
+                .is_ok_and(|t| t.worktree.is_none_or(|wt| !wt.ready))
     }
 
     /// Marks the run `Working` and makes the thread's worktree in a task of
@@ -652,8 +653,10 @@ impl Service {
             .map_or_else(|| "The agent".to_string(), |(_, spec)| spec.name)
     }
 
-    /// Makes the worktree, copies the project's files into it and runs its
-    /// setup command there. The setup command's output becomes run events.
+    /// Makes the worktree, or reuses one whose setup didn't finish, copies
+    /// the project's files into it and runs its setup command there. Only
+    /// then is the worktree marked ready. The setup command's output
+    /// becomes run events.
     async fn set_up_worktree(
         &self,
         job: &Job,
@@ -661,43 +664,68 @@ impl Service {
     ) -> Result<(), RunOutcome> {
         let failed =
             |what: &str, e: &dyn std::fmt::Display| RunOutcome::Failed(format!("{what}: {e}"));
-        let (project, project_slug, title) = {
+        let (project, project_slug, thread) = {
             let db = self.db();
             let found = db.store.project_of_thread(job.thread).and_then(|project| {
                 let projects = db.store.projects()?;
-                let title = db.store.thread(job.thread)?.title;
+                let thread = db.store.thread(job.thread)?;
                 let slug = project_slug(&projects, project.id);
-                Ok((project, slug, title))
+                Ok((project, slug, thread))
             });
             found.map_err(|e| failed("Couldn't make the worktree", &e))?
         };
 
-        let dir = self.0.worktrees.join(project_slug);
-        let svc = self.clone();
-        let (root, main) = (project.root.clone(), project.main_branch.clone());
-        let wt = blocking(move || {
-            let _held = svc.0.slugs.lock().unwrap_or_else(PoisonError::into_inner);
-            let taken = |slug: &str| {
-                dir.join(slug).exists()
-                    || worktree::branch_exists(&root, &format!("crew/{slug}")).unwrap_or(false)
-            };
-            let slug = slugify(&title, &taken);
-            let path = dir.join(&slug);
-            let branch = format!("crew/{slug}");
-            let base = worktree::create(&root, &main, &path, &branch)?;
-            Ok::<_, worktree::WorktreeError>(ThreadWorktree { path, branch, base })
+        let wt = match thread.worktree {
+            Some(wt) => wt,
+            None => {
+                let dir = self.0.worktrees.join(project_slug);
+                let svc = self.clone();
+                let (root, main, title) = (
+                    project.root.clone(),
+                    project.main_branch.clone(),
+                    thread.title,
+                );
+                let wt = blocking(move || {
+                    let _held = svc.0.slugs.lock().unwrap_or_else(PoisonError::into_inner);
+                    let taken = |slug: &str| {
+                        dir.join(slug).exists()
+                            || worktree::branch_exists(&root, &format!("crew/{slug}"))
+                                .unwrap_or(false)
+                    };
+                    let slug = slugify(&title, &taken);
+                    let path = dir.join(&slug);
+                    let branch = format!("crew/{slug}");
+                    let base = worktree::create(&root, &main, &path, &branch)?;
+                    Ok::<_, worktree::WorktreeError>(ThreadWorktree {
+                        path,
+                        branch,
+                        base,
+                        ready: false,
+                    })
+                })
+                .await
+                .map_err(|e| failed("Couldn't make the worktree", &e))?;
+                self.db()
+                    .store
+                    .set_thread_worktree(job.thread, Some(&wt))
+                    .map_err(|e| failed("Couldn't save the worktree", &e))?;
+                wt
+            }
+        };
+
+        if !wt.path.is_dir() {
+            let msg = format!("The worktree folder {} is missing.", wt.path.display());
+            return Err(RunOutcome::Failed(msg));
+        }
+        let (root, dest, files) = (project.root.clone(), wt.path.clone(), project.copy_files);
+        let skipped = blocking(move || {
+            let skipped = worktree::copy_files(&root, &dest, &files)?;
+            let copied: Vec<String> = files.into_iter().filter(|f| !skipped.contains(f)).collect();
+            worktree::exclude(&dest, &copied)?;
+            Ok::<_, worktree::WorktreeError>(skipped)
         })
         .await
-        .map_err(|e| failed("Couldn't make the worktree", &e))?;
-        self.db()
-            .store
-            .set_thread_worktree(job.thread, Some(&wt))
-            .map_err(|e| failed("Couldn't save the worktree", &e))?;
-
-        let (root, dest, files) = (project.root.clone(), wt.path.clone(), project.copy_files);
-        let skipped = blocking(move || worktree::copy_files(&root, &dest, &files))
-            .await
-            .map_err(|e| failed("Couldn't copy files into the worktree", &e))?;
+        .map_err(|e| failed("Couldn't copy files into the worktree", &e))?;
         if !skipped.is_empty() {
             let body = format!("Skipped missing files: {}.", skipped.join(", "));
             let mut db = self.db();
@@ -706,13 +734,33 @@ impl Service {
             }
         }
 
-        let command = project.setup_command.filter(|c| !c.trim().is_empty());
-        let Some(command) = command else {
-            return Ok(());
-        };
+        if let Some(command) = project.setup_command.filter(|c| !c.trim().is_empty()) {
+            self.run_setup(job, &command, &wt.path, stop_rx).await?;
+        }
+        let ready = ThreadWorktree { ready: true, ..wt };
+        self.db()
+            .store
+            .set_thread_worktree(job.thread, Some(&ready))
+            .map_err(|e| failed("Couldn't save the worktree", &e))
+    }
+
+    /// Runs the project's setup command in the worktree, recording its
+    /// output as events of the job's run.
+    async fn run_setup(
+        &self,
+        job: &Job,
+        command: &str,
+        cwd: &Path,
+        stop_rx: watch::Receiver<bool>,
+    ) -> Result<(), RunOutcome> {
         if *stop_rx.borrow() || stop_rx.has_changed().is_err() {
             return Err(RunOutcome::Stopped);
         }
+        let result = |output: String, is_error: bool| Event::ToolResult {
+            id: SETUP_ID.into(),
+            is_error,
+            output,
+        };
         self.record_event(
             job.thread,
             job.run,
@@ -720,26 +768,25 @@ impl Service {
                 id: SETUP_ID.into(),
                 name: "Setup".into(),
                 kind: ToolKind::Run,
-                target: Some(command.clone()),
+                target: Some(command.to_string()),
                 input: serde_json::json!({ "command": command }),
             },
         );
-        let (mut lines, join) = spawn_setup(&command, &wt.path, stop_rx);
+        let (mut lines, join) = spawn_setup(command, cwd, stop_rx);
         while let Some(output) = lines.recv().await {
-            self.record_event(
-                job.thread,
-                job.run,
-                Event::ToolResult {
-                    id: SETUP_ID.into(),
-                    is_error: false,
-                    output,
-                },
-            );
+            self.record_event(job.thread, job.run, result(output, false));
         }
-        match join.await {
-            Ok(RunOutcome::Done) => Ok(()),
-            Ok(outcome) => Err(outcome),
-            Err(e) => Err(RunOutcome::Failed(format!("The setup task ended: {e}"))),
+        let outcome = join
+            .await
+            .unwrap_or_else(|e| RunOutcome::Failed(format!("The setup task ended: {e}")));
+        match outcome {
+            RunOutcome::Done => Ok(()),
+            RunOutcome::Failed(msg) => {
+                let first = msg.lines().next().unwrap_or_default().to_string();
+                self.record_event(job.thread, job.run, result(first, true));
+                Err(RunOutcome::Failed(msg))
+            }
+            RunOutcome::Stopped => Err(RunOutcome::Stopped),
         }
     }
 
