@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use crew_core::agent::{AgentSpec, PermissionMode};
+use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::claude::{ClaudeInvocation, McpWiring, SessionArg, build_claude};
 use crew_core::event::{Event, RunStatus, ToolKind};
-use crew_core::ids::{AgentId, ApprovalId, MessageId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
@@ -33,15 +33,18 @@ pub const NO_CREW_MCP: &str = "Permission prompts are off: crew-mcp wasn't found
 const YOU_NAME: &str = "You";
 /// Tool call id of the setup command's events.
 const SETUP_ID: &str = "setup";
+/// How long finished runs stay in a `SubscribeAll` snapshot.
+const RECENT_RUNS_MS: i64 = 60 * 60 * 1000;
 
-/// A notification for subscribers of `thread`.
+/// A notification for subscribers of `thread`, or for `SubscribeAll`
+/// clients only if it has none.
 ///
 /// `serial` grows by one per notification and lets a subscriber skip what
 /// its backlog already covered.
 #[derive(Debug, Clone)]
 pub struct Notice {
     pub serial: u64,
-    pub thread: ThreadId,
+    pub thread: Option<ThreadId>,
     pub msg: ServerMsg,
 }
 
@@ -170,14 +173,16 @@ impl Service {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Handles every request except `Hello`, `Subscribe` and
-    /// `PermissionAsk`, which belong to the connection. `ThreadDiff`,
-    /// `Commit` and `Discard` run git and can take a while.
+    /// Handles every request except `Hello`, `Subscribe`, `SubscribeAll`
+    /// and `PermissionAsk`, which belong to the connection. `ThreadDiff`,
+    /// `Commit` and `Discard` run git and `Runtimes` runs the agent CLIs,
+    /// so they can take a while.
     pub async fn handle(&self, req: Request) -> Reply {
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
             Request::Discard { thread } => self.discard(thread).await,
+            Request::Runtimes => json(crate::runtimes::detect(self.0.claude_bin.clone()).await),
             other => self.handle_now(other),
         }
     }
@@ -185,7 +190,10 @@ impl Service {
     /// Requests that only touch the store or the scheduler.
     fn handle_now(&self, req: Request) -> Reply {
         match req {
-            Request::Hello { .. } | Request::Subscribe { .. } | Request::PermissionAsk { .. } => {
+            Request::Hello { .. }
+            | Request::Subscribe { .. }
+            | Request::SubscribeAll
+            | Request::PermissionAsk { .. } => {
                 Err("This request is handled by the connection.".into())
             }
             Request::CreateProject {
@@ -204,18 +212,41 @@ impl Service {
                     .create_channel(project, &name)
                     .map_err(|e| e.to_string())?,
             ),
-            Request::CreateAgent { spec } => json(
-                self.db()
-                    .store
-                    .create_agent(&spec)
-                    .map_err(|e| e.to_string())?,
-            ),
+            Request::CreateAgent { spec } => {
+                supported(&spec)?;
+                let mut db = self.db();
+                let agent = db.store.create_agent(&spec).map_err(|e| e.to_string())?;
+                self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+                json(agent)
+            }
+            Request::UpdateAgent { agent, spec } => {
+                supported(&spec)?;
+                let mut db = self.db();
+                db.store
+                    .update_agent(agent, &spec)
+                    .map_err(|e| e.to_string())?;
+                self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+                Ok(serde_json::Value::Null)
+            }
+            Request::DeleteAgent { agent } => {
+                self.delete_agent(agent)?;
+                Ok(serde_json::Value::Null)
+            }
             Request::CreateThread { channel, title } => json(
-                self.db()
-                    .store
-                    .create_thread(channel, &title)
+                self.create_thread(channel, &title)
                     .map_err(|e| e.to_string())?,
             ),
+            Request::RenameThread { thread, title } => {
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err("Give the thread a title.".into());
+                }
+                self.db()
+                    .store
+                    .rename_thread(thread, title)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
             Request::PostMessage { thread, body } => json(
                 self.post_message(thread, &body)
                     .map_err(|e| e.to_string())?,
@@ -264,9 +295,10 @@ impl Service {
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::Value::Null)
             }
-            Request::ThreadDiff { .. } | Request::Commit { .. } | Request::Discard { .. } => {
-                Err("This request needs git and is handled elsewhere.".into())
-            }
+            Request::ThreadDiff { .. }
+            | Request::Commit { .. }
+            | Request::Discard { .. }
+            | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -310,6 +342,37 @@ impl Service {
                 Ok(serde_json::Value::Null)
             }
         }
+    }
+
+    /// Saves a thread and tells `SubscribeAll` clients.
+    fn create_thread(&self, channel: ChannelId, title: &str) -> Result<ThreadId, StoreError> {
+        let mut db = self.db();
+        let id = db.store.create_thread(channel, title)?;
+        let thread = db.store.thread(id)?;
+        self.publish_global(&mut db, ServerMsg::ThreadCreated { channel, thread });
+        Ok(id)
+    }
+
+    /// Deletes an agent unless it has queued or working runs.
+    fn delete_agent(&self, agent: AgentId) -> Result<(), String> {
+        // The state lock keeps a run from being queued meanwhile.
+        let _state = self.state();
+        let mut db = self.db();
+        let stored = db.store.agent(agent).map_err(|e| e.to_string())?;
+        let busy = db
+            .store
+            .runs(RunFilter::default())
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|r| {
+                r.agent == agent && matches!(r.status, RunStatus::Queued | RunStatus::Working)
+            });
+        if busy {
+            return Err(format!("Stop {}'s runs first.", stored.spec.name));
+        }
+        db.store.delete_agent(agent).map_err(|e| e.to_string())?;
+        self.publish_global(&mut db, ServerMsg::AgentChanged { agent });
+        Ok(())
     }
 
     /// Uncommitted changes in the thread's worktree, or nothing if it has
@@ -411,7 +474,7 @@ impl Service {
             .find(|(_, (t, _))| *t == thread)
             .map(|(run, _)| *run);
         if let Some(run) = live {
-            let agents = db.store.agents().map_err(|e| e.to_string())?;
+            let agents = db.store.agents_with_deleted().map_err(|e| e.to_string())?;
             let agent = db.store.run(run).map_err(|e| e.to_string())?.agent;
             let name = agents
                 .iter()
@@ -486,6 +549,34 @@ impl Service {
         })
     }
 
+    /// Everything a `SubscribeAll` client starts from, and the serial it
+    /// covers.
+    pub fn snapshot(&self) -> Result<(ServerMsg, u64), StoreError> {
+        let db = self.db();
+        let projects = db.store.projects()?;
+        let mut channels = Vec::new();
+        for project in &projects {
+            channels.extend(db.store.channels(project.id)?);
+        }
+        let mut threads = Vec::new();
+        for channel in &channels {
+            threads.extend(db.store.threads(channel.id)?);
+        }
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64)
+            - RECENT_RUNS_MS;
+        let msg = ServerMsg::Snapshot {
+            projects,
+            channels,
+            threads,
+            agents: db.store.all_agents()?,
+            runs: db.store.recent_runs(since)?,
+            approvals: db.store.pending_approvals(None)?,
+        };
+        Ok((msg, db.serial))
+    }
+
     /// Saves the message, then queues a run for each mentioned agent.
     pub fn post_message(&self, thread: ThreadId, body: &str) -> Result<MessageId, StoreError> {
         let id = {
@@ -497,7 +588,7 @@ impl Service {
 
             let names: Vec<&str> = agents.iter().map(|(_, a)| a.name.as_str()).collect();
             let (known, unknown) = parse_mentions(body, &names);
-            let context = render_context(&earlier, &agents);
+            let context = render_context(&earlier, &db.store.agents_with_deleted()?);
             let fresh = if context.is_empty() {
                 body.to_string()
             } else {
@@ -826,7 +917,7 @@ impl Service {
     }
 
     fn agent_name(&self, agent: AgentId) -> String {
-        let agents = self.db().store.agents().unwrap_or_default();
+        let agents = self.db().store.agents_with_deleted().unwrap_or_default();
         agents
             .into_iter()
             .find(|(id, _)| *id == agent)
@@ -987,12 +1078,12 @@ impl Service {
         pending: Option<Pending>,
         announce: bool,
     ) -> Result<(String, ClaudeInvocation), StoreError> {
-        let agents = db.store.agents()?;
-        let spec = agents
-            .iter()
-            .find(|(id, _)| *id == job.agent)
-            .map(|(_, spec)| spec.clone())
-            .ok_or(StoreError::NotFound("agent"))?;
+        let agents = db.store.agents_with_deleted()?;
+        let spec = db.store.agent(job.agent)?;
+        if spec.deleted_at.is_some() {
+            return Err(StoreError::NotFound("agent"));
+        }
+        let spec = spec.spec;
         let cwd = db.store.thread_cwd(job.thread)?;
         let filter = RunFilter {
             status: None,
@@ -1231,6 +1322,15 @@ impl Service {
     }
 
     pub(crate) fn publish(&self, db: &mut Db, thread: ThreadId, msg: ServerMsg) {
+        self.send_notice(db, Some(thread), msg);
+    }
+
+    /// Notifies `SubscribeAll` clients only.
+    fn publish_global(&self, db: &mut Db, msg: ServerMsg) {
+        self.send_notice(db, None, msg);
+    }
+
+    fn send_notice(&self, db: &mut Db, thread: Option<ThreadId>, msg: ServerMsg) {
         db.serial += 1;
         // No receivers is fine: nobody is listening.
         let _ = self.0.tx.send(Notice {
@@ -1238,6 +1338,14 @@ impl Service {
             thread,
             msg,
         });
+    }
+}
+
+/// Refuses runtimes that have no adapter yet.
+fn supported(spec: &AgentSpec) -> Result<(), String> {
+    match spec.runtime {
+        Runtime::ClaudeCode => Ok(()),
+        Runtime::Codex => Err("Codex agents aren't supported yet. Pick Claude Code.".into()),
     }
 }
 

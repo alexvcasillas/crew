@@ -22,9 +22,12 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
-const MIGRATIONS: &[&str] = &[include_str!("migrate_v2.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrate_v2.sql"),
+    include_str!("migrate_v3.sql"),
+];
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +42,8 @@ pub enum StoreError {
     DuplicateAgentName(String),
     #[error("This database was written by a newer Crew.")]
     NewerSchema,
+    #[error("Upgrading the database left broken references. It was left as it was.")]
+    BrokenMigration,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -68,6 +73,18 @@ pub struct StoredMessage {
     /// The approval a system note is about, if any.
     #[serde(default)]
     pub approval: Option<ApprovalId>,
+}
+
+/// An agent as saved in the store. Deleted agents stay, so their past
+/// messages and runs can still name them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredAgent {
+    pub id: AgentId,
+    pub spec: AgentSpec,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds, set once the agent was deleted.
+    pub deleted_at: Option<i64>,
 }
 
 /// A project as saved in the store.
@@ -214,7 +231,8 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", true)?;
+        // Off while migrating: a migration may rebuild a table others point to.
+        conn.pragma_update(None, "foreign_keys", false)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(StoreError::NewerSchema);
@@ -229,9 +247,13 @@ impl Store {
             for migration in &MIGRATIONS[version as usize - 1..] {
                 tx.execute_batch(migration)?;
             }
+            if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+                return Err(StoreError::BrokenMigration);
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
+        conn.pragma_update(None, "foreign_keys", true)?;
         Ok(Store { conn })
     }
 
@@ -340,31 +362,77 @@ impl Store {
                 now_ms()
             ],
         );
-        match result {
-            Ok(_) => Ok(id),
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::ConstraintViolation
-                    && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
-            {
-                Err(StoreError::DuplicateAgentName(spec.name.clone()))
-            }
-            Err(e) => Err(e.into()),
-        }
+        result.map_err(|e| name_taken(e, spec))?;
+        Ok(id)
     }
 
-    pub fn agents(&self) -> Result<Vec<(AgentId, AgentSpec)>> {
+    /// Replaces the spec of an agent that isn't deleted.
+    pub fn update_agent(&self, a: AgentId, spec: &AgentSpec) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE agents SET name = ?2, spec = ?3 WHERE id = ?1 AND deleted_at IS NULL",
+                params![a.to_string(), spec.name, serde_json::to_string(spec)?],
+            )
+            .map_err(|e| name_taken(e, spec))?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("agent"));
+        }
+        Ok(())
+    }
+
+    /// Marks an agent deleted. It keeps its messages and runs, and its
+    /// name is free for a new agent.
+    pub fn delete_agent(&self, a: AgentId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE agents SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![a.to_string(), now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("agent"));
+        }
+        Ok(())
+    }
+
+    /// One agent, deleted or not.
+    pub fn agent(&self, a: AgentId) -> Result<StoredAgent> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("{AGENT_COLUMNS} WHERE id = ?1"),
+                [a.to_string()],
+                read_agent,
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("agent"))?
+    }
+
+    /// Every agent, deleted ones included.
+    pub fn all_agents(&self) -> Result<Vec<StoredAgent>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, spec FROM agents ORDER BY created_at, rowid")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((AgentId(uuid_col(r, 0)?), r.get::<_, String>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, spec) = row?;
-            out.push((id, serde_json::from_str(&spec)?));
-        }
-        Ok(out)
+            .prepare(&format!("{AGENT_COLUMNS} ORDER BY created_at, rowid"))?;
+        let rows = stmt.query_map([], read_agent)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Agents that aren't deleted: those you can mention.
+    pub fn agents(&self) -> Result<Vec<(AgentId, AgentSpec)>> {
+        Ok(self
+            .all_agents()?
+            .into_iter()
+            .filter(|a| a.deleted_at.is_none())
+            .map(|a| (a.id, a.spec))
+            .collect())
+    }
+
+    /// Every agent's spec, deleted ones included, for naming past work.
+    pub fn agents_with_deleted(&self) -> Result<Vec<(AgentId, AgentSpec)>> {
+        Ok(self
+            .all_agents()?
+            .into_iter()
+            .map(|a| (a.id, a.spec))
+            .collect())
     }
 
     pub fn create_thread(&self, c: ChannelId, title: &str) -> Result<ThreadId> {
@@ -394,6 +462,17 @@ impl Store {
         ))?;
         let rows = stmt.query_map([c.to_string()], read_thread)?;
         rows.map(|r| r?).collect()
+    }
+
+    pub fn rename_thread(&self, t: ThreadId, title: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET title = ?2 WHERE id = ?1",
+            params![t.to_string(), title],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("thread"));
+        }
+        Ok(())
     }
 
     /// Sets or clears the thread's worktree.
@@ -639,6 +718,23 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
+    /// Runs that are queued or working, plus those that ended at or after
+    /// `ended_since` (Unix ms), in order.
+    pub fn recent_runs(&self, ended_since: i64) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE status IN (?1, ?2) OR ended_at >= ?3 ORDER BY ord"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                status_text(&RunStatus::Queued)?,
+                status_text(&RunStatus::Working)?,
+                ended_since
+            ],
+            read_run,
+        )?;
+        rows.map(|r| r?).collect()
+    }
+
     /// Appends an event and returns its sequence number (0 for the first of a run).
     pub fn append_event(&self, r: RunId, e: &Event) -> Result<u64> {
         let seq: i64 = self.conn.query_row(
@@ -680,6 +776,35 @@ impl Store {
             ],
         )?)
     }
+}
+
+/// Turns a unique name clash into [`StoreError::DuplicateAgentName`].
+fn name_taken(e: rusqlite::Error, spec: &AgentSpec) -> StoreError {
+    match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation
+                && f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            StoreError::DuplicateAgentName(spec.name.clone())
+        }
+        e => e.into(),
+    }
+}
+
+const AGENT_COLUMNS: &str = "SELECT id, spec, created_at, deleted_at FROM agents";
+
+fn read_agent(r: &Row) -> rusqlite::Result<Result<StoredAgent>> {
+    let id = AgentId(uuid_col(r, 0)?);
+    let spec: String = r.get(1)?;
+    let (created_at, deleted_at) = (r.get(2)?, r.get(3)?);
+    Ok(serde_json::from_str(&spec)
+        .map(|spec| StoredAgent {
+            id,
+            spec,
+            created_at,
+            deleted_at,
+        })
+        .map_err(StoreError::from))
 }
 
 const PROJECT_COLUMNS: &str = "SELECT p.id, p.name, p.root, p.main_branch, p.created_at,

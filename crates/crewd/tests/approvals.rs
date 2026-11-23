@@ -523,6 +523,40 @@ async fn approve_runs_target_with_edited_brief() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn handoff_to_a_deleted_agent_is_not_approved() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    let run = start_forge(&mut c, chat.thread).await;
+
+    let mut mcp = d.client().await;
+    handoff(&mut mcp, run, "Scout", "check it").await.unwrap();
+    let seen = until_system(&mut c, "Forge wants to bring in Scout.").await;
+    let ask = approvals(&seen).pop().unwrap();
+    c.call(Request::DeleteAgent { agent: chat.scout })
+        .await
+        .unwrap();
+    let err = c
+        .call(Request::Decide {
+            approval: ask.id,
+            approve: true,
+            brief: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Scout was deleted. Decline this instead.");
+    c.call(Request::Decide {
+        approval: ask.id,
+        approve: false,
+        brief: None,
+    })
+    .await
+    .unwrap();
+    until_system(&mut c, "Declined Scout.").await;
+    c.call(Request::StopAll).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn budget_runs_then_pauses() {
     let d = Daemon::start(Duration::from_secs(60)).await;
     let mut c = d.client().await;

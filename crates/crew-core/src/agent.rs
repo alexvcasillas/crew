@@ -16,6 +16,8 @@ fn default_max_run_minutes() -> u32 {
 #[serde(rename_all = "snake_case")]
 pub enum Runtime {
     ClaudeCode,
+    /// Detected, but agents can't use it yet.
+    Codex,
 }
 
 /// How much the agent may do without asking.
