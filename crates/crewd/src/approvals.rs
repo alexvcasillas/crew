@@ -148,7 +148,7 @@ impl Service {
                         approval: cancelled,
                     },
                 );
-                let agents = db.store.agents()?;
+                let agents = db.store.agents_with_deleted()?;
                 let agent = db.store.run(run)?.agent;
                 let name = spec_of(&agents, agent)?.name.clone();
                 let body = format!("{name} stopped waiting for permission.");
@@ -318,6 +318,17 @@ impl Service {
             if current.status != ApprovalStatus::Pending {
                 return Err("That request was already answered.".into());
             }
+            if let ApprovalKind::Handoff { to, .. } = &current.kind
+                && approve
+            {
+                let to = db.store.agent(*to).map_err(store_err)?;
+                if to.deleted_at.is_some() {
+                    return Err(format!(
+                        "{} was deleted. Decline this instead.",
+                        to.spec.name
+                    ));
+                }
+            }
             // The handoff's own changes come first, so if one fails the
             // approval stays pending.
             let queued = match &current.kind {
@@ -360,7 +371,7 @@ impl Service {
                 ApprovalKind::Handoff {
                     from, to, brief, ..
                 } => {
-                    let agents = db.store.agents().map_err(store_err)?;
+                    let agents = db.store.agents_with_deleted().map_err(store_err)?;
                     let to_name = spec_of(&agents, to).map_err(store_err)?.name.clone();
                     let body = match queued {
                         Some(run) => {
@@ -392,7 +403,7 @@ impl Service {
         let thread = approval.thread;
         if paused {
             // One more, so exactly this handoff runs.
-            let agents = db.store.agents()?;
+            let agents = db.store.agents_with_deleted()?;
             let row = db.store.thread(thread)?;
             let inputs = policy_inputs(db, &row, Some(spec_of(&agents, from)?))?;
             let raised = policy::budget(&inputs).saturating_add(1);

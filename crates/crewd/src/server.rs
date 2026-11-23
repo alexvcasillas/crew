@@ -296,6 +296,23 @@ async fn next_notice(
     }
 }
 
+/// Whether a connection gets a notice, and so gets each notice at most
+/// once. `all` is the serial a `SubscribeAll` snapshot covered, if any;
+/// `subscribed` maps each subscribed thread to the serial its backlog
+/// covered.
+fn wanted(n: &Notice, all: Option<u64>, subscribed: &HashMap<ThreadId, u64>) -> bool {
+    let by_thread = n
+        .thread
+        .and_then(|t| subscribed.get(&t))
+        .is_some_and(|seen| n.serial > *seen);
+    let by_all = all.is_some_and(|seen| n.serial > seen);
+    match n.msg {
+        // Too many for everyone: only for the thread's subscribers.
+        ServerMsg::Event { .. } => by_thread,
+        _ => by_thread || by_all,
+    }
+}
+
 /// Answers requests and forwards notices for subscribed threads until the
 /// client goes away. Runs keep going after that.
 ///
@@ -308,6 +325,8 @@ async fn requests_and_notices(
 ) -> io::Result<()> {
     // Thread -> serial already covered by that thread's backlog.
     let mut subscribed: HashMap<ThreadId, u64> = HashMap::new();
+    // Serial covered by the SubscribeAll snapshot, once it was sent.
+    let mut all: Option<u64> = None;
     // Taken on the first Subscribe, so a connection that only asks never
     // falls behind.
     let mut notices: Option<broadcast::Receiver<Notice>> = None;
@@ -343,6 +362,17 @@ async fn requests_and_notices(
                             Err(e) => respond(wr, id, Err(e.to_string())).await?,
                         }
                     }
+                    Request::SubscribeAll => {
+                        notices.get_or_insert_with(|| service.notices());
+                        match service.snapshot() {
+                            Ok((snapshot, serial)) => {
+                                respond(wr, id, Ok(serde_json::Value::Null)).await?;
+                                write_frame(wr, &snapshot).await?;
+                                all = Some(serial);
+                            }
+                            Err(e) => respond(wr, id, Err(e.to_string())).await?,
+                        }
+                    }
                     Request::Hello { .. } => {
                         respond(wr, id, Err("Hello was already sent.".into())).await?;
                     }
@@ -367,7 +397,8 @@ async fn requests_and_notices(
                     }
                     req @ (Request::ThreadDiff { .. }
                     | Request::Commit { .. }
-                    | Request::Discard { .. }) => {
+                    | Request::Discard { .. }
+                    | Request::Runtimes) => {
                         let (svc, tx) = (service.clone(), answer_tx.clone());
                         tokio::spawn(async move {
                             let result = svc.handle(req).await;
@@ -382,7 +413,7 @@ async fn requests_and_notices(
             }
             notice = next_notice(&mut notices) => match notice {
                 Ok(n) => {
-                    if subscribed.get(&n.thread).is_some_and(|seen| n.serial > *seen) {
+                    if wanted(&n, all, &subscribed) {
                         write_frame(wr, &n.msg).await?;
                     }
                 }

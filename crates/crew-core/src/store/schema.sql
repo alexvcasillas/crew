@@ -19,10 +19,12 @@ CREATE TABLE channels (
 
 CREATE TABLE agents (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL COLLATE NOCASE,
     spec TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    deleted_at INTEGER
 );
+CREATE UNIQUE INDEX agents_by_live_name ON agents(name) WHERE deleted_at IS NULL;
 
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,

@@ -4,17 +4,20 @@
 
 use std::io;
 
-use crew_core::agent::AgentSpec;
+use crew_core::agent::{AgentSpec, Runtime};
 use crew_core::event::{Event, RunStatus};
-use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
-use crew_core::store::{StoredApproval, StoredMessage};
+use crew_core::store::{
+    StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
+    StoredThread,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -44,8 +47,22 @@ pub enum Request {
     CreateAgent {
         spec: AgentSpec,
     },
+    /// Replaces the agent's spec. Its next run uses it.
+    UpdateAgent {
+        agent: AgentId,
+        spec: AgentSpec,
+    },
+    /// Deletes an agent that has no queued or working runs. Its messages
+    /// and runs stay.
+    DeleteAgent {
+        agent: AgentId,
+    },
     CreateThread {
         channel: ChannelId,
+        title: String,
+    },
+    RenameThread {
+        thread: ThreadId,
         title: String,
     },
     PostMessage {
@@ -55,6 +72,11 @@ pub enum Request {
     Subscribe {
         thread: ThreadId,
     },
+    /// Answered first, then a [`ServerMsg::Snapshot`], then every
+    /// `RunStatus`, `Message` and `Approval` of all threads, plus
+    /// `ThreadCreated` and `AgentChanged`. Events stay per thread: use
+    /// `Subscribe` for those.
+    SubscribeAll,
     StopRun {
         run: RunId,
     },
@@ -146,6 +168,24 @@ pub enum Request {
         policy: Option<HandoffPolicy>,
         budget: Option<u32>,
     },
+    /// Answered with `Vec<RuntimeInfo>`. Runs each CLI's `--version` and
+    /// sign-in status command, so it can take a few seconds.
+    Runtimes,
+}
+
+/// One agent CLI crewd can find. The answer to [`Request::Runtimes`] is a
+/// `Vec` of these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    pub runtime: Runtime,
+    pub installed: bool,
+    /// As the CLI reports it, such as `2.1.0`.
+    pub version: Option<String>,
+    /// From the CLI's own status command. `None` if it has none or it
+    /// couldn't tell.
+    pub signed_in: Option<bool>,
+    /// Where the binary is.
+    pub path: Option<String>,
 }
 
 /// The answer to [`Request::PermissionAsk`].
@@ -188,6 +228,25 @@ pub enum ServerMsg {
         thread: ThreadId,
         approval: StoredApproval,
     },
+    /// Everything a `SubscribeAll` client starts from. Agents include
+    /// deleted ones, so past messages can name them. Runs are those queued
+    /// or working and those that ended in the last hour. Approvals are the
+    /// pending ones.
+    Snapshot {
+        projects: Vec<StoredProject>,
+        channels: Vec<StoredChannel>,
+        threads: Vec<StoredThread>,
+        agents: Vec<StoredAgent>,
+        runs: Vec<StoredRun>,
+        approvals: Vec<StoredApproval>,
+    },
+    /// A thread was created.
+    ThreadCreated {
+        channel: ChannelId,
+        thread: StoredThread,
+    },
+    /// An agent was created, changed or deleted.
+    AgentChanged { agent: AgentId },
     /// This connection fell behind and missed notifications. crewd closes
     /// it next; connect and subscribe again to catch up.
     Resync,

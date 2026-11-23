@@ -685,7 +685,11 @@ async fn watch(
                     }
                 }
             },
-            ServerMsg::Response { .. } => {}
+            // Responses are read elsewhere, the rest only reach SubscribeAll.
+            ServerMsg::Response { .. }
+            | ServerMsg::Snapshot { .. }
+            | ServerMsg::ThreadCreated { .. }
+            | ServerMsg::AgentChanged { .. } => {}
             ServerMsg::Resync => bail!("watch fell behind crewd. Run it again."),
         }
     }

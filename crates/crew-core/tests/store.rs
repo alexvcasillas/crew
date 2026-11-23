@@ -271,7 +271,7 @@ fn table_shapes(conn: &rusqlite::Connection) -> Vec<TableShape> {
 }
 
 #[test]
-fn migrates_v1_db_to_v2_keeping_rows() {
+fn migrates_v1_db_to_latest_keeping_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("crew.db");
     let (p, c, t, a, r) = (
@@ -339,18 +339,18 @@ fn migrates_v1_db_to_v2_keeping_rows() {
     assert!(store.pending_approvals(None).unwrap().is_empty());
     drop(store);
 
-    // The migrated file has the same shape as a fresh one and is at version 2.
+    // The migrated file has the same shape as a fresh one and is at version 3.
     let migrated = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
     assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
 
-    // Reopening a v2 file does not migrate again.
+    // Reopening a migrated file does not migrate again.
     let store = Store::open(&path).unwrap();
     assert_eq!(store.projects().unwrap().len(), 1);
 }
@@ -592,4 +592,138 @@ fn agent_spec_defaults_new_fields() {
         serde_json::to_value(&per_agent).unwrap()["handoff_policy"],
         "per_agent"
     );
+}
+
+#[test]
+fn agents_are_updated_and_soft_deleted() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, ada) = setup_run(&store);
+    let bo = store.create_agent(&spec("Bo")).unwrap();
+
+    let mut changed = spec("Ada");
+    changed.model = "claude-opus-4-5".into();
+    store.update_agent(ada, &changed).unwrap();
+    assert_eq!(store.agent(ada).unwrap().spec.model, "claude-opus-4-5");
+    let err = store.update_agent(bo, &spec("ADA")).unwrap_err();
+    assert!(matches!(err, StoreError::DuplicateAgentName(n) if n == "ADA"));
+    assert!(matches!(
+        store.update_agent(crew_core::ids::AgentId::new(), &spec("X")),
+        Err(StoreError::NotFound(_))
+    ));
+
+    let msg = store
+        .add_message(t, Author::Agent(ada), "hi", None)
+        .unwrap();
+    store.delete_agent(ada).unwrap();
+    let live: Vec<_> = store
+        .agents()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!live.contains(&ada));
+    assert!(live.contains(&bo));
+    let all = store.all_agents().unwrap();
+    let deleted = all.iter().find(|a| a.id == ada).unwrap();
+    assert_eq!(deleted.spec.name, "Ada");
+    assert!(deleted.deleted_at.is_some());
+    assert!(store.agent(ada).unwrap().deleted_at.is_some());
+    assert!(
+        store
+            .agents_with_deleted()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == ada)
+    );
+    // Its messages stay.
+    assert!(store.messages(t).unwrap().iter().any(|m| m.id == msg));
+    // A deleted agent can't be changed or deleted again, and its name is free.
+    assert!(matches!(
+        store.update_agent(ada, &spec("Ada")),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.delete_agent(ada),
+        Err(StoreError::NotFound(_))
+    ));
+    let again = store.create_agent(&spec("ada")).unwrap();
+    assert_ne!(again, ada);
+}
+
+#[test]
+fn threads_are_renamed() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, _) = setup_run(&store);
+    store.rename_thread(t, "better").unwrap();
+    assert_eq!(store.thread(t).unwrap().title, "better");
+    assert!(matches!(
+        store.rename_thread(crew_core::ids::ThreadId::new(), "x"),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+const SCHEMA_V2: &str = include_str!("../src/store/schema_v2.sql");
+
+#[test]
+fn migrates_v2_db_to_v3_keeping_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    let (p, c, t, a, r) = (
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+    );
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        let spec = serde_json::to_string(&spec("Ada")).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO projects (id, name, root, main_branch, created_at) VALUES ('{p}', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at) VALUES ('{c}', '{p}', 'general', 2);
+             INSERT INTO agents VALUES ('{a}', 'Ada', '{spec}', 3);
+             INSERT INTO threads (id, channel_id, title, created_at) VALUES ('{t}', '{c}', 'first', 4);
+             INSERT INTO runs VALUES ('{r}', '{t}', '{a}', 'sess', 'done', 6, 7, 0);
+             INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, ord, run_id)
+                 VALUES ('00000000-0000-4000-8000-000000000006', '{t}', 'agent', '{a}', 'done', 8, 0, '{r}');"
+        ))
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let agents = store.agents().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].1, spec("Ada"));
+    let runs = store.runs(RunFilter::default()).unwrap();
+    assert_eq!(runs[0].agent, agents[0].0);
+    let msgs = store.messages(runs[0].thread).unwrap();
+    assert_eq!(msgs[0].author, Author::Agent(agents[0].0));
+    // Names are still unique among agents that aren't deleted.
+    assert!(matches!(
+        store.create_agent(&spec("ADA")),
+        Err(StoreError::DuplicateAgentName(_))
+    ));
+    store.delete_agent(agents[0].0).unwrap();
+    store.create_agent(&spec("Ada")).unwrap();
+    drop(store);
+
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let broken: Vec<String> = migrated
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(broken.is_empty(), "foreign keys broken: {broken:?}");
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
 }
