@@ -19,3 +19,6 @@ nix = { version = "0.32.0", features = ["signal", "process", "user", "fs"] }
 anyhow = "1.0.105"
 clap = { version = "4.6.9", features = ["derive"] }
 assert_cmd = "2.2.2"
+# The app's UI. gpui-kit 0.8.1 pins this exact GPUI; upgrade both together.
+gpui-kit = "=0.8.1"
+gpui-pre = "=0.3.10"
