@@ -659,6 +659,16 @@ async fn runtimes_reports_fake_claude_version() {
     assert_eq!(list[0].version.as_deref(), Some("1.0.0"));
     assert_eq!(list[0].signed_in, None);
 
+    // Found but its --version fails: still installed, version unknown.
+    let bin = script(&dir.path().join("claude-mute.sh"), "exit 3\n");
+    let d = Daemon::start(bin.clone()).await;
+    let mut c = d.client().await;
+    let list: Vec<RuntimeInfo> = c.ok(Request::Runtimes).await;
+    assert!(list[0].installed);
+    assert_eq!(list[0].version, None);
+    assert_eq!(list[0].signed_in, None);
+    assert_eq!(list[0].path.as_deref(), Some(bin.to_str().unwrap()));
+
     // Missing binary.
     let d = Daemon::start(dir.path().join("no-such-claude")).await;
     let mut c = d.client().await;

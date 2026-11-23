@@ -185,6 +185,11 @@ impl Workspace {
         (now.working.len(), now.needs_you.len())
     }
 
+    /// Whether the app is connected to crewd now.
+    pub(super) fn connected(&self) -> bool {
+        self.state().connection() == Some(&crate::model::ConnectionState::Connected)
+    }
+
     /// Whether any run is queued or working.
     pub(super) fn anything_live(&self) -> bool {
         !self.state().running().is_empty()
@@ -221,7 +226,8 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(
+            // Like the status bar's, only while connected.
+            .children(self.connected().then(|| {
                 Button::new("running-stop-all")
                     .outline()
                     .small()
@@ -229,8 +235,8 @@ impl Workspace {
                     .icon(IconName::Square)
                     .label("Stop all ⌘⇧.")
                     .disabled(self.stopping_all || !self.anything_live())
-                    .on_click(cx.listener(|this, _, window, cx| this.stop_all(window, cx))),
-            )
+                    .on_click(cx.listener(|this, _, window, cx| this.stop_all(window, cx)))
+            }))
             .children(self.render_title_actions(cx))
             .into_any_element();
         Some((left, right))
@@ -260,7 +266,7 @@ impl Workspace {
     fn render_running_nav(&self, view: &RunningView, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state();
         let all = state.running_now(None, now_ms());
-        let live = all.working.len() + all.queued.len();
+        let live = all.working.len();
         let needs = all.needs_you.len();
         let projects: Vec<AnyElement> = state
             .projects()
@@ -412,14 +418,10 @@ impl Workspace {
 
     /// The rows of each group: needs you, working, queued, finished.
     fn running_rows(&self, groups: &RunningNow<'_>, now: i64) -> [Vec<Row>; 4] {
-        let asks = groups
-            .needs_you
-            .iter()
-            .filter_map(|a| self.ask_row(a))
-            .collect();
+        let asks = groups.needs_you.iter().map(|a| self.ask_row(a)).collect();
         let runs = |runs: &[&StoredRun], kind: fn(RunId) -> RowKind| {
             runs.iter()
-                .filter_map(|r| self.run_row(r, kind(r.id), now))
+                .map(|r| self.run_row(r, kind(r.id), now))
                 .collect::<Vec<_>>()
         };
         [
@@ -430,33 +432,34 @@ impl Workspace {
         ]
     }
 
-    /// A row's agent, place, task and runtime. `None` for a run or
-    /// thread the app doesn't know.
-    fn row_base(&self, run: &StoredRun, kind: RowKind) -> Option<Row> {
+    /// A row's agent, place, task and runtime. Every row is drawn, so
+    /// what the app doesn't know reads as a placeholder and the counts
+    /// always match the rows.
+    fn row_base(&self, thread: ThreadId, run: Option<&StoredRun>, kind: RowKind) -> Row {
         let state = self.state();
-        let thread = state.thread(run.thread)?;
-        let channel = state.channel(thread.channel)?;
-        let project = state.project(channel.project)?;
-        let agent = state.agent(run.agent)?;
-        Some(Row {
+        let known = state.thread(thread);
+        let channel = known.and_then(|t| state.channel(t.channel));
+        let project = channel.and_then(|c| state.project(c.project));
+        let agent = run.and_then(|r| state.agent(r.agent));
+        Row {
             kind,
-            thread: thread.id,
-            agent: agent.spec.name.clone(),
-            project: project.name.clone(),
-            channel: channel.name.clone(),
-            title: thread.title.clone(),
+            thread,
+            agent: agent.map_or_else(|| "An agent".into(), |a| a.spec.name.clone()),
+            project: project.map_or_else(String::new, |p| p.name.clone()),
+            channel: channel.map_or_else(String::new, |c| c.name.clone()),
+            title: known.map_or_else(String::new, |t| t.title.clone()),
             now: String::new(),
             now_mono: false,
-            chip: runtime_chip(&agent.spec),
+            chip: agent.map_or_else(String::new, |a| runtime_chip(&a.spec)),
             state: String::new(),
             state_token: "text-secondary",
             state_mono: false,
             deciding: false,
-        })
+        }
     }
 
-    fn ask_row(&self, approval: &StoredApproval) -> Option<Row> {
-        let run = self.state().run(approval.run)?;
+    fn ask_row(&self, approval: &StoredApproval) -> Row {
+        let run = self.state().run(approval.run);
         let (handoff, paused, now, mono) = match &approval.kind {
             ApprovalKind::Handoff { to, paused, .. } => {
                 let to = self
@@ -472,23 +475,24 @@ impl Workspace {
             }
         };
         let mut row = self.row_base(
+            approval.thread,
             run,
             RowKind::Ask {
                 id: approval.id,
                 handoff,
                 paused,
             },
-        )?;
+        );
         row.now = now;
         row.now_mono = mono;
         row.state = if handoff { "Handoff" } else { "Permission" }.into();
         row.state_token = "warning";
         row.deciding = self.deciding.contains(&approval.id);
-        Some(row)
+        row
     }
 
-    fn run_row(&self, run: &StoredRun, kind: RowKind, now: i64) -> Option<Row> {
-        let mut row = self.row_base(run, kind)?;
+    fn run_row(&self, run: &StoredRun, kind: RowKind, now: i64) -> Row {
+        let mut row = self.row_base(run.thread, Some(run), kind);
         let state = self.state();
         // Watched threads know their latest step; the rest only their
         // status.
@@ -508,7 +512,14 @@ impl Workspace {
             RowKind::Queued(_) => {
                 row.state = "Queued".into();
                 row.state_token = "text-tertiary";
-                row.now = "Queued".into();
+                row.now = queued_line(
+                    state
+                        .live_runs(run.thread)
+                        .into_iter()
+                        .find(|r| r.status == RunStatus::Working)
+                        .and_then(|r| state.agent(r.agent))
+                        .map(|a| a.spec.name.as_str()),
+                );
             }
             _ => {
                 let (word, token) = run_state(run);
@@ -519,7 +530,16 @@ impl Workspace {
         }
         // Steps name paths and commands.
         row.now_mono = step_shown;
-        Some(row)
+        row
+    }
+}
+
+/// Why a queued run waits: another run in its thread, or the cap on
+/// runs at once.
+pub fn queued_line(busy_in_thread: Option<&str>) -> String {
+    match busy_in_thread {
+        Some(agent) => format!("Starts after {agent} finishes in this thread"),
+        None => "Starts when a run slot is free".into(),
     }
 }
 
@@ -782,7 +802,16 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
 
 #[cfg(test)]
 mod tests {
-    use super::summary_line;
+    use super::{queued_line, summary_line};
+
+    #[test]
+    fn a_queued_run_says_what_it_waits_for() {
+        assert_eq!(
+            queued_line(Some("Forge")),
+            "Starts after Forge finishes in this thread"
+        );
+        assert_eq!(queued_line(None), "Starts when a run slot is free");
+    }
 
     #[test]
     fn the_summary_counts_agents_projects_and_asks() {

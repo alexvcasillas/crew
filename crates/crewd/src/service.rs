@@ -16,7 +16,7 @@ use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{
-    Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, ThreadWorktree,
+    Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun, ThreadWorktree,
 };
 use crew_core::worktree::{self, Diff};
 use crew_proto::{PermissionAnswer, Request, ServerMsg};
@@ -627,13 +627,17 @@ impl Service {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64)
             - RECENT_RUNS_MS;
+        let approvals = db.store.pending_approvals(None)?;
+        let runs = with_asked_runs(db.store.recent_runs(since)?, &approvals, |r| {
+            db.store.run(r)
+        })?;
         let msg = ServerMsg::Snapshot {
             projects,
             channels,
             threads,
             agents: db.store.all_agents()?,
-            runs: db.store.recent_runs(since)?,
-            approvals: db.store.pending_approvals(None)?,
+            runs,
+            approvals,
         };
         Ok((msg, db.serial))
     }
@@ -1520,4 +1524,73 @@ fn render_context(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `runs` plus the run each approval points to, when it isn't among them
+/// already, so every pending approval can name its run and agent.
+fn with_asked_runs(
+    mut runs: Vec<StoredRun>,
+    approvals: &[StoredApproval],
+    run: impl Fn(RunId) -> Result<StoredRun, StoreError>,
+) -> Result<Vec<StoredRun>, StoreError> {
+    for approval in approvals {
+        if !runs.iter().any(|r| r.id == approval.run) {
+            runs.push(run(approval.run)?);
+        }
+    }
+    Ok(runs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_asked_runs;
+    use crew_core::event::RunStatus;
+    use crew_core::ids::{AgentId, ApprovalId, RunId, ThreadId};
+    use crew_core::store::{ApprovalKind, ApprovalStatus, StoreError, StoredApproval, StoredRun};
+
+    fn run(status: RunStatus) -> StoredRun {
+        StoredRun {
+            id: RunId::new(),
+            thread: ThreadId::new(),
+            agent: AgentId::new(),
+            session_id: String::new(),
+            status,
+            started_at: 1,
+            ended_at: None,
+        }
+    }
+
+    fn ask(run: &StoredRun) -> StoredApproval {
+        StoredApproval {
+            id: ApprovalId::new(),
+            thread: run.thread,
+            run: run.id,
+            kind: ApprovalKind::Permission {
+                tool: "Bash".into(),
+                input: serde_json::json!({}),
+                tool_use_id: None,
+            },
+            status: ApprovalStatus::Pending,
+            created_at: 1,
+            decided_at: None,
+        }
+    }
+
+    #[test]
+    fn the_snapshot_brings_the_runs_approvals_point_to() {
+        let recent = run(RunStatus::Working);
+        let mut old = run(RunStatus::Done);
+        old.ended_at = Some(2);
+        let approvals = [ask(&recent), ask(&old), ask(&old)];
+        let store = [old.clone()];
+        let runs = with_asked_runs(vec![recent.clone()], &approvals, |id| {
+            store
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .ok_or(StoreError::NotFound("run"))
+        })
+        .unwrap();
+        assert_eq!(runs, [recent, old], "each run once");
+    }
 }

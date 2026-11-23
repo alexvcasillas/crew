@@ -13,7 +13,7 @@ use super::inspector_tests::{answer_of, ask_permission};
 use super::test_ui::{click, has, label_of, open, press, wait_until};
 use super::thread_tests::{World, open_thread, world};
 use super::workspace::Workspace;
-use crate::test_support::{Daemon, fake_claude, fixture, short_home};
+use crate::test_support::{Daemon, fake_claude, fixture, recording_proxy, short_home};
 
 /// A claude that edits a file, starts the tests, then works until it is
 /// stopped.
@@ -287,6 +287,14 @@ fn queued_run_shows_in_queued_group(cx: &mut TestAppContext) {
         label_of(cx, window, format!("running-state-{queued}")).as_deref(),
         Some("Queued")
     );
+    assert_eq!(
+        label_of(cx, window, format!("running-now-{queued}")).as_deref(),
+        Some("Starts when a run slot is free")
+    );
+    assert_eq!(
+        label_of(cx, window, "running-nav-all").as_deref(),
+        Some("Running now 1")
+    );
     assert!(has(cx, window, format!("running-run-{working}")));
 
     // Stop on the row drops it from the queue.
@@ -335,12 +343,19 @@ fn needs_you_row_approves_inline(cx: &mut TestAppContext) {
 
     wait_label(cx, window, "title-running".into(), "0 running · 1 need you");
     wait_label(cx, window, "status-needs".into(), "1 need you");
+    // Waiting on you isn't running, anywhere.
+    assert!(!has(cx, window, "status-working"));
+    assert!(!has(cx, window, "sidebar-running"));
     press(cx, window, "cmd-2");
     wait_label(cx, window, "running-group-needs".into(), "NEEDS YOU · 1");
     assert!(!has(cx, window, "running-group-working"), "it waits on you");
     assert_eq!(
         label_of(cx, window, "running-nav-needs").as_deref(),
         Some("Needs you 1")
+    );
+    assert_eq!(
+        label_of(cx, window, "running-nav-all").as_deref(),
+        Some("Running now 0")
     );
     assert_eq!(
         label_of(cx, window, format!("running-ask-{id}")).as_deref(),
@@ -367,4 +382,69 @@ fn needs_you_row_approves_inline(cx: &mut TestAppContext) {
     assert!(has(cx, window, format!("running-run-{run}")));
     wait_label(cx, window, "title-running".into(), "1 running · 0 need you");
     assert!(!has(cx, window, "status-needs"));
+    assert_eq!(
+        label_of(cx, window, "status-working").as_deref(),
+        Some("Forge working")
+    );
+    assert_eq!(
+        label_of(cx, window, "running-nav-all").as_deref(),
+        Some("Running now 1")
+    );
+}
+
+/// Two Stop all presses in one update send one request; once crewd
+/// answers, Stop all can be sent again.
+#[gpui_kit::test]
+fn stop_all_is_sent_once_while_in_flight(cx: &mut TestAppContext) {
+    use gpui_kit::{Action as _, AppContext as _};
+    let crewd_home = short_home();
+    let _daemon = Daemon::start(crewd_home.path().to_path_buf());
+    let home = short_home();
+    let seen = recording_proxy(
+        &home.path().join("crewd.sock"),
+        crewd_home.path().join("crewd.sock"),
+    );
+    let stop_alls = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Request::StopAll))
+            .count()
+    };
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the connection", |cx| {
+        ws.read_with(cx, |ws, _| ws.connected())
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_action(crate::app::StopAll.boxed_clone(), cx);
+        window.dispatch_action(crate::app::StopAll.boxed_clone(), cx);
+    })
+    .unwrap();
+    wait_until(cx, "the answer", |cx| {
+        ws.read_with(cx, |ws, _| !ws.stopping_all)
+    });
+    assert_eq!(stop_alls(), 1);
+
+    press(cx, window, "cmd-shift-.");
+    wait_until(cx, "the second Stop all", |_| stop_alls() == 2);
+}
+
+/// A claude whose `--version` never answers still reads as installed.
+#[gpui_kit::test]
+fn status_bar_names_a_claude_that_wont_say_its_version(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("claude.sh");
+    std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), bin);
+    let (window, _) = open(cx, home.path());
+    wait_label(
+        cx,
+        window,
+        "status-runtimes".into(),
+        "Claude Code installed",
+    );
 }

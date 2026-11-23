@@ -236,8 +236,8 @@ pub enum ServerMsg {
     },
     /// Everything a `SubscribeAll` client starts from. Agents include
     /// deleted ones, so past messages can name them. Runs are those queued
-    /// or working and those that ended in the last hour. Approvals are the
-    /// pending ones.
+    /// or working, those that ended in the last hour, and those a pending
+    /// approval points to. Approvals are the pending ones.
     Snapshot {
         projects: Vec<StoredProject>,
         channels: Vec<StoredChannel>,

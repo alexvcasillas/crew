@@ -12,12 +12,13 @@ use crew_core::claude::claude_bin_from;
 use crew_proto::RuntimeInfo;
 use tokio::process::Command;
 
-use crate::service::CliBins;
+use crate::service::{CliBins, log};
 
 /// How long one CLI command may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Claude Code, then Codex. The `claude` binary is the one runs use.
+/// Claude Code, then Codex. The `claude` binary is the one runs use. A
+/// binary that is found counts as installed, even if `--version` fails.
 pub async fn detect(bins: &CliBins) -> Vec<RuntimeInfo> {
     let claude = bins
         .claude
@@ -76,9 +77,22 @@ async fn probe(runtime: Runtime, bin: &Path, status: Option<&[&str]>) -> Runtime
             None => None,
         }
     });
+    // The binary is there even if it won't say its version, as a stuck or
+    // stubbed CLI may not.
     let version = match version {
         Some(ran) if ran.ok => parse_version(&ran.stdout),
-        _ => return missing,
+        Some(_) => {
+            log(format!("`{} --version` failed", path.display()));
+            None
+        }
+        None => {
+            log(format!(
+                "`{} --version` didn't answer within {} s",
+                path.display(),
+                TIMEOUT.as_secs()
+            ));
+            None
+        }
     };
     RuntimeInfo {
         runtime,

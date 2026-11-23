@@ -353,11 +353,26 @@ impl State {
             .count()
     }
 
-    /// Agents with a working run, each once. Queued runs don't count.
+    /// What counts as running everywhere: working runs that don't wait
+    /// on you, by start time. Queued runs don't count.
+    pub fn working_runs(&self) -> Vec<&StoredRun> {
+        let waiting: HashSet<RunId> = self
+            .approvals
+            .values()
+            .filter(|a| a.status == ApprovalStatus::Pending)
+            .map(|a| a.run)
+            .collect();
+        self.running()
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Working && !waiting.contains(&r.id))
+            .collect()
+    }
+
+    /// Agents of the [`working_runs`](Self::working_runs), each once.
     pub fn working_agents(&self) -> Vec<AgentId> {
         let mut agents: Vec<AgentId> = Vec::new();
-        for run in self.running() {
-            if run.status == RunStatus::Working && !agents.contains(&run.agent) {
+        for run in self.working_runs() {
+            if !agents.contains(&run.agent) {
                 agents.push(run.agent);
             }
         }
@@ -425,16 +440,14 @@ impl State {
             .map(|n| n.approval)
             .filter(|a| here(a.thread))
             .collect();
-        let waits = |run: RunId| needs_you.iter().any(|a| a.run == run);
-        let live = self.running();
-        let working = live
-            .iter()
-            .copied()
-            .filter(|r| r.status == RunStatus::Working && here(r.thread) && !waits(r.id))
+        let working = self
+            .working_runs()
+            .into_iter()
+            .filter(|r| here(r.thread))
             .collect();
-        let queued = live
-            .iter()
-            .copied()
+        let queued = self
+            .running()
+            .into_iter()
             .filter(|r| r.status == RunStatus::Queued && here(r.thread))
             .collect();
         let since = now - HOUR_MS;
@@ -990,6 +1003,22 @@ mod tests {
             state.apply(status(r));
         }
         assert_eq!(state.working_agents(), [forge]);
+        assert_eq!(state.working_runs().len(), 2);
+
+        // A run waiting on you isn't counted as running.
+        let prism = AgentId::new();
+        let mut w = run(t.id, RunStatus::Working, 4);
+        w.agent = prism;
+        state.apply(status(&w));
+        assert_eq!(state.working_agents(), [forge, prism]);
+        let mut ask = approval(t.id, 5);
+        ask.run = w.id;
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: ask,
+        });
+        assert_eq!(state.working_agents(), [forge]);
+        assert_eq!(state.working_runs().len(), 2);
     }
 
     #[test]
