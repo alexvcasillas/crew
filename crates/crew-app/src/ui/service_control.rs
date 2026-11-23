@@ -1,5 +1,6 @@
-//! "Start Crew service" and "Restart service": run crewd, then check
-//! until it answers. Task 9 replaces the spawning with launchd.
+//! "Start Crew service" and "Restart service": run crewd, check until it
+//! answers, then have the client connect. Task 9 replaces the spawning
+//! with launchd.
 
 use std::time::{Duration, Instant};
 
@@ -42,19 +43,14 @@ impl Workspace {
                 })
                 .await;
             let state = match &started {
-                Ok(()) => wait_for_crewd(&executor, &conn).await,
-                Err(_) => {
-                    let probe_conn = conn.clone();
-                    executor
-                        .spawn(async move { connection::probe(&probe_conn) })
-                        .await
-                }
+                Ok(()) => Some(wait_for_crewd(&executor, &conn).await),
+                Err(_) => None,
             };
             this.update_in(cx, |this, window, cx| {
                 this.starting = false;
                 let error = match started {
                     Err(e) => Some(e.message()),
-                    Ok(()) if state == ConnectionState::NotRunning => Some(format!(
+                    Ok(()) if state == Some(ConnectionState::NotRunning) => Some(format!(
                         "Crew's service didn't start. Its log is at {}.",
                         conn.log().display()
                     )),
@@ -63,7 +59,10 @@ impl Workspace {
                 if let Some(error) = error {
                     this.show_error(error, window, cx);
                 }
-                this.set_connection(state, cx);
+                // The client reports what it finds, without waiting out
+                // its backoff.
+                this.client.reconnect_now();
+                cx.notify();
             })
             .ok();
         }));

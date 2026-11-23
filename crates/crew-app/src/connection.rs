@@ -10,10 +10,12 @@ use std::time::Duration;
 use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
 use tokio::net::UnixStream;
 
+pub use crate::model::ConnectionState;
+
 /// The socket's file name inside the Crew home.
 const SOCKET_NAME: &str = "crewd.sock";
 /// How long a probe waits for crewd to answer `Hello`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Where the app finds crewd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,18 +47,6 @@ impl ConnectionConfig {
     }
 }
 
-/// What a probe found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectionState {
-    Connected,
-    NotRunning,
-    /// crewd answered but refused this app's protocol version.
-    VersionMismatch {
-        theirs: u32,
-        ours: u32,
-    },
-}
-
 /// Connects to crewd and says `Hello`. Blocks for up to a few seconds, so
 /// run it off the UI thread.
 pub fn probe(conn: &ConnectionConfig) -> ConnectionState {
@@ -70,39 +60,37 @@ pub fn probe(conn: &ConnectionConfig) -> ConnectionState {
     };
     let socket = conn.socket();
     runtime.block_on(async move {
-        tokio::time::timeout(PROBE_TIMEOUT, hello(&socket))
-            .await
-            .unwrap_or(Ok(None))
-            .map_or(ConnectionState::NotRunning, |answer| match answer {
-                Some(Ok(())) => ConnectionState::Connected,
-                Some(Err(e)) => match their_version(&e) {
-                    Some(theirs) => ConnectionState::VersionMismatch {
-                        theirs,
-                        ours: PROTO_VERSION,
-                    },
-                    None => {
-                        eprintln!("crew: crewd refused hello: {e}");
-                        ConnectionState::NotRunning
-                    }
+        match tokio::time::timeout(PROBE_TIMEOUT, hello(&socket)).await {
+            Ok(Ok(Some((_, Ok(()))))) => ConnectionState::Connected,
+            Ok(Ok(Some((_, Err(e))))) => match their_version(&e) {
+                Some(theirs) => ConnectionState::VersionMismatch {
+                    theirs,
+                    ours: PROTO_VERSION,
                 },
-                None => ConnectionState::NotRunning,
-            })
+                None => {
+                    eprintln!("crew: crewd refused hello: {e}");
+                    ConnectionState::NotRunning
+                }
+            },
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => ConnectionState::NotRunning,
+        }
     })
 }
 
 /// The version in crewd's refusal of `Hello`:
 /// `crewd speaks protocol 2, client speaks 3. Restart crewd.`
-fn their_version(refusal: &str) -> Option<u32> {
+pub(crate) fn their_version(refusal: &str) -> Option<u32> {
     let rest = refusal.strip_prefix("crewd speaks protocol ")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
 
-/// crewd's answer to `Hello`, or `None` if it hung up first.
-async fn hello(socket: &Path) -> io::Result<Option<Result<(), String>>> {
+/// Connects and says `Hello`. Returns the connection with crewd's answer,
+/// or `None` if it hung up first.
+pub(crate) async fn hello(socket: &Path) -> io::Result<Option<(UnixStream, Result<(), String>)>> {
     let mut stream = UnixStream::connect(socket).await?;
     let hello = ClientMsg::Request {
-        id: 1,
+        id: 0,
         req: Request::Hello {
             version: PROTO_VERSION,
         },
@@ -110,7 +98,9 @@ async fn hello(socket: &Path) -> io::Result<Option<Result<(), String>>> {
     write_frame(&mut stream, &hello).await?;
     loop {
         match read_frame::<_, ServerMsg>(&mut stream).await? {
-            Some(ServerMsg::Response { id: 1, result }) => return Ok(Some(result.map(|_| ()))),
+            Some(ServerMsg::Response { id: 0, result }) => {
+                return Ok(Some((stream, result.map(|_| ()))));
+            }
             Some(_) => continue,
             None => return Ok(None),
         }

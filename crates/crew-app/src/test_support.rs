@@ -24,14 +24,23 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Starts crewd and waits until its socket accepts.
+    /// Starts crewd and waits until its socket accepts. Agents can't run:
+    /// there is no `claude` for them.
     pub fn start(home: PathBuf) -> Self {
+        Self::start_with(home, PathBuf::from("/nonexistent/claude"))
+    }
+
+    /// Like [`Daemon::start`], running agents with the fake `claude_bin`.
+    pub fn start_with(home: PathBuf, claude_bin: PathBuf) -> Self {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serve_home = home.clone();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let opts = crewd::ServeOptions {
+                    claude_bin: Some(claude_bin),
+                    // Never the real codex.
+                    codex_bin: Some(PathBuf::from("/nonexistent/codex")),
                     crew_mcp_bin: None,
                     ..Default::default()
                 };

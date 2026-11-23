@@ -1,25 +1,40 @@
 //! The window's root view: title bar, sidebar, main area and status bar.
 
+use crew_core::event::RunStatus;
+use crew_core::store::{StoredAgent, StoredRun};
+use crew_proto::Request;
+use futures::StreamExt as _;
+use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
+use serde::de::DeserializeOwned;
 
 use super::status_bar::StatusBar;
-use crate::connection::{self, ConnectionConfig, ConnectionState};
+use crate::client::{self, ClientEvent, ClientHandle};
+use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
+use crate::model::State;
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
 
 pub struct Workspace {
     pub(super) conn: ConnectionConfig,
-    /// `None` while the first check runs.
-    connection: Option<ConnectionState>,
+    /// What crewd told the client, connection included.
+    state: State,
+    pub(super) client: ClientHandle,
+    /// Takes in what the client reports.
+    _client_events: Task<()>,
+    /// Asks for the agents after one changed.
+    agents_fetch: Option<Task<()>>,
+    /// Asks for the details of runs known only by their status.
+    runs_fetch: Option<Task<()>>,
     /// Starting (or restarting) crewd.
     pub(super) starting: bool,
     status_bar: Entity<StatusBar>,
     focus: FocusHandle,
-    /// The running check, or start and check.
+    /// Starting crewd and waiting for it to answer.
     pub(super) probe: Option<Task<()>>,
     /// The last error shown as a notification.
     pub(super) last_error: Option<SharedString>,
@@ -27,41 +42,102 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut ws = Self {
+        let (client, events) = client::spawn(conn.clone());
+        Self {
             conn,
-            connection: None,
+            state: State::default(),
+            client,
+            _client_events: Self::take_in_events(events, window, cx),
+            agents_fetch: None,
+            runs_fetch: None,
             starting: false,
             status_bar: cx.new(|_| StatusBar::default()),
             focus: cx.focus_handle(),
             probe: None,
             last_error: None,
-        };
-        ws.check(window, cx);
-        ws
+        }
+    }
+
+    /// What the UI renders from.
+    pub fn state(&self) -> &State {
+        &self.state
     }
 
     pub(super) fn starting(&self) -> bool {
         self.starting
     }
 
-    /// Checks whether crewd answers, off the UI thread.
-    fn check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let conn = self.conn.clone();
-        let probe = cx
-            .background_executor()
-            .spawn(async move { connection::probe(&conn) });
-        self.probe = Some(cx.spawn_in(window, async move |this, cx| {
-            let state = probe.await;
-            this.update(cx, |this, cx| this.set_connection(state, cx))
-                .ok();
-        }));
+    /// Applies the client's events as they come, a batch per update.
+    fn take_in_events(
+        mut events: UnboundedReceiver<ClientEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                if this.update(cx, |this, cx| this.apply(batch, cx)).is_err() {
+                    break;
+                }
+            }
+        })
     }
 
-    pub(super) fn set_connection(&mut self, state: ConnectionState, cx: &mut Context<Self>) {
-        self.connection = Some(state.clone());
+    fn apply(&mut self, events: Vec<ClientEvent>, cx: &mut Context<Self>) {
+        for event in events {
+            event.apply_to(&mut self.state);
+        }
+        let connection = self.state.connection().cloned();
         self.status_bar
-            .update(cx, |bar, cx| bar.set_connection(Some(state), cx));
+            .update(cx, |bar, cx| bar.set_connection(connection, cx));
+        self.fetch_wanted(cx);
         cx.notify();
+    }
+
+    /// Asks crewd for the details its notices leave out. A newer fetch
+    /// replaces an older one still running.
+    fn fetch_wanted(&mut self, cx: &mut Context<Self>) {
+        let wants = self.state.take_wants();
+        if wants.agents {
+            let agents = self.client.request(Request::ListAgents {
+                include_deleted: true,
+            });
+            self.agents_fetch = Some(cx.spawn(async move |this, cx| {
+                let Some(agents) = decode::<Vec<StoredAgent>>(agents.await) else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    this.state.set_agents(agents);
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        if wants.runs {
+            // A new run is queued or working by the time crewd answers,
+            // unless it already ended. Asked in this order, it can't slip
+            // between the two.
+            let queued = self.client.request(Request::ListRuns {
+                status: Some(RunStatus::Queued),
+            });
+            let working = self.client.request(Request::ListRuns {
+                status: Some(RunStatus::Working),
+            });
+            self.runs_fetch = Some(cx.spawn(async move |this, cx| {
+                let mut runs = Vec::new();
+                for answer in [queued.await, working.await] {
+                    runs.extend(decode::<Vec<StoredRun>>(answer).unwrap_or_default());
+                }
+                this.update(cx, |this, cx| {
+                    this.state.merge_runs(runs);
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
     }
 
     /// Shows `error` as a notification.
@@ -74,6 +150,14 @@ impl Workspace {
         self.last_error = Some(error.clone().into());
         window.push_notification(Notification::error(error), cx);
     }
+}
+
+/// crewd's answer as `T`, or `None` after logging why not.
+fn decode<T: DeserializeOwned>(answer: Result<serde_json::Value, String>) -> Option<T> {
+    let decoded = answer.and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()));
+    decoded
+        .inspect_err(|e| eprintln!("crew: couldn't refresh from crewd: {e}"))
+        .ok()
 }
 
 impl Render for Workspace {
@@ -111,7 +195,7 @@ impl Render for Workspace {
 
 impl Workspace {
     fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
-        match &self.connection {
+        match self.state.connection() {
             // Checking: nothing to show yet.
             None => div().into_any_element(),
             Some(ConnectionState::Connected) => render_nothing_selected().into_any_element(),
@@ -164,8 +248,11 @@ fn render_nothing_selected() -> impl IntoElement {
 #[cfg(test)]
 mod gpui_tests {
     use super::Workspace;
+    use crate::client;
     use crate::connection::ConnectionConfig;
     use crate::test_support::{Daemon, refuse_hello, short_home};
+    use crew_core::ids::{ChannelId, ProjectId, ThreadId};
+    use crew_proto::Request;
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
     use gpui_kit::{
@@ -173,9 +260,15 @@ mod gpui_tests {
         WindowOptions, px, size,
     };
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
-    /// A window as `app::run` opens it, pointed at `home`.
+    /// Generous, for a loaded CI runner.
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// A window as `app::run` opens it, pointed at `home`. The client's
+    /// thread wakes the test executor, so parking is allowed.
     fn open(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
+        cx.executor().allow_parking();
         let conn = ConnectionConfig {
             crew_home: home.to_path_buf(),
         };
@@ -196,6 +289,28 @@ mod gpui_tests {
         });
         cx.run_until_parked();
         (window, ws)
+    }
+
+    /// Runs the app until `done` holds, in real time. Panics after
+    /// [`WAIT`].
+    fn wait_until(
+        cx: &mut TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let started = Instant::now();
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(started.elapsed() < WAIT, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_to_show(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) {
+        wait_until(cx, label, |cx| shows(cx, window, label));
     }
 
     fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) -> bool {
@@ -243,13 +358,13 @@ mod gpui_tests {
     fn no_daemon_shows_the_start_screen(cx: &mut TestAppContext) {
         let home = short_home();
         let (window, _) = open(cx, home.path());
+        wait_to_show(cx, window, "Not connected");
         assert!(shows(
             cx,
             window,
             "Crew's background service isn't running."
         ));
         assert!(has(cx, window, "connect-start"));
-        assert!(shows(cx, window, "Not connected"));
         assert!(!shows(cx, window, "Nothing selected"));
     }
 
@@ -261,6 +376,7 @@ mod gpui_tests {
         assert!(!exe.with_file_name("crewd").exists());
         let home = short_home();
         let (window, ws) = open(cx, home.path());
+        wait_to_show(cx, window, "Not connected");
         assert_eq!(notifications(cx, window), 0);
         click(cx, window, "connect-start");
         assert_eq!(notifications(cx, window), 1);
@@ -280,11 +396,11 @@ mod gpui_tests {
         let home = short_home();
         let server = refuse_hello(&home.path().join("crewd.sock"), 2);
         let (window, _) = open(cx, home.path());
+        wait_to_show(cx, window, "Service out of date");
         server.join().unwrap();
         assert!(shows(cx, window, "Crew's service is out of date."));
         assert!(has(cx, window, "connect-restart"));
         assert!(!has(cx, window, "connect-start"));
-        assert!(shows(cx, window, "Service out of date"));
     }
 
     #[gpui_kit::test]
@@ -292,8 +408,53 @@ mod gpui_tests {
         let home = short_home();
         let _daemon = Daemon::start(home.path().to_path_buf());
         let (window, _) = open(cx, home.path());
-        assert!(shows(cx, window, "Connected to crewd"));
+        wait_to_show(cx, window, "Connected to crewd");
         assert!(shows(cx, window, "Nothing selected"));
         assert!(!has(cx, window, "connect-start"));
+    }
+
+    #[gpui_kit::test]
+    fn workspace_reflects_a_thread_another_client_creates(cx: &mut TestAppContext) {
+        let home = short_home();
+        let _daemon = Daemon::start(home.path().to_path_buf());
+        let (window, ws) = open(cx, home.path());
+        wait_to_show(cx, window, "Connected to crewd");
+
+        // Another app or the CLI, on its own connection.
+        let (other, _other_events) = client::spawn(ConnectionConfig {
+            crew_home: home.path().to_path_buf(),
+        });
+        let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
+        let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
+            name: "demo".into(),
+            root: "/work/demo".into(),
+            main_branch: "main".into(),
+        }))
+        .unwrap();
+        let channel: ChannelId = serde_json::from_value(ask(Request::CreateChannel {
+            project,
+            name: "general".into(),
+        }))
+        .unwrap();
+        let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
+            channel,
+            title: "fix the login".into(),
+        }))
+        .unwrap();
+
+        wait_until(cx, "the new thread", |cx| {
+            ws.read_with(cx, |ws, _| ws.state().thread(thread).is_some())
+        });
+        ws.read_with(cx, |ws, _| {
+            let state = ws.state();
+            assert_eq!(state.projects().len(), 1);
+            assert_eq!(state.channels(project).len(), 1);
+            let titles: Vec<&str> = state
+                .threads(channel)
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect();
+            assert_eq!(titles, ["fix the login"]);
+        });
     }
 }
