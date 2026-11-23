@@ -93,7 +93,8 @@ pub enum Request {
         thread: ThreadId,
         message: String,
     },
-    /// Removes the thread's worktree and its branch, changes included.
+    /// Removes the thread's worktree, changes included, and its branch
+    /// unless the branch has commits beyond the worktree's base.
     Discard {
         thread: ThreadId,
     },
@@ -110,6 +111,9 @@ pub enum Request {
         run: RunId,
         tool: String,
         input: serde_json::Value,
+        /// Claude's id for the tool call, if it sent one.
+        #[serde(default)]
+        tool_use_id: Option<String>,
     },
     /// Answered with the pending `Vec<StoredApproval>`, for one thread or
     /// all of them.
@@ -132,6 +136,13 @@ pub enum Request {
     /// to the agent or channel.
     SetThreadHandoff {
         thread: ThreadId,
+        policy: Option<HandoffPolicy>,
+        budget: Option<u32>,
+    },
+    /// Sets the channel's handoff policy and budget. `None` falls back to
+    /// the global default.
+    SetChannelHandoff {
+        channel: ChannelId,
         policy: Option<HandoffPolicy>,
         budget: Option<u32>,
     },
@@ -177,6 +188,9 @@ pub enum ServerMsg {
         thread: ThreadId,
         approval: StoredApproval,
     },
+    /// This connection fell behind and missed notifications. crewd closes
+    /// it next; connect and subscribe again to catch up.
+    Resync,
 }
 
 /// Writes one frame and flushes.
@@ -256,6 +270,7 @@ mod tests {
                     run: RunId::new(),
                     tool: "Bash".into(),
                     input: serde_json::json!({ "command": "touch x.txt" }),
+                    tool_use_id: Some("toolu_1".into()),
                 },
             },
         ];

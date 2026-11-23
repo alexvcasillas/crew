@@ -487,7 +487,14 @@ async fn late_subscriber_gets_backlog_from_seq_0() {
             _ => None,
         })
         .collect();
-    assert_eq!(bodies, vec!["@Forge fix it", "Fixed."]);
+    assert_eq!(
+        bodies,
+        vec![
+            "@Forge fix it",
+            "Permission prompts are off: crew-mcp wasn't found next to crewd.",
+            "Fixed."
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -779,7 +786,7 @@ async fn runs_get_crew_mcp_when_it_exists() {
     })
     .await
     .unwrap();
-    c.until(|m| is_status(m, RunStatus::Done)).await;
+    let seen = c.until(|m| is_status(m, RunStatus::Done)).await;
 
     let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
     let calls = logged_calls(&log);
@@ -815,6 +822,14 @@ async fn runs_get_crew_mcp_when_it_exists() {
         allowed.split(',').any(|t| t == "mcp__crew__handoff"),
         "{allowed}"
     );
+    // Edits go through without asking only inside the working folder.
+    assert!(allowed.split(',').any(|t| t == "Edit(./**)"), "{allowed}");
+    assert!(!allowed.split(',').any(|t| t == "Edit"), "{allowed}");
+    // A wired run hears nothing about prompts being off.
+    assert!(!seen.iter().any(|m| matches!(
+        m,
+        ServerMsg::Message { message, .. } if message.author == Author::System
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -873,7 +888,21 @@ async fn runs_go_without_crew_mcp_when_it_is_missing() {
     })
     .await
     .unwrap();
-    c.until(|m| is_status(m, RunStatus::Done)).await;
+    let seen = c.until(|m| is_status(m, RunStatus::Done)).await;
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    let notes: Vec<&StoredMessage> = seen
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Message { message, .. } if message.author == Author::System => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(
+        notes[0].body,
+        "Permission prompts are off: crew-mcp wasn't found next to crewd."
+    );
+    assert_eq!(notes[0].run, Some(runs[0].id));
 
     let calls = logged_calls(&log);
     assert_eq!(calls.len(), 1);

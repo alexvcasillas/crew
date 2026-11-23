@@ -8,7 +8,7 @@ use crate::ids::{AgentId, ApprovalId, RunId, ThreadId};
 
 /// What is being asked. On the wire:
 /// `{"kind":"handoff","from":..,"to":..,"brief":..,"paused":..}` or
-/// `{"kind":"permission","tool":..,"input":..}`.
+/// `{"kind":"permission","tool":..,"input":..,"tool_use_id":..}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalKind {
@@ -24,6 +24,9 @@ pub enum ApprovalKind {
     Permission {
         tool: String,
         input: serde_json::Value,
+        /// Claude's id for the tool call, to match it in the run's events.
+        #[serde(default)]
+        tool_use_id: Option<String>,
     },
 }
 
@@ -120,6 +123,7 @@ fn read_approval(r: &Row) -> rusqlite::Result<Result<StoredApproval>> {
         kind: ApprovalKind::Permission {
             tool: String::new(),
             input: serde_json::Value::Null,
+            tool_use_id: None,
         },
         status: ApprovalStatus::Pending,
         created_at: r.get(5)?,
@@ -221,6 +225,15 @@ impl Store {
             ],
             read_approval,
         )?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Every approval of a thread, whatever its status, oldest first.
+    pub fn approvals(&self, thread: ThreadId) -> Result<Vec<StoredApproval>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{APPROVAL_COLUMNS} WHERE thread_id = ?1 ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([thread.to_string()], read_approval)?;
         rows.map(|r| r?).collect()
     }
 

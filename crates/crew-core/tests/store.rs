@@ -464,6 +464,7 @@ fn approvals_are_created_decided_and_cancelled() {
             &ApprovalKind::Permission {
                 tool: "Bash".into(),
                 input: serde_json::json!({"command": "touch x"}),
+                tool_use_id: Some("toolu_1".into()),
             },
         )
         .unwrap();
@@ -527,6 +528,52 @@ fn approvals_are_created_decided_and_cancelled() {
         serde_json::to_value(ApprovalStatus::Cancelled).unwrap(),
         "cancelled"
     );
+
+    // Every approval of the thread, decided ones too, with the tool call id.
+    let all = store.approvals(t).unwrap();
+    assert_eq!(all.iter().map(|a| a.id).collect::<Vec<_>>(), [handoff, ask]);
+    assert_eq!(all[1].status, ApprovalStatus::Cancelled);
+    assert_eq!(
+        all[1].kind,
+        ApprovalKind::Permission {
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "touch x"}),
+            tool_use_id: Some("toolu_1".into()),
+        }
+    );
+
+    // A system note can point at the approval it is about.
+    store
+        .add_approval_message(t, "Ada wants to run Bash: touch x", r2, ask)
+        .unwrap();
+    store.add_message(t, Author::You, "hi", None).unwrap();
+    let msgs = store.messages(t).unwrap();
+    assert_eq!(msgs[0].author, Author::System);
+    assert_eq!(msgs[0].run, Some(r2));
+    assert_eq!(msgs[0].approval, Some(ask));
+    assert_eq!(msgs[1].approval, None);
+}
+
+#[test]
+fn channels_keep_handoff_settings() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    store
+        .set_channel_handoff(c, Some(HandoffPolicy::PerAgent), Some(4))
+        .unwrap();
+    let got = &store.channels(p).unwrap()[0];
+    assert_eq!(got.handoff_policy, Some(HandoffPolicy::PerAgent));
+    assert_eq!(got.handoff_budget, Some(4));
+    store.set_channel_handoff(c, None, None).unwrap();
+    let got = &store.channels(p).unwrap()[0];
+    assert_eq!((got.handoff_policy, got.handoff_budget), (None, None));
+    assert!(matches!(
+        store.set_channel_handoff(crew_core::ids::ChannelId::new(), None, None),
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 #[test]

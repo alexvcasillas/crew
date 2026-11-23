@@ -99,17 +99,36 @@ struct Daemon {
     home: PathBuf,
 }
 
+/// `path` written relative to the current folder.
+fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let mut rel = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        rel.push("..");
+    }
+    rel.join(path.strip_prefix("/").unwrap())
+}
+
 impl Daemon {
     async fn start(claude_bin: PathBuf) -> Daemon {
+        Self::start_with(claude_bin, ServeOptions::default(), false).await
+    }
+
+    /// Starts crewd with `opts`, given a relative crew home if `relative`.
+    async fn start_with(claude_bin: PathBuf, opts: ServeOptions, relative: bool) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
-        let path = home.clone();
+        let path = if relative {
+            relative_to_cwd(&home)
+        } else {
+            home.clone()
+        };
+        assert_eq!(path.is_relative(), relative);
         tokio::spawn(async move {
             let opts = ServeOptions {
-                max_runs: 4,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
-                ..Default::default()
+                ..opts
             };
             if let Err(e) = serve(&path, opts).await {
                 panic!("serve failed: {e:#}");
@@ -155,12 +174,32 @@ struct Client {
 }
 
 impl Client {
-    async fn call(&mut self, req: Request) -> Result<serde_json::Value, String> {
+    async fn send(&mut self, req: Request) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         write_frame(&mut self.stream, &ClientMsg::Request { id, req })
             .await
             .unwrap();
+        id
+    }
+
+    async fn call(&mut self, req: Request) -> Result<serde_json::Value, String> {
+        let id = self.send(req).await;
+        self.response(id).await
+    }
+
+    /// Reads until the response to request `id`, keeping other frames.
+    async fn response(&mut self, id: u64) -> Result<serde_json::Value, String> {
+        if let Some(pos) = self
+            .pending
+            .iter()
+            .position(|m| matches!(m, ServerMsg::Response { id: got, .. } if *got == id))
+        {
+            let ServerMsg::Response { result, .. } = self.pending.remove(pos) else {
+                unreachable!()
+            };
+            return result;
+        }
         loop {
             let msg = timeout(WAIT, read_frame(&mut self.stream))
                 .await
@@ -316,7 +355,7 @@ async fn first_writing_run_creates_worktree() {
     let wt_path = d.home.join("worktrees/demo/fix-login");
     let thread = thread_of(&mut c, &s).await;
     let wt = thread.worktree.expect("thread has a worktree");
-    assert_eq!(wt.path, wt_path);
+    assert_eq!(wt.path, std::fs::canonicalize(&wt_path).unwrap());
     assert_eq!(wt.branch, "crew/fix-login");
     assert_eq!(wt.base, git(&d.root(), &["rev-parse", "main"]));
     assert_eq!(
@@ -526,7 +565,7 @@ async fn failed_setup_runs_again_next_time() {
     )));
     // Same worktree, missing files copied again, and now ready.
     let wt = thread_of(&mut c, &s).await.worktree.unwrap();
-    assert_eq!(wt.path, wt_path);
+    assert_eq!(wt.path, std::fs::canonicalize(&wt_path).unwrap());
     assert!(wt.ready);
     assert!(wt_path.join(".env").is_file());
     assert_eq!(
@@ -759,4 +798,169 @@ async fn commit_refused_while_running() {
         .await
         .unwrap();
     c.until_status(RunStatus::Stopped).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_keeps_a_branch_with_commits() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+
+    c.call(Request::Discard { thread: s.thread }).await.unwrap();
+    let wt_path = d.home.join("worktrees/demo/fix-login");
+    assert!(!wt_path.exists());
+    assert!(thread_of(&mut c, &s).await.worktree.is_none());
+    // The committed work is still on its branch.
+    assert_eq!(
+        git(&d.root(), &["branch", "--list", "crew/fix-login"]),
+        "crew/fix-login"
+    );
+    assert_eq!(
+        git(&d.root(), &["log", "-1", "--format=%s", "crew/fix-login"]),
+        "Add file"
+    );
+    let note = "Kept branch crew/fix-login because it has commits that aren't merged.";
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::Message { message, .. } if message.body == note))
+        .await;
+    assert!(system_messages(&seen).contains(&note.to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_commit_does_not_hold_up_other_requests() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let hook = d.root().join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let commit = c
+        .send(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+    // Let the commit get as far as the hook.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let stop = c.send(Request::StopAll).await;
+    let first = timeout(WAIT, async {
+        loop {
+            match c.recv().await {
+                ServerMsg::Response { id, .. } => return id,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first, stop, "StopAll waited for the commit");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let sha: String = serde_json::from_value(c.response(commit).await.unwrap()).unwrap();
+    let wt_path = d.home.join("worktrees/demo/fix-login");
+    assert_eq!(git(&wt_path, &["rev-parse", "HEAD"]), sha);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relative_crew_home_keeps_worktrees_in_the_home() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start_with(
+        writing_script(scripts.path()),
+        ServeOptions::default(),
+        true,
+    )
+    .await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+
+    let wt = thread_of(&mut c, &s).await.worktree.unwrap();
+    let home = std::fs::canonicalize(&d.home).unwrap();
+    assert_eq!(wt.path, home.join("worktrees/demo/fix-login"));
+    assert!(wt.path.join("file.txt").is_file());
+    assert!(!d.root().join("file.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lagging_subscriber_is_told_to_resync() {
+    let scripts = tempfile::tempdir().unwrap();
+    let opts = ServeOptions {
+        notice_buffer: 2,
+        ..ServeOptions::default()
+    };
+    let d = Daemon::start_with(writing_script(scripts.path()), opts, false).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+
+    // `c` doesn't read, so crewd blocks writing the first big message to
+    // it while the rest pile up.
+    let mut poster = d.client().await;
+    let big = "x".repeat(1 << 20);
+    for _ in 0..5 {
+        post(&mut poster, s.thread, &big).await;
+    }
+    // A connection that never subscribed never falls behind.
+    let _: serde_json::Value = poster.ok(Request::ListAgents).await;
+
+    loop {
+        if matches!(c.recv().await, ServerMsg::Resync) {
+            break;
+        }
+    }
+    let after = timeout(WAIT, read_frame::<_, ServerMsg>(&mut c.stream))
+        .await
+        .expect("crewd kept the connection open");
+    assert!(matches!(after, Ok(None) | Err(_)), "{after:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_limit_starts_after_setup() {
+    let scripts = tempfile::tempdir().unwrap();
+    let opts = ServeOptions {
+        minute: Duration::from_secs(1),
+        ..ServeOptions::default()
+    };
+    let d = Daemon::start_with(session_then_sleep_script(scripts.path()), opts, false).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    let quick = AgentSpec {
+        max_run_minutes: 1,
+        ..agent("Quick", PermissionMode::EditFiles)
+    };
+    let _: AgentId = c.ok(Request::CreateAgent { spec: quick }).await;
+    c.call(Request::UpdateProject {
+        project: s.project,
+        setup_command: Some("sleep 2".into()),
+        copy_files: vec![],
+    })
+    .await
+    .unwrap();
+
+    post(&mut c, s.thread, "@Quick go").await;
+    let limit = "Quick hit its 1 min limit and was stopped. Its changes are kept.";
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::Message { message, .. } if message.body == limit))
+        .await;
+    // Claude got to start: the setup's 2 s didn't count.
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        ServerMsg::Event {
+            event: Event::SessionStarted { .. },
+            ..
+        }
+    )));
 }

@@ -294,6 +294,7 @@ async fn approve_allow_returns_updated_input() {
             run: mcp.run,
             tool: "Bash".into(),
             input,
+            tool_use_id: Some("toolu_1".into()),
         }
     );
 }
@@ -409,4 +410,61 @@ async fn bad_tool_calls_are_errors() {
     assert!(!is_error);
     let decision: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(decision["behavior"], "deny");
+}
+
+/// A crewd that never answers a permission ask and reports, through the
+/// returned receiver, when the connection that asked is closed.
+fn silent_crewd(home: &Path) -> mpsc::UnboundedReceiver<&'static str> {
+    let listener = UnixListener::bind(home.join("crewd.sock")).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(ClientMsg::Request { id, req })) =
+                    read_frame::<_, ClientMsg>(&mut stream).await
+                {
+                    match req {
+                        Request::Hello { .. } => {
+                            let reply = ServerMsg::Response {
+                                id,
+                                result: Ok(Value::Null),
+                            };
+                            write_frame(&mut stream, &reply).await.unwrap();
+                        }
+                        _ => tx.send("asked").unwrap(),
+                    }
+                }
+                tx.send("closed").unwrap();
+            });
+        }
+    });
+    rx
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_approve_drops_its_crewd_connection() {
+    let (_tmp, home) = home();
+    let mut crewd = silent_crewd(&home);
+    let mut mcp = Mcp::start(&home);
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": "approve", "arguments": {"tool_name": "Bash", "input": {}}},
+    }))
+    .await;
+    assert_eq!(timeout(WAIT, crewd.recv()).await.unwrap(), Some("asked"));
+
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 7, "reason": "timed out"},
+    }))
+    .await;
+    assert_eq!(timeout(WAIT, crewd.recv()).await.unwrap(), Some("closed"));
+    // The cancelled call gets no reply; the next request is answered.
+    let reply = mcp.request(8, "ping", json!({})).await;
+    assert_eq!(reply["result"], json!({}));
 }

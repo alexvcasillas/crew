@@ -93,7 +93,8 @@ enum Command {
         #[arg(short, long)]
         message: String,
     },
-    /// Remove a thread's worktree and branch, changes included.
+    /// Remove a thread's worktree, changes included. Its branch goes too,
+    /// unless it has commits.
     Discard {
         /// A thread id, or a unique prefix of at least 4 characters.
         thread: String,
@@ -104,6 +105,42 @@ enum Command {
     /// Manage agents.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Manage threads.
+    #[command(subcommand)]
+    Thread(ThreadCommand),
+    /// Manage channels.
+    #[command(subcommand)]
+    Channel(ChannelCommand),
+}
+
+#[derive(Subcommand)]
+enum ThreadCommand {
+    /// Set how handoffs in a thread are approved.
+    Handoff {
+        /// A thread id, or a unique prefix of at least 4 characters.
+        thread: String,
+        #[command(flatten)]
+        setting: HandoffSetting,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelCommand {
+    /// Set how handoffs in a channel's threads are approved.
+    Handoff {
+        /// A channel id, or a unique prefix of at least 4 characters.
+        channel: String,
+        #[command(flatten)]
+        setting: HandoffSetting,
+    },
+}
+
+#[derive(Args)]
+struct HandoffSetting {
+    policy: PolicyArg,
+    /// Handoffs that may run on their own before crew asks.
+    #[arg(long)]
+    budget: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -112,11 +149,21 @@ enum AgentCommand {
     Add(AgentAdd),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum PolicyArg {
     Ask,
     Budget,
     PerAgent,
+}
+
+impl From<PolicyArg> for HandoffPolicy {
+    fn from(p: PolicyArg) -> Self {
+        match p {
+            PolicyArg::Ask => HandoffPolicy::AskFirst,
+            PolicyArg::Budget => HandoffPolicy::Budget,
+            PolicyArg::PerAgent => HandoffPolicy::PerAgent,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -132,11 +179,15 @@ struct AgentAdd {
     /// How this agent's handoff requests are approved.
     #[arg(long)]
     policy: Option<PolicyArg>,
-    /// Handoffs this agent may start on their own.
-    #[arg(long)]
+    /// Handoffs this agent may start on their own. Needs `--policy budget`.
+    #[arg(long, requires = "policy")]
     budget: Option<u32>,
     /// Stop a run after this many minutes.
-    #[arg(long, default_value_t = crew_core::agent::DEFAULT_MAX_RUN_MINUTES)]
+    #[arg(
+        long,
+        default_value_t = crew_core::agent::DEFAULT_MAX_RUN_MINUTES,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     max_minutes: u32,
     #[arg(long, default_value = "")]
     instructions: String,
@@ -193,24 +244,40 @@ async fn resolve_run(c: &mut Client, s: &str) -> Result<RunId> {
     pick(s, active.collect(), "run", "Use the full run id.")
 }
 
-/// Every thread of every project.
-async fn all_threads(c: &mut Client) -> Result<Vec<StoredThread>> {
-    let mut threads = Vec::new();
+/// Every channel of every project.
+async fn all_channels(c: &mut Client) -> Result<Vec<StoredChannel>> {
+    let mut channels = Vec::new();
     let projects: Vec<StoredProject> = c.ask(Request::ListProjects).await?;
     for project in projects {
-        let channels: Vec<StoredChannel> = c
+        let rows: Vec<StoredChannel> = c
             .ask(Request::ListChannels {
                 project: project.id,
             })
             .await?;
-        for channel in channels {
-            let rows: Vec<StoredThread> = c
-                .ask(Request::ListThreads {
-                    channel: channel.id,
-                })
-                .await?;
-            threads.extend(rows);
-        }
+        channels.extend(rows);
+    }
+    Ok(channels)
+}
+
+/// Resolves a full channel id or a unique prefix of any channel.
+async fn resolve_channel(c: &mut Client, s: &str) -> Result<ChannelId> {
+    if let Some(id) = parse_full(s) {
+        return Ok(id);
+    }
+    let channels = all_channels(c).await?.into_iter().map(|ch| ch.id).collect();
+    pick(s, channels, "channel", "Use the full channel id.")
+}
+
+/// Every thread of every project.
+async fn all_threads(c: &mut Client) -> Result<Vec<StoredThread>> {
+    let mut threads = Vec::new();
+    for channel in all_channels(c).await? {
+        let rows: Vec<StoredThread> = c
+            .ask(Request::ListThreads {
+                channel: channel.id,
+            })
+            .await?;
+        threads.extend(rows);
     }
     Ok(threads)
 }
@@ -458,7 +525,7 @@ async fn approval_text(
     approval: &StoredApproval,
 ) -> Result<String> {
     Ok(match &approval.kind {
-        ApprovalKind::Permission { tool, input } => {
+        ApprovalKind::Permission { tool, input, .. } => {
             let name = names.of_run(ctl, approval.run).await?;
             permission_text(&name, tool, input)
         }
@@ -619,6 +686,7 @@ async fn watch(
                 }
             },
             ServerMsg::Response { .. } => {}
+            ServerMsg::Resync => bail!("watch fell behind crewd. Run it again."),
         }
     }
 }
@@ -735,15 +803,36 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Discard { thread, yes } => {
             if !yes {
-                bail!(
-                    "Discard removes the worktree and its branch, changes included. Add --yes to confirm."
-                );
+                bail!("Discard removes the worktree, changes included. Add --yes to confirm.");
             }
             let thread = resolve_thread(&mut c, &thread).await?;
             c.call(Request::Discard { thread }).await?;
             Ok(())
         }
+        Command::Thread(ThreadCommand::Handoff { thread, setting }) => {
+            let thread = resolve_thread(&mut c, &thread).await?;
+            c.call(Request::SetThreadHandoff {
+                thread,
+                policy: Some(setting.policy.into()),
+                budget: setting.budget,
+            })
+            .await?;
+            Ok(())
+        }
+        Command::Channel(ChannelCommand::Handoff { channel, setting }) => {
+            let channel = resolve_channel(&mut c, &channel).await?;
+            c.call(Request::SetChannelHandoff {
+                channel,
+                policy: Some(setting.policy.into()),
+                budget: setting.budget,
+            })
+            .await?;
+            Ok(())
+        }
         Command::Agent(AgentCommand::Add(a)) => {
+            if a.budget.is_some() && a.policy != Some(PolicyArg::Budget) {
+                bail!("--budget needs --policy budget.");
+            }
             let spec = AgentSpec {
                 name: a.name,
                 role: a.role,
@@ -756,11 +845,7 @@ async fn run(cli: Cli) -> Result<()> {
                     PermissionMode::ReadOnly
                 },
                 allowed_tools: vec![],
-                handoff_policy: a.policy.map(|p| match p {
-                    PolicyArg::Ask => HandoffPolicy::AskFirst,
-                    PolicyArg::Budget => HandoffPolicy::Budget,
-                    PolicyArg::PerAgent => HandoffPolicy::PerAgent,
-                }),
+                handoff_policy: a.policy.map(HandoffPolicy::from),
                 handoff_budget: a.budget,
                 max_run_minutes: a.max_minutes,
             };
