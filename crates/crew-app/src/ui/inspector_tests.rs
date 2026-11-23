@@ -16,8 +16,8 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, ListOffset, TestAppContext, px};
 
 use super::test_ui::{
-    WAIT, click, has, label_of, notifications, open_sized, press, shows, type_text, wait_to_show,
-    wait_until,
+    WAIT, bounds_of, click, has, label_of, notifications, open_sized, press, shows, type_text,
+    wait_to_show, wait_until,
 };
 use super::thread_tests::{World, agent, ask, go_to, live_run, open_thread, world};
 use super::workspace::Workspace;
@@ -327,6 +327,41 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
             "Bash denied by you · ",
         )
     });
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+}
+
+#[gpui_kit::test]
+fn a_pending_ask_stands_under_its_runs_card(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    let answer = ask_permission(&w, run, serde_json::json!({"command": "touch x.txt"}));
+    let id = pending(cx, &ws, w.thread);
+    let card = format!("approval-{id}");
+    wait_until(cx, "the permission card", |cx| {
+        has(cx, window, card.clone())
+    });
+    let run_card = bounds_of(cx, window, format!("run-card-{run}")).expect("the run card");
+    let ask = bounds_of(cx, window, card.clone()).unwrap();
+    assert!(
+        ask.top() >= run_card.bottom(),
+        "the ask {ask:?} is under the run card {run_card:?}"
+    );
+
+    // Once decided, the card stays where it was asked, above the run.
+    click(cx, window, format!("approval-allow-{id}"));
+    assert!(answer_of(cx, &answer).allow);
+    wait_until(cx, "the card to fold", |cx| {
+        starts(cx, window, card.clone(), "Bash allowed by you · ")
+    });
+    let run_card = bounds_of(cx, window, format!("run-card-{run}")).unwrap();
+    let decided = bounds_of(cx, window, card).unwrap();
+    assert!(decided.bottom() <= run_card.top());
     std::fs::write(tmp.path().join("go"), "").unwrap();
 }
 
