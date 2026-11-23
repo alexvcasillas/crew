@@ -15,5 +15,5 @@ rusqlite = { version = "0.43.0", features = ["bundled"] }
 thiserror = "2.0.21"
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["process", "io-util", "sync", "rt", "macros", "time"] }
-nix = { version = "0.32.0", features = ["signal", "process", "user"] }
+nix = { version = "0.32.0", features = ["signal", "process", "user", "fs"] }
 anyhow = "1.0.105"

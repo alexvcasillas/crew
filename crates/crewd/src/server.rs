@@ -1,8 +1,9 @@
 //! Unix socket server: framing, handshake and the per-connection loop.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,6 +11,8 @@ use anyhow::{Context, bail};
 use crew_core::ids::ThreadId;
 use crew_core::store::Store;
 use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
@@ -18,6 +21,8 @@ use crate::service::Service;
 
 /// Socket file name inside the crew home.
 pub const SOCKET_NAME: &str = "crewd.sock";
+/// Lock file name inside the crew home.
+pub const LOCK_NAME: &str = "crewd.lock";
 /// Database file name inside the crew home.
 pub const DB_NAME: &str = "crew.db";
 
@@ -50,6 +55,19 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
         .mode(0o700)
         .create(home)
         .with_context(|| format!("creating {}", home.display()))?;
+    // Also tightens a home that already existed. The socket is bound in
+    // here, so it is never reachable by others even before its chmod.
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting the mode of {}", home.display()))?;
+
+    // Held for as long as this daemon runs. Taken before anything touches
+    // the database, so a second crewd can't disturb the live one.
+    let sock = home.join(SOCKET_NAME);
+    if UnixStream::connect(&sock).await.is_ok() {
+        bail!("crewd is already running on {}", sock.display());
+    }
+    let _lock = lock_home(home, &sock)?;
+
     let store = Store::open(&home.join(DB_NAME)).context("opening the database")?;
     let interrupted = store.mark_working_runs_interrupted()?;
     if interrupted > 0 {
@@ -58,11 +76,8 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
         ));
     }
 
-    let sock = home.join(SOCKET_NAME);
+    // We hold the lock, so any socket left here is stale.
     if sock.symlink_metadata().is_ok() {
-        if UnixStream::connect(&sock).await.is_ok() {
-            bail!("crewd is already running on {}", sock.display());
-        }
         std::fs::remove_file(&sock).context("removing the stale socket")?;
     }
     let listener =
@@ -86,6 +101,24 @@ pub async fn serve(home: &Path, opts: ServeOptions) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+/// Takes the exclusive lock on `home/crewd.lock`, or fails if another
+/// crewd holds it.
+fn lock_home(home: &Path, sock: &Path) -> anyhow::Result<Flock<File>> {
+    let path = home.join(LOCK_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(lock),
+        Err((_, Errno::EWOULDBLOCK)) => bail!("crewd is already running on {}", sock.display()),
+        Err((_, e)) => Err(e).with_context(|| format!("locking {}", path.display())),
     }
 }
 

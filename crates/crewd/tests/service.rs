@@ -90,13 +90,18 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
 }
 
 struct Daemon {
-    home: TempDir,
+    _tmp: TempDir,
+    /// The crew home. It starts out as mode 0755 so tests see crewd fix it.
+    home: PathBuf,
 }
 
 impl Daemon {
     async fn start(max_runs: usize, claude_bin: PathBuf) -> Daemon {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().to_path_buf();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("crew");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
                 max_runs,
@@ -106,7 +111,7 @@ impl Daemon {
                 panic!("serve failed: {e:#}");
             }
         });
-        let sock = home.path().join("crewd.sock");
+        let sock = home.join("crewd.sock");
         timeout(WAIT, async {
             while UnixStream::connect(&sock).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -114,11 +119,11 @@ impl Daemon {
         })
         .await
         .expect("crewd did not start");
-        Daemon { home }
+        Daemon { _tmp: tmp, home }
     }
 
     fn socket(&self) -> PathBuf {
-        self.home.path().join("crewd.sock")
+        self.home.join("crewd.sock")
     }
 
     async fn client(&self) -> Client {
@@ -544,6 +549,113 @@ async fn socket_is_0600() {
     let d = Daemon::start(4, fake("claude_sleeps.sh")).await;
     let mode = std::fs::metadata(d.socket()).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
+    let home_mode = std::fs::metadata(&d.home).unwrap().permissions().mode();
+    assert_eq!(home_mode & 0o777, 0o700);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_daemon_refuses_and_leaves_runs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(4, fake("claude_sleeps.sh")).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge wait".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::RunStatus {
+                status: RunStatus::Working,
+                ..
+            }
+        )
+    })
+    .await;
+
+    let err = timeout(WAIT, serve(&d.home, ServeOptions::default()))
+        .await
+        .expect("second serve should return")
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("already running"),
+        "unexpected error: {err:#}"
+    );
+
+    let working: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Working),
+        })
+        .await;
+    assert_eq!(working.len(), 1, "the live run must stay Working");
+    // The first daemon still answers.
+    let mut again = d.client().await;
+    let _: Vec<StoredRun> = again.ok(Request::ListRuns { status: None }).await;
+    c.call(Request::StopAll).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_spawn_does_not_get_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    // Missing for the first run, written before the second.
+    let bin = dir.path().join("claude-late.sh");
+    let d = Daemon::start(4, bin.clone()).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge first".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::RunStatus {
+                status: RunStatus::Failed,
+                ..
+            }
+        )
+    })
+    .await;
+
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    std::fs::rename(&script, &bin).unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge second".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::RunStatus {
+                status: RunStatus::Done,
+                ..
+            }
+        )
+    })
+    .await;
+
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 1);
+    assert!(arg_after(&calls[0], "--session-id").is_some());
+    assert!(arg_after(&calls[0], "--resume").is_none());
+    let prompt = arg_after(&calls[0], "-p").unwrap();
+    assert!(
+        prompt.starts_with("You: @Forge first\n"),
+        "prompt: {prompt}"
+    );
+    assert!(prompt.ends_with("\n\n@Forge second"), "prompt: {prompt}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -586,7 +698,7 @@ async fn reply_in_thread_resumes_agent_session() {
     let session = arg_after(&calls[0], "--session-id").expect("new session id");
     assert_eq!(
         arg_after(&calls[0], "-p").unwrap(),
-        "Alex: hello\n\n@Forge look at it"
+        "You: hello\n\n@Forge look at it"
     );
     assert_eq!(arg_after(&calls[1], "--resume"), Some(session.clone()));
     assert_eq!(arg_after(&calls[1], "-p").unwrap(), "@Forge and again");
