@@ -405,3 +405,55 @@ fn esc_in_the_message_keeps_the_review_and_the_text(cx: &mut TestAppContext) {
         Some(typed)
     );
 }
+
+#[gpui_kit::test]
+fn a_read_only_reply_after_the_edits_keeps_the_editor_on_the_review(cx: &mut TestAppContext) {
+    // Read-only runs reply "Done thinking." and change nothing.
+    let s = setup(&format!(
+        "case \"$*\" in *'--permission-mode plan'*) cat '{}'; exit 0;; esac\nprintf 'one\\n' > new.txt",
+        fixture("thinking.jsonl").display()
+    ));
+    let scout: AgentId = ask(
+        &s.w.client,
+        Request::CreateAgent {
+            spec: crew_core::agent::AgentSpec {
+                permission_mode: PermissionMode::ReadOnly,
+                ..agent("Scout", "Reviews")
+            },
+        },
+    );
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    s.w.post("@Scout look it over");
+    run_of(cx, &ws, s.w.thread, scout, RunStatus::Done);
+    wait_until(cx, "Scout's reply", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(s.w.thread)
+                .iter()
+                .any(|m| m.body == "Done thinking.")
+        })
+    });
+
+    review_from_inspector(cx, window);
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some("Fixed."),
+        "drafted from Forge's reply, not Scout's"
+    );
+    assert!(shows(cx, window, "Commit message · drafted by Forge"));
+    click(cx, window, "review-discard");
+    wait_to_show(cx, window, DISCARD_ASK);
+    click(cx, window, "discard-cancel");
+    wait_until(cx, "the dialog to close", |cx| {
+        !shows(cx, window, DISCARD_ASK)
+    });
+
+    click(cx, window, "review-ask");
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.composer.read(cx).text(cx)),
+        "@Forge "
+    );
+}
