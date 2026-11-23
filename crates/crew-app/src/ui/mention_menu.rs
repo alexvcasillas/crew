@@ -194,8 +194,7 @@ fn render_no_agents() -> impl IntoElement {
                 .cursor_pointer()
                 .child("Add one in Settings.")
                 .tooltip(|window, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new("Settings are coming soon.")
-                        .build(window, cx)
+                    gpui_kit::component::tooltip::Tooltip::new("Coming soon.").build(window, cx)
                 })
                 .test_support(),
         )

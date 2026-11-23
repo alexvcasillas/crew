@@ -337,6 +337,17 @@ impl State {
             .count()
     }
 
+    /// Agents with a working run, each once. Queued runs don't count.
+    pub fn working_agents(&self) -> Vec<AgentId> {
+        let mut agents: Vec<AgentId> = Vec::new();
+        for run in self.running() {
+            if run.status == RunStatus::Working && !agents.contains(&run.agent) {
+                agents.push(run.agent);
+            }
+        }
+        agents
+    }
+
     /// The thread's queued and working runs, by start time.
     pub fn live_runs(&self, thread: ThreadId) -> Vec<&StoredRun> {
         sorted(
@@ -881,6 +892,24 @@ mod tests {
         assert_eq!(state.unread(c.id, 20), 1);
         assert_eq!(state.unread(ChannelId::new(), 0), 0);
         assert_eq!(state.last_message(t.id).unwrap().body, "Forge stopped.");
+    }
+
+    #[test]
+    fn working_agents_are_counted_once_and_queued_runs_not() {
+        let (mut state, _, c, t) = one_thread();
+        let other = thread(c.id, "other", 2);
+        let forge = AgentId::new();
+        let scout = AgentId::new();
+        let mut a = run(t.id, RunStatus::Working, 1);
+        a.agent = forge;
+        let mut b = run(other.id, RunStatus::Working, 2);
+        b.agent = forge;
+        let mut q = run(t.id, RunStatus::Queued, 3);
+        q.agent = scout;
+        for r in [&a, &b, &q] {
+            state.apply(status(r));
+        }
+        assert_eq!(state.working_agents(), [forge]);
     }
 
     #[test]

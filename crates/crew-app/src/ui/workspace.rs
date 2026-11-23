@@ -44,7 +44,20 @@ pub(super) struct Nav {
     pub(super) scroll: ScrollHandle,
     /// Messages in the open thread when last drawn, to scroll on new ones.
     seen_messages: usize,
+    /// The thread was just opened: show its end whatever the scroll.
+    stick_to_bottom: bool,
 }
+
+/// Whose text the composer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum DraftKey {
+    Thread(ThreadId),
+    /// The first message of a new thread in the channel.
+    NewThread(ChannelId),
+}
+
+/// How close to the end, in px, still counts as reading the end.
+const NEAR_BOTTOM: f32 = 40.;
 
 pub struct Workspace {
     pub(super) conn: ConnectionConfig,
@@ -60,6 +73,12 @@ pub struct Workspace {
     _composer_events: Subscription,
     focus: FocusHandle,
     pub(super) nav: Nav,
+    /// What you wrote and left, per thread and per new-thread draft.
+    drafts: HashMap<DraftKey, String>,
+    /// The channel whose new thread is being created.
+    creating: Option<ChannelId>,
+    /// A thread to open once it is known (debug builds' startup hook).
+    open_pending: Option<ThreadId>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Requests waiting for their answers, by a number of their own.
@@ -94,6 +113,9 @@ impl Workspace {
             _composer_events: composer_events,
             focus: cx.focus_handle(),
             nav: Nav::default(),
+            drafts: HashMap::new(),
+            creating: None,
+            open_pending: dev_open_thread(),
             ticker: None,
             requests: HashMap::new(),
             next_request: 0,
@@ -105,6 +127,28 @@ impl Workspace {
     /// What the UI renders from.
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Opens `thread` now if it is known, else as soon as it arrives, as
+    /// the debug startup hook does.
+    #[cfg(test)]
+    pub(super) fn open_when_known(
+        &mut self,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_pending = Some(thread);
+        self.open_if_known(window, cx);
+    }
+
+    fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(thread) = self.open_pending
+            && self.state.thread(thread).is_some()
+        {
+            self.open_pending = None;
+            self.open_thread(thread, window, cx);
+        }
     }
 
     /// The open thread, if any.
@@ -128,14 +172,15 @@ impl Workspace {
                 while let Ok(event) = events.try_recv() {
                     batch.push(event);
                 }
-                if this.update(cx, |this, cx| this.apply(batch, cx)).is_err() {
+                let applied = this.update_in(cx, |this, window, cx| this.apply(batch, window, cx));
+                if applied.is_err() {
                     break;
                 }
             }
         })
     }
 
-    fn apply(&mut self, events: Vec<ClientEvent>, cx: &mut Context<Self>) {
+    fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
         for event in events {
             event.apply_to(&mut self.state);
         }
@@ -143,6 +188,7 @@ impl Workspace {
         self.status_bar
             .update(cx, |bar, cx| bar.set_connection(connection, cx));
         self.sync(cx);
+        self.open_if_known(window, cx);
         cx.notify();
     }
 
@@ -177,8 +223,11 @@ impl Workspace {
             .filter_map(|r| self.state.agent(r.agent).map(|a| a.spec.name.clone()))
             .collect();
         let hint = working_hint(&working);
+        let busy =
+            self.nav.drafting && self.creating.is_some() && self.creating == self.nav.channel;
         self.composer.update(cx, |composer, cx| {
-            composer.set_context(agents, project, hint, cx)
+            composer.set_context(agents, project, hint, cx);
+            composer.set_busy(busy, cx);
         });
 
         if working.is_empty() {
@@ -197,7 +246,12 @@ impl Workspace {
         let messages = self.nav.thread.map_or(0, |t| self.state.messages(t).len());
         if messages != self.nav.seen_messages {
             self.nav.seen_messages = messages;
-            self.nav.scroll.scroll_to_bottom();
+            // The scroll handle still measures the content drawn last.
+            let scroll = &self.nav.scroll;
+            let at_end = near_bottom(scroll.offset().y.as_f32(), scroll.max_offset().y.as_f32());
+            if std::mem::take(&mut self.nav.stick_to_bottom) || at_end {
+                scroll.scroll_to_bottom();
+            }
         }
     }
 
@@ -221,12 +275,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.stash_draft(cx);
         self.close_thread();
         self.nav.drafting = false;
         self.look_at(Some(channel));
         self.composer.update(cx, |composer, cx| {
             composer.set_first_message(false, window, cx)
         });
+        self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
     }
@@ -238,11 +294,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.stash_draft(cx);
         if self.nav.thread != Some(thread) {
             self.close_thread();
             self.watch_thread(thread);
             self.nav.thread = Some(thread);
             self.nav.seen_messages = 0;
+            self.nav.stick_to_bottom = true;
         }
         self.nav.drafting = false;
         let channel = self.state.thread(thread).map(|t| t.channel);
@@ -251,6 +309,7 @@ impl Workspace {
             composer.set_first_message(false, window, cx);
             composer.focus(window, cx);
         });
+        self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
     }
@@ -261,14 +320,66 @@ impl Workspace {
         if self.nav.channel.is_none() {
             return;
         }
+        self.stash_draft(cx);
         self.close_thread();
         self.nav.drafting = true;
         self.composer.update(cx, |composer, cx| {
             composer.set_first_message(true, window, cx);
             composer.focus(window, cx);
         });
+        self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Whose text the composer holds now.
+    fn draft_key(&self) -> Option<DraftKey> {
+        match (self.nav.thread, self.nav.channel) {
+            (Some(thread), _) => Some(DraftKey::Thread(thread)),
+            (None, Some(channel)) if self.nav.drafting => Some(DraftKey::NewThread(channel)),
+            _ => None,
+        }
+    }
+
+    /// Keeps the composer's text for what is open, before leaving it.
+    fn stash_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.draft_key() {
+            let text = self.composer.read(cx).text(cx);
+            if text.is_empty() {
+                self.drafts.remove(&key);
+            } else {
+                self.drafts.insert(key, text);
+            }
+        }
+    }
+
+    /// Puts the text kept for what is now open in the composer.
+    fn load_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .draft_key()
+            .and_then(|key| self.drafts.remove(&key))
+            .unwrap_or_default();
+        self.composer
+            .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+    }
+
+    /// Gives `text` back to `key` after a send failed, unless you have
+    /// written something else there since.
+    fn restore_draft(
+        &mut self,
+        key: DraftKey,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.draft_key() == Some(key) {
+            if self.composer.read(cx).text(cx).trim().is_empty() {
+                self.composer
+                    .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+            }
+        } else {
+            self.drafts.entry(key).or_insert(text);
+        }
     }
 
     fn close_thread(&mut self) {
@@ -290,45 +401,69 @@ impl Workspace {
     }
 
     /// Posts what you wrote: in the open thread, or as the first message
-    /// of a new one titled by its first line.
+    /// of a new one titled by its first line. A new thread opens when
+    /// crewd made it, if you are still on its draft.
     fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let client = self.client.clone();
-        if self.nav.drafting {
-            let Some(channel) = self.nav.channel else {
-                return;
-            };
-            let title = thread_title(&text);
-            self.spawn_request(window, cx, async move |this, cx| {
-                let thread = client
-                    .request(Request::CreateThread { channel, title })
-                    .await
-                    .and_then(|v| serde_json::from_value::<ThreadId>(v).map_err(|e| e.to_string()));
-                let thread = match thread {
-                    Ok(thread) => thread,
-                    Err(e) => return Err((e, Some(text))),
-                };
-                this.update_in(cx, |this, window, cx| this.open_thread(thread, window, cx))
-                    .ok();
-                client
-                    .request(Request::PostMessage {
-                        thread,
-                        body: text.clone(),
-                    })
-                    .await
-                    .map(drop)
-                    .map_err(|e| (e, Some(text)))
-            });
-        } else if let Some(thread) = self.nav.thread {
-            self.spawn_request(window, cx, async move |_, _| {
-                client
-                    .request(Request::PostMessage {
-                        thread,
-                        body: text.clone(),
-                    })
-                    .await
-                    .map(drop)
-                    .map_err(|e| (e, Some(text)))
-            });
+        let Some(key) = self.draft_key() else {
+            return;
+        };
+        match key {
+            DraftKey::NewThread(channel) => {
+                if self.creating.is_some() {
+                    return;
+                }
+                self.creating = Some(channel);
+                self.sync(cx);
+                let title = thread_title(&text);
+                self.spawn_request(window, cx, async move |this, cx| {
+                    let made = client
+                        .request(Request::CreateThread { channel, title })
+                        .await
+                        .and_then(|v| {
+                            serde_json::from_value::<ThreadId>(v).map_err(|e| e.to_string())
+                        });
+                    let still_here = this
+                        .update_in(cx, |this, window, cx| {
+                            this.creating = None;
+                            let here = this.draft_key() == Some(key);
+                            if let (Ok(thread), true) = (&made, here) {
+                                this.open_thread(*thread, window, cx);
+                            }
+                            this.sync(cx);
+                            here
+                        })
+                        .unwrap_or(false);
+                    let thread = match made {
+                        Ok(thread) => thread,
+                        Err(e) => return Err((e, Some((key, text)))),
+                    };
+                    let posted = client
+                        .request(Request::PostMessage {
+                            thread,
+                            body: text.clone(),
+                        })
+                        .await;
+                    let back = if still_here {
+                        DraftKey::Thread(thread)
+                    } else {
+                        key
+                    };
+                    posted.map(drop).map_err(|e| (e, Some((back, text))))
+                });
+            }
+            DraftKey::Thread(thread) => {
+                self.spawn_request(window, cx, async move |_, _| {
+                    client
+                        .request(Request::PostMessage {
+                            thread,
+                            body: text.clone(),
+                        })
+                        .await
+                        .map(drop)
+                        .map_err(|e| (e, Some((key, text))))
+                });
+            }
         }
     }
 
@@ -345,7 +480,7 @@ impl Workspace {
     }
 
     /// Runs `work`, keeping its task until it ends. An error is shown,
-    /// and its text, if any, goes back in the composer.
+    /// and its text, if any, goes back to the draft it came from.
     fn spawn_request(
         &mut self,
         window: &mut Window,
@@ -353,7 +488,7 @@ impl Workspace {
         work: impl AsyncFnOnce(
             WeakEntity<Self>,
             &mut AsyncWindowContext,
-        ) -> Result<(), (String, Option<String>)>
+        ) -> Result<(), (String, Option<(DraftKey, String)>)>
         + 'static,
     ) {
         let id = self.next_request;
@@ -362,9 +497,8 @@ impl Workspace {
             let result = work(this.clone(), cx).await;
             this.update_in(cx, |this, window, cx| {
                 if let Err((error, text)) = result {
-                    if let Some(text) = text {
-                        this.composer
-                            .update(cx, |composer, cx| composer.restore(&text, window, cx));
+                    if let Some((key, text)) = text {
+                        this.restore_draft(key, text, window, cx);
                     }
                     this.show_error(error, window, cx);
                 }
@@ -396,6 +530,24 @@ pub fn thread_title(text: &str) -> String {
         .unwrap_or_default()
         .trim();
     line.chars().take(TITLE_MAX).collect()
+}
+
+/// Whether a scroll `offset` (negative as content moves up) is within
+/// [`NEAR_BOTTOM`] of its end, `max`.
+pub(super) fn near_bottom(offset: f32, max: f32) -> bool {
+    -offset >= max - NEAR_BOTTOM
+}
+
+/// `CREW_APP_OPEN_THREAD`, in debug builds only.
+fn dev_open_thread() -> Option<ThreadId> {
+    #[cfg(debug_assertions)]
+    {
+        super::dev_hooks::read(|k| std::env::var(k).ok()).open_thread
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 /// "Forge is working. A reply now is queued for its next turn."
@@ -489,7 +641,7 @@ fn render_nothing_selected() -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{thread_title, working_hint};
+    use super::{near_bottom, thread_title, working_hint};
 
     #[test]
     fn a_title_is_the_first_line_cut_to_80() {
@@ -499,6 +651,15 @@ mod tests {
         );
         assert_eq!(thread_title("\n  @Forge look  \nmore"), "@Forge look");
         assert_eq!(thread_title(&"x".repeat(100)).chars().count(), 80);
+    }
+
+    #[test]
+    fn new_messages_scroll_only_from_near_the_bottom() {
+        // Offsets are negative as content scrolls up.
+        assert!(near_bottom(-500., 500.));
+        assert!(near_bottom(-470., 500.), "within 40 px");
+        assert!(!near_bottom(-400., 500.), "you scrolled up to read");
+        assert!(near_bottom(0., 0.), "nothing to scroll");
     }
 
     #[test]

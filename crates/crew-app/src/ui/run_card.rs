@@ -87,6 +87,8 @@ struct Call {
     id: String,
     kind: ToolKind,
     name: String,
+    /// Relative to the run's folder.
+    path: Option<String>,
     target: String,
     lines: Option<(u32, u32)>,
 }
@@ -95,7 +97,6 @@ struct Call {
 pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
     let mut cwd = String::new();
     let mut calls: Vec<Call> = Vec::new();
-    let mut files: Vec<FileChange> = Vec::new();
     let mut ends: HashMap<String, bool> = HashMap::new();
     for logged in events.iter().filter(|e| e.run == run) {
         match &logged.event {
@@ -108,32 +109,38 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
                 input,
             } => {
                 let target = target.as_deref().map(|t| relative(t, &cwd));
-                let lines = changed_lines(kind, input);
-                if let (Some((added, removed)), Some(path)) = (lines, &target) {
-                    match files.iter_mut().find(|f| &f.path == path) {
-                        Some(f) => {
-                            f.added += added;
-                            f.removed += removed;
-                        }
-                        None => files.push(FileChange {
-                            path: path.clone(),
-                            added,
-                            removed,
-                        }),
-                    }
-                }
                 calls.push(Call {
                     id: id.clone(),
                     kind: kind.clone(),
                     name: name.clone(),
-                    target: shorten(&target.unwrap_or_default()),
-                    lines,
+                    target: shorten(target.as_deref().unwrap_or_default()),
+                    path: target,
+                    lines: changed_lines(kind, input),
                 });
             }
             Event::ToolResult { id, is_error, .. } => {
                 ends.insert(id.clone(), *is_error);
             }
             _ => {}
+        }
+    }
+    // Only edits that went through count.
+    let succeeded = |call: &Call| ends.get(&call.id) == Some(&false);
+    let mut files: Vec<FileChange> = Vec::new();
+    for call in calls.iter().filter(|c| succeeded(c)) {
+        let (Some((added, removed)), Some(path)) = (call.lines, &call.path) else {
+            continue;
+        };
+        match files.iter_mut().find(|f| &f.path == path) {
+            Some(f) => {
+                f.added += added;
+                f.removed += removed;
+            }
+            None => files.push(FileChange {
+                path: path.clone(),
+                added,
+                removed,
+            }),
         }
     }
     let skip = calls.len().saturating_sub(STEPS_SHOWN);
@@ -149,8 +156,8 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
             Step {
                 verb: verb(&call.kind, &call.name, state == StepState::Running),
                 state,
+                lines: call.lines.filter(|_| state == StepState::Done),
                 target: call.target,
-                lines: call.lines,
             }
         })
         .collect();
@@ -222,10 +229,10 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let id = run.id;
         let queued = matches!(run.status, crew_core::event::RunStatus::Queued);
-        let (word, time) = if queued {
-            ("Queued", String::new())
+        let (word, token, time) = if queued {
+            ("Queued", "text-tertiary", String::new())
         } else {
-            ("Working", elapsed(now_ms() - run.started_at))
+            ("Working", "accent-blue", elapsed(now_ms() - run.started_at))
         };
         let mut header = div()
             .flex()
@@ -234,16 +241,21 @@ impl Workspace {
             .h(px(36.))
             .px(px(12.))
             .text_size(px(12.))
-            .child(
-                Icon::new(IconName::LoaderCircle)
-                    .size(px(14.))
-                    .text_color(color("accent-blue")),
-            )
+            .when(!queued, |header| {
+                header.child(
+                    Icon::new(IconName::LoaderCircle)
+                        .size(px(14.))
+                        .text_color(color(token)),
+                )
+            })
             .child(
                 div()
+                    .id(format!("run-state-{id}"))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(color("accent-blue"))
-                    .child(word),
+                    .text_color(color(token))
+                    .aria_label(word)
+                    .child(word)
+                    .test_support(),
             );
         if !time.is_empty() {
             header = header.child(
@@ -267,7 +279,7 @@ impl Workspace {
                     .small()
                     .label("Watch")
                     .disabled(true)
-                    .tooltip("Coming in the next step."),
+                    .tooltip("Coming soon."),
             )
             .child(
                 Button::new(format!("run-stop-{id}"))
@@ -289,7 +301,7 @@ impl Workspace {
                         .flex_col()
                         .px(px(12.))
                         .pb(px(8.))
-                        .children(summary.steps.iter().map(step_row)),
+                        .children(summary.steps.iter().enumerate().map(step_row)),
                 )
             })
             .test_support()
@@ -330,7 +342,7 @@ impl Workspace {
                             .small()
                             .label("Review changes")
                             .disabled(true)
-                            .tooltip("Coming in the next step."),
+                            .tooltip("Coming soon."),
                     ),
             )
             .child(div().flex().flex_col().px(px(12.)).pb(px(8.)).children(
@@ -403,7 +415,7 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
         )
 }
 
-fn step_row(step: &Step) -> impl IntoElement {
+fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
     let (icon, token) = match step.state {
         StepState::Done => (IconName::Check, "success"),
         StepState::Running => (IconName::LoaderCircle, "accent-blue"),
@@ -411,7 +423,7 @@ fn step_row(step: &Step) -> impl IntoElement {
     };
     let text = step.text();
     div()
-        .id(SharedString::from(format!("step-{text}")))
+        .id(("run-step", ix))
         .flex()
         .items_center()
         .gap(px(8.))
@@ -535,6 +547,29 @@ mod tests {
         );
         assert_eq!(summary.steps[0].lines, Some((1, 2)));
         assert_eq!(summary.counts().as_deref(), Some("2 files · +4 −2"));
+    }
+
+    #[test]
+    fn only_successful_edits_count() {
+        let run = RunId::new();
+        let edit = |seq, id: &str| {
+            call(
+                run,
+                seq,
+                id,
+                "Edit",
+                serde_json::json!({"file_path": "/work/demo/a.rs", "old_string": "a", "new_string": "b\nc"}),
+            )
+        };
+        let events = vec![edit(1, "t1"), result(run, 2, "t1", true), edit(3, "t2")];
+        let summary = summarize(&events, run);
+        assert_eq!(summary.counts(), None, "failed or still running");
+        assert_eq!(summary.steps[0].lines, None);
+        let mut events = events;
+        events.push(result(run, 4, "t2", false));
+        let summary = summarize(&events, run);
+        assert_eq!(summary.counts().as_deref(), Some("1 file · +2 −1"));
+        assert_eq!(summary.steps[1].lines, Some((2, 1)));
     }
 
     #[test]

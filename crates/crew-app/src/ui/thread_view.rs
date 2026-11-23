@@ -13,6 +13,7 @@ use gpui_kit::*;
 use super::common::{chip, clock, elapsed, monogram, runtime_chip};
 use super::run_card::summarize;
 use super::workspace::Workspace;
+use crate::fonts::{mono_font, ui_font};
 use crate::theme::color;
 
 impl Workspace {
@@ -295,7 +296,11 @@ impl Workspace {
                     .p(px(1.))
                     .rounded(px(8.))
                     .border_2()
-                    .border_color(color("accent-blue"))
+                    .border_color(color(if run.status == RunStatus::Working {
+                        "accent-blue"
+                    } else {
+                        "border-200"
+                    }))
                     .child(monogram(&name, 30.)),
             )
             .child(
@@ -424,31 +429,74 @@ fn policy_name(policy: Option<HandoffPolicy>) -> &'static str {
     }
 }
 
-/// The body with `@Agent` mentions in blue and `code` on a chip.
-fn styled_body(body: &str, names: &[String]) -> StyledText {
-    let mention = HighlightStyle {
-        color: Some(color("accent-blue")),
-        font_weight: Some(FontWeight::MEDIUM),
-        ..Default::default()
-    };
-    let code = HighlightStyle {
-        background_color: Some(color("surface-300")),
-        ..Default::default()
-    };
-    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    for range in code_spans(body) {
-        highlights.push((range, code));
-    }
+/// How a stretch of a message body is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    Plain,
+    Mention,
+    Code,
+}
+
+/// The body cut into stretches covering all of it, in order: `code`
+/// first, then known `@Agent` mentions outside code.
+fn body_spans(body: &str, names: &[String]) -> Vec<(Range<usize>, Span)> {
+    let mut marked: Vec<(Range<usize>, Span)> = code_spans(body)
+        .into_iter()
+        .map(|r| (r, Span::Code))
+        .collect();
     for range in mention_spans(body, names) {
-        if !highlights
+        if !marked
             .iter()
             .any(|(r, _)| r.start < range.end && range.start < r.end)
         {
-            highlights.push((range, mention));
+            marked.push((range, Span::Mention));
         }
     }
-    highlights.sort_by_key(|(r, _)| r.start);
-    StyledText::new(body.to_string()).with_highlights(highlights)
+    marked.sort_by_key(|(r, _)| r.start);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (range, span) in marked {
+        if at < range.start {
+            spans.push((at..range.start, Span::Plain));
+        }
+        at = range.end;
+        spans.push((range, span));
+    }
+    if at < body.len() {
+        spans.push((at..body.len(), Span::Plain));
+    }
+    spans
+}
+
+/// The body with `@Agent` mentions in blue and `code` in mono on a
+/// background. Text runs share one size and have no corner radius.
+fn styled_body(body: &str, names: &[String]) -> StyledText {
+    let runs = body_spans(body, names)
+        .into_iter()
+        .map(|(range, span)| {
+            let (mut font, text, background) = match span {
+                Span::Plain => (font(ui_font()), "text-primary", None),
+                Span::Mention => (font(ui_font()), "accent-blue", None),
+                Span::Code => (
+                    font(mono_font()),
+                    "text-primary",
+                    Some(color("surface-300")),
+                ),
+            };
+            if span == Span::Mention {
+                font.weight = FontWeight::MEDIUM;
+            }
+            TextRun {
+                len: range.len(),
+                font,
+                color: color(text),
+                background_color: background,
+                underline: None,
+                strikethrough: None,
+            }
+        })
+        .collect();
+    StyledText::new(body.to_string()).with_runs(runs)
 }
 
 /// Byte ranges of `code` spans, backticks included.
@@ -483,7 +531,7 @@ fn mention_spans(body: &str, names: &[String]) -> Vec<Range<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_spans, mention_spans};
+    use super::{Span, body_spans, code_spans, mention_spans};
 
     #[test]
     fn known_mentions_and_code_are_found() {
@@ -492,5 +540,24 @@ mod tests {
         assert_eq!(mention_spans(body, &names), vec![0..6_usize]);
         assert_eq!(&body[code_spans(body)[0].clone()], "`a.txt`");
         assert!(code_spans("one ` tick").is_empty());
+    }
+
+    #[test]
+    fn spans_cover_the_whole_body() {
+        let names = ["Forge".to_string()];
+        let body = "hi @Forge, see `@Forge x` ok";
+        let spans = body_spans(body, &names);
+        let kinds: Vec<(&str, Span)> = spans.iter().map(|(r, k)| (&body[r.clone()], *k)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("hi ", Span::Plain),
+                ("@Forge", Span::Mention),
+                (", see ", Span::Plain),
+                ("`@Forge x`", Span::Code),
+                (" ok", Span::Plain),
+            ]
+        );
+        assert!(body_spans("", &names).is_empty());
     }
 }

@@ -3,6 +3,8 @@
 mod common;
 pub mod composer;
 mod connect;
+#[cfg(debug_assertions)]
+mod dev_hooks;
 mod mention_menu;
 mod run_card;
 mod service_control;
