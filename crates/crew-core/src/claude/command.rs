@@ -12,6 +12,9 @@ use crate::ids::RunId;
 /// Name of the permission prompt tool crew-mcp serves.
 pub const APPROVE_TOOL: &str = "mcp__crew__approve";
 
+/// The handoff tool crew-mcp serves. Every wired agent may use it.
+pub const HANDOFF_TOOL: &str = "mcp__crew__handoff";
+
 /// Tools an `EditFiles` agent may use without asking when crew-mcp is wired.
 const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
@@ -97,7 +100,8 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 ///
 /// With `mcp`, the run gets crew-mcp as an MCP server. An `EditFiles`
 /// agent then runs in `default` mode and asks crewd through
-/// `mcp__crew__approve` before anything but file edits.
+/// `mcp__crew__approve` before anything but file edits. Every wired
+/// agent may use `mcp__crew__handoff` without asking.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
@@ -143,10 +147,16 @@ pub fn build_claude(
         args.push(agent.instructions.clone());
     }
     let mut allowed = agent.allowed_tools.clone();
-    if edits && mcp.is_some() {
-        // The agent's own list first, then the edit tools, each once.
+    if mcp.is_some() {
+        // The agent's own list first, then what wiring adds, each once.
+        let extra: &[&str] = if edits { &EDIT_TOOLS } else { &[] };
         let mut merged: Vec<String> = Vec::new();
-        for tool in allowed.iter().map(String::as_str).chain(EDIT_TOOLS) {
+        for tool in allowed
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .chain([HANDOFF_TOOL])
+        {
             if !merged.iter().any(|t| t == tool) {
                 merged.push(tool.to_string());
             }
@@ -312,7 +322,7 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.",
                 "--allowedTools",
-                "Read,Write,Grep,Edit,MultiEdit,NotebookEdit",
+                "Read,Write,Grep,Edit,MultiEdit,NotebookEdit,mcp__crew__handoff",
                 "--mcp-config",
                 &config,
                 "--permission-prompt-tool",
@@ -356,6 +366,8 @@ mod tests {
                 "abc",
                 "--append-system-prompt",
                 "Be brief.",
+                "--allowedTools",
+                "mcp__crew__handoff",
                 "--mcp-config",
                 &config,
                 "--",

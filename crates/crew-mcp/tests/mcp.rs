@@ -232,6 +232,40 @@ async fn crewd_error_becomes_tool_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn approve_denies_when_crewd_fails() {
+    let (_tmp, home) = home();
+    let _seen = fake_crewd(
+        &home,
+        Duration::ZERO,
+        answer(|_| Err("Not supported yet.".into())),
+    );
+    let mut mcp = Mcp::start(&home);
+    let (text, is_error) = mcp
+        .call(1, "approve", json!({"tool_name": "Bash", "input": {}}))
+        .await;
+    assert!(!is_error);
+    let decision: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        decision,
+        json!({"behavior": "deny", "message": "Not supported yet."})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_denies_an_unreadable_answer() {
+    let (_tmp, home) = home();
+    let _seen = fake_crewd(&home, Duration::ZERO, answer(|_| Ok(json!("yes"))));
+    let mut mcp = Mcp::start(&home);
+    let (text, is_error) = mcp
+        .call(1, "approve", json!({"tool_name": "Bash", "input": {}}))
+        .await;
+    assert!(!is_error);
+    let decision: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(decision["behavior"], "deny");
+    assert_eq!(decision["message"], "Crew sent an answer I can't read.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn approve_allow_returns_updated_input() {
     let (_tmp, home) = home();
     let mut seen = fake_crewd(
@@ -333,11 +367,16 @@ async fn unreachable_crewd_returns_error_text() {
         .await;
     assert_eq!(text, "Crew isn't reachable right now.");
     assert!(is_error);
+    // approve never fails: it denies, so Claude gets a clean answer.
     let (text, is_error) = mcp
         .call(2, "approve", json!({"tool_name": "Bash", "input": {}}))
         .await;
-    assert_eq!(text, "Crew isn't reachable right now.");
-    assert!(is_error);
+    assert!(!is_error);
+    let decision: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        decision,
+        json!({"behavior": "deny", "message": "Crew isn't reachable right now."})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -365,4 +404,9 @@ async fn bad_tool_calls_are_errors() {
         .request(2, "tools/call", json!({"name": "nope", "arguments": {}}))
         .await;
     assert_eq!(reply["error"]["code"], -32602);
+    // Even a malformed approve is a deny, never a tool error.
+    let (text, is_error) = mcp.call(3, "approve", json!({"input": {}})).await;
+    assert!(!is_error);
+    let decision: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(decision["behavior"], "deny");
 }

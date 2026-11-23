@@ -4,6 +4,7 @@ pub mod command;
 pub mod parse;
 
 pub use command::{
-    APPROVE_TOOL, ClaudeInvocation, McpWiring, SessionArg, build_claude, claude_bin_from,
+    APPROVE_TOOL, ClaudeInvocation, HANDOFF_TOOL, McpWiring, SessionArg, build_claude,
+    claude_bin_from,
 };
 pub use parse::parse_line;
