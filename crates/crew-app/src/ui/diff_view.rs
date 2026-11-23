@@ -239,13 +239,20 @@ impl Workspace {
         true
     }
 
-    /// The commit message drafted from the thread's latest agent reply.
+    /// The commit message drafted from the reply of the run that made the
+    /// changes, else from the thread's latest agent reply.
     fn current_draft(&self, thread: ThreadId) -> String {
-        self.state()
-            .messages(thread)
-            .iter()
-            .rev()
-            .find(|m| matches!(m.author, Author::Agent(_)))
+        let state = self.state();
+        let run = state.editing_run(thread).map(|r| r.id);
+        let replies = || {
+            state
+                .messages(thread)
+                .iter()
+                .rev()
+                .filter(|m| matches!(m.author, Author::Agent(_)))
+        };
+        run.and_then(|run| replies().find(|m| m.run == Some(run)))
+            .or_else(|| replies().next())
             .map(|m| draft_commit_message(&m.body))
             .unwrap_or_default()
     }
@@ -273,10 +280,12 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The agent whose changes these are: the latest to reply, else the
-    /// latest to run.
+    /// The agent whose changes these are: the one of the latest run that
+    /// may have changed files, else the latest to reply, else the latest
+    /// to run.
     fn review_agent(&self, thread: ThreadId) -> Option<String> {
         let state = self.state();
+        let edited = state.editing_run(thread).map(|r| r.agent);
         let replied = state
             .messages(thread)
             .iter()
@@ -286,7 +295,8 @@ impl Workspace {
                 _ => None,
             });
         let ran = state.thread_runs(thread).last().map(|r| r.agent);
-        replied
+        edited
+            .or(replied)
             .or(ran)
             .and_then(|a| state.agent(a))
             .map(|a| a.spec.name.clone())

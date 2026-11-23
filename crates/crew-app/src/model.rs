@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crew_core::event::{Event, RunStatus};
+use crew_core::agent::PermissionMode;
+use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{
     ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
@@ -405,6 +406,32 @@ impl State {
     pub fn thread_runs(&self, thread: ThreadId) -> Vec<&StoredRun> {
         sorted(self.runs.values().filter(|r| r.thread == thread), |r| {
             (r.started_at, r.id.0)
+        })
+    }
+
+    /// The thread's latest run that may have changed files: its agent can
+    /// edit, or it made an edit that worked. Needs the thread watched to
+    /// see edits.
+    pub fn editing_run(&self, thread: ThreadId) -> Option<&StoredRun> {
+        let events = self.events(thread);
+        let edited = |run: RunId| {
+            events.iter().any(|call| {
+                let Event::ToolCall { id, kind, .. } = &call.event else {
+                    return false;
+                };
+                call.run == run
+                    && matches!(kind, ToolKind::Edit | ToolKind::Create)
+                    && events.iter().any(|done| {
+                        done.run == run
+                            && matches!(&done.event, Event::ToolResult { id: got, is_error: false, .. } if got == id)
+                    })
+            })
+        };
+        self.thread_runs(thread).into_iter().rev().find(|run| {
+            let edits = self
+                .agent(run.agent)
+                .is_some_and(|a| a.spec.permission_mode != PermissionMode::ReadOnly);
+            edits || edited(run.id)
         })
     }
 
