@@ -139,13 +139,14 @@ impl Workspace {
                 )
             })
             .when(connected, |bar| {
+                let (enabled, token) = self.stop_all_look();
                 bar.child(
                     Button::new("status-stop-all")
                         .ghost()
                         .xsmall()
-                        .text_color(color("danger"))
+                        .text_color(color(token))
                         .label("Stop all ⌘⇧.")
-                        .disabled(self.stopping_all || !self.anything_live())
+                        .disabled(!enabled)
                         .on_click(cx.listener(|this, _, window, cx| this.stop_all(window, cx))),
                 )
             })

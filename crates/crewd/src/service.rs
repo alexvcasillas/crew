@@ -111,6 +111,10 @@ pub struct Service(Arc<Inner>);
 
 pub(crate) type Reply = Result<serde_json::Value, String>;
 
+/// How long `Runtimes` waits for the CLIs before it answers with less,
+/// unless set otherwise.
+pub const QUICK_ANSWER: Duration = Duration::from_secs(1);
+
 pub(crate) fn json(v: impl Serialize) -> Reply {
     serde_json::to_value(v).map_err(|e| e.to_string())
 }
@@ -127,6 +131,9 @@ pub struct CliBins {
     pub claude: Option<PathBuf>,
     /// Only looked for, by `Runtimes`.
     pub codex: Option<PathBuf>,
+    /// How long `Runtimes` waits for the CLIs before it answers with
+    /// less. `None` is [`QUICK_ANSWER`].
+    pub runtimes_wait: Option<Duration>,
 }
 
 impl Service {
@@ -193,7 +200,7 @@ impl Service {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
             Request::Discard { thread } => self.discard(thread).await,
-            Request::Runtimes => json(crate::runtimes::detect(&self.0.bins).await),
+            Request::Runtimes => self.runtimes().await,
             other => self.handle_now(other),
         }
     }
@@ -378,6 +385,27 @@ impl Service {
         let project = db.store.project(project).map_err(|e| e.to_string())?;
         self.publish_global(db, ServerMsg::ProjectChanged { project });
         Ok(())
+    }
+
+    /// The agent CLIs. A check that takes longer than the wait (by
+    /// default [`QUICK_ANSWER`]) is
+    /// answered with what was found on `PATH`, and `SubscribeAll` clients
+    /// get the whole of it once it ends.
+    async fn runtimes(&self) -> Reply {
+        let (tx, rx) = oneshot::channel();
+        let service = self.clone();
+        tokio::spawn(async move {
+            let full = crate::runtimes::detect(&service.0.bins).await;
+            if let Err(full) = tx.send(full) {
+                let mut db = service.db();
+                service.publish_global(&mut db, ServerMsg::RuntimesChanged { runtimes: full });
+            }
+        });
+        let wait = self.0.bins.runtimes_wait.unwrap_or(QUICK_ANSWER);
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(full)) => json(full),
+            _ => json(crate::runtimes::found(&self.0.bins)),
+        }
     }
 
     /// Tells `SubscribeAll` clients the channel as it is now.

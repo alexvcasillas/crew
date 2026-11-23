@@ -226,6 +226,10 @@ fn runtimes(answer: Result<Value, String>) -> Vec<RuntimeInfo> {
     serde_json::from_value(answer.unwrap()).unwrap()
 }
 
+/// Long enough that `Runtimes` waits for a slow fake claude, as these
+/// tests use it as a request that takes a while.
+const SLOW_RUNTIMES: Duration = Duration::from_secs(10);
+
 #[test]
 fn client_reconnects_after_daemon_restart_without_duplicates() {
     let tmp = tempfile::tempdir().unwrap();
@@ -294,7 +298,14 @@ fn requests_answered_out_of_order_reach_their_callers() {
     let tmp = tempfile::tempdir().unwrap();
     let claude = fake_claude(tmp.path(), 2, &reads_a_file());
     let home = short_home();
-    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let _daemon = Daemon::start_with_options(
+        home.path().to_path_buf(),
+        crewd::ServeOptions {
+            claude_bin: Some(claude),
+            runtimes_wait: Some(SLOW_RUNTIMES),
+            ..Default::default()
+        },
+    );
     let (client, _w) = connect(home.path());
 
     // Runtimes waits for claude's slow `--version`; crewd answers later
@@ -321,6 +332,7 @@ fn a_resync_reopens_only_the_stream() {
         crewd::ServeOptions {
             claude_bin: Some(claude),
             notice_buffer: 1,
+            runtimes_wait: Some(SLOW_RUNTIMES),
             ..Default::default()
         },
     );

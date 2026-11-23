@@ -341,7 +341,7 @@ fn render_footer(running: usize, stopping: bool, cx: &mut Context<Workspace>) ->
             Button::new("sidebar-stop-all")
                 .outline()
                 .xsmall()
-                .text_color(color("danger"))
+                .text_color(color(super::running_view::stop_all_look(true, stopping).1))
                 .icon(IconName::Square)
                 .label("Stop all")
                 .disabled(stopping)

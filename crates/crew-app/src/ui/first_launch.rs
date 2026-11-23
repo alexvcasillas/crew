@@ -11,15 +11,14 @@ use gpui_kit::*;
 
 use super::settings::Page;
 use super::settings::agents::{INSTALL_CLAUDE, blank_spec};
-use super::settings::projects::{FolderFor, Repo, folder_name};
-use super::settings::runtimes::{runtime_name, runtime_state};
+use super::settings::projects::{FIRST_CHANNEL, FolderFor, Repo, create_project, folder_name};
+use super::settings::runtimes::{listed_state, runtime_name};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::theme::color;
 
 pub const STARTER_NAME: &str = "Forge";
-const STARTER_CHANNEL: &str = "general";
 
 /// The starter agent: Claude Code, Sonnet, edits files.
 pub fn starter_spec() -> AgentSpec {
@@ -35,8 +34,11 @@ pub fn starter_spec() -> AgentSpec {
 /// Where the first launch is.
 #[derive(Default)]
 pub struct FirstLaunch {
-    /// The project you added.
+    /// The project you added, its `#general` and its folder. Set once:
+    /// step 1 is then done.
     pub project: Option<ProjectId>,
+    pub channel: Option<ChannelId>,
+    pub repo: Option<Repo>,
     pub error: Option<String>,
     /// Waiting on crewd.
     pub busy: bool,
@@ -50,7 +52,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(first) = self.first_launch.as_mut() else {
+        // A project was already added, or is being added.
+        let Some(first) = self
+            .first_launch
+            .as_mut()
+            .filter(|f| f.project.is_none() && !f.busy)
+        else {
             return;
         };
         let repo = match checked {
@@ -63,20 +70,18 @@ impl Workspace {
         };
         first.error = None;
         first.busy = true;
-        let answer = self.client.request(Request::CreateProject {
-            name: folder_name(&repo.root),
-            root: repo.root.to_string_lossy().into_owned(),
-            main_branch: repo.branch,
-        });
+        let made = create_project(self.client.clone(), folder_name(&repo.root), repo.clone());
         self.spawn_request(window, cx, async move |this, cx| {
-            let made = answer
-                .await
-                .and_then(|v| serde_json::from_value::<ProjectId>(v).map_err(|e| e.to_string()));
+            let made = made.await;
             this.update(cx, |this, cx| {
                 if let Some(first) = this.first_launch.as_mut() {
                     first.busy = false;
                     match made {
-                        Ok(project) => first.project = Some(project),
+                        Ok((project, channel)) => {
+                            first.project = Some(project);
+                            first.channel = Some(channel);
+                            first.repo = Some(repo);
+                        }
                         Err(e) => first.error = Some(e),
                     }
                 }
@@ -88,14 +93,15 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Makes Forge unless an agent has that name, then `#general` if the
-    /// project has no channel, and opens a new thread there.
+    /// Makes Forge unless an agent has that name, then opens a new thread
+    /// in the project's `#general` (made with the project, or made now if
+    /// it has no channel).
     fn create_starter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project) = self
+        let Some((project, made_channel)) = self
             .first_launch
             .as_ref()
             .filter(|f| !f.busy)
-            .and_then(|f| f.project)
+            .and_then(|f| Some((f.project?, f.channel)))
         else {
             return;
         };
@@ -109,11 +115,13 @@ impl Workspace {
             .iter()
             .any(|a| a.spec.name.eq_ignore_ascii_case(STARTER_NAME));
         let channels = state.channels(project);
-        let existing = channels
-            .iter()
-            .find(|c| c.name == STARTER_CHANNEL)
-            .or(channels.first())
-            .map(|c| c.id);
+        let existing = made_channel.or_else(|| {
+            channels
+                .iter()
+                .find(|c| c.name == FIRST_CHANNEL)
+                .or(channels.first())
+                .map(|c| c.id)
+        });
         let client = self.client.clone();
         self.spawn_request(window, cx, async move |this, cx| {
             let made = async {
@@ -131,7 +139,7 @@ impl Workspace {
                         let channel = client
                             .request(Request::CreateChannel {
                                 project,
-                                name: STARTER_CHANNEL.into(),
+                                name: FIRST_CHANNEL.into(),
                             })
                             .await?;
                         serde_json::from_value::<ChannelId>(channel).map_err(|e| e.to_string())
@@ -169,25 +177,30 @@ impl Workspace {
         let Some(first) = &self.first_launch else {
             return div().into_any_element();
         };
-        let project = first.project.and_then(|p| self.state().project(p));
-        let step1 = match project {
-            Some(p) => div()
-                .id("first-launch-project")
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .aria_label(format!("{} added", p.name))
-                .child(div().text_color(color("success")).child("✓"))
-                .child(div().font_weight(FontWeight::MEDIUM).child(p.name.clone()))
-                .child(
-                    div()
-                        .font_family(mono_font())
-                        .text_size(px(12.))
-                        .text_color(color("text-tertiary"))
-                        .child(format!("{} · {}", home_relative(&p.root), p.main_branch)),
-                )
-                .test_support()
-                .into_any_element(),
+        // Done once the project is added, whether or not crewd's notice of
+        // it arrived yet.
+        let added = first.repo.as_ref().filter(|_| first.project.is_some());
+        let step1 = match added {
+            Some(repo) => {
+                let name = folder_name(&repo.root);
+                div()
+                    .id("first-launch-project")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .aria_label(format!("{name} added"))
+                    .child(div().text_color(color("success")).child("✓"))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                    .child(
+                        div()
+                            .font_family(mono_font())
+                            .text_size(px(12.))
+                            .text_color(color("text-tertiary"))
+                            .child(format!("{} · {}", home_relative(&repo.root), repo.branch)),
+                    )
+                    .test_support()
+                    .into_any_element()
+            }
             None => div()
                 .flex()
                 .child(
@@ -195,7 +208,7 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Choose a folder…")
-                        .disabled(first.busy)
+                        .disabled(first.busy || self.picking_folder())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.choose_folder(FolderFor::FirstLaunch, window, cx);
                         })),
@@ -209,7 +222,7 @@ impl Workspace {
                 .iter()
                 .map(|info| {
                     let name = runtime_name(&info.runtime);
-                    let (word, token) = runtime_state(info);
+                    let (word, token) = listed_state(info);
                     let version = info
                         .version
                         .as_ref()
@@ -302,7 +315,7 @@ impl Workspace {
                                 .primary()
                                 .small()
                                 .label("Create Forge and start")
-                                .disabled(project.is_none() || first.busy)
+                                .disabled(first.project.is_none() || first.busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.create_starter(window, cx);
                                 })),

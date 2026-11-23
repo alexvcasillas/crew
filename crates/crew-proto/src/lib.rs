@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -173,7 +173,9 @@ pub enum Request {
         budget: Option<u32>,
     },
     /// Answered with `Vec<RuntimeInfo>`. Runs each CLI's `--version` and
-    /// sign-in status command, so it can take a few seconds.
+    /// sign-in status command. If they take over a second, the answer says
+    /// only which CLIs were found, and `ServerMsg::RuntimesChanged` follows
+    /// with the rest.
     Runtimes,
 }
 
@@ -260,6 +262,9 @@ pub enum ServerMsg {
     /// An agent was created, changed or deleted. Deleted agents have
     /// `deleted_at` set.
     AgentChanged { agent: StoredAgent },
+    /// What crewd found about the agent CLIs, once a slow `Runtimes`
+    /// check finished after its early answer.
+    RuntimesChanged { runtimes: Vec<RuntimeInfo> },
     /// This connection fell behind and missed notifications. crewd closes
     /// it next; connect and subscribe again to catch up.
     Resync,

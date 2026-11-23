@@ -16,6 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{control, field, form_error, help, segment, segmented};
+use crate::client::ClientHandle;
 use crate::fonts::mono_font;
 use crate::theme::color;
 use crate::ui::common::chip;
@@ -116,9 +117,39 @@ pub fn channel_name(text: &str, taken: &[&str]) -> Result<String, String> {
         return Err("Use - instead of spaces in a channel name.".into());
     }
     if taken.iter().any(|t| t.eq_ignore_ascii_case(name)) {
-        return Err(format!("This project already has #{name}."));
+        return Err(format!(
+            "This project already has #{name}. Pick another name."
+        ));
     }
     Ok(name.to_string())
+}
+
+/// The general channel every new project starts with.
+pub const FIRST_CHANNEL: &str = "general";
+
+/// Makes the project and its `#general`, the way both Settings and the
+/// first launch add one.
+pub(crate) async fn create_project(
+    client: ClientHandle,
+    name: String,
+    repo: Repo,
+) -> Result<(ProjectId, ChannelId), String> {
+    let project = client
+        .request(Request::CreateProject {
+            name,
+            root: repo.root.to_string_lossy().into_owned(),
+            main_branch: repo.branch,
+        })
+        .await?;
+    let project: ProjectId = serde_json::from_value(project).map_err(|e| e.to_string())?;
+    let channel = client
+        .request(Request::CreateChannel {
+            project,
+            name: FIRST_CHANNEL.into(),
+        })
+        .await?;
+    let channel: ChannelId = serde_json::from_value(channel).map_err(|e| e.to_string())?;
+    Ok((project, channel))
 }
 
 /// Who asked for a folder.
@@ -234,18 +265,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // One picker at a time.
+        if self.folder_task.is_some() {
+            return;
+        }
         let picked = (self.pick_folder)(cx);
         let background = cx.background_executor().clone();
         self.folder_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let Some(dir) = picked.await else {
-                return;
+            let checked = match picked.await {
+                Some(dir) => Some(background.spawn(async move { check_folder(&dir) }).await),
+                None => None,
             };
-            let checked = background.spawn(async move { check_folder(&dir) }).await;
             this.update_in(cx, |this, window, cx| {
-                this.folder_checked(target, checked, window, cx);
+                this.folder_task = None;
+                if let Some(checked) = checked {
+                    this.folder_checked(target, checked, window, cx);
+                }
+                cx.notify();
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    /// A picker is open or git is being asked about its folder.
+    pub(crate) fn picking_folder(&self) -> bool {
+        self.folder_task.is_some()
     }
 
     fn folder_checked(
@@ -258,7 +303,10 @@ impl Workspace {
         let checked = checked.and_then(|repo| {
             let known = self.state().projects().iter().any(|p| p.root == repo.root);
             if known {
-                Err(format!("{} is already a project.", folder_name(&repo.root)))
+                Err(format!(
+                    "{} is already a project. Open it from the sidebar.",
+                    folder_name(&repo.root)
+                ))
             } else {
                 Ok(repo)
             }
@@ -307,20 +355,19 @@ impl Workspace {
         }
         adding.saving = true;
         adding.error = None;
-        let req = Request::CreateProject {
-            name,
-            root: adding.repo.root.to_string_lossy().into_owned(),
-            main_branch: adding.repo.branch.clone(),
-        };
-        let answer = self.client.request(req);
+        let id = adding.name.entity_id();
+        let repo = adding.repo.clone();
+        let made = create_project(self.client.clone(), name, repo);
         self.spawn_request(window, cx, async move |this, cx| {
-            let made = answer
-                .await
-                .and_then(|v| serde_json::from_value::<ProjectId>(v).map_err(|e| e.to_string()));
+            let made = made.await;
             this.update_in(cx, |this, window, cx| match made {
-                Ok(project) => this.project_added(project, window, cx),
+                Ok((project, _)) => this.project_added(project, window, cx),
                 Err(e) => {
-                    if let Some(adding) = this.projects_page().and_then(|p| p.adding.as_mut()) {
+                    if let Some(adding) = this
+                        .projects_page()
+                        .and_then(|p| p.adding.as_mut())
+                        .filter(|a| a.name.entity_id() == id)
+                    {
                         adding.saving = false;
                         adding.error = Some(e);
                     }
@@ -374,6 +421,7 @@ impl Workspace {
         let copy_files = copy_lines(&form.copy_files.read(cx).value());
         form.saving = true;
         form.error = None;
+        let id = form.setup.entity_id();
         let req = Request::UpdateProject {
             project: form.project,
             setup_command: (!setup.is_empty()).then_some(setup),
@@ -383,7 +431,11 @@ impl Workspace {
         self.spawn_request(window, cx, async move |this, cx| {
             let result = answer.await;
             this.update(cx, |this, cx| {
-                if let Some(form) = this.projects_page().and_then(|p| p.form.as_mut()) {
+                if let Some(form) = this
+                    .projects_page()
+                    .and_then(|p| p.form.as_mut())
+                    .filter(|f| f.setup.entity_id() == id)
+                {
                     form.saving = false;
                     match result {
                         Ok(_) => form.saved = true,
@@ -561,6 +613,7 @@ impl Workspace {
                             .xsmall()
                             .icon(IconName::Plus)
                             .label("Add project")
+                            .disabled(self.picking_folder())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.choose_folder(FolderFor::Settings, window, cx);
                             })),
@@ -911,7 +964,7 @@ mod tests {
         assert!(channel_name("two words", &[]).is_err());
         assert_eq!(
             channel_name("General", &["general"]).unwrap_err(),
-            "This project already has #General."
+            "This project already has #General. Pick another name."
         );
     }
 }

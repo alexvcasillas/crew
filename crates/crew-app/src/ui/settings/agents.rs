@@ -13,6 +13,7 @@ use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::runtimes::runtime_state;
 use super::{control, field, form_error, help, segment, segmented};
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -226,14 +227,53 @@ pub fn claude_check(runtimes: &[RuntimeInfo]) -> ClaudeCheck {
     }
 }
 
+/// A form's fields as you typed them, valid or not.
+#[derive(Clone)]
+struct Fields {
+    name: String,
+    role: String,
+    model: &'static str,
+    other_model: String,
+    instructions: String,
+    permission: PermissionMode,
+    allowed_tools: String,
+    policy: Option<HandoffPolicy>,
+    budget: String,
+    max_minutes: String,
+}
+
+impl Fields {
+    fn of(spec: &AgentSpec) -> Self {
+        let known = MODELS.iter().find(|(m, _)| *m == spec.model).map(|m| m.0);
+        Self {
+            name: spec.name.clone(),
+            role: spec.role.clone(),
+            model: known.unwrap_or("sonnet"),
+            other_model: if known.is_some() {
+                String::new()
+            } else {
+                spec.model.clone()
+            },
+            instructions: spec.instructions.clone(),
+            permission: spec.permission_mode.clone(),
+            allowed_tools: spec.allowed_tools.join(", "),
+            policy: spec.handoff_policy,
+            budget: spec
+                .handoff_budget
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            max_minutes: spec.max_run_minutes.to_string(),
+        }
+    }
+}
+
 impl AgentForm {
     fn new(
         editing: Option<AgentId>,
-        spec: &AgentSpec,
+        f: Fields,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
-        let known = MODELS.iter().find(|(m, _)| *m == spec.model).map(|m| m.0);
         let mut input = |value: String, placeholder: &'static str, cx: &mut Context<Workspace>| {
             cx.new(|cx| {
                 InputState::new(window, cx)
@@ -241,35 +281,21 @@ impl AgentForm {
                     .default_value(value)
             })
         };
-        let name = input(spec.name.clone(), "Forge", cx);
-        let role = input(spec.role.clone(), "Engineer", cx);
-        let other_model = input(
-            if known.is_some() {
-                String::new()
-            } else {
-                spec.model.clone()
-            },
-            "Other model, such as claude-sonnet-4-5",
-            cx,
-        );
+        let name = input(f.name, "Forge", cx);
+        let role = input(f.role, "Engineer", cx);
+        let other_model = input(f.other_model, "Other model, such as claude-sonnet-4-5", cx);
         let allowed_tools = input(
-            spec.allowed_tools.join(", "),
+            f.allowed_tools,
             "e.g. Bash(cargo test:*), Bash(git diff:*)",
             cx,
         );
-        let budget = input(
-            spec.handoff_budget
-                .map(|b| b.to_string())
-                .unwrap_or_default(),
-            "3",
-            cx,
-        );
-        let max_minutes = input(spec.max_run_minutes.to_string(), "20", cx);
+        let budget = input(f.budget, "3", cx);
+        let max_minutes = input(f.max_minutes, "20", cx);
         let instructions = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(6)
                 .placeholder("What this agent is for and how it should work.")
-                .default_value(spec.instructions.clone())
+                .default_value(f.instructions)
         });
         let edited = |this: &mut Workspace, event: &InputEvent, cx: &mut Context<Workspace>| {
             if matches!(event, InputEvent::Change) {
@@ -297,12 +323,12 @@ impl AgentForm {
             editing,
             name,
             role,
-            model: known.unwrap_or("sonnet"),
+            model: f.model,
             other_model,
             instructions,
-            permission: spec.permission_mode.clone(),
+            permission: f.permission,
             allowed_tools,
-            policy: spec.handoff_policy,
+            policy: f.policy,
             budget,
             max_minutes,
             error: None,
@@ -312,29 +338,42 @@ impl AgentForm {
         }
     }
 
-    fn spec(&self, taken: &[&str], cx: &App) -> Result<AgentSpec, String> {
+    /// What is in the form now.
+    fn fields(&self, cx: &App) -> Fields {
         let text = |e: &Entity<InputState>| e.read(cx).value().to_string();
-        let (name, role, other, tools, budget, max) = (
-            text(&self.name),
-            text(&self.role),
-            text(&self.other_model),
-            text(&self.allowed_tools),
-            text(&self.budget),
-            text(&self.max_minutes),
-        );
-        let instructions = self.instructions.read(cx).value().to_string();
+        Fields {
+            name: text(&self.name),
+            role: text(&self.role),
+            model: self.model,
+            other_model: text(&self.other_model),
+            instructions: self.instructions.read(cx).value().to_string(),
+            permission: self.permission.clone(),
+            allowed_tools: text(&self.allowed_tools),
+            policy: self.policy,
+            budget: text(&self.budget),
+            max_minutes: text(&self.max_minutes),
+        }
+    }
+
+    /// Tells one form from another, so a late answer finds its own.
+    fn id(&self) -> EntityId {
+        self.name.entity_id()
+    }
+
+    fn spec(&self, taken: &[&str], cx: &App) -> Result<AgentSpec, String> {
+        let f = self.fields(cx);
         build_spec(
             &Draft {
-                name: &name,
-                role: &role,
-                model: self.model,
-                other_model: &other,
-                instructions: &instructions,
-                permission: self.permission.clone(),
-                allowed_tools: &tools,
-                policy: self.policy,
-                budget: &budget,
-                max_minutes: &max,
+                name: &f.name,
+                role: &f.role,
+                model: f.model,
+                other_model: &f.other_model,
+                instructions: &f.instructions,
+                permission: f.permission.clone(),
+                allowed_tools: &f.allowed_tools,
+                policy: f.policy,
+                budget: &f.budget,
+                max_minutes: &f.max_minutes,
             },
             taken,
         )
@@ -362,11 +401,11 @@ impl Workspace {
 
     /// Opens an empty form.
     pub(crate) fn new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = AgentForm::new(None, &blank_spec(), window, cx);
+        let form = AgentForm::new(None, Fields::of(&blank_spec()), window, cx);
         self.set_agent_form(form, window, cx);
     }
 
-    pub(super) fn edit_agent(
+    pub(crate) fn edit_agent(
         &mut self,
         agent: AgentId,
         window: &mut Window,
@@ -375,21 +414,19 @@ impl Workspace {
         let Some(spec) = self.state().agent(agent).map(|a| a.spec.clone()) else {
             return;
         };
-        let form = AgentForm::new(Some(agent), &spec, window, cx);
+        let form = AgentForm::new(Some(agent), Fields::of(&spec), window, cx);
         self.set_agent_form(form, window, cx);
     }
 
-    /// A new form holding a copy of this one, named `<Name>-copy`.
+    /// A new form holding what this one holds, as typed, named
+    /// `<Name>-copy`.
     fn duplicate_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.settings.as_ref().and_then(|s| s.agents.form.as_ref()) else {
             return;
         };
-        let mut spec = match form.spec(&[], cx) {
-            Ok(spec) => spec,
-            Err(_) => blank_spec(),
-        };
-        spec.name = format!("{}-copy", form.name.read(cx).value().trim());
-        let copy = AgentForm::new(None, &spec, window, cx);
+        let mut fields = form.fields(cx);
+        fields.name = format!("{}-copy", fields.name.trim());
+        let copy = AgentForm::new(None, fields, window, cx);
         self.set_agent_form(copy, window, cx);
     }
 
@@ -438,7 +475,7 @@ impl Workspace {
 
     /// Saves the form: a new agent, or the changes to one. Its next run
     /// uses them.
-    pub(super) fn save_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn save_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.claude_usable() {
             return;
         }
@@ -449,6 +486,7 @@ impl Workspace {
             return;
         }
         let editing = form.editing;
+        let id = form.id();
         let taken: Vec<&str> = self
             .state()
             .agents()
@@ -478,7 +516,7 @@ impl Workspace {
         self.spawn_request(window, cx, async move |this, cx| {
             let result = answer.await;
             this.update(cx, |this, cx| {
-                if let Some(form) = this.agent_form_mut() {
+                if let Some(form) = this.agent_form_mut().filter(|f| f.id() == id) {
                     form.saving = false;
                     match result {
                         Ok(value) => {
@@ -945,35 +983,25 @@ impl Workspace {
 
     /// Claude Code, then the runtimes that are coming.
     fn render_runtime_cards(&self) -> impl IntoElement {
-        let (detail, status, token) = match claude_check(&self.runtimes) {
-            ClaudeCheck::Checking => (String::new(), "Checking…".to_string(), "text-tertiary"),
-            ClaudeCheck::NotInstalled => (
-                INSTALL_CLAUDE.to_string(),
-                "Not installed".to_string(),
-                "warning",
-            ),
-            ClaudeCheck::Installed {
-                version,
-                path,
-                signed_in,
-            } => {
-                let detail = [
-                    Some(format!(
-                        "claude {}",
-                        version.unwrap_or_else(|| "(version unknown)".into())
-                    )),
-                    path,
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-                let (word, token) = match signed_in {
-                    Some(true) => ("Signed in", "success"),
-                    Some(false) => ("Signed out", "warning"),
-                    None => ("Installed", "text-secondary"),
-                };
-                (detail, word.to_string(), token)
+        let info = self
+            .runtimes
+            .iter()
+            .find(|r| r.runtime == Runtime::ClaudeCode);
+        let (detail, status, token) = match (self.runtimes.is_empty(), info) {
+            (true, _) => (String::new(), "Checking…", "text-tertiary"),
+            (false, Some(info)) if info.installed => {
+                let version = info.version.as_deref().unwrap_or("(version unknown)");
+                let detail = [Some(format!("claude {version}")), info.path.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let (word, token) = runtime_state(info);
+                (detail, word, token)
+            }
+            (false, info) => {
+                let (word, token) = info.map_or(("Not installed", "text-tertiary"), runtime_state);
+                (INSTALL_CLAUDE.to_string(), word, token)
             }
         };
         let claude = runtime_card("runtime-claude", true, true)

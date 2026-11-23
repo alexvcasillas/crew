@@ -694,7 +694,8 @@ async fn watch(
             | ServerMsg::ChannelChanged { .. }
             | ServerMsg::ThreadCreated { .. }
             | ServerMsg::ThreadChanged { .. }
-            | ServerMsg::AgentChanged { .. } => {}
+            | ServerMsg::AgentChanged { .. }
+            | ServerMsg::RuntimesChanged { .. } => {}
             ServerMsg::Resync => bail!("watch fell behind crewd. Run it again."),
         }
     }

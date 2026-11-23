@@ -50,6 +50,9 @@ pub struct ServeOptions {
     /// How many notifications a subscriber may fall behind before crewd
     /// sends it `Resync` and hangs up.
     pub notice_buffer: usize,
+    /// How long `Runtimes` waits for slow CLIs before answering with what
+    /// it found on `PATH`. `None` is one second.
+    pub runtimes_wait: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -61,6 +64,7 @@ impl Default for ServeOptions {
             crew_mcp_bin: default_crew_mcp_bin(),
             minute: Duration::from_secs(60),
             notice_buffer: 4096,
+            runtimes_wait: None,
         }
     }
 }
@@ -158,6 +162,7 @@ pub async fn serve_until(
         CliBins {
             claude: opts.claude_bin,
             codex: opts.codex_bin,
+            runtimes_wait: opts.runtimes_wait,
         },
         abs_home.join(WORKTREES_DIR),
         usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),

@@ -293,6 +293,9 @@ impl Workspace {
                 event,
                 ClientEvent::Msg(crew_proto::ServerMsg::Snapshot { .. })
             );
+            if let ClientEvent::Msg(crew_proto::ServerMsg::RuntimesChanged { runtimes }) = &event {
+                self.runtimes = runtimes.clone();
+            }
             event.apply_to(&mut self.state);
         }
         if connected {
