@@ -1,0 +1,13 @@
+# Local notes, specs, plans and mockups stay out of the repo
+docs/superpowers/
+docs/specs/
+docs/plans/
+specs/
+plans/
+artifacts/
+
+# Rust
+target/
+
+# macOS
+.DS_Store
