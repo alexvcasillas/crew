@@ -238,7 +238,8 @@ impl Service {
         }
     }
 
-    /// Uncommitted changes in the thread's worktree, or nothing if it has none.
+    /// Uncommitted changes in the thread's worktree, or nothing if it has
+    /// none. Files copied in from the project root are left out.
     async fn thread_diff(&self, thread: ThreadId) -> Reply {
         let wt = self
             .db()
@@ -249,21 +250,34 @@ impl Service {
         let Some(wt) = wt else {
             return json(Diff::default());
         };
-        json(blocking(move || worktree::diff(&wt.path, "HEAD")).await?)
+        let copied = self.copied_files(thread)?;
+        json(blocking(move || worktree::diff(&wt.path, "HEAD", &copied)).await?)
     }
 
-    /// Commits everything in the thread's worktree. The worktree stays.
+    /// The project's `copy_files`, which stay out of diffs and commits.
+    fn copied_files(&self, thread: ThreadId) -> Result<Vec<String>, String> {
+        let project = self
+            .db()
+            .store
+            .project_of_thread(thread)
+            .map_err(|e| e.to_string())?;
+        Ok(project.copy_files)
+    }
+
+    /// Commits everything in the thread's worktree except files copied in
+    /// from the project root. The worktree stays.
     async fn commit(&self, thread: ThreadId, message: &str) -> Reply {
         let message = message.trim().to_string();
         if message.is_empty() {
             return Err("Write a commit message.".into());
         }
+        let copied = self.copied_files(thread)?;
         let wt = self.claim_for_change(thread)?;
         let result = blocking(move || {
-            if worktree::diff(&wt.path, "HEAD")?.files.is_empty() {
+            if worktree::diff(&wt.path, "HEAD", &copied)?.files.is_empty() {
                 return Ok(None);
             }
-            worktree::commit(&wt.path, &message).map(Some)
+            worktree::commit(&wt.path, &message, &copied).map(Some)
         })
         .await;
         self.release_change(thread);
@@ -675,6 +689,8 @@ impl Service {
             found.map_err(|e| failed("Couldn't make the worktree", &e))?
         };
 
+        // A retry copies only the files that are missing, so edits stay.
+        let retry = thread.worktree.is_some();
         let wt = match thread.worktree {
             Some(wt) => wt,
             None => {
@@ -719,10 +735,15 @@ impl Service {
         }
         let (root, dest, files) = (project.root.clone(), wt.path.clone(), project.copy_files);
         let skipped = blocking(move || {
-            let skipped = worktree::copy_files(&root, &dest, &files)?;
-            let copied: Vec<String> = files.into_iter().filter(|f| !skipped.contains(f)).collect();
-            worktree::exclude(&dest, &copied)?;
-            Ok::<_, worktree::WorktreeError>(skipped)
+            let files: Vec<String> = if retry {
+                files
+                    .into_iter()
+                    .filter(|f| !dest.join(f).exists())
+                    .collect()
+            } else {
+                files
+            };
+            worktree::copy_files(&root, &dest, &files)
         })
         .await
         .map_err(|e| failed("Couldn't copy files into the worktree", &e))?;

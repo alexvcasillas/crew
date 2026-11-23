@@ -82,7 +82,7 @@ fn diff_lists_modified_added_and_untracked() {
     fs::write(dest.join("ignored.txt"), "nope\n").unwrap();
     let status_before = git(&dest, &["status", "--porcelain"]);
 
-    let diff = worktree::diff(&dest, &base).unwrap();
+    let diff = worktree::diff(&dest, &base, &[]).unwrap();
 
     let change = |path: &str, status: char, added: u32, removed: u32| FileChange {
         path: path.into(),
@@ -114,7 +114,7 @@ fn commit_then_diff_is_empty() {
     fs::write(dest.join("a.txt"), "changed\n").unwrap();
     fs::write(dest.join("c.txt"), "new\n").unwrap();
 
-    let sha = worktree::commit(&dest, "feat: change a").unwrap();
+    let sha = worktree::commit(&dest, "feat: change a", &[]).unwrap();
 
     assert_eq!(sha, git(&dest, &["rev-parse", "HEAD"]));
     assert_eq!(git(&dest, &["rev-parse", "HEAD^"]), base);
@@ -124,11 +124,11 @@ fn commit_then_diff_is_empty() {
         "Test <test@example.com>"
     );
     assert_eq!(git(&dest, &["status", "--porcelain"]), "");
-    let diff = worktree::diff(&dest, &sha).unwrap();
+    let diff = worktree::diff(&dest, &sha, &[]).unwrap();
     assert!(diff.files.is_empty());
     assert_eq!(diff.patch, "");
     // Against the thread's base the committed work still shows.
-    assert_eq!(worktree::diff(&dest, &base).unwrap().files.len(), 2);
+    assert_eq!(worktree::diff(&dest, &base, &[]).unwrap().files.len(), 2);
 }
 
 #[test]
@@ -189,31 +189,46 @@ fn copy_files_skips_missing() {
 }
 
 #[test]
-fn excluded_files_stay_out_of_diff_and_commit() {
+fn excluded_paths_stay_out_of_diff_and_commit() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_root, dest, base) = setup(tmp.path());
+    let (root, dest, base) = setup(tmp.path());
+    let root_exclude = root.join(".git/info/exclude");
+    let before = fs::read(&root_exclude).ok();
     fs::write(dest.join(".env.local"), "SECRET=1\n").unwrap();
     fs::create_dir_all(dest.join("config")).unwrap();
     fs::write(dest.join("config/dev.toml"), "x = 1\n").unwrap();
+    // A tracked file that was copied over is left out too.
+    fs::write(dest.join("b.txt"), "copied\n").unwrap();
     fs::write(dest.join("new.txt"), "new\n").unwrap();
+    let exclude = vec![
+        ".env.local".to_string(),
+        "config/dev.toml".to_string(),
+        "b.txt".to_string(),
+        "not-there.txt".to_string(),
+    ];
 
-    let files = vec![".env.local".to_string(), "config/dev.toml".to_string()];
-    worktree::exclude(&dest, &files).unwrap();
-    // A second call adds nothing.
-    worktree::exclude(&dest, &files).unwrap();
-
-    let exclude = git(&dest, &["rev-parse", "--git-path", "info/exclude"]);
-    let text = fs::read_to_string(dest.join(exclude)).unwrap();
-    assert_eq!(text.matches("/.env.local\n").count(), 1);
-    assert_eq!(text.matches("/config/dev.toml\n").count(), 1);
-
-    let diff = worktree::diff(&dest, &base).unwrap();
+    let diff = worktree::diff(&dest, &base, &exclude).unwrap();
     let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, vec!["new.txt"]);
-    worktree::commit(&dest, "Add new").unwrap();
+    assert!(!diff.patch.contains(".env.local"));
+    assert!(!diff.patch.contains("b.txt"));
+    assert!(diff.patch.contains("new.txt"));
+
+    worktree::commit(&dest, "Add new", &exclude).unwrap();
     assert_eq!(
         git(&dest, &["show", "--name-only", "--format=", "HEAD"]),
         "new.txt"
     );
     assert!(dest.join(".env.local").is_file());
+    assert_eq!(fs::read_to_string(dest.join("b.txt")).unwrap(), "copied\n");
+    // The excluded paths are still there, unstaged.
+    let paths: Vec<String> = worktree::diff(&dest, "HEAD", &[])
+        .unwrap()
+        .files
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    assert_eq!(paths, vec![".env.local", "b.txt", "config/dev.toml"]);
+    // The repo's own exclude file is never touched.
+    assert_eq!(fs::read(&root_exclude).ok(), before);
 }

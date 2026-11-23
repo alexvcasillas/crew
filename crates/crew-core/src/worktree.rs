@@ -83,43 +83,6 @@ pub fn copy_files(root: &Path, dest: &Path, files: &[String]) -> Result<Vec<Stri
     Ok(skipped)
 }
 
-/// Adds `files` (paths relative to the worktree) to the repo's
-/// `info/exclude`, so `diff` and `commit` leave them out. Paths already
-/// listed are not added again. The file is shared by all worktrees of
-/// the repo.
-pub fn exclude(dest: &Path, files: &[String]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let path = PathBuf::from(git(dest, ["rev-parse", "--git-path", "info/exclude"])?.trim());
-    let path = if path.is_absolute() {
-        path
-    } else {
-        dest.join(path)
-    };
-    let mut text = fs::read_to_string(&path).unwrap_or_default();
-    let mut changed = false;
-    for file in files {
-        let line = format!("/{}", file.trim_start_matches("./"));
-        if text.lines().any(|l| l == line) {
-            continue;
-        }
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&line);
-        text.push('\n');
-        changed = true;
-    }
-    if changed {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, text)?;
-    }
-    Ok(())
-}
-
 fn is_plain_relative(path: &str) -> bool {
     let path = Path::new(path);
     !path.as_os_str().is_empty()
@@ -129,30 +92,24 @@ fn is_plain_relative(path: &str) -> bool {
 }
 
 /// Everything in `dest` that differs from `base`: commits, staged and
-/// unstaged edits, and untracked files that are not ignored. The real
-/// index is left untouched.
-pub fn diff(dest: &Path, base: &str) -> Result<Diff> {
+/// unstaged edits, and untracked files that are not ignored. Paths in
+/// `exclude` (relative to `dest`) are left out. The real index is left
+/// untouched.
+pub fn diff(dest: &Path, base: &str, exclude: &[String]) -> Result<Diff> {
     let index = TempIndex::new(dest)?;
     index.git(["add", "-A"])?;
-    let names = index.git([
-        "diff",
-        "--cached",
-        "--no-renames",
-        "-z",
-        "--name-status",
-        base,
-        "--",
-    ])?;
-    let counts = index.git([
-        "diff",
-        "--cached",
-        "--no-renames",
-        "-z",
-        "--numstat",
-        base,
-        "--",
-    ])?;
-    let patch = index.git(["diff", "--cached", "--no-renames", base, "--"])?;
+    let mut paths = vec![".".to_string()];
+    paths.extend(exclude.iter().map(|p| format!(":(exclude,literal){p}")));
+    let diff = |opts: &[&str]| {
+        let mut args = vec!["diff", "--cached", "--no-renames"];
+        args.extend_from_slice(opts);
+        args.extend([base, "--"]);
+        args.extend(paths.iter().map(String::as_str));
+        index.git(args)
+    };
+    let names = diff(&["-z", "--name-status"])?;
+    let counts = diff(&["-z", "--numstat"])?;
+    let patch = diff(&[])?;
 
     let mut files = Vec::new();
     let mut fields = names.split('\0').filter(|s| !s.is_empty());
@@ -178,10 +135,21 @@ pub fn diff(dest: &Path, base: &str) -> Result<Diff> {
     Ok(Diff { files, patch })
 }
 
-/// Stages everything in `dest` and commits it. Uses the repo's git identity,
-/// or `Crew <crew@localhost>` for any part that is not set. Returns the sha.
-pub fn commit(dest: &Path, message: &str) -> Result<String> {
+/// Stages everything in `dest` except the paths in `exclude` (relative to
+/// `dest`) and commits it. Uses the repo's git identity, or
+/// `Crew <crew@localhost>` for any part that is not set. Returns the sha.
+pub fn commit(dest: &Path, message: &str, exclude: &[String]) -> Result<String> {
     git(dest, ["add", "-A"])?;
+    let present: Vec<String> = exclude
+        .iter()
+        .filter(|p| dest.join(p).exists())
+        .map(|p| format!(":(literal){p}"))
+        .collect();
+    if !present.is_empty() {
+        let mut args = vec!["reset".to_string(), "-q".into(), "--".into()];
+        args.extend(present);
+        git(dest, &args)?;
+    }
     let mut args: Vec<String> = Vec::new();
     for (key, fallback) in [("user.name", "Crew"), ("user.email", "crew@localhost")] {
         if config(dest, key)?.is_none() {
@@ -318,7 +286,11 @@ impl TempIndex {
         })
     }
 
-    fn git<const N: usize>(&self, args: [&str; N]) -> Result<String> {
+    fn git<I, S>(&self, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
         let mut cmd = command(&self.dir);
         cmd.env("GIT_INDEX_FILE", &self.path);
         run(cmd, args)

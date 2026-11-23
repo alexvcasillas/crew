@@ -494,6 +494,7 @@ async fn failed_setup_runs_again_next_time() {
     let mut c = d.client().await;
     let s = setup(&d, &mut c).await;
     std::fs::write(d.root().join(".env"), "KEY=1\n").unwrap();
+    std::fs::write(d.root().join(".env.dev"), "DEV=1\n").unwrap();
     // Fails the first time, works after that.
     let marker = scripts.path().join("tried");
     c.call(Request::UpdateProject {
@@ -502,7 +503,7 @@ async fn failed_setup_runs_again_next_time() {
             "if [ -f '{m}' ]; then echo second try; else touch '{m}'; exit 1; fi",
             m = marker.display()
         )),
-        copy_files: vec![".env".into()],
+        copy_files: vec![".env".into(), ".env.dev".into()],
     })
     .await
     .unwrap();
@@ -510,7 +511,9 @@ async fn failed_setup_runs_again_next_time() {
     post(&mut c, s.thread, "@Forge fix it").await;
     c.until_status(RunStatus::Failed).await;
     let wt_path = d.home.join("worktrees/demo/fix-login");
+    // The retry copies what is missing and keeps what is there.
     std::fs::remove_file(wt_path.join(".env")).unwrap();
+    std::fs::write(wt_path.join(".env.dev"), "EDITED=1\n").unwrap();
 
     post(&mut c, s.thread, "@Forge try again").await;
     let seen = c.until_status(RunStatus::Done).await;
@@ -519,11 +522,15 @@ async fn failed_setup_runs_again_next_time() {
         m,
         ServerMsg::Event { event: Event::ToolResult { output, .. }, .. } if output == "second try"
     )));
-    // Same worktree, files copied again, and now ready.
+    // Same worktree, missing files copied again, and now ready.
     let wt = thread_of(&mut c, &s).await.worktree.unwrap();
     assert_eq!(wt.path, wt_path);
     assert!(wt.ready);
     assert!(wt_path.join(".env").is_file());
+    assert_eq!(
+        std::fs::read_to_string(wt_path.join(".env.dev")).unwrap(),
+        "EDITED=1\n"
+    );
     assert!(wt_path.join("file.txt").is_file());
 
     // Ready: no setup on later runs.
@@ -539,6 +546,8 @@ async fn copied_files_stay_out_of_commits() {
     let mut c = d.client().await;
     let s = setup(&d, &mut c).await;
     std::fs::write(d.root().join(".env.local"), "SECRET=1\n").unwrap();
+    let root_exclude = d.root().join(".git/info/exclude");
+    let exclude_before = std::fs::read(&root_exclude).ok();
     c.call(Request::UpdateProject {
         project: s.project,
         setup_command: None,
@@ -565,6 +574,8 @@ async fn copied_files_stay_out_of_commits() {
     let committed = git(&wt_path, &["show", "--name-only", "--format=", "HEAD"]);
     assert_eq!(committed, "file.txt");
     assert!(wt_path.join(".env.local").is_file());
+    // The user's repo is left alone.
+    assert_eq!(std::fs::read(&root_exclude).ok(), exclude_before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
