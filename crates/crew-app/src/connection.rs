@@ -182,6 +182,39 @@ pub fn stop_crewd(conn: &ConnectionConfig, wait: Duration) -> bool {
     false
 }
 
+/// How many processes the crewd answering on `conn`'s socket has
+/// started, which are its running agents. 0 if none answers. Blocks, so
+/// run it off the UI thread.
+#[cfg(target_os = "macos")]
+pub fn crewd_children(conn: &ConnectionConfig) -> usize {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(conn.socket()) else {
+        return 0;
+    };
+    let Ok(pid) = getsockopt(&stream, LocalPeerPid) else {
+        return 0;
+    };
+    drop(stream);
+    match Command::new("pgrep")
+        .arg("-P")
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(out) => count_pids(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => 0,
+    }
+}
+
+/// The number of pids `pgrep` printed, one a line.
+#[cfg(target_os = "macos")]
+fn count_pids(printed: &str) -> usize {
+    printed
+        .lines()
+        .filter(|l| l.trim().parse::<u32>().is_ok())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +263,23 @@ mod tests {
             }
         );
         server.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pgrep_output_counts_one_agent_a_line() {
+        assert_eq!(count_pids("812\n813\n"), 2);
+        assert_eq!(count_pids(""), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nothing_on_the_socket_has_no_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = ConnectionConfig {
+            crew_home: dir.path().to_path_buf(),
+        };
+        assert_eq!(crewd_children(&conn), 0);
     }
 
     #[test]

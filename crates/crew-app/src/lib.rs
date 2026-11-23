@@ -13,6 +13,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod fonts;
 #[cfg(target_os = "macos")]
+pub mod launchd;
+#[cfg(target_os = "macos")]
 mod theme;
 #[cfg(target_os = "macos")]
 pub mod ui;

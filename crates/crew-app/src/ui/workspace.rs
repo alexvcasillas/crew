@@ -96,6 +96,11 @@ pub struct Workspace {
     next_request: u64,
     /// Starting crewd and waiting for it to answer.
     pub(super) service_task: Option<Task<()>>,
+    /// The bundled crewd launchd runs, when the app runs from its bundle.
+    /// A dev build starts the crewd beside it instead.
+    pub(super) bundled_crewd: Option<std::path::PathBuf>,
+    /// An out-of-date crewd was restarted, or found busy, once already.
+    pub(super) auto_restarted: bool,
     /// The last error shown as a notification.
     pub(super) last_error: Option<SharedString>,
     pub(super) inspector: Inspector,
@@ -162,6 +167,15 @@ impl Workspace {
                 },
             );
         let hooks = dev_hooks();
+        let bundled_crewd = std::env::current_exe()
+            .ok()
+            .and_then(|exe| crate::launchd::bundled_crewd(&exe));
+        if bundled_crewd.is_some() {
+            // Loads crewd's LaunchAgent, which starts it if needed.
+            cx.defer_in(window, |this, window, cx| {
+                this.start_service(false, window, cx)
+            });
+        }
         // Window-wide shortcuts such as Stop all need a focused element
         // inside the workspace, even before anything is clicked.
         let focus = cx.focus_handle();
@@ -192,6 +206,8 @@ impl Workspace {
             requests: HashMap::new(),
             next_request: 0,
             service_task: None,
+            bundled_crewd,
+            auto_restarted: false,
             last_error: None,
             inspector: Inspector::default(),
             editing: None,
@@ -300,6 +316,15 @@ impl Workspace {
         }
         if connected {
             self.watch_runtimes(cx);
+        }
+        if matches!(
+            self.state.connection(),
+            Some(ConnectionState::VersionMismatch { .. })
+        ) && self.bundled_crewd.is_some()
+            && !self.starting
+            && !std::mem::replace(&mut self.auto_restarted, true)
+        {
+            self.restart_service(true, window, cx);
         }
         // Only the first snapshot decides: an empty install starts with
         // the first launch.
@@ -639,7 +664,7 @@ impl Workspace {
                 match runtimes {
                     Ok(runtimes) => {
                         let kept = this.update(cx, |this, cx| {
-                            this.runtimes = runtimes;
+                            this.runtimes = merge_runtimes(&this.runtimes, runtimes);
                             cx.notify();
                         });
                         if kept.is_err() {
@@ -906,9 +931,70 @@ fn render_nothing_selected() -> impl IntoElement {
         )
 }
 
+/// The runtimes a `Runtimes` answer brings, keeping a known version and
+/// sign-in where the answer has neither for an installed CLI. A slow check
+/// answers with only what it found, and its RuntimesChanged may land first.
+fn merge_runtimes(known: &[RuntimeInfo], answer: Vec<RuntimeInfo>) -> Vec<RuntimeInfo> {
+    answer
+        .into_iter()
+        .map(|new| {
+            let bare = new.installed && new.version.is_none() && new.signed_in.is_none();
+            let fuller = known.iter().find(|k| {
+                k.runtime == new.runtime
+                    && k.installed
+                    && (k.version.is_some() || k.signed_in.is_some())
+            });
+            match fuller {
+                Some(k) if bare => k.clone(),
+                _ => new,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{near_bottom, thread_title, working_hint};
+    use super::{merge_runtimes, near_bottom, thread_title, working_hint};
+    use crew_core::agent::Runtime;
+    use crew_proto::RuntimeInfo;
+
+    fn info(runtime: Runtime, version: Option<&str>, signed_in: Option<bool>) -> RuntimeInfo {
+        RuntimeInfo {
+            runtime,
+            installed: true,
+            version: version.map(Into::into),
+            signed_in,
+            path: Some("/usr/local/bin/x".into()),
+        }
+    }
+
+    /// A quick answer that only says what was found doesn't overwrite the
+    /// fuller one a RuntimesChanged already brought.
+    #[test]
+    fn a_bare_runtimes_answer_keeps_what_is_known() {
+        let known = vec![
+            info(Runtime::ClaudeCode, Some("2.1.0"), Some(true)),
+            info(Runtime::Codex, None, None),
+        ];
+        let bare = vec![
+            info(Runtime::ClaudeCode, None, None),
+            info(Runtime::Codex, Some("0.5.0"), None),
+        ];
+        assert_eq!(
+            merge_runtimes(&known, bare),
+            vec![
+                info(Runtime::ClaudeCode, Some("2.1.0"), Some(true)),
+                info(Runtime::Codex, Some("0.5.0"), None),
+            ]
+        );
+        // Not installed any more wins.
+        let gone = RuntimeInfo {
+            installed: false,
+            path: None,
+            ..info(Runtime::ClaudeCode, None, None)
+        };
+        assert_eq!(merge_runtimes(&known, vec![gone.clone()]), vec![gone]);
+    }
 
     #[test]
     fn a_title_is_the_first_line_cut_to_80() {
