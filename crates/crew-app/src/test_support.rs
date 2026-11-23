@@ -144,3 +144,24 @@ pub fn always_refuse_hello(socket: &Path, theirs: u32) {
         });
     });
 }
+
+/// A recorded claude session from crew-core's fixtures, such as
+/// `read_file.jsonl`.
+pub fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../crew-core/tests/fixtures/claude")
+        .join(name)
+}
+
+/// A fake `claude` in `dir` that runs the shell script `run` as an agent
+/// and answers `--version` at once.
+pub fn fake_claude(dir: &Path, run: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("claude.sh");
+    let body = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo '9.9.9 (Claude Code)'; exit 0;;\n  auth) exit 0;;\nesac\n{run}\n"
+    );
+    std::fs::write(&bin, body).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}

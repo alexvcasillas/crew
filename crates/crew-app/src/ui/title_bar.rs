@@ -3,6 +3,9 @@
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
+use std::path::{Path, PathBuf};
+
+use super::common::chip;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -21,15 +24,24 @@ impl Workspace {
             .border_color(color("border-100"))
             .child(
                 // Equal flexible sides keep the search button centred.
-                div().flex_1().flex_basis(px(0.)).min_w_0().child(
-                    div()
-                        .id("title-app")
-                        .px(px(8.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .aria_label("Crew")
-                        .child("Crew")
-                        .test_support(),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .min_w_0()
+                    .px(px(8.))
+                    .child(
+                        div()
+                            .id("title-app")
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .aria_label("Crew")
+                            .child("Crew")
+                            .test_support(),
+                    )
+                    .children(self.render_breadcrumb()),
             )
             .child(render_search_button())
             .child(
@@ -42,6 +54,68 @@ impl Workspace {
                     .pl(px(TRAFFIC_LIGHTS_INSET))
                     .pr(px(12.)),
             )
+    }
+}
+
+impl Workspace {
+    /// `/ project / #channel` and the project's folder, for the selected
+    /// channel.
+    fn render_breadcrumb(&self) -> Vec<AnyElement> {
+        let state = self.state();
+        let Some(channel) = self.nav.channel.and_then(|c| state.channel(c)) else {
+            return Vec::new();
+        };
+        let Some(project) = state.project(channel.project) else {
+            return Vec::new();
+        };
+        let path = home_relative(&project.root);
+        let slash = || div().flex_none().text_color(color("border-200")).child("/");
+        vec![
+            slash().into_any_element(),
+            div()
+                .id("title-project")
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .aria_label(project.name.clone())
+                .child(project.name.clone())
+                .test_support()
+                .into_any_element(),
+            slash().into_any_element(),
+            div()
+                .id("title-channel")
+                .flex()
+                .flex_none()
+                .gap(px(2.))
+                .font_weight(FontWeight::MEDIUM)
+                .aria_label(format!("#{}", channel.name))
+                .child(
+                    div()
+                        .font_family(mono_font())
+                        .text_color(color("text-tertiary"))
+                        .child("#"),
+                )
+                .child(channel.name.clone())
+                .test_support()
+                .into_any_element(),
+            chip(path.clone())
+                .id("title-path")
+                .min_w_0()
+                .truncate()
+                .aria_label(path)
+                .test_support()
+                .into_any_element(),
+        ]
+    }
+}
+
+/// `path` with the home folder written as `~`.
+fn home_relative(path: &Path) -> String {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) if !home.as_os_str().is_empty() => match path.strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        _ => path.display().to_string(),
     }
 }
 

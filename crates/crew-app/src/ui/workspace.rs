@@ -1,13 +1,24 @@
 //! The window's root view: title bar, sidebar, main area and status bar.
+//! The views themselves live in their own files; this one holds what is
+//! selected and talks to the client.
 
-use crew_core::ids::ThreadId;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use crew_core::event::RunStatus;
+use crew_core::ids::{ChannelId, ProjectId, RunId, ThreadId};
+use crew_proto::Request;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
+use super::common::runtime_chip;
+use super::composer::{Composer, ComposerEvent};
+use super::mention_menu::MentionAgent;
 use super::status_bar::StatusBar;
+use crate::app::NewThread;
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
@@ -15,6 +26,25 @@ use crate::model::State;
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
+/// Longest thread title taken from a first message.
+pub const TITLE_MAX: usize = 80;
+
+/// What is selected and open, kept in memory only.
+#[derive(Default)]
+pub(super) struct Nav {
+    /// Projects whose channels are hidden.
+    pub(super) collapsed: HashSet<ProjectId>,
+    pub(super) channel: Option<ChannelId>,
+    /// The open, watched thread.
+    pub(super) thread: Option<ThreadId>,
+    /// Writing the first message of a new thread in `channel`.
+    pub(super) drafting: bool,
+    /// When you last looked at each channel, in Unix ms.
+    pub(super) viewed: HashMap<ChannelId, i64>,
+    pub(super) scroll: ScrollHandle,
+    /// Messages in the open thread when last drawn, to scroll on new ones.
+    seen_messages: usize,
+}
 
 pub struct Workspace {
     pub(super) conn: ConnectionConfig,
@@ -26,7 +56,15 @@ pub struct Workspace {
     /// Starting (or restarting) crewd.
     pub(super) starting: bool,
     status_bar: Entity<StatusBar>,
+    pub(super) composer: Entity<Composer>,
+    _composer_events: Subscription,
     focus: FocusHandle,
+    pub(super) nav: Nav,
+    /// Redraws the open thread's timers once a second while a run works.
+    ticker: Option<Task<()>>,
+    /// Requests waiting for their answers, by a number of their own.
+    requests: HashMap<u64, Task<()>>,
+    next_request: u64,
     /// Starting crewd and waiting for it to answer.
     pub(super) service_task: Option<Task<()>>,
     /// The last error shown as a notification.
@@ -36,6 +74,15 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (client, events) = client::spawn(conn.clone());
+        let composer = cx.new(|cx| Composer::new(window, cx));
+        let composer_events =
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, event, window, cx| match event {
+                    ComposerEvent::Send(text) => this.send(text.clone(), window, cx),
+                },
+            );
         Self {
             conn,
             state: State::default(),
@@ -43,7 +90,13 @@ impl Workspace {
             _client_events: Self::take_in_events(events, window, cx),
             starting: false,
             status_bar: cx.new(|_| StatusBar::default()),
+            composer,
+            _composer_events: composer_events,
             focus: cx.focus_handle(),
+            nav: Nav::default(),
+            ticker: None,
+            requests: HashMap::new(),
+            next_request: 0,
             service_task: None,
             last_error: None,
         }
@@ -52,6 +105,11 @@ impl Workspace {
     /// What the UI renders from.
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The open thread, if any.
+    pub fn open_thread_id(&self) -> Option<ThreadId> {
+        self.nav.thread
     }
 
     pub(super) fn starting(&self) -> bool {
@@ -84,7 +142,63 @@ impl Workspace {
         let connection = self.state.connection().cloned();
         self.status_bar
             .update(cx, |bar, cx| bar.set_connection(connection, cx));
+        self.sync(cx);
         cx.notify();
+    }
+
+    /// Brings the composer, the timer and the scroll position in line
+    /// with what is known and open.
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        let project = self
+            .nav
+            .channel
+            .and_then(|c| self.state.channel(c))
+            .and_then(|c| self.state.project(c.project))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let agents: Vec<MentionAgent> = self
+            .state
+            .agents()
+            .into_iter()
+            .map(|a| MentionAgent {
+                name: a.spec.name.clone(),
+                role: a.spec.role.clone(),
+                chip: runtime_chip(&a.spec),
+                status: self.state.agent_status(a.id),
+            })
+            .collect();
+        let working: Vec<String> = self
+            .nav
+            .thread
+            .map(|t| self.state.live_runs(t))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Working)
+            .filter_map(|r| self.state.agent(r.agent).map(|a| a.spec.name.clone()))
+            .collect();
+        let hint = working_hint(&working);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_context(agents, project, hint, cx)
+        });
+
+        if working.is_empty() {
+            self.ticker = None;
+        } else if self.ticker.is_none() {
+            self.ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        let messages = self.nav.thread.map_or(0, |t| self.state.messages(t).len());
+        if messages != self.nav.seen_messages {
+            self.nav.seen_messages = messages;
+            self.nav.scroll.scroll_to_bottom();
+        }
     }
 
     /// Shows `thread`'s events live: its log fills from crewd's backlog,
@@ -100,6 +214,167 @@ impl Workspace {
         self.client.unwatch_thread(thread);
     }
 
+    /// Shows the channel's threads.
+    pub(super) fn select_channel(
+        &mut self,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_thread();
+        self.nav.drafting = false;
+        self.look_at(Some(channel));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_first_message(false, window, cx)
+        });
+        self.sync(cx);
+        cx.notify();
+    }
+
+    /// Opens `thread` and watches it, in place of the open one.
+    pub(super) fn open_thread(
+        &mut self,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.nav.thread != Some(thread) {
+            self.close_thread();
+            self.watch_thread(thread);
+            self.nav.thread = Some(thread);
+            self.nav.seen_messages = 0;
+        }
+        self.nav.drafting = false;
+        let channel = self.state.thread(thread).map(|t| t.channel);
+        self.look_at(channel.or(self.nav.channel));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_first_message(false, window, cx);
+            composer.focus(window, cx);
+        });
+        self.sync(cx);
+        cx.notify();
+    }
+
+    /// Starts a new thread in the selected channel: the composer takes its
+    /// first message.
+    pub(super) fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav.channel.is_none() {
+            return;
+        }
+        self.close_thread();
+        self.nav.drafting = true;
+        self.composer.update(cx, |composer, cx| {
+            composer.set_first_message(true, window, cx);
+            composer.focus(window, cx);
+        });
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn close_thread(&mut self) {
+        if let Some(open) = self.nav.thread.take() {
+            self.unwatch_thread(open);
+        }
+    }
+
+    /// Marks the channel you leave and the one you go to as seen now.
+    fn look_at(&mut self, channel: Option<ChannelId>) {
+        let now = super::common::now_ms();
+        if let Some(left) = self.nav.channel {
+            self.nav.viewed.insert(left, now);
+        }
+        if let Some(channel) = channel {
+            self.nav.viewed.insert(channel, now);
+        }
+        self.nav.channel = channel;
+    }
+
+    /// Posts what you wrote: in the open thread, or as the first message
+    /// of a new one titled by its first line.
+    fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        if self.nav.drafting {
+            let Some(channel) = self.nav.channel else {
+                return;
+            };
+            let title = thread_title(&text);
+            self.spawn_request(window, cx, async move |this, cx| {
+                let thread = client
+                    .request(Request::CreateThread { channel, title })
+                    .await
+                    .and_then(|v| serde_json::from_value::<ThreadId>(v).map_err(|e| e.to_string()));
+                let thread = match thread {
+                    Ok(thread) => thread,
+                    Err(e) => return Err((e, Some(text))),
+                };
+                this.update_in(cx, |this, window, cx| this.open_thread(thread, window, cx))
+                    .ok();
+                client
+                    .request(Request::PostMessage {
+                        thread,
+                        body: text.clone(),
+                    })
+                    .await
+                    .map(drop)
+                    .map_err(|e| (e, Some(text)))
+            });
+        } else if let Some(thread) = self.nav.thread {
+            self.spawn_request(window, cx, async move |_, _| {
+                client
+                    .request(Request::PostMessage {
+                        thread,
+                        body: text.clone(),
+                    })
+                    .await
+                    .map(drop)
+                    .map_err(|e| (e, Some(text)))
+            });
+        }
+    }
+
+    pub(super) fn stop_run(&mut self, run: RunId, window: &mut Window, cx: &mut Context<Self>) {
+        self.request(Request::StopRun { run }, window, cx);
+    }
+
+    /// Sends `req`, showing its error if it fails.
+    pub(super) fn request(&mut self, req: Request, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = self.client.request(req);
+        self.spawn_request(window, cx, async move |_, _| {
+            answer.await.map(drop).map_err(|e| (e, None))
+        });
+    }
+
+    /// Runs `work`, keeping its task until it ends. An error is shown,
+    /// and its text, if any, goes back in the composer.
+    fn spawn_request(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        work: impl AsyncFnOnce(
+            WeakEntity<Self>,
+            &mut AsyncWindowContext,
+        ) -> Result<(), (String, Option<String>)>
+        + 'static,
+    ) {
+        let id = self.next_request;
+        self.next_request += 1;
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = work(this.clone(), cx).await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err((error, text)) = result {
+                    if let Some(text) = text {
+                        this.composer
+                            .update(cx, |composer, cx| composer.restore(&text, window, cx));
+                    }
+                    this.show_error(error, window, cx);
+                }
+                this.requests.remove(&id);
+            })
+            .ok();
+        });
+        self.requests.insert(id, task);
+    }
+
     /// Shows `error` as a notification.
     pub(super) fn show_error(
         &mut self,
@@ -112,12 +387,38 @@ impl Workspace {
     }
 }
 
+/// A thread's title from its first message: the first line, at most
+/// [`TITLE_MAX`] characters.
+pub fn thread_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    line.chars().take(TITLE_MAX).collect()
+}
+
+/// "Forge is working. A reply now is queued for its next turn."
+fn working_hint(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some(format!(
+            "{one} is working. A reply now is queued for its next turn."
+        )),
+        [rest @ .., last] => Some(format!(
+            "{} and {last} are working. A reply now is queued for their next turns.",
+            rest.join(", ")
+        )),
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(window, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -131,7 +432,7 @@ impl Render for Workspace {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(render_sidebar())
+                    .child(self.render_sidebar(cx))
                     .child(
                         div()
                             .id("main")
@@ -152,36 +453,22 @@ impl Workspace {
             None => div().into_any_element(),
             // Reconnecting keeps what is known on screen.
             Some(ConnectionState::Connected | ConnectionState::Reconnecting) => {
-                render_nothing_selected().into_any_element()
+                match (self.nav.thread, self.nav.channel) {
+                    (Some(thread), _) if self.state.thread(thread).is_some() => {
+                        self.render_thread(thread, cx).into_any_element()
+                    }
+                    (_, Some(channel)) if self.nav.drafting => {
+                        self.render_new_thread(channel).into_any_element()
+                    }
+                    (_, Some(channel)) if self.state.channel(channel).is_some() => {
+                        self.render_thread_list(channel, cx).into_any_element()
+                    }
+                    _ => render_nothing_selected().into_any_element(),
+                }
             }
             Some(state) => self.render_connect(state, cx).into_any_element(),
         }
     }
-}
-
-fn render_sidebar() -> impl IntoElement {
-    div()
-        .id("sidebar")
-        .flex()
-        .flex_col()
-        .flex_none()
-        .w(px(SIDEBAR_WIDTH))
-        .h_full()
-        .px(px(8.))
-        .py(px(12.))
-        .border_r_1()
-        .border_color(color("border-100"))
-        .child(
-            div()
-                .id("sidebar-projects")
-                .px(px(8.))
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(color("text-tertiary"))
-                .aria_label("Projects")
-                .child("Projects")
-                .test_support(),
-        )
 }
 
 fn render_nothing_selected() -> impl IntoElement {
@@ -201,102 +488,42 @@ fn render_nothing_selected() -> impl IntoElement {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::{thread_title, working_hint};
+
+    #[test]
+    fn a_title_is_the_first_line_cut_to_80() {
+        assert_eq!(
+            thread_title("Fix the login\nIt fails on Safari"),
+            "Fix the login"
+        );
+        assert_eq!(thread_title("\n  @Forge look  \nmore"), "@Forge look");
+        assert_eq!(thread_title(&"x".repeat(100)).chars().count(), 80);
+    }
+
+    #[test]
+    fn the_hint_names_who_is_working() {
+        assert_eq!(working_hint(&[]), None);
+        assert_eq!(
+            working_hint(&["Forge".into()]).as_deref(),
+            Some("Forge is working. A reply now is queued for its next turn.")
+        );
+        assert_eq!(
+            working_hint(&["Forge".into(), "Scout".into(), "Prism".into()]).as_deref(),
+            Some("Forge, Scout and Prism are working. A reply now is queued for their next turns.")
+        );
+    }
+}
+
+#[cfg(test)]
 mod gpui_tests {
-    use super::Workspace;
+    use super::super::test_ui::{click, has, notifications, open, shows, wait_to_show, wait_until};
     use crate::client;
     use crate::connection::ConnectionConfig;
     use crate::test_support::{Daemon, refuse_hello, short_home};
     use crew_core::ids::{ChannelId, ProjectId, ThreadId};
     use crew_proto::Request;
-    use gpui_kit::component::WindowExt as _;
-    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
-    use gpui_kit::{
-        AnyWindowHandle, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds,
-        WindowOptions, px, size,
-    };
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    /// Generous, for a loaded CI runner.
-    const WAIT: Duration = Duration::from_secs(20);
-
-    /// A window as `app::run` opens it, pointed at `home`. The client's
-    /// thread wakes the test executor, so parking is allowed.
-    fn open(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
-        cx.executor().allow_parking();
-        let conn = ConnectionConfig {
-            crew_home: home.to_path_buf(),
-        };
-        let (window, ws) = cx.update(|cx| {
-            gpui_kit::init(cx);
-            crate::app::init(cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: size(px(1440.), px(900.)),
-                })),
-                ..Default::default()
-            };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::new(conn, window, cx))
-            })
-            .unwrap()
-        });
-        cx.run_until_parked();
-        (window, ws)
-    }
-
-    /// Runs the app until `done` holds, in real time. Panics after
-    /// [`WAIT`].
-    fn wait_until(
-        cx: &mut TestAppContext,
-        what: &str,
-        mut done: impl FnMut(&mut TestAppContext) -> bool,
-    ) {
-        let started = Instant::now();
-        loop {
-            cx.run_until_parked();
-            if done(cx) {
-                return;
-            }
-            assert!(started.elapsed() < WAIT, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn wait_to_show(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) {
-        wait_until(cx, label, |cx| shows(cx, window, label));
-    }
-
-    fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) -> bool {
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            window.try_find_by_label(label).is_some()
-        })
-        .unwrap()
-    }
-
-    fn has(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) -> bool {
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            window.try_find(id).is_some()
-        })
-        .unwrap()
-    }
-
-    fn click(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-            window.click(id, cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-    }
-
-    fn notifications(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
-        cx.update_window(window, |_, window, cx| window.notifications(cx).len())
-            .unwrap()
-    }
+    use gpui_kit::TestAppContext;
 
     #[gpui_kit::test]
     fn window_opens_with_title_bar_and_status_bar(cx: &mut TestAppContext) {
