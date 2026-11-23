@@ -18,10 +18,13 @@ use super::approval_card::BriefEditor;
 use super::common::runtime_chip;
 use super::composer::{Composer, ComposerEvent};
 use super::diff_view::{Review, SavedMessage};
+use super::first_launch::FirstLaunch;
 use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
-use crate::app::{ApproveLatest, NewThread, ShowRunning, ShowThreads, StopAll};
+use super::settings::projects::{PickFolder, native_picker};
+use super::settings::{Page, SettingsView};
+use crate::app::{ApproveLatest, NewThread, OpenSettings, ShowRunning, ShowThreads, StopAll};
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
@@ -126,6 +129,20 @@ pub struct Workspace {
     pub(super) runtimes: Vec<RuntimeInfo>,
     /// Asks crewd for the runtimes now and every [`RUNTIMES_EVERY`].
     runtimes_task: Option<Task<()>>,
+    /// A Refresh of the runtimes is waiting for its answer.
+    pub(super) runtimes_checking: bool,
+    pub(super) runtimes_refresh: Option<Task<()>>,
+    /// Settings, shown in place of the body.
+    pub(super) settings: Option<SettingsView>,
+    /// The first launch, shown in place of the body until it is done.
+    pub(super) first_launch: Option<FirstLaunch>,
+    /// Whether the first snapshot was seen, which decides the first
+    /// launch.
+    snapshot_seen: bool,
+    /// Opens a folder picker.
+    pub(super) pick_folder: PickFolder,
+    /// Picking a folder and asking git about it.
+    pub(super) folder_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -138,6 +155,10 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     ComposerEvent::Send(text) => this.send(text.clone(), window, cx),
+                    ComposerEvent::OpenAgentSettings => {
+                        this.open_settings(Page::Agents, window, cx);
+                        this.new_agent(window, cx);
+                    }
                 },
             );
         let hooks = dev_hooks();
@@ -145,9 +166,14 @@ impl Workspace {
         // inside the workspace, even before anything is clicked.
         let focus = cx.focus_handle();
         let running = hooks.running.then(|| RunningView::new(cx.focus_handle()));
+        let settings = hooks
+            .settings
+            .map(|page| SettingsView::new(page, cx.focus_handle()));
         running
             .as_ref()
-            .map_or(&focus, |r| &r.focus)
+            .map(|r| &r.focus)
+            .or(settings.as_ref().map(|s| &s.focus))
+            .unwrap_or(&focus)
             .focus(window, cx);
         Self {
             conn,
@@ -182,7 +208,20 @@ impl Workspace {
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
+            runtimes_checking: false,
+            runtimes_refresh: None,
+            settings,
+            first_launch: None,
+            snapshot_seen: false,
+            pick_folder: native_picker(),
+            folder_task: None,
         }
+    }
+
+    /// Replaces the folder picker, as tests do.
+    #[cfg(test)]
+    pub(super) fn set_folder_picker(&mut self, pick: PickFolder) {
+        self.pick_folder = pick;
     }
 
     /// What the UI renders from.
@@ -247,13 +286,27 @@ impl Workspace {
 
     fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let mut connected = false;
+        let mut snapshot = false;
         for event in events {
             connected |= event == ClientEvent::Connected;
+            snapshot |= matches!(
+                event,
+                ClientEvent::Msg(crew_proto::ServerMsg::Snapshot { .. })
+            );
             event.apply_to(&mut self.state);
         }
         if connected {
             self.watch_runtimes(cx);
         }
+        // Only the first snapshot decides: an empty install starts with
+        // the first launch.
+        if snapshot && !std::mem::replace(&mut self.snapshot_seen, true) {
+            if self.state.projects().is_empty() {
+                self.first_launch = Some(FirstLaunch::default());
+            }
+            self.page_opened(window, cx);
+        }
+        self.sync_settings(window, cx);
         self.sync(cx);
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
@@ -675,6 +728,7 @@ struct StartupHooks {
     open_thread: Option<ThreadId>,
     review: Option<ThreadId>,
     running: bool,
+    settings: Option<Page>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and `CREW_APP_SHOW=diff:<thread>|running`, in
@@ -687,6 +741,7 @@ fn dev_hooks() -> StartupHooks {
             open_thread: hooks.open_thread,
             review: hooks.review,
             running: hooks.running,
+            settings: hooks.settings,
         }
     }
     #[cfg(not(debug_assertions))]
@@ -726,8 +781,11 @@ impl Render for Workspace {
                 cx.listener(|this, _: &ShowRunning, window, cx| this.show_running(window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &ShowThreads, window, cx| this.close_running(window, cx)),
+                cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(Page::General, window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -736,10 +794,14 @@ impl Render for Workspace {
             .font_family(ui_font())
             .text_size(px(13.))
             .child(self.render_title_bar(cx))
-            .child(if self.running.is_some() {
+            .child(if self.settings.is_some() {
+                self.render_settings(cx)
+            } else if self.running.is_some() {
                 self.render_running(cx)
             } else if self.review.is_some() {
                 self.render_review(cx)
+            } else if self.first_launch.is_some() && self.inspector_connected() {
+                self.render_first_launch(cx)
             } else {
                 self.render_body(cx)
             })
@@ -779,12 +841,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The thread the inspector shows: the open one, while connected.
-    fn inspector_thread(&self) -> Option<ThreadId> {
-        let shown = matches!(
+    /// Connected, or reconnecting with what was known still shown.
+    fn inspector_connected(&self) -> bool {
+        matches!(
             self.state.connection(),
             Some(ConnectionState::Connected | ConnectionState::Reconnecting)
-        );
+        )
+    }
+
+    /// Leaves settings and Running now for the threads.
+    fn show_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_settings(window, cx);
+        self.close_running(window, cx);
+    }
+
+    /// The thread the inspector shows: the open one, while connected.
+    fn inspector_thread(&self) -> Option<ThreadId> {
+        let shown = self.inspector_connected();
         self.nav
             .thread
             .filter(|t| shown && self.state.thread(*t).is_some())
@@ -948,13 +1021,35 @@ mod gpui_tests {
         assert!(!has(cx, window, "connect-start"));
     }
 
+    /// A project made by another client, so the first launch is skipped.
+    fn one_project(home: &std::path::Path) {
+        let (other, _events) = client::spawn(ConnectionConfig {
+            crew_home: home.to_path_buf(),
+        });
+        futures::executor::block_on(other.request(Request::CreateProject {
+            name: "demo".into(),
+            root: "/work/demo".into(),
+            main_branch: "main".into(),
+        }))
+        .unwrap();
+    }
+
+    fn wait_for_projects(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
+        wait_until(cx, "the snapshot", |cx| {
+            ws.read_with(cx, |ws, _| !ws.state().projects().is_empty())
+        });
+    }
+
     #[gpui_kit::test]
     fn connected_daemon_shows_the_workspace(cx: &mut TestAppContext) {
         let home = short_home();
         let _daemon = Daemon::start(home.path().to_path_buf());
+        one_project(home.path());
         let (window, ws) = open(cx, home.path());
         wait_connected(cx, &ws);
+        wait_for_projects(cx, &ws);
         assert!(shows(cx, window, "Nothing selected"));
+        assert!(!shows(cx, window, "Welcome to Crew"), "not a first launch");
         assert!(!has(cx, window, "connect-start"));
         assert!(
             !has(cx, window, "status-connection"),
@@ -968,8 +1063,10 @@ mod gpui_tests {
     fn a_lost_connection_keeps_the_workspace_while_reconnecting(cx: &mut TestAppContext) {
         let home = short_home();
         let daemon = Daemon::start(home.path().to_path_buf());
+        one_project(home.path());
         let (window, ws) = open(cx, home.path());
         wait_connected(cx, &ws);
+        wait_for_projects(cx, &ws);
 
         drop(daemon);
         let _silent =

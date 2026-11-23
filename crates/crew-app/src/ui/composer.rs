@@ -45,6 +45,8 @@ pub fn bindings() -> Vec<KeyBinding> {
 /// What you asked the composer to send.
 pub enum ComposerEvent {
     Send(String),
+    /// The mention menu's "Add one in Settings." was clicked.
+    OpenAgentSettings,
 }
 
 /// An open mention menu.
@@ -155,6 +157,12 @@ impl Composer {
             });
             cx.notify();
         }
+    }
+
+    /// Whether the text field has focus.
+    #[cfg(test)]
+    pub fn focused(&self, window: &Window, cx: &App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {

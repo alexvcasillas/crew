@@ -28,6 +28,20 @@ pub fn open_sized(
     home: &Path,
     width: f32,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_sized_tall(cx, home, width, 900.)
+}
+
+/// Like [`open`], tall enough that long forms need no scrolling.
+pub fn open_tall(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_sized_tall(cx, home, 1440., 1800.)
+}
+
+fn open_sized_tall(
+    cx: &mut TestAppContext,
+    home: &Path,
+    width: f32,
+    height: f32,
+) -> (AnyWindowHandle, Entity<Workspace>) {
     cx.executor().allow_parking();
     let conn = ConnectionConfig {
         crew_home: home.to_path_buf(),
@@ -38,7 +52,7 @@ pub fn open_sized(
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::default(),
-                size: size(px(width), px(900.)),
+                size: size(px(width), px(height)),
             })),
             ..Default::default()
         };

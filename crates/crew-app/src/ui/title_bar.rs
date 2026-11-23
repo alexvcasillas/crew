@@ -2,12 +2,13 @@
 //! settings.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, IconName, Sizable as _, TitleBar};
+use gpui_kit::component::{IconName, Sizable as _, TitleBar};
 use gpui_kit::*;
 
 use std::path::{Path, PathBuf};
 
 use super::common::{chip, dot};
+use super::settings::Page;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -28,7 +29,8 @@ const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 impl Workspace {
     pub(super) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let special = self
-            .render_running_title(cx)
+            .render_settings_title(cx)
+            .or_else(|| self.render_running_title(cx))
             .or_else(|| self.render_review_title(cx));
         if let Some((left, right)) = special {
             return TitleBar::new()
@@ -132,8 +134,10 @@ impl Workspace {
                 .small()
                 .icon(IconName::Settings)
                 .accessibility_label("Settings")
-                .disabled(true)
-                .tooltip("Coming soon.")
+                .tooltip("Settings (⌘,)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_settings(Page::General, window, cx);
+                }))
                 .into_any_element(),
         );
         actions

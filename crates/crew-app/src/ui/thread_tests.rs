@@ -366,6 +366,16 @@ fn empty_agents_mention_menu_points_to_settings(cx: &mut TestAppContext) {
     press(cx, window, "enter");
     assert!(!menu_open(cx, &ws));
     assert_eq!(composer_text(cx, &ws), "@");
+
+    type_text(cx, window, " @");
+    assert!(menu_open(cx, &ws));
+    click(cx, window, "mention-settings");
+    assert!(has(cx, window, "agent-form"), "a new agent's form");
+    ws.read_with(cx, |ws, _| {
+        let settings = ws.settings.as_ref().expect("settings open");
+        assert_eq!(settings.page, super::settings::Page::Agents);
+        assert_eq!(settings.agents.form.as_ref().unwrap().editing, None);
+    });
 }
 
 #[gpui_kit::test]

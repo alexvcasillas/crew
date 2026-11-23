@@ -4,7 +4,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{chip, monogram, status_word};
-use super::composer::Composer;
+use super::composer::{Composer, ComposerEvent};
 use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
 use crate::theme::color;
@@ -76,7 +76,7 @@ impl Composer {
             .rounded(px(8.))
             .shadow_lg();
         if self.agents.is_empty() {
-            return menu.child(render_no_agents()).test_support();
+            return menu.child(render_no_agents(cx)).test_support();
         }
         menu = menu.child(
             div()
@@ -176,8 +176,8 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
         )
 }
 
-/// "No agents yet. Add one in Settings." Settings opens in a later step.
-fn render_no_agents() -> impl IntoElement {
+/// "No agents yet. Add one in Settings." The link opens Settings › Agents.
+fn render_no_agents(cx: &mut Context<Composer>) -> impl IntoElement {
     div()
         .id("mention-empty")
         .flex()
@@ -192,10 +192,9 @@ fn render_no_agents() -> impl IntoElement {
                 .id("mention-settings")
                 .text_color(color("accent-blue"))
                 .cursor_pointer()
+                .role(Role::Link)
                 .child("Add one in Settings.")
-                .tooltip(|window, cx| {
-                    gpui_kit::component::tooltip::Tooltip::new("Coming soon.").build(window, cx)
-                })
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::OpenAgentSettings)))
                 .test_support(),
         )
         .test_support()

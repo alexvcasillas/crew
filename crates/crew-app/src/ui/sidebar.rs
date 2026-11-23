@@ -8,6 +8,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{dot, monogram, status_word};
+use super::settings::Page;
+use super::settings::projects::FolderFor;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
 use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
@@ -65,7 +67,15 @@ impl Workspace {
                     .overflow_y_scroll()
                     .px(px(8.))
                     .py(px(12.))
-                    .child(section_header("sidebar-projects", "Projects"))
+                    .child(section_header(
+                        "sidebar-projects",
+                        "Projects",
+                        "Add project",
+                        cx.listener(|this, _, window, cx| {
+                            this.open_settings(Page::Projects, window, cx);
+                            this.choose_folder(FolderFor::Settings, window, cx);
+                        }),
+                    ))
                     .children(projects)
                     .child(
                         div()
@@ -74,7 +84,15 @@ impl Workspace {
                             .h(px(1.))
                             .bg(color("border-100")),
                     )
-                    .child(section_header("sidebar-agents", "Agents"))
+                    .child(section_header(
+                        "sidebar-agents",
+                        "Agents",
+                        "New agent",
+                        cx.listener(|this, _, window, cx| {
+                            this.open_settings(Page::Agents, window, cx);
+                            this.new_agent(window, cx);
+                        }),
+                    ))
                     .children(agents),
             )
             .when(running > 0, |sidebar| {
@@ -235,8 +253,13 @@ fn row(id: String) -> Stateful<Div> {
         .hover(|row| row.bg(color("surface-200")))
 }
 
-/// "Projects" or "Agents", with a plus button that comes alive later.
-fn section_header(id: &'static str, title: &'static str) -> impl IntoElement {
+/// "Projects" or "Agents", with a plus button.
+fn section_header(
+    id: &'static str,
+    title: &'static str,
+    add: &'static str,
+    on_add: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -258,8 +281,9 @@ fn section_header(id: &'static str, title: &'static str) -> impl IntoElement {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
-                .disabled(true)
-                .tooltip("Coming soon."),
+                .accessibility_label(add)
+                .tooltip(add)
+                .on_click(on_add),
         )
 }
 
