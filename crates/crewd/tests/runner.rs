@@ -108,6 +108,11 @@ async fn stop_escalates_to_kill() {
 
     let pid = Pid::from_raw(pid as i32);
     assert_eq!(kill(pid, None), Err(Errno::ESRCH), "leader still exists");
+    // Killed grandchildren are reaped by init, which can take a moment.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while killpg(pid, None) != Err(Errno::ESRCH) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(killpg(pid, None), Err(Errno::ESRCH), "group still exists");
 
     // Stopping after exit is a no-op.
@@ -129,4 +134,68 @@ async fn dropped_receiver_does_not_block_run() {
         .expect("outcome within 5 s")
         .unwrap();
     assert_eq!(outcome, RunOutcome::Done);
+}
+
+#[tokio::test]
+async fn dropping_handle_stops_run() {
+    let inv = invocation(fake("claude_sleeps.sh"), vec![]);
+    let (handle, _rx, join) = spawn_run(inv);
+    let pid = Pid::from_raw(handle.pid().expect("spawned") as i32);
+    drop(handle);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("outcome within 2 s")
+        .unwrap();
+    assert_eq!(outcome, RunOutcome::Stopped);
+    assert_eq!(kill(pid, None), Err(Errno::ESRCH), "leader still exists");
+}
+
+#[tokio::test]
+async fn invalid_utf8_stderr_keeps_tail() {
+    let inv = invocation(fake("claude_bad_utf8.sh"), vec![]);
+    let (_handle, _rx, join) = spawn_run(inv);
+
+    match join.await.unwrap() {
+        RunOutcome::Failed(msg) => {
+            assert!(msg.contains("bad "), "missing bad line in {msg:?}");
+            assert!(
+                msg.contains("after bad line"),
+                "missing next line in {msg:?}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_cwd_fails_with_folder_message() {
+    let mut inv = invocation(fake("claude_ok.sh"), vec![]);
+    inv.cwd = PathBuf::from("/nonexistent/crew-test/work");
+    let (handle, _rx, join) = spawn_run(inv);
+    assert_eq!(handle.pid(), None);
+    assert_eq!(
+        join.await.unwrap(),
+        RunOutcome::Failed("Working folder /nonexistent/crew-test/work doesn't exist.".into())
+    );
+}
+
+#[tokio::test]
+async fn exit_zero_without_turn_end_fails() {
+    let inv = invocation(fake("claude_ok.sh"), vec!["/dev/null".into()]);
+    let (_handle, _rx, join) = spawn_run(inv);
+    assert_eq!(
+        join.await.unwrap(),
+        RunOutcome::Failed("`claude` exited before finishing the turn.".into())
+    );
+}
+
+#[tokio::test]
+async fn nonzero_exit_without_stderr_reports_code() {
+    let inv = invocation(fake("claude_exits_3.sh"), vec![]);
+    let (_handle, _rx, join) = spawn_run(inv);
+    assert_eq!(
+        join.await.unwrap(),
+        RunOutcome::Failed("`claude` exited with code 3.".into())
+    );
 }
