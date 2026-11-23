@@ -69,16 +69,6 @@ pub fn apply(plan: &Plan, restart: bool) -> Result<()> {
     Launchd::system()?.apply(plan, restart)
 }
 
-/// Writes the LaunchAgent for `crewd` on `crew_home` if it is missing or
-/// different, loads it, and starts crewd if it isn't running. Reloading a
-/// changed plist restarts crewd: check [`Plan::reloads`] first when that
-/// matters.
-pub fn ensure(crewd: &Path, crew_home: &Path) -> Result<()> {
-    let launchd = Launchd::system()?;
-    let plan = launchd.plan(crewd, crew_home, false)?;
-    launchd.apply(&plan, false)
-}
-
 /// What a command printed and how it exited.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Output {
@@ -707,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn first_ensure_writes_bootstraps_and_starts() {
+    fn first_apply_writes_bootstraps_and_starts() {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake {
             shell_out: Some("/usr/bin:/bin".into()),
