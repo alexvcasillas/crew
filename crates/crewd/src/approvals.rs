@@ -46,18 +46,41 @@ fn spec_of(agents: &[(AgentId, AgentSpec)], id: AgentId) -> Result<&AgentSpec, S
         .ok_or(StoreError::NotFound("agent"))
 }
 
+/// One handoff request: in `thread`, the agent of run `run` (`from`)
+/// brings in `to` with `brief`.
+struct HandoffReq {
+    thread: ThreadId,
+    run: RunId,
+    from: AgentId,
+    to: AgentId,
+    brief: String,
+}
+
+/// Whether `run` is live and nobody asked it to stop.
+fn running(state: &State, run: RunId) -> bool {
+    state
+        .live
+        .get(&run)
+        .is_some_and(|(_, handle)| !handle.is_stopped())
+}
+
 impl Service {
     /// Saves a permission ask of a live run and tells the thread. The
     /// receiver gets the answer once someone decides, or is dropped if
-    /// crewd goes away first.
+    /// crewd goes away first. A run that is stopping is denied at once.
     pub(crate) fn ask_permission(
         &self,
         run: RunId,
         tool: &str,
         input: serde_json::Value,
     ) -> Result<oneshot::Receiver<PermissionAnswer>, String> {
+        let (tx, rx) = oneshot::channel();
         let mut state = self.state();
-        if !state.live.contains_key(&run) {
+        if state.live.contains_key(&run) && !running(&state, run) {
+            let _ = tx.send(stopped_answer());
+            return Ok(rx);
+        }
+        if !running(&state, run) {
             return Err("That run isn't running.".into());
         }
         let mut db = self.db();
@@ -84,7 +107,6 @@ impl Service {
         };
         self.add_message(&mut db, stored.thread, Author::System, &body, Some(run))
             .map_err(store_err)?;
-        let (tx, rx) = oneshot::channel();
         state.waiting.insert(id, tx);
         Ok(rx)
     }
@@ -94,32 +116,31 @@ impl Service {
     pub(crate) fn handoff(&self, run: RunId, agent: &str, brief: String) -> Result<String, String> {
         let text = {
             let mut state = self.state();
-            if !state.live.contains_key(&run) {
+            if !running(&state, run) {
                 return Err("That run isn't running.".into());
             }
             let mut db = self.db();
             let stored = db.store.run(run).map_err(store_err)?;
             let agents = db.store.agents().map_err(store_err)?;
+            let wanted = agent.trim().trim_start_matches('@');
             let to = agents
                 .iter()
-                .find(|(_, spec)| spec.name.eq_ignore_ascii_case(agent.trim()))
+                .find(|(_, spec)| spec.name.eq_ignore_ascii_case(wanted))
                 .map(|(id, _)| *id)
-                .ok_or_else(|| format!("There's no agent named {}.", agent.trim()))?;
+                .ok_or_else(|| format!("There's no agent named {wanted}."))?;
             if to == stored.agent {
                 return Err("You can't hand off to yourself.".into());
             }
             state.handed.entry(run).or_default().push(to);
-            self.request_handoff(
-                &mut state,
-                &mut db,
-                &agents,
-                stored.thread,
+            let req = HandoffReq {
+                thread: stored.thread,
                 run,
-                stored.agent,
+                from: stored.agent,
                 to,
                 brief,
-            )
-            .map_err(store_err)?
+            };
+            self.request_handoff(&mut state, &mut db, &agents, req)
+                .map_err(store_err)?
         };
         self.start_ready();
         Ok(text)
@@ -148,36 +169,31 @@ impl Service {
             if handed.contains(to) {
                 continue;
             }
-            self.request_handoff(
-                state,
-                db,
-                &agents,
+            let req = HandoffReq {
                 thread,
                 run,
-                agent,
-                *to,
-                reply.to_string(),
-            )?;
+                from: agent,
+                to: *to,
+                brief: reply.to_string(),
+            };
+            self.request_handoff(state, db, &agents, req)?;
         }
         Ok(())
     }
 
     /// Applies the thread's handoff policy to one request and returns the
     /// text for the requesting agent.
-    #[allow(clippy::too_many_arguments)]
     fn request_handoff(
         &self,
         state: &mut State,
         db: &mut Db,
         agents: &[(AgentId, AgentSpec)],
-        thread: ThreadId,
-        run: RunId,
-        from: AgentId,
-        to: AgentId,
-        brief: String,
+        req: HandoffReq,
     ) -> Result<String, StoreError> {
-        let from_spec = spec_of(agents, from)?;
-        let (from_name, to_name) = (from_spec.name.clone(), spec_of(agents, to)?.name.clone());
+        let from_spec = spec_of(agents, req.from)?;
+        let from_name = from_spec.name.clone();
+        let to_name = spec_of(agents, req.to)?.name.clone();
+        let (thread, run) = (req.thread, req.run);
         let row = db.store.thread(thread)?;
         let inputs = policy_inputs(db, &row, Some(from_spec))?;
         let system = |svc: &Service, db: &mut Db, body: &str| {
@@ -186,7 +202,7 @@ impl Service {
         };
         match policy::decide(&inputs) {
             Decision::Ask => {
-                self.ask_handoff(db, thread, run, from, to, brief, false)?;
+                self.ask_handoff(db, req, false)?;
                 system(
                     self,
                     db,
@@ -196,12 +212,13 @@ impl Service {
             }
             Decision::Run => {
                 db.store.bump_handoffs_used(thread)?;
+                let queued = db.store.create_run(thread, req.to)?;
                 system(self, db, &format!("{from_name} brought in {to_name}."))?;
-                self.enqueue_handoff(state, db, thread, to, brief)?;
+                self.queue_handoff(state, db, thread, queued, req.to, req.brief);
                 Ok(format!("{to_name} will pick this up after you finish."))
             }
             Decision::Pause { budget } => {
-                self.ask_handoff(db, thread, run, from, to, brief, true)?;
+                self.ask_handoff(db, req, true)?;
                 system(
                     self,
                     db,
@@ -212,38 +229,28 @@ impl Service {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn ask_handoff(
-        &self,
-        db: &mut Db,
-        thread: ThreadId,
-        run: RunId,
-        from: AgentId,
-        to: AgentId,
-        brief: String,
-        paused: bool,
-    ) -> Result<(), StoreError> {
+    fn ask_handoff(&self, db: &mut Db, req: HandoffReq, paused: bool) -> Result<(), StoreError> {
         let kind = ApprovalKind::Handoff {
-            from,
-            to,
-            brief,
+            from: req.from,
+            to: req.to,
+            brief: req.brief,
             paused,
         };
-        let id = db.store.create_approval(thread, run, &kind)?;
+        let id = db.store.create_approval(req.thread, req.run, &kind)?;
         self.publish_approval(db, id)
     }
 
-    /// Queues a run of `to` in the thread with `brief` as its prompt. It
-    /// waits behind whatever runs there now.
-    fn enqueue_handoff(
+    /// Queues the saved run `run` of `to` with `brief` as its prompt. It
+    /// waits behind whatever runs in the thread now.
+    fn queue_handoff(
         &self,
         state: &mut State,
         db: &mut Db,
         thread: ThreadId,
+        run: RunId,
         to: AgentId,
         brief: String,
-    ) -> Result<(), StoreError> {
-        let run = db.store.create_run(thread, to)?;
+    ) {
         self.publish_status(db, thread, run, RunStatus::Queued);
         state.scheduler.enqueue(Job {
             run,
@@ -251,7 +258,6 @@ impl Service {
             agent: to,
             prompt: brief,
         });
-        Ok(())
     }
 
     /// Approves or declines a pending approval.
@@ -268,6 +274,17 @@ impl Service {
             if current.status != ApprovalStatus::Pending {
                 return Err("That request was already answered.".into());
             }
+            // The handoff's own changes come first, so if one fails the
+            // approval stays pending.
+            let queued = match &current.kind {
+                ApprovalKind::Handoff {
+                    from, to, paused, ..
+                } if approve => Some(
+                    self.approve_handoff(&mut db, &current, *from, *to, *paused)
+                        .map_err(store_err)?,
+                ),
+                _ => None,
+            };
             let status = if approve {
                 ApprovalStatus::Approved
             } else {
@@ -285,7 +302,7 @@ impl Service {
                     approval: decided.clone(),
                 },
             );
-            match &decided.kind {
+            match decided.kind {
                 ApprovalKind::Permission { .. } => {
                     if let Some(tx) = state.waiting.remove(&id) {
                         let message = (!approve).then(|| DECLINED.to_string());
@@ -296,53 +313,56 @@ impl Service {
                         });
                     }
                 }
-                ApprovalKind::Handoff { .. } => self
-                    .decide_handoff(&mut state, &mut db, decided, approve)
-                    .map_err(store_err)?,
+                ApprovalKind::Handoff {
+                    from, to, brief, ..
+                } => {
+                    let agents = db.store.agents().map_err(store_err)?;
+                    let to_name = spec_of(&agents, to).map_err(store_err)?.name.clone();
+                    let body = match queued {
+                        Some(run) => {
+                            let from_name = spec_of(&agents, from).map_err(store_err)?.name.clone();
+                            self.queue_handoff(&mut state, &mut db, decided.thread, run, to, brief);
+                            format!("{from_name} brought in {to_name}.")
+                        }
+                        None => format!("Declined {to_name}."),
+                    };
+                    self.add_message(
+                        &mut db,
+                        decided.thread,
+                        Author::System,
+                        &body,
+                        Some(decided.run),
+                    )
+                    .map_err(store_err)?;
+                }
             }
         }
         self.start_ready();
         Ok(())
     }
 
-    /// Runs or drops a decided handoff and tells the thread.
-    fn decide_handoff(
+    /// Saves what an approved handoff changes: one more in the budget if
+    /// it was paused, one more used, and a new run of `to`. Returns that run.
+    fn approve_handoff(
         &self,
-        state: &mut State,
         db: &mut Db,
-        approval: StoredApproval,
-        approve: bool,
-    ) -> Result<(), StoreError> {
-        let ApprovalKind::Handoff {
-            from,
-            to,
-            brief,
-            paused,
-        } = approval.kind
-        else {
-            return Ok(());
-        };
+        approval: &StoredApproval,
+        from: AgentId,
+        to: AgentId,
+        paused: bool,
+    ) -> Result<RunId, StoreError> {
         let thread = approval.thread;
-        let agents = db.store.agents()?;
-        let to_name = spec_of(&agents, to)?.name.clone();
-        let from_spec = spec_of(&agents, from)?;
-        let body = if approve {
-            if paused {
-                // One more, so exactly this handoff runs.
-                let row = db.store.thread(thread)?;
-                let budget = policy::budget(&policy_inputs(db, &row, Some(from_spec))?);
-                let raised = budget.saturating_add(1);
-                db.store
-                    .set_thread_handoff(thread, row.handoff_policy, Some(raised))?;
-            }
-            db.store.bump_handoffs_used(thread)?;
-            self.enqueue_handoff(state, db, thread, to, brief)?;
-            format!("{} brought in {to_name}.", from_spec.name)
-        } else {
-            format!("Declined {to_name}.")
-        };
-        self.add_message(db, thread, Author::System, &body, Some(approval.run))?;
-        Ok(())
+        if paused {
+            // One more, so exactly this handoff runs.
+            let agents = db.store.agents()?;
+            let row = db.store.thread(thread)?;
+            let inputs = policy_inputs(db, &row, Some(spec_of(&agents, from)?))?;
+            let raised = policy::budget(&inputs).saturating_add(1);
+            db.store
+                .set_thread_handoff(thread, row.handoff_policy, Some(raised))?;
+        }
+        db.store.bump_handoffs_used(thread)?;
+        db.store.create_run(thread, to)
     }
 
     /// Lets `n` more handoffs run in the thread on their own.

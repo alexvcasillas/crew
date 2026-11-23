@@ -22,7 +22,8 @@ const WAIT: Duration = Duration::from_secs(10);
 /// A fake claude. It logs its arguments to `args.log` (each argument ends
 /// with byte 0x1e, each call with 0x1f). A prompt that ends with `WAIT`
 /// waits until the file `go` exists and then replies with the text in
-/// `reply`, if there is one. Any other prompt replies "ok" at once.
+/// `reply`, if there is one. `STUBBORN` does the same but ignores SIGINT,
+/// so a stop takes until SIGTERM. Any other prompt replies "ok" at once.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude-fake.sh");
     let script = format!(
@@ -32,6 +33,10 @@ printf '\037' >> '{dir}/args.log'
 for last in "$@"; do :; done
 reply=ok
 case "$last" in
+  *STUBBORN)
+    trap '' INT
+    while [ ! -e '{dir}/go' ]; do sleep 0.02; done
+    ;;
   *WAIT)
     while [ ! -e '{dir}/go' ]; do sleep 0.02; done
     if [ -f '{dir}/reply' ]; then reply=$(cat '{dir}/reply'); fi
@@ -294,9 +299,13 @@ async fn setup(d: &Daemon, c: &mut Client, forge_minutes: u32) -> Chat {
 
 /// Asks Forge to work and returns its run once it is working.
 async fn start_forge(c: &mut Client, thread: ThreadId) -> RunId {
+    start_forge_with(c, thread, "@Forge do it WAIT").await
+}
+
+async fn start_forge_with(c: &mut Client, thread: ThreadId, body: &str) -> RunId {
     c.call(Request::PostMessage {
         thread,
-        body: "@Forge do it WAIT".into(),
+        body: body.into(),
     })
     .await
     .unwrap();
@@ -389,7 +398,7 @@ async fn ask_first_creates_pending_handoff() {
     let run = start_forge(&mut c, chat.thread).await;
 
     let mut mcp = d.client().await;
-    let text = handoff(&mut mcp, run, "scout", "check the edit").await;
+    let text = handoff(&mut mcp, run, "@scout", "check the edit").await;
     assert_eq!(
         text.unwrap(),
         "Asked the user to approve bringing in Scout."
@@ -839,4 +848,139 @@ async fn run_time_limit_stops_run() {
     assert_eq!(system_message(&seen, body).unwrap().run, Some(run));
     let stopped = until_run(&mut c, chat.forge, RunStatus::Stopped).await;
     assert_eq!(stopped.id, run);
+}
+
+async fn set_budget(c: &mut Client, thread: ThreadId, budget: u32) {
+    c.call(Request::SetThreadHandoff {
+        thread,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(budget),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_run_refuses_handoffs_and_asks() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    set_budget(&mut c, chat.thread, 3).await;
+    let run = start_forge_with(&mut c, chat.thread, "@Forge do it STUBBORN").await;
+    // Wait until claude itself is up, so the stop has a process to wind down.
+    timeout(WAIT, async {
+        while logged_prompts(d.dir()).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("claude did not start");
+
+    c.call(Request::StopThread {
+        thread: chat.thread,
+    })
+    .await
+    .unwrap();
+    let mut mcp = d.client().await;
+    let err = handoff(&mut mcp, run, "Scout", "look").await.unwrap_err();
+    assert_eq!(err, "That run isn't running.");
+    let answer: PermissionAnswer = mcp
+        .ok(Request::PermissionAsk {
+            run,
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "touch x.txt" }),
+        })
+        .await;
+    assert_eq!(
+        answer,
+        PermissionAnswer {
+            allow: false,
+            message: Some("The run was stopped.".into()),
+        }
+    );
+
+    // The run was still winding down, and nothing came of either request.
+    let working: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Working),
+        })
+        .await;
+    assert!(working.iter().any(|r| r.id == run));
+    let queued: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Queued),
+        })
+        .await;
+    assert!(queued.is_empty());
+    let listed: Vec<StoredApproval> = c.ok(Request::ListApprovals { thread: None }).await;
+    assert!(listed.is_empty());
+    assert_eq!(thread_row(&mut c, &chat).await.handoffs_used, 0);
+    until_run(&mut c, chat.forge, RunStatus::Stopped).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_thread_drops_queued_handoff() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    set_budget(&mut c, chat.thread, 3).await;
+    let run = start_forge(&mut c, chat.thread).await;
+    let mut mcp = d.client().await;
+    handoff(&mut mcp, run, "Scout", "look").await.unwrap();
+    let queued = until_run(&mut c, chat.scout, RunStatus::Queued).await;
+
+    c.call(Request::StopThread {
+        thread: chat.thread,
+    })
+    .await
+    .unwrap();
+    let stopped = until_run(&mut c, chat.scout, RunStatus::Stopped).await;
+    assert_eq!(stopped.id, queued.id);
+    until_run(&mut c, chat.forge, RunStatus::Stopped).await;
+    // Scout never started.
+    assert!(logged_prompts(d.dir()).iter().all(|p| p.ends_with("WAIT")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_on_approval_counts_toward_limit() {
+    let d = Daemon::start(Duration::from_secs(1)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 1).await;
+    let run = start_forge(&mut c, chat.thread).await;
+
+    let mut mcp = d.client().await;
+    let ask = mcp
+        .send(Request::PermissionAsk {
+            run,
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "touch x.txt" }),
+        })
+        .await;
+    until_system(&mut c, "Forge wants to run Bash: touch x.txt").await;
+
+    // Nobody decides, and the limit ends the run anyway.
+    let answer: PermissionAnswer =
+        serde_json::from_value(mcp.response(ask).await.unwrap()).unwrap();
+    assert!(!answer.allow);
+    until_system(
+        &mut c,
+        "Forge hit its 1 min limit and was stopped. Its changes are kept.",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reply_handoff_prompt_has_reply_once() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    set_budget(&mut c, chat.thread, 3).await;
+    start_forge(&mut c, chat.thread).await;
+
+    let reply = "Done. @Scout look at it";
+    d.go(reply);
+    until_run(&mut c, chat.scout, RunStatus::Done).await;
+    let prompts = logged_prompts(d.dir());
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert_eq!(prompts[1].matches(reply).count(), 1, "{prompts:?}");
 }

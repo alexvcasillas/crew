@@ -596,7 +596,12 @@ impl Service {
         let timer = tokio::spawn(async move {
             tokio::time::sleep(limit).await;
             let mut state = svc.state();
-            if state.live.contains_key(&run) {
+            // A run you already stopped ends as stopped by you.
+            if state
+                .live
+                .get(&run)
+                .is_some_and(|(_, handle)| !handle.is_stopped())
+            {
                 state.timed_out.insert(run, minutes);
                 svc.stop_live(&mut state, run);
             }
@@ -976,12 +981,7 @@ impl Service {
                     pending.as_ref().map(|p| p.message),
                     job.agent,
                 );
-                let context = render_context(&missed, &agents);
-                let prompt = if context.is_empty() {
-                    job.prompt.clone()
-                } else {
-                    format!("{context}\n\n{}", job.prompt)
-                };
+                let prompt = with_context(&missed, &agents, &job.prompt);
                 (
                     run.session_id.clone(),
                     SessionArg::Resume(run.session_id),
@@ -993,14 +993,7 @@ impl Service {
                 let prompt = match pending {
                     Some(p) => p.fresh,
                     // A handoff: the whole thread so far, then the brief.
-                    None => {
-                        let context = render_context(&db.store.messages(job.thread)?, &agents);
-                        if context.is_empty() {
-                            job.prompt.clone()
-                        } else {
-                            format!("{context}\n\n{}", job.prompt)
-                        }
-                    }
+                    None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
                 };
                 (id.to_string(), SessionArg::New(id), prompt)
             }
@@ -1222,8 +1215,30 @@ fn missed_messages(
         .collect()
 }
 
+/// `messages` as context, then `prompt`. A prompt that is the last
+/// message from you or an agent, as a reply handed on is, isn't repeated.
+fn with_context(
+    messages: &[crew_core::store::StoredMessage],
+    agents: &[(AgentId, AgentSpec)],
+    prompt: &str,
+) -> String {
+    let context = render_context(messages, agents);
+    let repeated = messages
+        .iter()
+        .rev()
+        .find(|m| m.author != Author::System)
+        .is_some_and(|m| m.body == prompt);
+    if context.is_empty() {
+        prompt.to_string()
+    } else if repeated {
+        context
+    } else {
+        format!("{context}\n\n{prompt}")
+    }
+}
+
 /// Messages as plain text, one per line.
-pub(crate) fn render_context(
+fn render_context(
     messages: &[crew_core::store::StoredMessage],
     agents: &[(AgentId, AgentSpec)],
 ) -> String {
