@@ -1280,11 +1280,14 @@ dependencies = [
 name = "crew-app"
 version = "0.1.0"
 dependencies = [
+ "crew-core",
  "crew-proto",
  "crewd",
+ "futures",
  "gpui-kit",
  "gpui-pre",
  "nix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

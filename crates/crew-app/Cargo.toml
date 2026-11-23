@@ -7,14 +7,17 @@ description = "Crew: a macOS app where coding agents work as chat members"
 publish = false
 
 [dependencies]
+crew-core = { path = "../crew-core" }
 crew-proto = { path = "../crew-proto" }
-tokio = { workspace = true, features = ["net", "rt", "time"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "time", "sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-kit = { workspace = true }
 gpui-pre = { workspace = true }
 nix = { workspace = true, features = ["socket"] }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 crewd = { path = "../crewd" }
