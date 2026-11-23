@@ -64,6 +64,8 @@ pub enum Request {
     ListRuns {
         status: Option<RunStatus>,
     },
+    /// Answered with `Vec<(AgentId, AgentSpec)>`.
+    ListAgents,
 }
 
 /// A message from crewd.
