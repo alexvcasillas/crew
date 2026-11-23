@@ -36,6 +36,7 @@ fn start_crewd(home: &Path, claude_bin: PathBuf) {
             let opts = ServeOptions {
                 max_runs: 4,
                 claude_bin: Some(claude_bin),
+                crew_mcp_bin: None,
             };
             serve(&serve_home, opts).await.unwrap();
         });

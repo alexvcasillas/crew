@@ -96,6 +96,28 @@ pub enum Request {
     Discard {
         thread: ThreadId,
     },
+    /// From crew-mcp: the agent of `run` hands work to `agent`. Answered
+    /// with a text for the agent.
+    Handoff {
+        run: RunId,
+        agent: String,
+        brief: String,
+    },
+    /// From crew-mcp: the agent of `run` wants to use `tool`. Answered with
+    /// a [`PermissionAnswer`] once someone decides.
+    PermissionAsk {
+        run: RunId,
+        tool: String,
+        input: serde_json::Value,
+    },
+}
+
+/// The answer to [`Request::PermissionAsk`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionAnswer {
+    pub allow: bool,
+    /// Why it was denied, shown to the agent.
+    pub message: Option<String>,
 }
 
 /// A message from crewd.
@@ -190,6 +212,22 @@ mod tests {
                     status: Some(RunStatus::Working),
                 },
             },
+            ClientMsg::Request {
+                id: 4,
+                req: Request::Handoff {
+                    run: RunId::new(),
+                    agent: "Sentinel".into(),
+                    brief: "check the edit".into(),
+                },
+            },
+            ClientMsg::Request {
+                id: 5,
+                req: Request::PermissionAsk {
+                    run: RunId::new(),
+                    tool: "Bash".into(),
+                    input: serde_json::json!({ "command": "touch x.txt" }),
+                },
+            },
         ];
         let mut buf: Vec<u8> = Vec::new();
         for m in &msgs {
@@ -214,6 +252,21 @@ mod tests {
         write_frame(&mut buf, &reply).await.unwrap();
         let got: ServerMsg = read_frame(&mut buf.as_slice()).await.unwrap().unwrap();
         assert_eq!(got, reply);
+    }
+
+    #[test]
+    fn permission_answer_json_shape() {
+        let a: PermissionAnswer =
+            serde_json::from_str(r#"{"allow":false,"message":"no"}"#).unwrap();
+        assert_eq!(
+            a,
+            PermissionAnswer {
+                allow: false,
+                message: Some("no".into())
+            }
+        );
+        let a: PermissionAnswer = serde_json::from_str(r#"{"allow":true,"message":null}"#).unwrap();
+        assert!(a.allow);
     }
 
     #[tokio::test]

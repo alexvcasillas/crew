@@ -37,6 +37,10 @@ pub struct ServeOptions {
     pub max_runs: usize,
     /// Overrides the `claude` binary for every run.
     pub claude_bin: Option<PathBuf>,
+    /// The crew-mcp binary passed to every run, so agents can hand off
+    /// and ask for permission. Runs go without it if it is `None` or
+    /// missing.
+    pub crew_mcp_bin: Option<PathBuf>,
 }
 
 impl Default for ServeOptions {
@@ -44,6 +48,28 @@ impl Default for ServeOptions {
         Self {
             max_runs: 4,
             claude_bin: None,
+            crew_mcp_bin: default_crew_mcp_bin(),
+        }
+    }
+}
+
+/// `crew-mcp` next to the running executable.
+pub fn default_crew_mcp_bin() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("crew-mcp"))
+}
+
+/// The crew-mcp binary to wire into runs, if it is there.
+fn usable_crew_mcp(bin: Option<PathBuf>) -> Option<PathBuf> {
+    let bin = bin?;
+    match std::fs::canonicalize(&bin) {
+        Ok(path) if path.is_file() => Some(path),
+        _ => {
+            log(format!(
+                "{} not found, agents run without handoffs and permission prompts",
+                bin.display()
+            ));
+            None
         }
     }
 }
@@ -110,11 +136,15 @@ pub async fn serve_until(
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     log(format!("listening on {}", sock.display()));
 
+    // crew-mcp runs in the agent's folder, so it gets an absolute home.
+    let abs_home =
+        std::fs::canonicalize(home).with_context(|| format!("resolving {}", home.display()))?;
     let service = Service::new(
         store,
         opts.max_runs,
         opts.claude_bin,
         home.join(WORKTREES_DIR),
+        usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),
     );
     let mut shutdown = std::pin::pin!(shutdown);
     loop {

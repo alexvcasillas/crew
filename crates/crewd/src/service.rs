@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crew_core::agent::{AgentSpec, PermissionMode};
-use crew_core::claude::{ClaudeInvocation, SessionArg, build_claude};
+use crew_core::claude::{ClaudeInvocation, McpWiring, SessionArg, build_claude};
 use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
@@ -81,6 +81,8 @@ struct Inner {
     claude_bin: Option<PathBuf>,
     /// Where thread worktrees go, one folder per project.
     worktrees: PathBuf,
+    /// The crew-mcp binary and the crew home it is given, if runs get it.
+    crew_mcp: Option<(PathBuf, PathBuf)>,
     /// Held while a worktree's slug is picked and the worktree made, so
     /// two threads can't pick the same one.
     slugs: Mutex<()>,
@@ -102,12 +104,14 @@ fn log(msg: impl std::fmt::Display) {
 
 impl Service {
     /// Wraps an open store. `claude_bin` overrides the binary for every run.
-    /// Thread worktrees are made under `worktrees`.
+    /// Thread worktrees are made under `worktrees`. `crew_mcp` is the
+    /// crew-mcp binary and crew home passed to every run, if any.
     pub fn new(
         store: Store,
         max_runs: usize,
         claude_bin: Option<PathBuf>,
         worktrees: PathBuf,
+        crew_mcp: Option<(PathBuf, PathBuf)>,
     ) -> Service {
         let (tx, _) = broadcast::channel(NOTICE_BUFFER);
         Service(Arc::new(Inner {
@@ -122,6 +126,7 @@ impl Service {
             tx,
             claude_bin,
             worktrees,
+            crew_mcp,
             slugs: Mutex::new(()),
         }))
     }
@@ -234,6 +239,9 @@ impl Service {
             }
             Request::ThreadDiff { .. } | Request::Commit { .. } | Request::Discard { .. } => {
                 Err("This request needs git and is handled elsewhere.".into())
+            }
+            Request::Handoff { .. } | Request::PermissionAsk { .. } => {
+                Err("Not supported yet.".into())
             }
         }
     }
@@ -879,7 +887,12 @@ impl Service {
         if announce {
             self.publish_status(db, job.thread, job.run, RunStatus::Working);
         }
-        let mut inv = build_claude(&spec, &prompt, &cwd, session);
+        let wiring = self.0.crew_mcp.as_ref().map(|(bin, home)| McpWiring {
+            crew_mcp_bin: bin.clone(),
+            run: job.run,
+            crew_home: home.clone(),
+        });
+        let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring);
         if let Some(bin) = &self.0.claude_bin {
             inv.bin = bin.clone();
         }
