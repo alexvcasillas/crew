@@ -6,20 +6,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use crew_core::agent::{AgentSpec, PermissionMode};
 use crew_core::claude::{ClaudeInvocation, McpWiring, SessionArg, build_claude};
 use crew_core::event::{Event, RunStatus, ToolKind};
-use crew_core::ids::{AgentId, MessageId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{Author, RunFilter, Store, StoreError, StoredProject, ThreadWorktree};
 use crew_core::worktree::{self, Diff};
-use crew_proto::{Request, ServerMsg};
+use crew_proto::{PermissionAnswer, Request, ServerMsg};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
@@ -51,8 +52,8 @@ pub struct Backlog {
 
 /// The store plus the serial of the last notice. Notices are sent while
 /// this is locked, so a backlog read under the same lock lines up exactly.
-struct Db {
-    store: Store,
+pub(crate) struct Db {
+    pub(crate) store: Store,
     serial: u64,
 }
 
@@ -64,14 +65,22 @@ struct Pending {
     fresh: String,
 }
 
-struct State {
-    scheduler: Scheduler,
-    live: HashMap<RunId, (ThreadId, RunHandle)>,
+pub(crate) struct State {
+    pub(crate) scheduler: Scheduler,
+    pub(crate) live: HashMap<RunId, (ThreadId, RunHandle)>,
     pending: HashMap<RunId, Pending>,
     /// One task per started run, so shutdown can wait for them.
     watchers: JoinSet<()>,
     /// Set once crewd is shutting down. Nothing starts after that.
     shutting_down: bool,
+    /// Permission asks waiting for a decision, by approval.
+    pub(crate) waiting: HashMap<ApprovalId, oneshot::Sender<PermissionAnswer>>,
+    /// Agents each live run handed off to with the tool.
+    pub(crate) handed: HashMap<RunId, Vec<AgentId>>,
+    /// The time limit of each live run.
+    timers: HashMap<RunId, AbortHandle>,
+    /// Runs stopped by their time limit, with the limit in minutes.
+    timed_out: HashMap<RunId, u32>,
 }
 
 struct Inner {
@@ -86,33 +95,41 @@ struct Inner {
     /// Held while a worktree's slug is picked and the worktree made, so
     /// two threads can't pick the same one.
     slugs: Mutex<()>,
+    /// How long one minute of a run's time limit lasts.
+    minute: Duration,
 }
 
 /// Holds the store, the scheduler and the live runs.
 #[derive(Clone)]
 pub struct Service(Arc<Inner>);
 
-type Reply = Result<serde_json::Value, String>;
+pub(crate) type Reply = Result<serde_json::Value, String>;
 
-fn json(v: impl Serialize) -> Reply {
+pub(crate) fn json(v: impl Serialize) -> Reply {
     serde_json::to_value(v).map_err(|e| e.to_string())
 }
 
-fn log(msg: impl std::fmt::Display) {
+pub(crate) fn log(msg: impl std::fmt::Display) {
     eprintln!("crewd: {msg}");
 }
 
 impl Service {
     /// Wraps an open store. `claude_bin` overrides the binary for every run.
     /// Thread worktrees are made under `worktrees`. `crew_mcp` is the
-    /// crew-mcp binary and crew home passed to every run, if any.
+    /// crew-mcp binary and crew home passed to every run, if any. A run's
+    /// time limit counts in units of `minute`.
     pub fn new(
         store: Store,
         max_runs: usize,
         claude_bin: Option<PathBuf>,
         worktrees: PathBuf,
         crew_mcp: Option<(PathBuf, PathBuf)>,
+        minute: Duration,
     ) -> Service {
+        // Nothing waits for permission asks of an earlier crewd any more.
+        if let Err(e) = crate::approvals::cancel_stale_permissions(&store) {
+            log(format!("couldn't cancel old permission asks: {e}"));
+        }
         let (tx, _) = broadcast::channel(NOTICE_BUFFER);
         Service(Arc::new(Inner {
             db: Mutex::new(Db { store, serial: 0 }),
@@ -122,12 +139,17 @@ impl Service {
                 pending: HashMap::new(),
                 watchers: JoinSet::new(),
                 shutting_down: false,
+                waiting: HashMap::new(),
+                handed: HashMap::new(),
+                timers: HashMap::new(),
+                timed_out: HashMap::new(),
             }),
             tx,
             claude_bin,
             worktrees,
             crew_mcp,
             slugs: Mutex::new(()),
+            minute,
         }))
     }
 
@@ -136,16 +158,16 @@ impl Service {
         self.0.tx.subscribe()
     }
 
-    fn db(&self) -> MutexGuard<'_, Db> {
+    pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
         self.0.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
+    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Handles every request except `Hello` and `Subscribe`, which belong
-    /// to the connection.
+    /// Handles every request except `Hello`, `Subscribe` and
+    /// `PermissionAsk`, which belong to the connection.
     pub async fn handle(&self, req: Request) -> Reply {
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
@@ -158,7 +180,7 @@ impl Service {
     /// Requests that only touch the store or the scheduler.
     fn handle_now(&self, req: Request) -> Reply {
         match req {
-            Request::Hello { .. } | Request::Subscribe { .. } => {
+            Request::Hello { .. } | Request::Subscribe { .. } | Request::PermissionAsk { .. } => {
                 Err("This request is handled by the connection.".into())
             }
             Request::CreateProject {
@@ -240,8 +262,36 @@ impl Service {
             Request::ThreadDiff { .. } | Request::Commit { .. } | Request::Discard { .. } => {
                 Err("This request needs git and is handled elsewhere.".into())
             }
-            Request::Handoff { .. } | Request::PermissionAsk { .. } => {
-                Err("Not supported yet.".into())
+            Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
+            Request::ListApprovals { thread } => json(
+                self.db()
+                    .store
+                    .pending_approvals(thread)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Request::Decide {
+                approval,
+                approve,
+                brief,
+            } => {
+                self.decide(approval, approve, brief)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::AllowMoreHandoffs { thread, n } => {
+                self.allow_more_handoffs(thread, n)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::SetThreadHandoff {
+                thread,
+                policy,
+                budget,
+            } => {
+                self.db()
+                    .store
+                    .set_thread_handoff(thread, policy, budget)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
             }
         }
     }
@@ -385,6 +435,9 @@ impl Service {
         for message in db.store.messages(thread)? {
             msgs.push(ServerMsg::Message { thread, message });
         }
+        for approval in db.store.pending_approvals(Some(thread))? {
+            msgs.push(ServerMsg::Approval { thread, approval });
+        }
         Ok(Backlog {
             msgs,
             serial: db.serial,
@@ -398,7 +451,7 @@ impl Service {
             let mut db = self.db();
             let earlier = db.store.messages(thread)?;
             let agents = db.store.agents()?;
-            let id = self.add_message(&mut db, thread, Author::You, body)?;
+            let id = self.add_message(&mut db, thread, Author::You, body, None)?;
 
             let names: Vec<&str> = agents.iter().map(|(_, a)| a.name.as_str()).collect();
             let (known, unknown) = parse_mentions(body, &names);
@@ -434,6 +487,7 @@ impl Service {
                     thread,
                     Author::System,
                     &format!("No agent named @{name}."),
+                    None,
                 )?;
             }
             id
@@ -445,8 +499,8 @@ impl Service {
     /// Stops a live run, or takes a queued one out of the queue.
     fn stop_run(&self, run: RunId) -> Result<(), String> {
         let mut state = self.state();
-        if let Some((_, handle)) = state.live.get(&run) {
-            handle.stop();
+        if state.live.contains_key(&run) {
+            self.stop_live(&mut state, run);
             return Ok(());
         }
         match state.scheduler.remove(run) {
@@ -462,10 +516,14 @@ impl Service {
     /// Stops the thread's live run and drops its queued jobs.
     fn stop_thread(&self, thread: ThreadId) -> Result<(), StoreError> {
         let mut state = self.state();
-        for (t, handle) in state.live.values() {
-            if *t == thread {
-                handle.stop();
-            }
+        let live: Vec<RunId> = state
+            .live
+            .iter()
+            .filter(|(_, (t, _))| *t == thread)
+            .map(|(run, _)| *run)
+            .collect();
+        for run in live {
+            self.stop_live(&mut state, run);
         }
         let jobs = state.scheduler.clear();
         let (dropped, kept): (Vec<Job>, Vec<Job>) =
@@ -482,8 +540,9 @@ impl Service {
     /// Stops every live run and drops the whole queue.
     fn stop_all(&self) -> Result<(), StoreError> {
         let mut state = self.state();
-        for (_, handle) in state.live.values() {
-            handle.stop();
+        let live: Vec<RunId> = state.live.keys().copied().collect();
+        for run in live {
+            self.stop_live(&mut state, run);
         }
         let dropped = state.scheduler.clear();
         state.pending.clear();
@@ -497,8 +556,9 @@ impl Service {
         let mut watchers = {
             let mut state = self.state();
             state.shutting_down = true;
-            for (_, handle) in state.live.values() {
-                handle.stop();
+            let live: Vec<RunId> = state.live.keys().copied().collect();
+            for run in live {
+                self.stop_live(&mut state, run);
             }
             let dropped = state.scheduler.clear();
             state.pending.clear();
@@ -508,6 +568,48 @@ impl Service {
             std::mem::take(&mut state.watchers)
         };
         while watchers.join_next().await.is_some() {}
+    }
+
+    /// Stops a live run and denies its pending permission asks at once,
+    /// so nobody decides them while the run winds down.
+    fn stop_live(&self, state: &mut State, run: RunId) {
+        if let Some((_, handle)) = state.live.get(&run) {
+            handle.stop();
+        }
+        let mut db = self.db();
+        self.cancel_permissions(state, &mut db, run);
+    }
+
+    /// Starts the run's time limit, which counts from now.
+    fn start_timer(&self, state: &mut State, job: &Job) {
+        let minutes = self
+            .db()
+            .store
+            .agents()
+            .ok()
+            .and_then(|agents| agents.into_iter().find(|(id, _)| *id == job.agent))
+            .map_or(crew_core::agent::DEFAULT_MAX_RUN_MINUTES, |(_, spec)| {
+                spec.max_run_minutes
+            });
+        let limit = self.0.minute.saturating_mul(minutes);
+        let (svc, run) = (self.clone(), job.run);
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(limit).await;
+            let mut state = svc.state();
+            if state.live.contains_key(&run) {
+                state.timed_out.insert(run, minutes);
+                svc.stop_live(&mut state, run);
+            }
+        });
+        state.timers.insert(job.run, timer.abort_handle());
+    }
+
+    /// Forgets a run that is no longer live, and its time limit.
+    fn end_live(state: &mut State, run: RunId) {
+        state.live.remove(&run);
+        if let Some(timer) = state.timers.remove(&run) {
+            timer.abort();
+        }
     }
 
     /// Records queued runs that will never start, and tells each thread.
@@ -524,14 +626,20 @@ impl Service {
         }
         if status == RunStatus::Stopped {
             for thread in threads {
-                self.add_message(&mut db, thread, Author::System, "Stopped before starting.")?;
+                self.add_message(
+                    &mut db,
+                    thread,
+                    Author::System,
+                    "Stopped before starting.",
+                    None,
+                )?;
             }
         }
         Ok(())
     }
 
     /// Starts queued jobs while the scheduler allows.
-    fn start_ready(&self) {
+    pub(crate) fn start_ready(&self) {
         let mut state = self.state();
         if state.shutting_down {
             return;
@@ -540,6 +648,7 @@ impl Service {
             let pending = state.pending.remove(&job.run);
             // Forget watchers that are done, so the set stays small.
             while state.watchers.try_join_next().is_some() {}
+            self.start_timer(&mut state, &job);
             if self.needs_worktree(&job) {
                 self.begin_setup(&mut state, job, pending);
             } else if let Some(watch) = self.launch(&mut state, job, pending, true) {
@@ -609,14 +718,15 @@ impl Service {
                     "couldn't start a run in thread {}: {e}",
                     job.thread
                 ));
-                state.live.remove(&job.run);
+                Self::end_live(state, job.run);
                 state.scheduler.finished(job.thread);
                 match db.store.set_run_status(job.run, RunStatus::Failed) {
                     Ok(()) => self.publish_status(&mut db, job.thread, job.run, RunStatus::Failed),
                     Err(e) => log(e),
                 }
                 let body = format!("Couldn't start the run: {e}");
-                if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
+                let run = Some(job.run);
+                if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body, run) {
                     log(e);
                 }
                 None
@@ -758,7 +868,8 @@ impl Service {
         if !skipped.is_empty() {
             let body = format!("Skipped missing files: {}.", skipped.join(", "));
             let mut db = self.db();
-            if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
+            let run = Some(job.run);
+            if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body, run) {
                 log(e);
             }
         }
@@ -879,7 +990,18 @@ impl Service {
             }
             None => {
                 let id = Uuid::new_v4();
-                let prompt = pending.map_or_else(|| job.prompt.clone(), |p| p.fresh);
+                let prompt = match pending {
+                    Some(p) => p.fresh,
+                    // A handoff: the whole thread so far, then the brief.
+                    None => {
+                        let context = render_context(&db.store.messages(job.thread)?, &agents);
+                        if context.is_empty() {
+                            job.prompt.clone()
+                        } else {
+                            format!("{context}\n\n{}", job.prompt)
+                        }
+                    }
+                };
                 (id.to_string(), SessionArg::New(id), prompt)
             }
         };
@@ -944,16 +1066,28 @@ impl Service {
     ) -> Result<(), StoreError> {
         let mut state = self.state();
         // The process is gone, so dropping the handle does nothing more.
-        state.live.remove(&run);
+        Self::end_live(&mut state, run);
+        let limit = state.timed_out.remove(&run);
+        let handed = state.handed.remove(&run).unwrap_or_default();
         state.scheduler.finished(thread);
         let mut db = self.db();
+        self.cancel_permissions(&mut state, &mut db, run);
+        let done = matches!(outcome, RunOutcome::Done);
         let (status, author, body) = match outcome {
             RunOutcome::Stopped if state.shutting_down => (
                 RunStatus::Interrupted,
                 Author::System,
                 format!("{name} was interrupted because crewd stopped."),
             ),
-            RunOutcome::Done => (RunStatus::Done, Author::Agent(agent), reply),
+            RunOutcome::Stopped if limit.is_some() => (
+                RunStatus::Stopped,
+                Author::System,
+                format!(
+                    "{name} hit its {} min limit and was stopped. Its changes are kept.",
+                    limit.unwrap_or_default()
+                ),
+            ),
+            RunOutcome::Done => (RunStatus::Done, Author::Agent(agent), reply.clone()),
             RunOutcome::Failed(msg) => (
                 RunStatus::Failed,
                 Author::System,
@@ -967,9 +1101,12 @@ impl Service {
         };
         db.store.set_run_status(run, status.clone())?;
         if !body.is_empty() {
-            self.add_message(&mut db, thread, author, &body)?;
+            self.add_message(&mut db, thread, author, &body, Some(run))?;
         }
         self.publish_status(&mut db, thread, run, status);
+        if done && !state.shutting_down {
+            self.reply_handoffs(&mut state, &mut db, run, agent, &reply, &handed)?;
+        }
         Ok(())
     }
 
@@ -991,7 +1128,13 @@ impl Service {
         }
     }
 
-    fn publish_status(&self, db: &mut Db, thread: ThreadId, run: RunId, status: RunStatus) {
+    pub(crate) fn publish_status(
+        &self,
+        db: &mut Db,
+        thread: ThreadId,
+        run: RunId,
+        status: RunStatus,
+    ) {
         self.publish(
             db,
             thread,
@@ -1003,15 +1146,17 @@ impl Service {
         );
     }
 
-    /// Saves a message and notifies the thread.
-    fn add_message(
+    /// Saves a message and notifies the thread. `run` is the run it is
+    /// about, if any.
+    pub(crate) fn add_message(
         &self,
         db: &mut Db,
         thread: ThreadId,
         author: Author,
         body: &str,
+        run: Option<RunId>,
     ) -> Result<MessageId, StoreError> {
-        let id = db.store.add_message(thread, author, body, None)?;
+        let id = db.store.add_message(thread, author, body, run)?;
         let message = db
             .store
             .messages(thread)?
@@ -1023,7 +1168,7 @@ impl Service {
         Ok(id)
     }
 
-    fn publish(&self, db: &mut Db, thread: ThreadId, msg: ServerMsg) {
+    pub(crate) fn publish(&self, db: &mut Db, thread: ThreadId, msg: ServerMsg) {
         db.serial += 1;
         // No receivers is fine: nobody is listening.
         let _ = self.0.tx.send(Notice {
@@ -1078,7 +1223,7 @@ fn missed_messages(
 }
 
 /// Messages as plain text, one per line.
-fn render_context(
+pub(crate) fn render_context(
     messages: &[crew_core::store::StoredMessage],
     agents: &[(AgentId, AgentSpec)],
 ) -> String {

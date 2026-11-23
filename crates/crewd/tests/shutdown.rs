@@ -235,6 +235,7 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
         max_runs: 1,
         claude_bin: Some(sleeping_script(tmp.path(), &pid_file)),
         crew_mcp_bin: None,
+        ..Default::default()
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_home = home.clone();

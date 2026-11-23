@@ -6,8 +6,9 @@ use std::io;
 
 use crew_core::agent::AgentSpec;
 use crew_core::event::{Event, RunStatus};
-use crew_core::ids::{ChannelId, ProjectId, RunId, ThreadId};
-use crew_core::store::StoredMessage;
+use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::policy::HandoffPolicy;
+use crew_core::store::{StoredApproval, StoredMessage};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -110,6 +111,30 @@ pub enum Request {
         tool: String,
         input: serde_json::Value,
     },
+    /// Answered with the pending `Vec<StoredApproval>`, for one thread or
+    /// all of them.
+    ListApprovals {
+        thread: Option<ThreadId>,
+    },
+    /// Approves or declines a pending approval. `brief` replaces a
+    /// handoff's brief.
+    Decide {
+        approval: ApprovalId,
+        approve: bool,
+        brief: Option<String>,
+    },
+    /// Lets `n` more handoffs run in the thread on their own.
+    AllowMoreHandoffs {
+        thread: ThreadId,
+        n: u32,
+    },
+    /// Sets the thread's own handoff policy and budget. `None` falls back
+    /// to the agent or channel.
+    SetThreadHandoff {
+        thread: ThreadId,
+        policy: Option<HandoffPolicy>,
+        budget: Option<u32>,
+    },
 }
 
 /// The answer to [`Request::PermissionAsk`].
@@ -146,6 +171,11 @@ pub enum ServerMsg {
     Message {
         thread: ThreadId,
         message: StoredMessage,
+    },
+    /// An approval was asked for or decided.
+    Approval {
+        thread: ThreadId,
+        approval: StoredApproval,
     },
 }
 

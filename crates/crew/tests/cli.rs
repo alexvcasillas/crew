@@ -37,6 +37,7 @@ fn start_crewd(home: &Path, claude_bin: PathBuf) {
                 max_runs: 4,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
+                ..Default::default()
             };
             serve(&serve_home, opts).await.unwrap();
         });

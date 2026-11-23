@@ -11,7 +11,9 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use crew_core::ids::ThreadId;
 use crew_core::store::Store;
-use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
+use crew_proto::{
+    ClientMsg, PROTO_VERSION, PermissionAnswer, Request, ServerMsg, read_frame, write_frame,
+};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::net::unix::OwnedWriteHalf;
@@ -19,6 +21,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::approvals::stopped_answer;
 use crate::service::Service;
 
 /// Socket file name inside the crew home.
@@ -41,6 +44,9 @@ pub struct ServeOptions {
     /// and ask for permission. Runs go without it if it is `None` or
     /// missing.
     pub crew_mcp_bin: Option<PathBuf>,
+    /// How long one minute of an agent's `max_run_minutes` lasts. Tests
+    /// make it short.
+    pub minute: Duration,
 }
 
 impl Default for ServeOptions {
@@ -49,6 +55,7 @@ impl Default for ServeOptions {
             max_runs: 4,
             claude_bin: None,
             crew_mcp_bin: default_crew_mcp_bin(),
+            minute: Duration::from_secs(60),
         }
     }
 }
@@ -145,6 +152,7 @@ pub async fn serve_until(
         opts.claude_bin,
         home.join(WORKTREES_DIR),
         usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),
+        opts.minute,
     );
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -269,8 +277,14 @@ async fn requests_and_notices(
 ) -> io::Result<()> {
     // Thread -> serial already covered by that thread's backlog.
     let mut subscribed: HashMap<ThreadId, u64> = HashMap::new();
+    // Answers to permission asks, which come whenever someone decides.
+    let (answer_tx, mut answer_rx) = mpsc::channel::<(u64, PermissionAnswer)>(8);
     loop {
         tokio::select! {
+            Some((id, answer)) = answer_rx.recv() => {
+                let result = serde_json::to_value(answer).map_err(|e| e.to_string());
+                respond(wr, id, result).await?;
+            }
             msg = req_rx.recv() => {
                 let Some(ClientMsg::Request { id, req }) = msg else {
                     return Ok(());
@@ -288,6 +302,19 @@ async fn requests_and_notices(
                     },
                     Request::Hello { .. } => {
                         respond(wr, id, Err("Hello was already sent.".into())).await?;
+                    }
+                    Request::PermissionAsk { run, tool, input } => {
+                        match service.ask_permission(run, &tool, input) {
+                            Ok(rx) => {
+                                let tx = answer_tx.clone();
+                                tokio::spawn(async move {
+                                    // A dropped sender means the run is gone.
+                                    let answer = rx.await.unwrap_or_else(|_| stopped_answer());
+                                    let _ = tx.send((id, answer)).await;
+                                });
+                            }
+                            Err(e) => respond(wr, id, Err(e)).await?,
+                        }
                     }
                     other => {
                         let result = service.handle(other).await;

@@ -453,6 +453,7 @@ fn approvals_are_created_decided_and_cancelled() {
                 from: a,
                 to: b,
                 brief: "check it".into(),
+                paused: false,
             },
         )
         .unwrap();
@@ -499,6 +500,7 @@ fn approvals_are_created_decided_and_cancelled() {
             from: a,
             to: b,
             brief: "check it well".into(),
+            paused: false,
         }
     );
     // A decided approval cannot be decided again.
@@ -513,8 +515,14 @@ fn approvals_are_created_decided_and_cancelled() {
 
     assert_eq!(
         serde_json::to_value(&decided.kind).unwrap(),
-        serde_json::json!({"kind": "handoff", "from": a.to_string(), "to": b.to_string(), "brief": "check it well"})
+        serde_json::json!({"kind": "handoff", "from": a.to_string(), "to": b.to_string(), "brief": "check it well", "paused": false})
     );
+    // Rows saved before `paused` existed still read.
+    let old: ApprovalKind = serde_json::from_value(
+        serde_json::json!({"kind": "handoff", "from": a.to_string(), "to": b.to_string(), "brief": "check it well"}),
+    )
+    .unwrap();
+    assert_eq!(old, decided.kind);
     assert_eq!(
         serde_json::to_value(ApprovalStatus::Cancelled).unwrap(),
         "cancelled"
