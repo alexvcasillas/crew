@@ -1,5 +1,5 @@
 Crew is a macOS app where coding agents like Claude Code and Codex work as members of project chat channels.
-Status: Early. Not usable yet.
+Status: Early. Usable for Claude Code agents.
 License: MIT.
 
 ## Build and run
@@ -14,3 +14,13 @@ open /Applications/Crew.app
 
 The app starts its background service, crewd, with launchd. It runs the
 `claude` on your login shell's `PATH`.
+
+## Uninstall
+
+```sh
+launchctl bootout gui/$(id -u)/dev.crew.crewd
+rm ~/Library/LaunchAgents/dev.crew.crewd.plist
+rm -rf /Applications/Crew.app
+```
+
+Crew keeps its data in `~/.crew`. Delete it too if you don't want it.
