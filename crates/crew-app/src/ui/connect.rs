@@ -79,7 +79,11 @@ impl Workspace {
                                 .label(wording.button)
                                 .loading(self.starting())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.start_service(restart, window, cx);
+                                    if restart {
+                                        this.restart_service(false, window, cx);
+                                    } else {
+                                        this.start_service(false, window, cx);
+                                    }
                                 })),
                         ),
                     ),
