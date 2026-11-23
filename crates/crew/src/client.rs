@@ -1,5 +1,6 @@
 //! A small blocking-style client for the crewd socket.
 
+use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
@@ -7,8 +8,17 @@ use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write
 use serde::de::DeserializeOwned;
 use tokio::net::UnixStream;
 
-/// Shown when the socket is missing or refuses the connection.
-pub const NOT_RUNNING: &str = "crewd isn't running. Start it with `crewd`.";
+/// The socket is missing or refuses the connection.
+#[derive(Debug)]
+pub struct NotRunning;
+
+impl std::fmt::Display for NotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("crewd isn't running. Start it with `crewd`.")
+    }
+}
+
+impl std::error::Error for NotRunning {}
 
 /// One connection to crewd, already past the `Hello` handshake.
 pub struct Client {
@@ -21,9 +31,13 @@ pub struct Client {
 impl Client {
     /// Connects to `<home>/crewd.sock` and says hello.
     pub async fn connect(home: &Path) -> Result<Client> {
-        let stream = UnixStream::connect(home.join("crewd.sock"))
-            .await
-            .map_err(|_| anyhow!(NOT_RUNNING))?;
+        let stream = match UnixStream::connect(home.join("crewd.sock")).await {
+            Ok(stream) => stream,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return Err(NotRunning.into());
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("Can't connect to crewd")),
+        };
         let mut client = Client {
             stream,
             next_id: 1,
