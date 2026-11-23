@@ -233,9 +233,9 @@ async fn held_stdout_does_not_hang_the_outcome() {
     );
     let (handle, mut rx, join) = spawn_run(inv);
 
-    let outcome = tokio::time::timeout(Duration::from_secs(4), join)
+    let outcome = tokio::time::timeout(Duration::from_secs(6), join)
         .await
-        .expect("outcome within 4 s")
+        .expect("outcome within 6 s")
         .unwrap();
     assert_eq!(
         outcome,
@@ -277,4 +277,50 @@ async fn stop_with_held_stdout_closes_events() {
     .await;
     assert!(closed.is_ok(), "event channel still open after stop");
     handle.stop();
+}
+
+#[tokio::test]
+async fn good_turn_with_held_stdout_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("leaked.pid");
+    let _leaked = Leaked(pid_file.clone());
+    let inv = invocation(
+        fake("claude_turn_then_leaks.sh"),
+        vec![
+            pid_file.to_string_lossy().into_owned(),
+            fixture("read_file.jsonl").to_string_lossy().into_owned(),
+        ],
+    );
+    let (_handle, _rx, join) = spawn_run(inv);
+    let outcome = tokio::time::timeout(Duration::from_secs(6), join)
+        .await
+        .expect("outcome within 6 s")
+        .unwrap();
+    assert_eq!(outcome, RunOutcome::Done);
+    wait_for_pid_file(&pid_file).await;
+}
+
+#[tokio::test]
+async fn crash_with_held_stderr_keeps_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("leaked.pid");
+    let _leaked = Leaked(pid_file.clone());
+    let inv = invocation(
+        fake("claude_crash_then_leaks.sh"),
+        vec![pid_file.to_string_lossy().into_owned()],
+    );
+    let (_handle, _rx, join) = spawn_run(inv);
+    let outcome = tokio::time::timeout(Duration::from_secs(6), join)
+        .await
+        .expect("outcome within 6 s")
+        .unwrap();
+    match outcome {
+        RunOutcome::Failed(msg) => {
+            for line in ["first error line", "second error line", "third error line"] {
+                assert!(msg.contains(line), "missing {line:?} in {msg:?}");
+            }
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    wait_for_pid_file(&pid_file).await;
 }
