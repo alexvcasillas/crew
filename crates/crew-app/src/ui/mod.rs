@@ -8,11 +8,13 @@ mod connect;
 #[cfg(debug_assertions)]
 mod dev_hooks;
 pub mod diff_view;
+mod first_launch;
 mod inspector;
 mod mention_menu;
 mod run_card;
 pub mod running_view;
 mod service_control;
+pub mod settings;
 mod sidebar;
 mod status_bar;
 mod thread_list;
@@ -27,6 +29,8 @@ mod diff_tests;
 mod inspector_tests;
 #[cfg(test)]
 mod running_tests;
+#[cfg(test)]
+mod settings_tests;
 #[cfg(test)]
 mod test_ui;
 #[cfg(test)]

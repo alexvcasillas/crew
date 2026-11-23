@@ -37,8 +37,6 @@ pub const WINDOW_MIN_HEIGHT: f32 = 600.;
 /// One shortcut: its binding and what the shortcuts list calls it.
 pub struct Shortcut {
     pub binding: KeyBinding,
-    // Read by the shortcuts list in settings.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub label: &'static str,
 }
 
@@ -92,6 +90,7 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(crate::ui::composer::bindings());
     cx.bind_keys(crate::ui::diff_view::bindings());
     cx.bind_keys(crate::ui::running_view::bindings());
+    cx.bind_keys(crate::ui::settings::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
