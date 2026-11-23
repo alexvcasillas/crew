@@ -8,7 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use crew_core::ids::{ApprovalId, ThreadId};
 use crew_core::store::Store;
 use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
@@ -131,7 +131,7 @@ pub async fn serve_until(
     // the database, so a second crewd can't disturb the live one.
     let sock = home.join(SOCKET_NAME);
     if UnixStream::connect(&sock).await.is_ok() {
-        bail!("crewd is already running on {}", sock.display());
+        return Err(AlreadyRunning(sock).into());
     }
     let _lock = lock_home(home, &sock)?;
 
@@ -202,6 +202,19 @@ pub async fn serve_until(
     Ok(())
 }
 
+/// Another crewd already serves this home. Not a crash: the `crewd`
+/// binary exits 0 on it.
+#[derive(Debug)]
+pub struct AlreadyRunning(pub PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "crewd is already running on {}", self.0.display())
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 /// Takes the exclusive lock on `home/crewd.lock`, or fails if another
 /// crewd holds it.
 fn lock_home(home: &Path, sock: &Path) -> anyhow::Result<Flock<File>> {
@@ -215,7 +228,7 @@ fn lock_home(home: &Path, sock: &Path) -> anyhow::Result<Flock<File>> {
         .with_context(|| format!("opening {}", path.display()))?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(lock),
-        Err((_, Errno::EWOULDBLOCK)) => bail!("crewd is already running on {}", sock.display()),
+        Err((_, Errno::EWOULDBLOCK)) => Err(AlreadyRunning(sock.to_path_buf()).into()),
         Err((_, e)) => Err(e).with_context(|| format!("locking {}", path.display())),
     }
 }

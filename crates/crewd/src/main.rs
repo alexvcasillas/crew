@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crewd::{ServeOptions, serve};
+use crewd::{AlreadyRunning, ServeOptions, serve};
 
 fn non_empty(v: Option<OsString>) -> Option<OsString> {
     v.filter(|v| !v.is_empty())
@@ -42,6 +42,11 @@ async fn main() -> ExitCode {
     };
     match serve(&home, opts).await {
         Ok(()) => ExitCode::SUCCESS,
+        // Not a crash, so launchd doesn't start it again.
+        Err(e) if e.downcast_ref::<AlreadyRunning>().is_some() => {
+            eprintln!("crewd: {e}");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("crewd: {e:#}");
             ExitCode::FAILURE

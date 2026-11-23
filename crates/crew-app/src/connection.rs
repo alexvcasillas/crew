@@ -182,20 +182,20 @@ pub fn stop_crewd(conn: &ConnectionConfig, wait: Duration) -> bool {
     false
 }
 
-/// How many processes the crewd answering on `conn`'s socket has
-/// started, which are its running agents. 0 if none answers. Blocks, so
-/// run it off the UI thread.
+/// The pid of whatever answers on `conn`'s socket, if anything does.
 #[cfg(target_os = "macos")]
-pub fn crewd_children(conn: &ConnectionConfig) -> usize {
+pub fn crewd_pid(conn: &ConnectionConfig) -> Option<u32> {
     use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
 
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(conn.socket()) else {
-        return 0;
-    };
-    let Ok(pid) = getsockopt(&stream, LocalPeerPid) else {
-        return 0;
-    };
-    drop(stream);
+    let stream = std::os::unix::net::UnixStream::connect(conn.socket()).ok()?;
+    let pid = getsockopt(&stream, LocalPeerPid).ok()?;
+    u32::try_from(pid).ok()
+}
+
+/// How many processes `pid` has started. For crewd, those are its
+/// running agents. Blocks, so run it off the UI thread.
+#[cfg(target_os = "macos")]
+pub fn children_of(pid: u32) -> usize {
     match Command::new("pgrep")
         .arg("-P")
         .arg(pid.to_string())
@@ -274,12 +274,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn nothing_on_the_socket_has_no_agents() {
-        let dir = tempfile::tempdir().unwrap();
+    fn the_socket_peer_is_whoever_listens() {
+        let dir = crate::test_support::short_home();
         let conn = ConnectionConfig {
             crew_home: dir.path().to_path_buf(),
         };
-        assert_eq!(crewd_children(&conn), 0);
+        assert_eq!(crewd_pid(&conn), None);
+        let _listener = std::os::unix::net::UnixListener::bind(conn.socket()).unwrap();
+        assert_eq!(crewd_pid(&conn), Some(std::process::id()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn children_are_counted() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        assert!(children_of(std::process::id()) >= 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(children_of(child.id()), 0);
     }
 
     #[test]

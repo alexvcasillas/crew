@@ -277,3 +277,34 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
         "the socket should be removed"
     );
 }
+
+/// A second crewd on a live home exits 0, so launchd's KeepAlive (on
+/// crashes only) doesn't start it again and again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_crewd_exits_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    let _first = tokio::process::Command::new(env!("CARGO_BIN_EXE_crewd"))
+        .env("CREW_HOME", &home)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let _c = Client::connect(&home.join("crewd.sock")).await;
+
+    let second = timeout(
+        WAIT,
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_crewd"))
+            .env("CREW_HOME", &home)
+            .output(),
+    )
+    .await
+    .expect("the second crewd should exit")
+    .unwrap();
+    let said = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "exited with {}: {said}",
+        second.status
+    );
+    assert!(said.contains("already running"), "{said}");
+}
