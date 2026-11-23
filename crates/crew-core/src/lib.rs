@@ -4,3 +4,4 @@ pub mod agent;
 pub mod claude;
 pub mod event;
 pub mod ids;
+pub mod store;
