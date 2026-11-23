@@ -72,6 +72,13 @@ impl Client {
         Ok(serde_json::from_value(self.call(req).await?)?)
     }
 
+    /// How many notifications are waiting unread. Crewd writes a thread's
+    /// whole history before it answers the next request, so asking anything
+    /// after `Subscribe` leaves exactly the history here.
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+
     /// The next notification, or `None` when crewd hangs up.
     pub async fn next(&mut self) -> Result<Option<ServerMsg>> {
         if !self.pending.is_empty() {

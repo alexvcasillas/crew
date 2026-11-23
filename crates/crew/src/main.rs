@@ -16,7 +16,7 @@ use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId}
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredChannel, StoredProject, StoredRun,
-    StoredThread,
+    StoredThread, handoff_ask_text, paused_text, permission_text,
 };
 use crew_core::worktree::Diff;
 use crew_proto::{Request, ServerMsg};
@@ -193,12 +193,9 @@ async fn resolve_run(c: &mut Client, s: &str) -> Result<RunId> {
     pick(s, active.collect(), "run", "Use the full run id.")
 }
 
-/// Resolves a full thread id or a unique prefix of any thread.
-async fn resolve_thread(c: &mut Client, s: &str) -> Result<ThreadId> {
-    if let Some(id) = parse_full(s) {
-        return Ok(id);
-    }
-    let mut threads: Vec<ThreadId> = Vec::new();
+/// Every thread of every project.
+async fn all_threads(c: &mut Client) -> Result<Vec<StoredThread>> {
+    let mut threads = Vec::new();
     let projects: Vec<StoredProject> = c.ask(Request::ListProjects).await?;
     for project in projects {
         let channels: Vec<StoredChannel> = c
@@ -212,9 +209,18 @@ async fn resolve_thread(c: &mut Client, s: &str) -> Result<ThreadId> {
                     channel: channel.id,
                 })
                 .await?;
-            threads.extend(rows.into_iter().map(|t| t.id));
+            threads.extend(rows);
         }
     }
+    Ok(threads)
+}
+
+/// Resolves a full thread id or a unique prefix of any thread.
+async fn resolve_thread(c: &mut Client, s: &str) -> Result<ThreadId> {
+    if let Some(id) = parse_full(s) {
+        return Ok(id);
+    }
+    let threads = all_threads(c).await?.into_iter().map(|t| t.id).collect();
     pick(s, threads, "thread", "Use the full thread id.")
 }
 
@@ -425,43 +431,23 @@ impl Names {
 
 /// Fallback so `--until-idle` can't hang if a follow-up message never comes.
 const IDLE_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10);
-/// Once every follow-up is in, how long the stream must stay quiet before
-/// `--until-idle` exits. The history of a thread arrives in one burst.
-const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Tracks which runs owe the thread a chat message, so `--until-idle` can
-/// wait for them instead of guessing.
+/// wait for them instead of guessing. A run that ends `Done` owes an agent
+/// message, any other run a system message.
 #[derive(Default)]
 struct Followups {
-    expected: HashSet<RunId>,
-    seen: HashSet<RunId>,
+    /// Runs that ended, and whether the message is from the agent.
+    expected: HashMap<RunId, bool>,
+    /// Runs seen with a message, and whether it was from the agent.
+    seen: HashSet<(RunId, bool)>,
 }
 
 impl Followups {
     fn complete(&self) -> bool {
-        self.expected.is_subset(&self.seen)
-    }
-}
-
-/// A short, one-line view of a tool's input: its command or path if it
-/// has one, else its JSON.
-fn short_input(input: &serde_json::Value) -> String {
-    let text = ["command", "file_path", "path", "url", "pattern"]
-        .iter()
-        .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
-        .map(String::from)
-        .unwrap_or_else(|| match input {
-            serde_json::Value::Null => String::new(),
-            serde_json::Value::Object(map) if map.is_empty() => String::new(),
-            other => other.to_string(),
-        });
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or_default();
-    let cut: String = first.chars().take(80).collect();
-    if cut.len() < first.len() || lines.next().is_some() {
-        format!("{cut}...")
-    } else {
-        cut
+        self.expected
+            .iter()
+            .all(|(run, agent)| self.seen.contains(&(*run, *agent)))
     }
 }
 
@@ -474,34 +460,37 @@ async fn approval_text(
     Ok(match &approval.kind {
         ApprovalKind::Permission { tool, input } => {
             let name = names.of_run(ctl, approval.run).await?;
-            let shown = short_input(input);
-            if shown.is_empty() {
-                format!("{name} wants to run {tool}.")
-            } else {
-                format!("{name} wants to run {tool}: {shown}")
-            }
+            permission_text(&name, tool, input)
         }
         ApprovalKind::Handoff {
             from, to, paused, ..
         } => {
-            let from = names.of_agent(ctl, *from).await?;
-            let to = names.of_agent(ctl, *to).await?;
             if *paused {
-                format!("{from} wants to bring in {to}. The handoff budget is used up.")
+                let used = all_threads(ctl)
+                    .await?
+                    .into_iter()
+                    .find(|t| t.id == approval.thread)
+                    .map_or(0, |t| t.handoffs_used);
+                paused_text(used)
             } else {
-                format!("{from} wants to bring in {to}.")
+                let from = names.of_agent(ctl, *from).await?;
+                let to = names.of_agent(ctl, *to).await?;
+                handoff_ask_text(&from, &to)
             }
         }
     })
 }
 
 /// True when the thread has nothing running and nothing waiting on you.
-async fn settled(
-    ctl: &mut Client,
-    thread: ThreadId,
-    pending: &HashSet<ApprovalId>,
-) -> Result<bool> {
-    Ok(pending.is_empty() && idle(ctl, thread).await?)
+/// Asked of crewd, which answers once the run's end is fully recorded, so
+/// a handoff ask made as the run ended is already there.
+async fn settled(ctl: &mut Client, thread: ThreadId) -> Result<bool> {
+    let waiting: Vec<StoredApproval> = ctl
+        .ask(Request::ListApprovals {
+            thread: Some(thread),
+        })
+        .await?;
+    Ok(waiting.is_empty() && idle(ctl, thread).await?)
 }
 
 async fn watch(
@@ -516,30 +505,22 @@ async fn watch(
     let mut names = Names::load(&mut ctl).await?;
     // The reason a run failed, taken from its last error or failed turn.
     let mut reasons: HashMap<RunId, String> = HashMap::new();
-    // Approvals waiting on you. The backlog reports them after the runs
-    // finish, so they are read first.
-    let waiting: Vec<StoredApproval> = ctl
-        .ask(Request::ListApprovals {
-            thread: Some(thread),
-        })
-        .await?;
-    let mut pending: HashSet<ApprovalId> = waiting.iter().map(|a| a.id).collect();
     let mut asked: HashSet<ApprovalId> = HashSet::new();
     sub.call(Request::Subscribe { thread }).await?;
+    // Crewd answers this only after it wrote the thread's history, so the
+    // history is what is buffered now.
+    sub.call(Request::ListRuns { status: None }).await?;
+    let mut backlog = sub.buffered();
     // Once idle, keep reading until every finished run has its chat
     // message, since those arrive after the run backlog.
     let mut followups = Followups::default();
     let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
-        let deadline = idle_since.map(|since| {
-            if followups.complete() {
-                tokio::time::Instant::now() + QUIET
-            } else {
-                since + IDLE_FALLBACK
-            }
-        });
-        let next = match deadline {
-            Some(d) => match tokio::time::timeout_at(d, sub.next()).await {
+        if idle_since.is_some() && backlog == 0 && followups.complete() {
+            return Ok(());
+        }
+        let next = match idle_since {
+            Some(since) => match tokio::time::timeout_at(since + IDLE_FALLBACK, sub.next()).await {
                 Ok(next) => next?,
                 Err(_) => return Ok(()),
             },
@@ -548,6 +529,7 @@ async fn watch(
         let Some(msg) = next else {
             bail!("crewd closed the connection.");
         };
+        backlog = backlog.saturating_sub(1);
         match msg {
             ServerMsg::Event { run, event, .. } => {
                 match &event {
@@ -576,26 +558,33 @@ async fn watch(
                     let name = names.of_run(&mut ctl, run).await?;
                     println!("[{name}] {line}");
                     match status {
-                        RunStatus::Done | RunStatus::Failed => {
-                            followups.expected.insert(run);
+                        RunStatus::Done => {
+                            followups.expected.insert(run, true);
+                        }
+                        RunStatus::Failed => {
+                            followups.expected.insert(run, false);
                         }
                         // A run stopped before it started gets no message
                         // of its own, only the thread-wide one.
                         RunStatus::Stopped if started(&mut ctl, run).await? => {
-                            followups.expected.insert(run);
+                            followups.expected.insert(run, false);
                         }
                         _ => {}
                     }
                     if until_idle {
-                        update_idle(&mut ctl, thread, &pending, &mut idle_since).await?;
+                        update_idle(&mut ctl, thread, &mut idle_since).await?;
                     }
                 } else {
                     idle_since = None;
                 }
             }
             ServerMsg::Message { message, .. } => {
+                // Live, a run's last message comes just before its final
+                // status, so messages are noted whenever they arrive.
                 if let Some(run) = message.run {
-                    followups.seen.insert(run);
+                    followups
+                        .seen
+                        .insert((run, matches!(message.author, Author::Agent(_))));
                 }
                 let author = match message.author {
                     Author::You => "you".to_string(),
@@ -606,7 +595,6 @@ async fn watch(
             }
             ServerMsg::Approval { approval, .. } => match approval.status {
                 ApprovalStatus::Pending => {
-                    pending.insert(approval.id);
                     if asked.insert(approval.id) {
                         let text = approval_text(&mut names, &mut ctl, &approval).await?;
                         println!("[?] {text}  (crew approve {})", short(approval.id));
@@ -617,7 +605,6 @@ async fn watch(
                     }
                 }
                 ref decided => {
-                    pending.remove(&approval.id);
                     println!(
                         "{}",
                         match decided {
@@ -627,7 +614,7 @@ async fn watch(
                         }
                     );
                     if until_idle {
-                        update_idle(&mut ctl, thread, &pending, &mut idle_since).await?;
+                        update_idle(&mut ctl, thread, &mut idle_since).await?;
                     }
                 }
             },
@@ -640,10 +627,9 @@ async fn watch(
 async fn update_idle(
     ctl: &mut Client,
     thread: ThreadId,
-    pending: &HashSet<ApprovalId>,
     idle_since: &mut Option<tokio::time::Instant>,
 ) -> Result<()> {
-    if settled(ctl, thread, pending).await? {
+    if settled(ctl, thread).await? {
         idle_since.get_or_insert_with(tokio::time::Instant::now);
     } else {
         *idle_since = None;

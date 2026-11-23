@@ -10,6 +10,7 @@ use crew_core::policy::{self, Decision, PolicyInputs};
 use crew_core::scheduler::Job;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, Store, StoreError, StoredApproval, StoredThread,
+    handoff_ask_text, paused_text, permission_text,
 };
 use crew_proto::{PermissionAnswer, ServerMsg};
 use tokio::sync::oneshot;
@@ -20,8 +21,6 @@ use crate::service::{Db, Service, State};
 const RUN_STOPPED: &str = "The run was stopped.";
 /// What an agent is told when you decline its permission ask.
 const DECLINED: &str = "The user declined this.";
-/// Longest tool input shown in a permission ask.
-const SHORT_INPUT: usize = 80;
 
 /// Marks permission asks left pending by an earlier crewd as cancelled.
 /// Nothing waits for them any more.
@@ -90,7 +89,7 @@ impl Service {
             .map_err(store_err)?
             .name
             .clone();
-        let shown = short_input(&input);
+        let body = permission_text(&name, tool, &input);
         let kind = ApprovalKind::Permission {
             tool: tool.to_string(),
             input,
@@ -100,11 +99,6 @@ impl Service {
             .create_approval(stored.thread, run, &kind)
             .map_err(store_err)?;
         self.publish_approval(&mut db, id).map_err(store_err)?;
-        let body = if shown.is_empty() {
-            format!("{name} wants to run {tool}.")
-        } else {
-            format!("{name} wants to run {tool}: {shown}")
-        };
         self.add_message(&mut db, stored.thread, Author::System, &body, Some(run))
             .map_err(store_err)?;
         state.waiting.insert(id, tx);
@@ -203,11 +197,7 @@ impl Service {
         match policy::decide(&inputs) {
             Decision::Ask => {
                 self.ask_handoff(db, req, false)?;
-                system(
-                    self,
-                    db,
-                    &format!("{from_name} wants to bring in {to_name}."),
-                )?;
+                system(self, db, &handoff_ask_text(&from_name, &to_name))?;
                 Ok(format!("Asked the user to approve bringing in {to_name}."))
             }
             Decision::Run => {
@@ -219,11 +209,7 @@ impl Service {
             }
             Decision::Pause { budget } => {
                 self.ask_handoff(db, req, true)?;
-                system(
-                    self,
-                    db,
-                    &format!("Paused. This thread used its {budget} handoffs."),
-                )?;
+                system(self, db, &paused_text(budget))?;
                 Ok("This thread used its handoffs. Asked the user whether to continue.".into())
             }
         }
@@ -444,49 +430,4 @@ fn policy_inputs(
         channel: (channel.handoff_policy, channel.handoff_budget),
         used: thread.handoffs_used,
     })
-}
-
-/// A short, one-line view of a tool's input: its command or path if it
-/// has one, else its JSON.
-fn short_input(input: &serde_json::Value) -> String {
-    let text = ["command", "file_path", "path", "url", "pattern"]
-        .iter()
-        .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
-        .map(String::from)
-        .unwrap_or_else(|| match input {
-            serde_json::Value::Null => String::new(),
-            serde_json::Value::Object(map) if map.is_empty() => String::new(),
-            other => other.to_string(),
-        });
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or_default();
-    let cut: String = first.chars().take(SHORT_INPUT).collect();
-    if cut.len() < first.len() || lines.next().is_some() {
-        format!("{cut}...")
-    } else {
-        cut
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn short_input_picks_the_command_and_cuts_it() {
-        assert_eq!(short_input(&json!({"command": "ls -la"})), "ls -la");
-        assert_eq!(
-            short_input(&json!({"file_path": "/work/demo/a"})),
-            "/work/demo/a"
-        );
-        assert_eq!(short_input(&json!({})), "");
-        assert_eq!(short_input(&json!({"n": 1})), r#"{"n":1}"#);
-        assert_eq!(short_input(&json!({"command": "a\nb"})), "a...");
-        let long = "x".repeat(100);
-        assert_eq!(
-            short_input(&json!({ "command": long })),
-            format!("{}...", "x".repeat(80))
-        );
-    }
 }

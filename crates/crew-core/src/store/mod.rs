@@ -16,7 +16,10 @@ use crate::event::{Event, RunStatus};
 use crate::ids::{AgentId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crate::policy::HandoffPolicy;
 
-pub use approval::{ApprovalKind, ApprovalStatus, StoredApproval};
+pub use approval::{
+    ApprovalKind, ApprovalStatus, StoredApproval, handoff_ask_text, paused_text, permission_text,
+    short_input,
+};
 
 const SCHEMA: &str = include_str!("schema.sql");
 const SCHEMA_VERSION: i64 = 2;
