@@ -25,7 +25,9 @@ use super::running_view::RunningView;
 use super::service_control::ServiceAction;
 use super::settings::projects::{PickFolder, native_picker};
 use super::settings::{Page, SettingsView};
-use crate::app::{ApproveLatest, NewThread, OpenSettings, ShowRunning, ShowThreads, StopAll};
+use crate::app::{
+    ApproveLatest, NewThread, OpenSettings, Search, ShowRunning, ShowThreads, StopAll,
+};
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
@@ -239,6 +241,13 @@ impl Workspace {
     #[cfg(test)]
     pub(super) fn set_folder_picker(&mut self, pick: PickFolder) {
         self.pick_folder = pick;
+    }
+
+    /// Moves focus off any field onto the window, as clicking empty space
+    /// would.
+    #[cfg(test)]
+    pub(super) fn focus_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
     }
 
     /// What the UI renders from.
@@ -779,15 +788,16 @@ fn dev_hooks() -> StartupHooks {
     }
 }
 
-/// "Forge is working. A reply now is queued for its next turn."
+/// "Forge is working. Replies without @Forge become context for its next
+/// turn."
 fn working_hint(names: &[String]) -> Option<String> {
     match names {
         [] => None,
         [one] => Some(format!(
-            "{one} is working. A reply now is queued for its next turn."
+            "{one} is working. Replies without @{one} become context for its next turn."
         )),
         [rest @ .., last] => Some(format!(
-            "{} and {last} are working. A reply now is queued for their next turns.",
+            "{} and {last} are working. Replies without an @mention become context for their next turns.",
             rest.join(", ")
         )),
     }
@@ -812,6 +822,13 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
+            .on_action(cx.listener(|_, _: &Search, window, cx| {
+                struct SearchSoon;
+                window.push_notification(
+                    Notification::info(super::title_bar::SEARCH_SOON).id::<SearchSoon>(),
+                    cx,
+                );
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(Page::General, window, cx);
             }))
@@ -1021,18 +1038,22 @@ mod tests {
         assert_eq!(working_hint(&[]), None);
         assert_eq!(
             working_hint(&["Forge".into()]).as_deref(),
-            Some("Forge is working. A reply now is queued for its next turn.")
+            Some("Forge is working. Replies without @Forge become context for its next turn.")
         );
         assert_eq!(
             working_hint(&["Forge".into(), "Scout".into(), "Prism".into()]).as_deref(),
-            Some("Forge, Scout and Prism are working. A reply now is queued for their next turns.")
+            Some(
+                "Forge, Scout and Prism are working. Replies without an @mention become context for their next turns."
+            )
         );
     }
 }
 
 #[cfg(test)]
 mod gpui_tests {
-    use super::super::test_ui::{click, has, notifications, open, shows, wait_to_show, wait_until};
+    use super::super::test_ui::{
+        click, description_of, has, notifications, open, press, shows, wait_to_show, wait_until,
+    };
     use crate::client;
     use crate::connection::ConnectionConfig;
     use crate::test_support::{Daemon, refuse_hello, short_home};
@@ -1060,6 +1081,21 @@ mod gpui_tests {
         assert!(shows(cx, window, "Crew"), "the app name");
         assert!(shows(cx, window, "Search threads, agents, files…"));
         assert!(shows(cx, window, "Projects"), "the sidebar");
+    }
+
+    #[gpui_kit::test]
+    fn search_says_it_is_coming_soon(cx: &mut TestAppContext) {
+        let home = short_home();
+        let (window, _) = open(cx, home.path());
+        assert_eq!(
+            description_of(cx, window, "title-search").as_deref(),
+            Some("Search is coming soon.")
+        );
+        assert_eq!(notifications(cx, window), 0);
+        press(cx, window, "cmd-k");
+        assert_eq!(notifications(cx, window), 1);
+        press(cx, window, "cmd-k");
+        assert_eq!(notifications(cx, window), 1, "said once");
     }
 
     #[gpui_kit::test]

@@ -160,7 +160,6 @@ impl Composer {
     }
 
     /// Whether the text field has focus.
-    #[cfg(test)]
     pub fn focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
     }

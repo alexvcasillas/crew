@@ -139,6 +139,22 @@ pub fn label_of(
     .unwrap()
 }
 
+/// The accessible description of the element `id`, if it is on screen.
+pub fn description_of(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    id: impl Into<ElementId>,
+) -> Option<String> {
+    let id = id.into();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find(id)
+            .and_then(|e| e.description().map(str::to_string))
+    })
+    .unwrap()
+}
+
 /// Where the element `id` is drawn, if it is on screen.
 pub fn bounds_of(
     cx: &mut TestAppContext,

@@ -256,7 +256,7 @@ fn run_card_shows_steps_live_and_stop_stops_it(cx: &mut TestAppContext) {
     assert!(shows(
         cx,
         window,
-        "Forge is working. A reply now is queued for its next turn."
+        "Forge is working. Replies without @Forge become context for its next turn."
     ));
     assert_eq!(
         label_of(cx, window, format!("run-state-{run}")).as_deref(),

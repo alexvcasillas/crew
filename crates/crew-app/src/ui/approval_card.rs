@@ -113,11 +113,14 @@ impl Workspace {
 
     /// Approves the brief you are editing, else the newest pending
     /// handoff or permission ask in the open thread (⌘↵). ⌘↵ is bound for
-    /// the whole window, so text fields don't take it.
+    /// the whole window, so text fields don't take it. From the composer
+    /// it approves handoffs only: a permission ask is never allowed by a
+    /// reflex meant to send.
     pub(super) fn approve_latest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.nav.thread else {
             return;
         };
+        let from_composer = self.composer.read(cx).focused(window, cx);
         let state = self.state();
         let pending = state.pending_approvals(thread);
         let edited = self
@@ -130,7 +133,10 @@ impl Workspace {
                 .iter()
                 .rev()
                 .filter(|a| !self.deciding.contains(&a.id))
-                .find(|a| !matches!(a.kind, ApprovalKind::Handoff { paused: true, .. }))
+                .find(|a| match a.kind {
+                    ApprovalKind::Handoff { paused, .. } => !paused,
+                    _ => !from_composer,
+                })
                 .map(|a| a.id)
         });
         if let Some(approval) = latest {
