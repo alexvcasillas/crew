@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod connection;
+pub mod diff_parse;
 pub mod model;
 
 #[cfg(test)]

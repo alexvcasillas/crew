@@ -7,6 +7,7 @@ pub mod composer;
 mod connect;
 #[cfg(debug_assertions)]
 mod dev_hooks;
+pub mod diff_view;
 mod inspector;
 mod mention_menu;
 mod run_card;
@@ -19,6 +20,8 @@ mod thread_view;
 mod title_bar;
 pub mod workspace;
 
+#[cfg(test)]
+mod diff_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]

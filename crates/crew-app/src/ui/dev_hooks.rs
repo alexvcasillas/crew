@@ -8,8 +8,11 @@ use crew_core::ids::ThreadId;
 pub struct DevHooks {
     /// `CREW_APP_OPEN_THREAD`: opened once the thread is known.
     pub open_thread: Option<ThreadId>,
-    /// `CREW_APP_SHOW`: `running` or `settings`.
+    /// `CREW_APP_SHOW`: `running`, `settings` or `diff:<thread>`.
     pub show: Option<String>,
+    /// `CREW_APP_SHOW=diff:<thread>`: the thread's changes, opened once
+    /// the thread is known.
+    pub review: Option<ThreadId>,
 }
 
 /// Reads the hooks through `var`, logging values it can't use.
@@ -21,16 +24,25 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         }
         id
     });
+    let mut review = None;
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
             "running" | "settings" => {
                 eprintln!("crew: CREW_APP_SHOW={v} has no view yet, ignored")
             }
-            _ => eprintln!("crew: CREW_APP_SHOW={v} is unknown, ignored"),
+            _ => match v.strip_prefix("diff:").map(|id| id.trim().parse()) {
+                Some(Ok(id)) => review = Some(ThreadId(id)),
+                Some(Err(_)) => eprintln!("crew: CREW_APP_SHOW={v} is not diff:<thread id>"),
+                None => eprintln!("crew: CREW_APP_SHOW={v} is unknown, ignored"),
+            },
         }
         v
     });
-    DevHooks { open_thread, show }
+    DevHooks {
+        open_thread,
+        show,
+        review,
+    }
 }
 
 #[cfg(test)]
@@ -51,8 +63,13 @@ mod tests {
             DevHooks {
                 open_thread: Some(id),
                 show: Some("running".into()),
+                review: None,
             }
         );
+        let diff = format!("diff:{id}");
+        let review = read(|k| (k == "CREW_APP_SHOW").then(|| diff.clone()));
+        assert_eq!(review.review, Some(id));
+        assert_eq!(read(|_| Some("diff:nope".into())).review, None);
         assert_eq!(read(|_| None), DevHooks::default());
         let bad = read(|k| (k == "CREW_APP_OPEN_THREAD").then(|| "nope".to_string()));
         assert_eq!(bad.open_thread, None);
