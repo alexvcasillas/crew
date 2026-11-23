@@ -86,6 +86,7 @@ pub fn init(cx: &mut App) {
         Err(e) => eprintln!("crew: theme does not parse: {e}"),
     }
     cx.bind_keys(bindings().into_iter().map(|s| s.binding));
+    cx.bind_keys(crate::ui::composer::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
 }

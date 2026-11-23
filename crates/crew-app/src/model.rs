@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{
-    ApprovalStatus, StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject,
-    StoredRun, StoredThread,
+    ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
+    StoredProject, StoredRun, StoredThread,
 };
 use crew_proto::ServerMsg;
 
@@ -221,6 +221,14 @@ impl State {
         self.runs.get(&run)
     }
 
+    pub fn project(&self, project: ProjectId) -> Option<&StoredProject> {
+        self.projects.get(&project)
+    }
+
+    pub fn channel(&self, channel: ChannelId) -> Option<&StoredChannel> {
+        self.channels.get(&channel)
+    }
+
     pub fn thread(&self, thread: ThreadId) -> Option<&StoredThread> {
         self.threads.get(&thread)
     }
@@ -292,6 +300,77 @@ impl State {
         self.status_of(|t| threads.contains(&t))
     }
 
+    /// The most urgent status among the channel's threads.
+    pub fn channel_status(&self, channel: ChannelId) -> ThreadStatus {
+        let threads = self.thread_ids(|c| c == channel);
+        self.status_of(|t| threads.contains(&t))
+    }
+
+    /// Whether the agent waits on you, works, or neither.
+    pub fn agent_status(&self, agent: AgentId) -> ThreadStatus {
+        let asks = self.approvals.values().any(|a| {
+            a.status == ApprovalStatus::Pending
+                && self.runs.get(&a.run).is_some_and(|r| r.agent == agent)
+        });
+        if asks {
+            return ThreadStatus::NeedsYou;
+        }
+        let working = self
+            .runs
+            .values()
+            .any(|r| r.agent == agent && is_live(&r.status));
+        if working {
+            ThreadStatus::Working
+        } else {
+            ThreadStatus::Idle
+        }
+    }
+
+    /// Messages in the channel's threads after `since` (Unix ms) that you
+    /// didn't write.
+    pub fn unread(&self, channel: ChannelId, since: i64) -> usize {
+        let threads = self.thread_ids(|c| c == channel);
+        threads
+            .iter()
+            .flat_map(|t| self.messages(*t))
+            .filter(|m| m.created_at > since && m.author != Author::You)
+            .count()
+    }
+
+    /// The thread's queued and working runs, by start time.
+    pub fn live_runs(&self, thread: ThreadId) -> Vec<&StoredRun> {
+        sorted(
+            self.runs
+                .values()
+                .filter(|r| r.thread == thread && is_live(&r.status)),
+            |r| (r.started_at, r.id.0),
+        )
+    }
+
+    /// The thread's pending approvals, oldest first.
+    pub fn pending_approvals(&self, thread: ThreadId) -> Vec<&StoredApproval> {
+        sorted(
+            self.approvals
+                .values()
+                .filter(|a| a.thread == thread && a.status == ApprovalStatus::Pending),
+            |a| (a.created_at, a.id.0),
+        )
+    }
+
+    /// The thread's newest known message.
+    pub fn last_message(&self, thread: ThreadId) -> Option<&StoredMessage> {
+        self.messages(thread).last()
+    }
+
+    /// Threads whose channel `matches` accepts.
+    fn thread_ids(&self, matches: impl Fn(ChannelId) -> bool) -> HashSet<ThreadId> {
+        self.threads
+            .values()
+            .filter(|t| matches(t.channel))
+            .map(|t| t.id)
+            .collect()
+    }
+
     /// The most urgent status among threads `matches` accepts.
     fn status_of(&self, matches: impl Fn(ThreadId) -> bool) -> ThreadStatus {
         let asks = self
@@ -337,7 +416,7 @@ fn sorted<'a, T, K: Ord>(items: impl Iterator<Item = &'a T>, key: impl Fn(&T) ->
 mod tests {
     use super::*;
     use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
-    use crew_core::store::{ApprovalKind, Author};
+    use crew_core::store::ApprovalKind;
     use std::path::PathBuf;
 
     fn project(created_at: i64) -> StoredProject {
@@ -738,6 +817,104 @@ mod tests {
         assert!(state.events(t.id).is_empty());
         state.apply(event(t.id, r, 1, "old"));
         assert_eq!(texts(&state, t.id), ["old"]);
+    }
+
+    #[test]
+    fn channel_status_follows_its_threads_only() {
+        let (mut state, p, c, t) = one_thread();
+        let other = channel(p.id);
+        let elsewhere = thread(other.id, "elsewhere", 2);
+        state.apply(ServerMsg::ChannelChanged {
+            channel: other.clone(),
+        });
+        state.apply(ServerMsg::ThreadCreated {
+            channel: other.id,
+            thread: elsewhere.clone(),
+        });
+        state.apply(status(&run(elsewhere.id, RunStatus::Working, 1)));
+        assert_eq!(state.channel_status(c.id), ThreadStatus::Idle);
+        assert_eq!(state.channel_status(other.id), ThreadStatus::Working);
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: approval(t.id, 1),
+        });
+        assert_eq!(state.channel_status(c.id), ThreadStatus::NeedsYou);
+    }
+
+    #[test]
+    fn agent_status_comes_from_its_runs_and_their_asks() {
+        let (mut state, _, _, t) = one_thread();
+        let forge = agent("Forge");
+        state.apply(ServerMsg::AgentChanged {
+            agent: forge.clone(),
+        });
+        assert_eq!(state.agent_status(forge.id), ThreadStatus::Idle);
+        let mut working = run(t.id, RunStatus::Working, 1);
+        working.agent = forge.id;
+        state.apply(status(&working));
+        assert_eq!(state.agent_status(forge.id), ThreadStatus::Working);
+        let mut ask = approval(t.id, 2);
+        ask.run = working.id;
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: ask,
+        });
+        assert_eq!(state.agent_status(forge.id), ThreadStatus::NeedsYou);
+        // Someone else's run says nothing about Forge.
+        assert_eq!(state.agent_status(AgentId::new()), ThreadStatus::Idle);
+    }
+
+    #[test]
+    fn unread_counts_others_messages_after_a_time() {
+        let (mut state, _, c, t) = one_thread();
+        let mut reply = message(t.id, "done", 20);
+        reply.author = Author::Agent(AgentId::new());
+        let mut note = message(t.id, "Forge stopped.", 30);
+        note.author = Author::System;
+        for m in [message(t.id, "mine", 10), reply, note] {
+            state.apply(ServerMsg::Message {
+                thread: t.id,
+                message: m,
+            });
+        }
+        assert_eq!(state.unread(c.id, 0), 2, "your own message doesn't count");
+        assert_eq!(state.unread(c.id, 20), 1);
+        assert_eq!(state.unread(ChannelId::new(), 0), 0);
+        assert_eq!(state.last_message(t.id).unwrap().body, "Forge stopped.");
+    }
+
+    #[test]
+    fn live_runs_and_pending_approvals_are_per_thread() {
+        let (mut state, _, c, t) = one_thread();
+        let other = thread(c.id, "other", 2);
+        state.apply(ServerMsg::ThreadCreated {
+            channel: c.id,
+            thread: other.clone(),
+        });
+        let later = run(t.id, RunStatus::Queued, 20);
+        let first = run(t.id, RunStatus::Working, 10);
+        for r in [
+            &later,
+            &first,
+            &run(t.id, RunStatus::Done, 5),
+            &run(other.id, RunStatus::Working, 1),
+        ] {
+            state.apply(status(r));
+        }
+        let ids: Vec<RunId> = state.live_runs(t.id).iter().map(|r| r.id).collect();
+        assert_eq!(ids, [first.id, later.id]);
+
+        let ask = approval(t.id, 3);
+        let mut decided = approval(t.id, 1);
+        decided.status = ApprovalStatus::Declined;
+        for a in [&ask, &decided, &approval(other.id, 1)] {
+            state.apply(ServerMsg::Approval {
+                thread: a.thread,
+                approval: a.clone(),
+            });
+        }
+        let ids: Vec<ApprovalId> = state.pending_approvals(t.id).iter().map(|a| a.id).collect();
+        assert_eq!(ids, [ask.id]);
     }
 
     #[test]

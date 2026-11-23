@@ -1280,6 +1280,7 @@ dependencies = [
 name = "crew-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crew-core",
  "crew-proto",
  "crewd",
