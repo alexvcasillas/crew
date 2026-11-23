@@ -27,6 +27,7 @@ fn options() -> Result<(PathBuf, ServeOptions), String> {
             .ok_or_else(|| format!("CREW_MAX_RUNS must be a number above 0, got {v:?}."))?;
     }
     opts.claude_bin = non_empty(std::env::var_os("CREW_CLAUDE_BIN")).map(PathBuf::from);
+    opts.codex_bin = non_empty(std::env::var_os("CREW_CODEX_BIN")).map(PathBuf::from);
     Ok((home, opts))
 }
 

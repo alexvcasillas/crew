@@ -15,8 +15,8 @@ use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredChannel, StoredProject, StoredRun,
-    StoredThread, handoff_ask_text, paused_text, permission_text,
+    ApprovalKind, ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel,
+    StoredProject, StoredRun, StoredThread, handoff_ask_text, paused_text, permission_text,
 };
 use crew_core::worktree::Diff;
 use crew_proto::{Request, ServerMsg};
@@ -320,9 +320,11 @@ fn short(id: impl ToString) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-async fn agent_names(c: &mut Client) -> Result<HashMap<AgentId, String>> {
-    let agents: Vec<(AgentId, AgentSpec)> = c.ask(Request::ListAgents).await?;
-    Ok(agents.into_iter().map(|(id, a)| (id, a.name)).collect())
+/// Agent names by id. `include_deleted` also names deleted agents, for
+/// their past messages and runs.
+async fn agent_names(c: &mut Client, include_deleted: bool) -> Result<HashMap<AgentId, String>> {
+    let agents: Vec<StoredAgent> = c.ask(Request::ListAgents { include_deleted }).await?;
+    Ok(agents.into_iter().map(|a| (a.id, a.spec.name)).collect())
 }
 
 async fn init_demo(c: &mut Client) -> Result<()> {
@@ -340,7 +342,7 @@ async fn init_demo(c: &mut Client) -> Result<()> {
             name: "general".into(),
         })
         .await?;
-    let exists = agent_names(c).await?.values().any(|n| n == "Scout");
+    let exists = agent_names(c, false).await?.values().any(|n| n == "Scout");
     if !exists {
         let _: AgentId = c
             .ask(Request::CreateAgent {
@@ -385,7 +387,7 @@ fn is_active(status: &RunStatus) -> bool {
 }
 
 async fn status(c: &mut Client) -> Result<()> {
-    let names = agent_names(c).await?;
+    let names = agent_names(c, true).await?;
     let runs: Vec<StoredRun> = c.ask(Request::ListRuns { status: None }).await?;
     let mut any = false;
     for run in runs.iter().filter(|r| is_active(&r.status)) {
@@ -467,7 +469,7 @@ impl Names {
     async fn load(c: &mut Client) -> Result<Names> {
         let runs: Vec<StoredRun> = c.ask(Request::ListRuns { status: None }).await?;
         Ok(Names {
-            agents: agent_names(c).await?,
+            agents: agent_names(c, true).await?,
             runs: runs.into_iter().map(|r| (r.id, r.agent)).collect(),
         })
     }
@@ -688,7 +690,10 @@ async fn watch(
             // Responses are read elsewhere, the rest only reach SubscribeAll.
             ServerMsg::Response { .. }
             | ServerMsg::Snapshot { .. }
+            | ServerMsg::ProjectChanged { .. }
+            | ServerMsg::ChannelChanged { .. }
             | ServerMsg::ThreadCreated { .. }
+            | ServerMsg::ThreadChanged { .. }
             | ServerMsg::AgentChanged { .. } => {}
             ServerMsg::Resync => bail!("watch fell behind crewd. Run it again."),
         }

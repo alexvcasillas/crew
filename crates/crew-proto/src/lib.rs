@@ -87,8 +87,12 @@ pub enum Request {
     ListRuns {
         status: Option<RunStatus>,
     },
-    /// Answered with `Vec<(AgentId, AgentSpec)>`.
-    ListAgents,
+    /// Answered with `Vec<StoredAgent>`. Deleted agents only come with
+    /// `include_deleted`, for naming their past messages.
+    ListAgents {
+        #[serde(default)]
+        include_deleted: bool,
+    },
     /// Answered with `Vec<StoredProject>`.
     ListProjects,
     /// Answered with `Vec<StoredChannel>`.
@@ -240,11 +244,17 @@ pub enum ServerMsg {
         runs: Vec<StoredRun>,
         approvals: Vec<StoredApproval>,
     },
+    /// A project was created or its settings changed.
+    ProjectChanged { project: StoredProject },
+    /// A channel was created or its settings changed.
+    ChannelChanged { channel: StoredChannel },
     /// A thread was created.
     ThreadCreated {
         channel: ChannelId,
         thread: StoredThread,
     },
+    /// A thread was renamed or its settings changed.
+    ThreadChanged { thread: StoredThread },
     /// An agent was created, changed or deleted.
     AgentChanged { agent: AgentId },
     /// This connection fell behind and missed notifications. crewd closes

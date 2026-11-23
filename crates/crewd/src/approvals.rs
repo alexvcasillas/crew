@@ -416,11 +416,14 @@ impl Service {
 
     /// Lets `n` more handoffs run in the thread on their own.
     pub(crate) fn allow_more_handoffs(&self, thread: ThreadId, n: u32) -> Result<(), StoreError> {
-        let db = self.db();
+        let mut db = self.db();
         let row = db.store.thread(thread)?;
         let budget = policy::budget(&policy_inputs(&db, &row, None)?);
         db.store
-            .set_thread_handoff(thread, row.handoff_policy, Some(budget.saturating_add(n)))
+            .set_thread_handoff(thread, row.handoff_policy, Some(budget.saturating_add(n)))?;
+        let thread = db.store.thread(thread)?;
+        self.publish_global(&mut db, ServerMsg::ThreadChanged { thread });
+        Ok(())
     }
 
     /// Cancels the run's pending permission asks and tells each waiting

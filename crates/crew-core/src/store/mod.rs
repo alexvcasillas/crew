@@ -301,6 +301,18 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
+    pub fn project(&self, p: ProjectId) -> Result<StoredProject> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("{PROJECT_COLUMNS} WHERE p.id = ?1"),
+                [p.to_string()],
+                read_project,
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("project"))?
+    }
+
     /// The project a thread belongs to.
     pub fn project_of_thread(&self, t: ThreadId) -> Result<StoredProject> {
         let row = self
@@ -329,26 +341,23 @@ impl Store {
     }
 
     pub fn channels(&self, p: ProjectId) -> Result<Vec<StoredChannel>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, created_at, handoff_policy, handoff_budget
-             FROM channels WHERE project_id = ?1 ORDER BY created_at, rowid",
-        )?;
-        let rows = stmt.query_map([p.to_string()], |r| {
-            let channel = StoredChannel {
-                id: ChannelId(uuid_col(r, 0)?),
-                project: p,
-                name: r.get(1)?,
-                created_at: r.get(2)?,
-                handoff_policy: None,
-                handoff_budget: r.get(4)?,
-            };
-            let policy: Option<String> = r.get(3)?;
-            Ok(parse_policy(policy).map(|handoff_policy| StoredChannel {
-                handoff_policy,
-                ..channel
-            }))
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{CHANNEL_COLUMNS} WHERE project_id = ?1 ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([p.to_string()], read_channel)?;
         rows.map(|r| r?).collect()
+    }
+
+    pub fn channel(&self, c: ChannelId) -> Result<StoredChannel> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("{CHANNEL_COLUMNS} WHERE id = ?1"),
+                [c.to_string()],
+                read_channel,
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("channel"))?
     }
 
     pub fn create_agent(&self, spec: &AgentSpec) -> Result<AgentId> {
@@ -827,6 +836,25 @@ fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
             ..project
         })
         .map_err(StoreError::from))
+}
+
+const CHANNEL_COLUMNS: &str =
+    "SELECT id, project_id, name, created_at, handoff_policy, handoff_budget FROM channels";
+
+fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
+    let channel = StoredChannel {
+        id: ChannelId(uuid_col(r, 0)?),
+        project: ProjectId(uuid_col(r, 1)?),
+        name: r.get(2)?,
+        created_at: r.get(3)?,
+        handoff_policy: None,
+        handoff_budget: r.get(5)?,
+    };
+    let policy: Option<String> = r.get(4)?;
+    Ok(parse_policy(policy).map(|handoff_policy| StoredChannel {
+        handoff_policy,
+        ..channel
+    }))
 }
 
 const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,

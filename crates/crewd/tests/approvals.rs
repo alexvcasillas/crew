@@ -767,7 +767,11 @@ async fn permission_ask_waits_for_decision() {
     assert_eq!(pending.status, ApprovalStatus::Pending);
 
     // The same connection keeps answering other requests meanwhile.
-    let list = mcp.send(Request::ListAgents).await;
+    let list = mcp
+        .send(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
     match mcp.read().await {
         ServerMsg::Response { id, result } => {
             assert_eq!(id, list);
@@ -1122,7 +1126,11 @@ async fn approvals_come_before_their_messages_live_and_in_backlog() {
     })
     .await
     .unwrap();
-    late.call(Request::ListAgents).await.unwrap();
+    late.call(Request::ListAgents {
+        include_deleted: false,
+    })
+    .await
+    .unwrap();
     let backlog = std::mem::take(&mut late.pending);
     let found: Vec<&StoredApproval> = backlog
         .iter()
