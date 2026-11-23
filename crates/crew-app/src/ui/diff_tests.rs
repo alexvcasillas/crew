@@ -225,8 +225,22 @@ fn commit_empties_the_diff(cx: &mut TestAppContext) {
         label_of(cx, window, "review-commit").as_deref() == Some("Commit 1 file")
     });
 
+    click(cx, window, ("review-viewed", 0usize));
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.viewed_files(s.w.thread)),
+        ["new.txt"]
+    );
     click(cx, window, "review-commit");
     wait_to_show(cx, window, "No changes to review.");
+    assert!(
+        ws.read_with(cx, |ws, _| ws.viewed_files(s.w.thread))
+            .is_empty(),
+        "Viewed marks go with the commit"
+    );
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some("")
+    );
     let path = worktree(cx, &ws, s.w.thread).unwrap();
     assert_eq!(git(&path, &["log", "-1", "--format=%s"]).trim(), "Fixed.");
     assert_eq!(git(&path, &["status", "--porcelain"]), "");
@@ -309,4 +323,85 @@ fn commit_while_running_shows_the_wait_message(cx: &mut TestAppContext) {
 
     std::fs::write(&go, "").unwrap();
     run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+}
+
+/// Opens the review straight away, as the debug hook does.
+fn open_review_now(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ws: &Entity<Workspace>,
+    thread: ThreadId,
+) {
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_review(thread, window, cx));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_review_follows_the_run_and_drafts_from_its_reply(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let go = tmp.path().join("go");
+    let s = setup(&format!(
+        "printf 'one\\n' > new.txt\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nprintf 'later\\n' > later.txt",
+        go.display()
+    ));
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Working);
+    wait_until(cx, "the worktree", |cx| {
+        worktree(cx, &ws, s.w.thread).is_some_and(|p| p.join("new.txt").exists())
+    });
+    open_review_now(cx, window, &ws, s.w.thread);
+    wait_to_show(cx, window, "· 1 + one");
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some("")
+    );
+
+    // The run ends: its new file and its reply show up without a refresh.
+    std::fs::write(&go, "").unwrap();
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_to_show(cx, window, "· 1 + later");
+    wait_until(cx, "the drafted message", |cx| {
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref() == Some("Fixed.")
+    });
+    assert!(shows(cx, window, "Commit message · drafted by Forge"));
+}
+
+#[gpui_kit::test]
+fn esc_in_the_message_keeps_the_review_and_the_text(cx: &mut TestAppContext) {
+    let s = setup("printf 'one\\n' > new.txt");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some("Fixed."),
+        "drafted from Forge's reply"
+    );
+
+    click(cx, window, "review-message");
+    type_text(cx, window, " Trims the email.");
+    press(cx, window, "escape");
+    assert!(
+        shows(cx, window, "Forge's changes"),
+        "Esc leaves the field only"
+    );
+    let typed = "Fixed. Trims the email.";
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some(typed)
+    );
+
+    // A second Esc leaves the review; coming back keeps the text.
+    press(cx, window, "escape");
+    wait_until(cx, "the thread", |cx| has(cx, window, "thread-view"));
+    review_from_inspector(cx, window);
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.review_message(cx)).as_deref(),
+        Some(typed)
+    );
 }

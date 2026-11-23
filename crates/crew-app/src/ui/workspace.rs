@@ -17,7 +17,7 @@ use gpui_kit::*;
 use super::approval_card::BriefEditor;
 use super::common::runtime_chip;
 use super::composer::{Composer, ComposerEvent};
-use super::diff_view::Review;
+use super::diff_view::{Review, SavedMessage};
 use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
 use super::status_bar::StatusBar;
@@ -112,6 +112,10 @@ pub struct Workspace {
     /// A thread whose review opens once the thread is open (debug
     /// builds' startup hook).
     review_pending: Option<ThreadId>,
+    /// Commit messages of closed reviews, per thread.
+    pub(super) commit_messages: HashMap<ThreadId, SavedMessage>,
+    /// Numbers the thread diff reads, so only the latest lands.
+    pub(super) diff_seq: u64,
 }
 
 impl Workspace {
@@ -140,7 +144,7 @@ impl Workspace {
             nav: Nav::default(),
             drafts: HashMap::new(),
             creating: None,
-            open_pending: hooks.open_thread.or(hooks.review),
+            open_pending: hooks.review.or(hooks.open_thread),
             ticker: None,
             requests: HashMap::new(),
             next_request: 0,
@@ -155,6 +159,8 @@ impl Workspace {
             review: None,
             viewed: HashMap::new(),
             review_pending: hooks.review,
+            commit_messages: HashMap::new(),
+            diff_seq: 0,
         }
     }
 
@@ -227,6 +233,7 @@ impl Workspace {
             .update(cx, |bar, cx| bar.set_connection(connection, cx));
         self.sync(cx);
         self.sync_inspector(window, cx);
+        self.sync_review_draft(window, cx);
         self.open_if_known(window, cx);
         cx.notify();
     }
@@ -315,7 +322,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.stash_draft(cx);
-        self.close_thread();
+        self.close_thread(cx);
         self.nav.drafting = false;
         self.look_at(Some(channel));
         self.composer.update(cx, |composer, cx| {
@@ -335,7 +342,7 @@ impl Workspace {
     ) {
         self.stash_draft(cx);
         if self.nav.thread != Some(thread) {
-            self.close_thread();
+            self.close_thread(cx);
             self.watch_thread(thread);
             self.nav.thread = Some(thread);
             self.nav.seen_messages = 0;
@@ -361,7 +368,7 @@ impl Workspace {
             return;
         }
         self.stash_draft(cx);
-        self.close_thread();
+        self.close_thread(cx);
         self.nav.drafting = true;
         self.composer.update(cx, |composer, cx| {
             composer.set_first_message(true, window, cx);
@@ -422,8 +429,8 @@ impl Workspace {
         }
     }
 
-    fn close_thread(&mut self) {
-        self.review = None;
+    fn close_thread(&mut self, cx: &App) {
+        self.drop_review(cx);
         if let Some(open) = self.nav.thread.take() {
             self.unwatch_thread(open);
             self.inspector.reset();

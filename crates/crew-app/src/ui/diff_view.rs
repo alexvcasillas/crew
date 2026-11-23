@@ -31,10 +31,13 @@ actions!(
     [
         /// Leave the review for the thread.
         CloseReview,
+        /// Leave the commit message for the review.
+        LeaveMessage,
     ]
 );
 
 const REVIEW_CONTEXT: &str = "Review";
+const MESSAGE_CONTEXT: &str = "ReviewMessage";
 /// Files with more lines than this wait for "Show diff".
 pub const LARGE_FILE_LINES: usize = 2000;
 /// The longest first line a drafted commit message keeps.
@@ -46,9 +49,20 @@ const LINE_HEIGHT: f32 = 20.;
 const NOTHING_TO_REVIEW: &str = "No changes to review.";
 const NOTE: &str = "Nothing is pushed. Committing stays on your machine, and the branch is yours to merge or open a PR from.";
 
-/// Esc leaves the review, unless a field takes it first.
+/// Esc leaves the commit message first, then the review.
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new("escape", CloseReview, Some(REVIEW_CONTEXT))]
+    vec![
+        KeyBinding::new("escape", CloseReview, Some(REVIEW_CONTEXT)),
+        KeyBinding::new("escape", LeaveMessage, Some("ReviewMessage > Input")),
+    ]
+}
+
+/// A commit message kept while its thread's review is closed.
+pub(super) struct SavedMessage {
+    text: String,
+    /// The draft it started from: if `text` is still that, a newer draft
+    /// may replace it.
+    draft: String,
 }
 
 /// One row of the diff list.
@@ -66,8 +80,9 @@ enum Row {
 /// The open review of a thread's changes.
 pub(super) struct Review {
     pub(super) thread: ThreadId,
-    /// The last diff read, `None` until the first answer.
-    diff: Option<Diff>,
+    /// Whether a diff was read yet.
+    loaded: bool,
+    /// Parsed from the last diff read. The one source of file counts.
     files: Vec<FileDiff>,
     rows: Vec<Row>,
     /// Each file's header row.
@@ -76,10 +91,9 @@ pub(super) struct Review {
     /// Large files you asked to see, by path.
     shown: HashSet<String>,
     message: Entity<TextareaState>,
-    /// Whether the message was drafted from the agent's reply.
-    drafted: bool,
+    /// The draft from the agent's latest reply, empty if none.
+    draft: String,
     _message_events: Subscription,
-    load: Option<Task<()>>,
     /// A commit or discard was sent and has not been answered.
     busy: bool,
     /// Why the last read failed, shown in place of the diff.
@@ -161,15 +175,18 @@ impl Workspace {
         if self.nav.thread != Some(thread) {
             self.open_thread(thread, window, cx);
         }
-        let reply = self.latest_reply(thread);
-        let drafted = reply.is_some();
-        let text = reply.map(|r| draft_commit_message(&r)).unwrap_or_default();
+        let draft = self.current_draft(thread);
+        let text = match self.commit_messages.remove(&thread) {
+            Some(saved) if saved.text != saved.draft && !saved.text.is_empty() => saved.text,
+            _ => draft.clone(),
+        };
+        // Set before the field is first drawn, so it shows.
         let message = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(6)
                 .placeholder("Say what changed and why.")
+                .default_value(text)
         });
-        message.update(cx, |input, cx| input.set_value(text, window, cx));
         let events = cx.subscribe(&message, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
@@ -179,46 +196,86 @@ impl Workspace {
         focus.focus(window, cx);
         self.review = Some(Review {
             thread,
-            diff: None,
+            loaded: false,
             files: Vec::new(),
             rows: Vec::new(),
             file_rows: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             shown: HashSet::new(),
             message,
-            drafted,
+            draft,
             _message_events: events,
-            load: None,
             busy: false,
             failed: None,
             focus,
         });
-        self.load_review(cx);
+        self.load_thread_diff(thread, cx);
         cx.notify();
     }
 
     /// Goes back to the thread.
     pub(super) fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.take().is_some() {
+        if self.drop_review(cx) {
             self.composer
                 .update(cx, |composer, cx| composer.focus(window, cx));
             cx.notify();
         }
     }
 
-    /// The text of the latest agent message in the thread.
-    fn latest_reply(&self, thread: ThreadId) -> Option<String> {
+    /// Closes the review, keeping its message for next time. Whether one
+    /// was open.
+    pub(super) fn drop_review(&mut self, cx: &App) -> bool {
+        let Some(review) = self.review.take() else {
+            return false;
+        };
+        let text = review.message.read(cx).value().to_string();
+        self.commit_messages.insert(
+            review.thread,
+            SavedMessage {
+                text,
+                draft: review.draft,
+            },
+        );
+        true
+    }
+
+    /// The commit message drafted from the thread's latest agent reply.
+    fn current_draft(&self, thread: ThreadId) -> String {
         self.state()
             .messages(thread)
             .iter()
             .rev()
             .find(|m| matches!(m.author, Author::Agent(_)))
-            .map(|m| m.body.clone())
+            .map(|m| draft_commit_message(&m.body))
+            .unwrap_or_default()
+    }
+
+    /// Puts a newer draft in the message, unless you wrote your own.
+    pub(super) fn sync_review_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        let draft = self.current_draft(thread);
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        if draft == review.draft {
+            return;
+        }
+        let text = review.message.read(cx).value().to_string();
+        if text.is_empty() || text == review.draft {
+            let new = draft.clone();
+            review
+                .message
+                .update(cx, |input, cx| input.set_value(new, window, cx));
+        }
+        review.draft = draft;
+        cx.notify();
     }
 
     /// The agent whose changes these are: the latest to reply, else the
     /// latest to run.
-    fn review_agent(&self, thread: ThreadId) -> String {
+    fn review_agent(&self, thread: ThreadId) -> Option<String> {
         let state = self.state();
         let replied = state
             .messages(thread)
@@ -232,49 +289,52 @@ impl Workspace {
         replied
             .or(ran)
             .and_then(|a| state.agent(a))
-            .map_or_else(|| "the agent".to_string(), |a| a.spec.name.clone())
+            .map(|a| a.spec.name.clone())
     }
 
-    /// Reads the worktree's changes afresh.
-    fn load_review(&mut self, cx: &mut Context<Self>) {
-        let Some(review) = &mut self.review else {
-            return;
-        };
-        let thread = review.thread;
+    /// Reads the open thread's uncommitted changes, for the inspector and
+    /// the review. Only the latest read lands, and a failed read keeps
+    /// what was shown.
+    pub(super) fn load_thread_diff(&mut self, thread: ThreadId, cx: &mut Context<Self>) {
+        self.diff_seq += 1;
+        let seq = self.diff_seq;
         let answer = self.client.request(Request::ThreadDiff { thread });
         let background = cx.background_executor().clone();
-        review.load = Some(cx.spawn(async move |this, cx| {
+        let parse_it = self.review.as_ref().is_some_and(|r| r.thread == thread);
+        self.inspector.diff_task = Some(cx.spawn(async move |this, cx| {
             let read = answer
                 .await
                 .and_then(|v| serde_json::from_value::<Diff>(v).map_err(|e| e.to_string()));
             let read = match read {
-                Ok(diff) => {
+                Ok(diff) if parse_it => {
                     let patch = diff.patch.clone();
                     let files = background.spawn(async move { parse(&patch) }).await;
-                    Ok((diff, files))
+                    Ok((diff, Some(files)))
                 }
+                Ok(diff) => Ok((diff, None)),
                 Err(e) => Err(e),
             };
             this.update(cx, |this, cx| {
+                if this.diff_seq != seq || this.nav.thread != Some(thread) {
+                    return;
+                }
+                let review = this.review.as_mut().filter(|r| r.thread == thread);
                 match read {
                     Ok((diff, files)) => {
-                        if this.nav.thread == Some(thread) {
-                            // The inspector and the Done card see it too.
-                            this.inspector.diff = Some(diff.clone());
-                        }
-                        if let Some(review) = this.review.as_mut().filter(|r| r.thread == thread) {
+                        if let (Some(review), Some(files)) = (review, files) {
+                            review.loaded = true;
                             review.failed = None;
-                            review.diff = Some(diff);
                             review.files = files;
                             review
                                 .shown
                                 .retain(|p| review.files.iter().any(|f| &f.path == p));
                             rebuild_rows(review);
                         }
+                        this.inspector.diff = Some(diff);
                     }
                     Err(e) => {
-                        if let Some(review) = this.review.as_mut().filter(|r| r.thread == thread) {
-                            review.failed = Some(format!("{e} Refresh to try again."));
+                        if let Some(review) = review {
+                            review.failed = Some(e);
                         }
                     }
                 }
@@ -282,6 +342,13 @@ impl Workspace {
             })
             .ok();
         }));
+    }
+
+    /// Reads the review's changes afresh.
+    fn load_review(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread) = self.review.as_ref().map(|r| r.thread) {
+            self.load_thread_diff(thread, cx);
+        }
     }
 
     fn show_large_file(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -352,9 +419,7 @@ impl Workspace {
     /// nothing else is being sent.
     pub(super) fn review_can_commit(&self, cx: &App) -> bool {
         self.review.as_ref().is_some_and(|r| {
-            !r.busy
-                && r.diff.as_ref().is_some_and(|d| !d.files.is_empty())
-                && !r.message.read(cx).value().trim().is_empty()
+            !r.busy && !r.files.is_empty() && !r.message.read(cx).value().trim().is_empty()
         })
     }
 
@@ -401,6 +466,7 @@ impl Workspace {
                         Notification::success(format!("Committed to {branch}.")),
                         cx,
                     );
+                    this.forget_review_marks(thread, window, cx);
                     this.load_review(cx);
                 }
                 cx.notify();
@@ -415,9 +481,11 @@ impl Workspace {
         let Some(review) = &self.review else {
             return;
         };
+        let whose = self
+            .review_agent(review.thread)
+            .map_or_else(|| "these".to_string(), |a| format!("{a}'s"));
         let ask = format!(
-            "Discard {}'s changes? The worktree is removed. A branch with commits is kept.",
-            self.review_agent(review.thread)
+            "Discard {whose} changes? The worktree is removed. A branch with commits is kept."
         );
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -463,9 +531,12 @@ impl Workspace {
         let answer = self.client.request(Request::Discard { thread });
         self.spawn_request(window, cx, async move |this, cx| {
             let result = answer.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 if let Some(review) = &mut this.review {
                     review.busy = false;
+                }
+                if result.is_ok() {
+                    this.forget_review_marks(thread, window, cx);
                 }
                 this.load_review(cx);
                 cx.notify();
@@ -482,7 +553,10 @@ impl Workspace {
         let Some(review) = &self.review else {
             return;
         };
-        let mention = format!("@{} ", self.review_agent(review.thread));
+        let Some(agent) = self.review_agent(review.thread) else {
+            return;
+        };
+        let mention = format!("@{agent} ");
         self.close_review(window, cx);
         self.composer.update(cx, |composer, cx| {
             let draft = composer.text(cx);
@@ -494,6 +568,23 @@ impl Workspace {
             composer.set_text(&text, window, cx);
             composer.focus(window, cx);
         });
+    }
+
+    /// After a commit or discard: Viewed marks go, and the message
+    /// empties so the next reply can draft a new one.
+    fn forget_review_marks(
+        &mut self,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.viewed.remove(&thread);
+        self.commit_messages.remove(&thread);
+        if let Some(review) = self.review.as_mut().filter(|r| r.thread == thread) {
+            review
+                .message
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
     }
 
     /// Opens the worktree folder in the editor app, or in Finder.
@@ -529,6 +620,7 @@ impl Workspace {
                 let checked = viewed.is_some_and(|v| v.contains(&file.path));
                 div()
                     .id(("diff-file", f))
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -567,6 +659,7 @@ impl Workspace {
                 let header = review.files[f].hunks[h].header.clone();
                 div()
                     .id(("diff-row", ix))
+                    .w_full()
                     .flex()
                     .items_center()
                     .h(px(28.))
@@ -611,6 +704,7 @@ impl Workspace {
                 };
                 div()
                     .id(("diff-row", ix))
+                    .w_full()
                     .flex()
                     .h(px(LINE_HEIGHT))
                     .items_center()
@@ -649,6 +743,7 @@ impl Workspace {
                 let note = review.files[f].note.clone().unwrap_or_default();
                 div()
                     .id(("diff-row", ix))
+                    .w_full()
                     .px(px(16.))
                     .py(px(10.))
                     .text_size(px(12.))
@@ -663,6 +758,7 @@ impl Workspace {
                 let note = format!("{} changes {} lines.", file.path, file.line_count());
                 div()
                     .id(("diff-row", ix))
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap(px(12.))
@@ -705,7 +801,9 @@ impl Workspace {
             .and_then(|t| state.channel(t.channel))
             .map(|c| c.name.clone())
             .unwrap_or_default();
-        let heading = format!("{}'s changes", self.review_agent(review.thread));
+        let heading = self
+            .review_agent(review.thread)
+            .map_or_else(|| "Changes".to_string(), |a| format!("{a}'s changes"));
         let where_ = format!("{title} · #{channel}");
         let left = div()
             .flex()
@@ -908,12 +1006,15 @@ impl Workspace {
 
     fn render_review_diff(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let review = self.review.as_ref();
-        let failed = review.and_then(|r| r.failed.clone());
-        let empty = match review.and_then(|r| r.diff.as_ref()) {
-            _ if failed.is_some() => failed,
-            None => Some("Reading the changes…".to_string()),
-            Some(d) if d.files.is_empty() => Some(NOTHING_TO_REVIEW.to_string()),
+        let empty = match review {
+            Some(r) if !r.loaded => Some(
+                r.failed
+                    .clone()
+                    .unwrap_or_else(|| "Reading the changes…".to_string()),
+            ),
+            Some(r) if r.files.is_empty() => Some(NOTHING_TO_REVIEW.to_string()),
             Some(_) => None,
+            None => Some(NOTHING_TO_REVIEW.to_string()),
         };
         let body = match (empty, review) {
             (None, Some(review)) => div()
@@ -961,7 +1062,7 @@ impl Workspace {
         let thread = state.thread(review.thread);
         let branch = thread
             .and_then(|t| t.worktree.as_ref())
-            .map_or_else(|| "None".to_string(), |wt| wt.branch.clone());
+            .map_or_else(|| "No worktree".to_string(), |wt| wt.branch.clone());
         let into = thread
             .and_then(|t| state.channel(t.channel))
             .and_then(|c| state.project(c.project))
@@ -969,12 +1070,13 @@ impl Workspace {
             .unwrap_or_default();
         let has_worktree = thread.is_some_and(|t| t.worktree.is_some());
         let agent = self.review_agent(review.thread);
-        let n = review.diff.as_ref().map_or(0, |d| d.files.len());
+        let n = review.files.len();
         let can_commit = self.review_can_commit(cx);
-        let caption = if review.drafted {
-            format!("Commit message · drafted by {agent}")
-        } else {
-            "Commit message".to_string()
+        let drafted = !review.draft.is_empty()
+            && review.message.read(cx).value().as_ref() == review.draft.as_str();
+        let caption = match &agent {
+            Some(agent) if drafted => format!("Commit message · drafted by {agent}"),
+            _ => "Commit message".to_string(),
         };
         let field = |label: &'static str, id: &'static str, value: String| {
             div()
@@ -1024,13 +1126,22 @@ impl Workspace {
                     .gap(px(6.))
                     .child(
                         div()
+                            .id("review-message-caption")
                             .text_size(px(12.))
                             .text_color(color("text-secondary"))
-                            .child(caption),
+                            .aria_label(caption.clone())
+                            .child(caption)
+                            .test_support(),
                     )
                     .child(
                         div()
                             .id("review-message")
+                            .key_context(MESSAGE_CONTEXT)
+                            .on_action(cx.listener(|this, _: &LeaveMessage, window, cx| {
+                                if let Some(review) = &this.review {
+                                    review.focus.focus(window, cx);
+                                }
+                            }))
                             .font_family(mono_font())
                             .child(Textarea::new(&review.message).aria_label("Commit message"))
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1065,7 +1176,11 @@ impl Workspace {
                         Button::new("review-ask")
                             .outline()
                             .w_full()
-                            .label(format!("Ask {agent} for changes"))
+                            .label(agent.as_ref().map_or_else(
+                                || "Ask for changes".to_string(),
+                                |a| format!("Ask {a} for changes"),
+                            ))
+                            .disabled(agent.is_none())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.ask_for_changes(window, cx)),
                             ),
