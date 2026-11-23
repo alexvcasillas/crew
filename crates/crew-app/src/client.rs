@@ -32,7 +32,6 @@ use crate::connection::{self, ConnectionConfig, PROBE_TIMEOUT};
 use crate::model::{ConnectionState, State};
 
 /// First pause before connecting again. It doubles up to [`MAX_BACKOFF`].
-/// First pause before connecting again. It doubles up to [`MAX_BACKOFF`].
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
@@ -333,8 +332,9 @@ async fn open_stream(
 
 /// Opens the control connection and a stream, then forwards notices and
 /// answers requests until the control connection drops. A stream that
-/// drops or falls behind (`Resync`) is reopened right away, and requests
-/// in flight keep waiting for their answers.
+/// drops or falls behind (`Resync`) is reopened right away, or after
+/// [`MIN_BACKOFF`] if it was reopened less than [`MAX_BACKOFF`] ago.
+/// Requests in flight keep waiting for their answers.
 async fn session(
     socket: &Path,
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -355,6 +355,7 @@ async fn session(
     )));
     let mut next_id = 1;
     let mut streams = 0;
+    let mut reopened: Option<tokio::time::Instant> = None;
     let mut stream = match open_stream(socket, streams, &frames_tx, watched, &mut next_id).await {
         Ok(stream) => stream,
         Err(refused) => return Ended::Refused(refused),
@@ -419,6 +420,11 @@ async fn session(
                 };
                 if let Some(reason) = stream_lost {
                     eprintln!("crew: reopening the stream: {reason}");
+                    // A stream that keeps falling behind would spin.
+                    if reopened.is_some_and(|at| at.elapsed() < MAX_BACKOFF) {
+                        tokio::time::sleep(MIN_BACKOFF).await;
+                    }
+                    reopened = Some(tokio::time::Instant::now());
                     streams += 1;
                     stream = match open_stream(socket, streams, &frames_tx, watched, &mut next_id).await {
                         Ok(stream) => stream,
