@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-haiku-4-5","cwd":"/work/demo","tools":[]}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"session_id":"00000000-0000-4000-8000-000000000001","uuid":"00000000-0000-4000-8000-000000000002"}
+{"type":"system","subtype":"commands_changed","commands":[],"session_id":"00000000-0000-4000-8000-000000000001","uuid":"00000000-0000-4000-8000-000000000003"}
+{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_input":{"command":"rm -rf /work/demo/tmp"},"tool_use_id":"toolu_01","session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"system","subtype":"permission_denied","tool_name":"Write","tool_input":{"file_path":"/work/demo/a.txt"},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"system","subtype":"permission_denied","session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"result","subtype":"success","is_error":false,"result":"Could not.","duration_ms":900,"num_turns":2,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"rm -rf /work/demo/tmp"},"tool_use_id":"toolu_01"},{"tool_name":"Write","tool_input":{"file_path":"/work/demo/a.txt"}},{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"toolu_03"}],"session_id":"00000000-0000-4000-8000-000000000001"}

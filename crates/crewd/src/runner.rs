@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crew_core::claude::{ClaudeInvocation, parse_line};
+use crew_core::claude::{ClaudeInvocation, StreamParser};
 use crew_core::event::Event;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -256,9 +256,10 @@ async fn read_events(
     turn_ok: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
+    let mut parser = StreamParser::new();
     let mut receiver_alive = true;
     while let Some(line) = next_line(&mut reader).await {
-        for event in parse_line(&line) {
+        for event in parser.parse(&line) {
             if let Event::TurnEnd { ok, .. } = &event {
                 turn_ok.store(*ok, Ordering::SeqCst);
             }

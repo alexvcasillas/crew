@@ -1,4 +1,4 @@
-use crew_core::claude::parse_line;
+use crew_core::claude::{StreamParser, parse_line};
 use crew_core::event::{Event, ToolKind};
 use serde_json::json;
 
@@ -204,4 +204,68 @@ fn tool_target_falls_back_to_pattern_then_url_then_none() {
         Some("https://example.com".into())
     );
     assert_eq!(target(json!({"other": 1})), None);
+}
+
+fn fixture_lines(name: &str) -> Vec<String> {
+    let path = format!(
+        "{}/tests/fixtures/claude/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines().map(str::to_string).collect()
+}
+
+fn denied(tool: &str, input: serde_json::Value) -> Event {
+    Event::PermissionDenied {
+        tool: tool.into(),
+        input,
+    }
+}
+
+#[test]
+fn stream_parser_drops_noise_and_reports_each_denial_once() {
+    let mut parser = StreamParser::new();
+    let events: Vec<Event> = fixture_lines("denied_stream.jsonl")
+        .iter()
+        .flat_map(|line| parser.parse(line))
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            started(),
+            denied("Bash", json!({"command": "rm -rf /work/demo/tmp"})),
+            denied("Write", json!({"file_path": "/work/demo/a.txt"})),
+            Event::Raw {
+                line: r#"{"type":"system","subtype":"permission_denied","session_id":"00000000-0000-4000-8000-000000000001"}"#.into()
+            },
+            denied("Bash", json!({"command": "ls"})),
+            Event::TurnEnd {
+                ok: true,
+                summary: "Could not.".into(),
+                duration_ms: 900,
+                num_turns: 2
+            },
+        ]
+    );
+}
+
+#[test]
+fn parse_line_drops_thinking_tokens_and_commands_changed() {
+    let lines = fixture_lines("denied_stream.jsonl");
+    assert!(parse_line(&lines[1]).is_empty());
+    assert!(parse_line(&lines[2]).is_empty());
+    assert_eq!(
+        parse_line(&lines[3]),
+        vec![denied("Bash", json!({"command": "rm -rf /work/demo/tmp"}))]
+    );
+}
+
+#[test]
+fn stream_parser_keeps_result_denials_when_none_were_streamed() {
+    let mut parser = StreamParser::new();
+    let events: Vec<Event> = fixture_lines("error_result.jsonl")
+        .iter()
+        .flat_map(|line| parser.parse(line))
+        .collect();
+    assert_eq!(events, parse_fixture("error_result.jsonl"));
 }
