@@ -219,40 +219,47 @@ async fn call_tool(ctx: &Ctx, id: Value, params: &Value) -> Value {
             }
         }
         Some("approve") => {
-            let Some(tool) = str_arg("tool_name") else {
-                return text(id, "approve needs a tool_name.", true);
-            };
-            let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
-            let decision = if tool.starts_with(OWN_TOOLS) {
-                json!({"behavior": "allow", "updatedInput": input})
-            } else {
-                let req = Request::PermissionAsk {
-                    run: ctx.run,
-                    tool,
-                    input: input.clone(),
-                };
-                let answer = match ask(&ctx.home, req).await {
-                    Ok(v) => v,
-                    Err(e) => return text(id, &e, true),
-                };
-                match serde_json::from_value::<PermissionAnswer>(answer) {
-                    Ok(PermissionAnswer { allow: true, .. }) => {
-                        json!({"behavior": "allow", "updatedInput": input})
-                    }
-                    Ok(PermissionAnswer {
-                        allow: false,
-                        message,
-                    }) => json!({
-                        "behavior": "deny",
-                        "message": message.unwrap_or_else(|| "Denied in Crew.".into()),
-                    }),
-                    Err(_) => return text(id, "Crew sent an answer I can't read.", true),
-                }
-            };
+            // Always a decision, never a tool error, so Claude gets a clean
+            // answer even when Crew can't give one.
+            let decision = approve(ctx, args).await;
             text(id, &decision.to_string(), false)
         }
         Some(other) => error(id, INVALID_PARAMS, &format!("No tool {other}.")),
         None => error(id, INVALID_PARAMS, "tools/call needs a name."),
+    }
+}
+
+fn deny(message: &str) -> Value {
+    json!({"behavior": "deny", "message": message})
+}
+
+/// Decides one permission ask. Crew's own tools are allowed without asking.
+async fn approve(ctx: &Ctx, args: &Value) -> Value {
+    let Some(tool) = args.get("tool_name").and_then(Value::as_str) else {
+        return deny("approve needs a tool_name.");
+    };
+    let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+    if tool.starts_with(OWN_TOOLS) {
+        return json!({"behavior": "allow", "updatedInput": input});
+    }
+    let req = Request::PermissionAsk {
+        run: ctx.run,
+        tool: tool.to_string(),
+        input: input.clone(),
+    };
+    let answer = match ask(&ctx.home, req).await {
+        Ok(v) => v,
+        Err(e) => return deny(&e),
+    };
+    match serde_json::from_value::<PermissionAnswer>(answer) {
+        Ok(PermissionAnswer { allow: true, .. }) => {
+            json!({"behavior": "allow", "updatedInput": input})
+        }
+        Ok(PermissionAnswer {
+            allow: false,
+            message,
+        }) => deny(message.as_deref().unwrap_or("Denied in Crew.")),
+        Err(_) => deny("Crew sent an answer I can't read."),
     }
 }
 

@@ -809,6 +809,52 @@ async fn runs_get_crew_mcp_when_it_exists() {
         Some("default")
     );
     assert!(!args.iter().any(|a| a == "--permission-prompts"));
+    let allowed = arg_after(args, "--allowedTools").expect("--allowedTools");
+    assert!(
+        allowed.split(',').any(|t| t == "mcp__crew__handoff"),
+        "{allowed}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_runs_get_handoff_but_no_prompt_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let mcp_bin = dir.path().join("crew-mcp");
+    std::fs::write(&mcp_bin, "").unwrap();
+    let d = Daemon::start_with(4, script, Some(mcp_bin)).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, &dir.path().join("repo"), 1).await;
+    let scout = AgentSpec {
+        name: "Scout".into(),
+        permission_mode: PermissionMode::ReadOnly,
+        ..forge()
+    };
+    let _: AgentId = c.ok(Request::CreateAgent { spec: scout }).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Scout look".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Done)).await;
+
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 1);
+    let args = &calls[0];
+    assert!(arg_after(args, "--mcp-config").is_some());
+    assert_eq!(
+        arg_after(args, "--allowedTools").as_deref(),
+        Some("mcp__crew__handoff")
+    );
+    assert_eq!(
+        arg_after(args, "--permission-mode").as_deref(),
+        Some("plan")
+    );
+    assert_eq!(arg_after(args, "--permission-prompt-tool"), None);
+    assert!(!args.iter().any(|a| a == "--permission-prompts"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
