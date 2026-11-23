@@ -253,8 +253,7 @@ impl Service {
             }
             Decision::Run => {
                 db.store.bump_handoffs_used(thread)?;
-                let row = db.store.thread(thread)?;
-                self.publish_global(db, ServerMsg::ThreadChanged { thread: row });
+                self.thread_changed_or_log(db, thread);
                 let queued = db.store.create_run(thread, req.to)?;
                 let body = format!("{from_name} brought in {to_name}.");
                 self.add_message(db, thread, Author::System, &body, Some(run))?;
@@ -413,8 +412,7 @@ impl Service {
                 .set_thread_handoff(thread, row.handoff_policy, Some(raised))?;
         }
         db.store.bump_handoffs_used(thread)?;
-        let row = db.store.thread(thread)?;
-        self.publish_global(db, ServerMsg::ThreadChanged { thread: row });
+        self.thread_changed_or_log(db, thread);
         db.store.create_run(thread, to)
     }
 

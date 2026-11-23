@@ -19,6 +19,15 @@ pub const WAIT: Duration = Duration::from_secs(20);
 /// A window as `app::run` opens it, pointed at `home`. The client's
 /// thread wakes the test executor, so parking is allowed.
 pub fn open(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_sized(cx, home, 1440.)
+}
+
+/// Like [`open`], `width` px wide.
+pub fn open_sized(
+    cx: &mut TestAppContext,
+    home: &Path,
+    width: f32,
+) -> (AnyWindowHandle, Entity<Workspace>) {
     cx.executor().allow_parking();
     let conn = ConnectionConfig {
         crew_home: home.to_path_buf(),
@@ -29,7 +38,7 @@ pub fn open(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Entity<Wo
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::default(),
-                size: size(px(1440.), px(900.)),
+                size: size(px(width), px(900.)),
             })),
             ..Default::default()
         };

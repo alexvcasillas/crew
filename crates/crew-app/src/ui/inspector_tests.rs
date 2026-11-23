@@ -16,9 +16,10 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, ListOffset, TestAppContext, px};
 
 use super::test_ui::{
-    WAIT, click, has, label_of, notifications, press, shows, type_text, wait_to_show, wait_until,
+    WAIT, click, has, label_of, notifications, open_sized, press, shows, type_text, wait_to_show,
+    wait_until,
 };
-use super::thread_tests::{World, agent, ask, live_run, open_thread, world};
+use super::thread_tests::{World, agent, ask, go_to, live_run, open_thread, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, short_home};
 
@@ -576,4 +577,225 @@ fn git_repo(dir: &Path) {
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
     }
+}
+
+/// The thread's handoffs used and budget, as the app knows them.
+fn handoffs(
+    cx: &mut TestAppContext,
+    ws: &Entity<Workspace>,
+    thread: ThreadId,
+) -> (u32, Option<u32>) {
+    ws.read_with(cx, |ws, _| {
+        let t = ws.state().thread(thread).unwrap();
+        (t.handoffs_used, t.handoff_budget)
+    })
+}
+
+#[gpui_kit::test]
+fn budget_pause_allows_three_more_then_pauses_again(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(
+        home.path(),
+        &tmp.path().join("repo"),
+        &["Forge", "Scout", "Triage"],
+    );
+    let () = w.ask(Request::SetThreadHandoff {
+        thread: w.thread,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(1),
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+    assert_eq!(
+        hand_off(&w, run, "Scout", "one"),
+        "Scout will pick this up after you finish."
+    );
+    assert_eq!(
+        hand_off(&w, run, "Triage", "two"),
+        "This thread used its handoffs. Asked the user whether to continue."
+    );
+    let id = pending(cx, &ws, w.thread);
+    let card = format!("approval-{id}");
+    wait_until(cx, "the pause card", |cx| {
+        label_of(cx, window, card.clone()).as_deref()
+            == Some("Paused. This thread used its 1 handoffs.")
+    });
+
+    // A double click counts once.
+    let more = format!("approval-more-{id}");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(more.clone(), cx);
+        window.render_frame(cx);
+        window.click(more.clone(), cx);
+    })
+    .unwrap();
+    wait_until(cx, "the card to fold", |cx| {
+        starts(
+            cx,
+            window,
+            card.clone(),
+            "Handoff to Triage approved by you",
+        )
+    });
+    wait_until(cx, "the held-back handoff to count", |cx| {
+        handoffs(cx, &ws, w.thread) == (2, Some(4))
+    });
+    assert_eq!(notifications(cx, window), 0);
+
+    // With the held-back one, three more ran; the next waits again.
+    for brief in ["three", "four"] {
+        assert_eq!(
+            hand_off(&w, run, "Scout", brief),
+            "Scout will pick this up after you finish."
+        );
+    }
+    assert_eq!(
+        hand_off(&w, run, "Scout", "five"),
+        "This thread used its handoffs. Asked the user whether to continue."
+    );
+    wait_until(cx, "four used of four", |cx| {
+        label_of(cx, window, "inspector-tab-thread").is_some()
+            && handoffs(cx, &ws, w.thread) == (4, Some(4))
+    });
+    click(cx, window, "inspector-tab-thread");
+    assert_eq!(
+        label_of(cx, window, "handoffs-used").as_deref(),
+        Some("4 / 4")
+    );
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+    let () = w.ask(Request::StopThread { thread: w.thread });
+}
+
+#[gpui_kit::test]
+fn budget_pause_end_thread_declines_and_stops(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let forge = w.agents[0];
+    let () = w.ask(Request::SetThreadHandoff {
+        thread: w.thread,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(0),
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+    hand_off(&w, run, "Scout", "look");
+    let id = pending(cx, &ws, w.thread);
+    wait_until(cx, "the pause card", |cx| {
+        has(cx, window, format!("approval-end-{id}"))
+    });
+    click(cx, window, format!("approval-end-{id}"));
+    let stopped = run_of(cx, &ws, w.thread, forge, RunStatus::Stopped);
+    assert_eq!(stopped.id, run);
+    wait_until(cx, "the declined line", |cx| {
+        starts(
+            cx,
+            window,
+            format!("approval-{id}"),
+            "Handoff to Scout declined by you",
+        )
+    });
+    assert_eq!(status_of(cx, &ws, id), ApprovalStatus::Declined);
+    assert_eq!(handoffs(cx, &ws, w.thread).0, 0);
+}
+
+#[gpui_kit::test]
+fn decline_and_save_and_approve_buttons(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let scout = w.agents[1];
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    hand_off(&w, run, "Scout", "not this");
+    let id = pending(cx, &ws, w.thread);
+    wait_until(cx, "the first card", |cx| {
+        has(cx, window, format!("approval-decline-{id}"))
+    });
+    click(cx, window, format!("approval-decline-{id}"));
+    wait_until(cx, "the declined line", |cx| {
+        starts(
+            cx,
+            window,
+            format!("approval-{id}"),
+            "Handoff to Scout declined by you",
+        )
+    });
+    assert_eq!(status_of(cx, &ws, id), ApprovalStatus::Declined);
+
+    hand_off(&w, run, "Scout", "check the edit");
+    let id = pending(cx, &ws, w.thread);
+    wait_until(cx, "the second card", |cx| {
+        has(cx, window, format!("approval-edit-{id}"))
+    });
+    click(cx, window, format!("approval-edit-{id}"));
+    press(cx, window, "cmd-a");
+    type_text(cx, window, "only the README");
+    click(cx, window, format!("approval-save-{id}"));
+    wait_until(cx, "the approved line", |cx| {
+        starts(
+            cx,
+            window,
+            format!("approval-{id}"),
+            "Handoff to Scout approved by you",
+        )
+    });
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+    run_of(cx, &ws, w.thread, scout, RunStatus::Done);
+    let sent = prompts(tmp.path());
+    assert_eq!(sent.len(), 2, "one Scout run: {sent:?}");
+    assert!(sent[1].ends_with("only the README"), "{sent:?}");
+}
+
+#[gpui_kit::test]
+fn narrow_windows_hide_the_inspector_until_asked(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open_sized(cx, home.path(), 1100.);
+    go_to(cx, window, &ws, w.channel, w.thread);
+    assert!(!has(cx, window, "inspector"), "hidden below 1200 px");
+    assert_eq!(
+        label_of(cx, window, "toggle-activity").as_deref(),
+        Some("Show activity")
+    );
+    click(cx, window, "toggle-activity");
+    assert!(has(cx, window, "inspector"));
+    assert_eq!(
+        label_of(cx, window, "toggle-activity").as_deref(),
+        Some("Hide activity")
+    );
+    click(cx, window, "toggle-activity");
+    assert!(!has(cx, window, "inspector"));
+}
+
+#[gpui_kit::test]
+fn wide_windows_show_the_inspector_until_hidden(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open_sized(cx, home.path(), 1200.);
+    go_to(cx, window, &ws, w.channel, w.thread);
+    assert!(has(cx, window, "inspector"), "shown from 1200 px");
+    assert_eq!(
+        label_of(cx, window, "toggle-activity").as_deref(),
+        Some("Hide activity")
+    );
+    click(cx, window, "toggle-activity");
+    assert!(!has(cx, window, "inspector"));
+    assert_eq!(
+        label_of(cx, window, "toggle-activity").as_deref(),
+        Some("Show activity")
+    );
 }

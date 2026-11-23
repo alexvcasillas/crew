@@ -52,6 +52,12 @@ pub fn effective(
     (policy, policy::budget(&inputs))
 }
 
+/// Whether the bar shows the budget as used up: only when the budget
+/// is what decides handoffs.
+pub fn used_up(policy: HandoffPolicy, used: u32, budget: u32) -> bool {
+    policy == HandoffPolicy::Budget && budget > 0 && used >= budget
+}
+
 /// One agent in the thread and where it stands.
 struct Participant {
     agent: AgentId,
@@ -360,7 +366,7 @@ impl Workspace {
                             .rounded_full()
                             .bg(color("surface-300"))
                             .child(div().h_full().w(relative(fill)).rounded_full().bg(color(
-                                if used >= budget {
+                                if used_up(policy, used, budget) {
                                     "warning"
                                 } else {
                                     "text-secondary"
@@ -368,7 +374,9 @@ impl Workspace {
                             ))),
                     )
                     .when(policy != HandoffPolicy::Budget, |s| {
-                        s.child(help("Counts only while Run with budget is on."))
+                        s.child(help(
+                            "Every handoff that ran counts. The limit applies only with Run with budget.",
+                        ))
                     }),
             )
             .child(section("Working copy").children(working_copy))
@@ -431,10 +439,18 @@ fn value_row(label: &str, id: &'static str, value: String, mono: bool) -> impl I
 
 #[cfg(test)]
 mod tests {
-    use super::effective;
+    use super::{effective, used_up};
     use crew_core::ids::{ChannelId, ThreadId};
     use crew_core::policy::HandoffPolicy;
     use crew_core::store::StoredThread;
+
+    #[test]
+    fn the_bar_warns_only_when_the_budget_decides() {
+        assert!(used_up(HandoffPolicy::Budget, 3, 3));
+        assert!(!used_up(HandoffPolicy::Budget, 2, 3));
+        assert!(!used_up(HandoffPolicy::AskFirst, 3, 3));
+        assert!(!used_up(HandoffPolicy::Budget, 0, 0));
+    }
 
     #[test]
     fn the_thread_falls_back_to_its_channel_then_the_defaults() {

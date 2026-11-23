@@ -503,10 +503,8 @@ impl Service {
         let cleared = if result.is_ok() || !path.exists() {
             let mut db = self.db();
             let mut cleared = db.store.set_thread_worktree(thread, None);
-            if cleared.is_ok()
-                && let Err(e) = self.thread_changed(&mut db, thread)
-            {
-                log(e);
+            if cleared.is_ok() {
+                self.thread_changed_or_log(&mut db, thread);
             }
             if cleared.is_ok() && result == Ok(true) {
                 let body =
@@ -1086,9 +1084,16 @@ impl Service {
     fn save_worktree(&self, thread: ThreadId, wt: &ThreadWorktree) -> Result<(), StoreError> {
         let mut db = self.db();
         db.store.set_thread_worktree(thread, Some(wt))?;
-        let row = db.store.thread(thread)?;
-        self.publish_global(&mut db, ServerMsg::ThreadChanged { thread: row });
+        self.thread_changed_or_log(&mut db, thread);
         Ok(())
+    }
+
+    /// Like `thread_changed`, logging instead of failing: the change it
+    /// reports is already saved.
+    pub(crate) fn thread_changed_or_log(&self, db: &mut Db, thread: ThreadId) {
+        if let Err(e) = self.thread_changed(db, thread) {
+            log(format!("couldn't tell clients about thread {thread}: {e}"));
+        }
     }
 
     /// Runs the project's setup command in the worktree, recording its

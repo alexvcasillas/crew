@@ -270,6 +270,8 @@ impl Workspace {
         };
         div()
             .id(("activity-row", ix))
+            // Rows and their hairlines span the whole column.
+            .w_full()
             .flex()
             .gap(px(8.))
             .px(px(16.))
@@ -371,7 +373,13 @@ impl Workspace {
                 })
         });
         let output = tool.output.as_ref().filter(|o| !o.is_empty()).map(|text| {
-            let expanded = self.inspector.expanded.contains(&tool.id);
+            let key = self
+                .inspector
+                .rows_from
+                .map(|(run, _)| (run, tool.id.clone()));
+            let expanded = key
+                .as_ref()
+                .is_some_and(|k| self.inspector.expanded.contains(k));
             let (shown, more) = if expanded {
                 (text.clone(), 0)
             } else {
@@ -399,7 +407,7 @@ impl Workspace {
                         .test_support(),
                 )
                 .when(more > 0, |block| {
-                    let id = tool.id.clone();
+                    let key = key.clone();
                     block.child(
                         div()
                             .id(("activity-show-all", ix))
@@ -408,7 +416,9 @@ impl Workspace {
                             .aria_label(format!("Show all ({more} more lines)"))
                             .child(format!("Show all ({more} more lines)"))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.inspector.expanded.insert(id.clone());
+                                if let Some(key) = key.clone() {
+                                    this.inspector.expanded.insert(key);
+                                }
                                 this.inspector.list.remeasure_items(ix..ix + 1);
                                 cx.notify();
                             }))

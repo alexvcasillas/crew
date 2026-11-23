@@ -7,7 +7,8 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{Author, StoredMessage, StoredRun};
-use gpui_kit::component::{Icon, IconName};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -105,6 +106,20 @@ impl Workspace {
                             ),
                     )
                     .child(self.render_participants(thread))
+                    .child({
+                        let (label, icon) = if self.inspector_shown {
+                            ("Hide activity", IconName::PanelRightClose)
+                        } else {
+                            ("Show activity", IconName::PanelRightOpen)
+                        };
+                        Button::new("toggle-activity")
+                            .ghost()
+                            .small()
+                            .icon(icon)
+                            .tooltip(label)
+                            .accessibility_label(label)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
+                    })
                     .child({
                         let handoffs = format!(
                             "Handoffs: {}",
