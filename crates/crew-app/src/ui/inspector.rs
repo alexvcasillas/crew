@@ -61,7 +61,7 @@ pub(super) struct Inspector {
     pub(super) diff: Option<Diff>,
     /// What `diff` was asked for: thread, worktree and finished runs.
     diff_for: Option<(ThreadId, Option<PathBuf>, usize)>,
-    diff_task: Option<Task<()>>,
+    pub(super) diff_task: Option<Task<()>>,
 }
 
 impl Default for Inspector {
@@ -265,28 +265,8 @@ impl Workspace {
         let key = (thread, worktree, finished);
         if self.inspector.diff_for.as_ref() != Some(&key) {
             self.inspector.diff_for = Some(key);
-            self.load_diff(thread, cx);
+            self.load_thread_diff(thread, cx);
         }
-    }
-
-    /// Asks crewd for the working copy's uncommitted changes.
-    fn load_diff(&mut self, thread: ThreadId, cx: &mut Context<Self>) {
-        let answer = self
-            .client
-            .request(crew_proto::Request::ThreadDiff { thread });
-        self.inspector.diff_task = Some(cx.spawn(async move |this, cx| {
-            let diff = answer
-                .await
-                .and_then(|v| serde_json::from_value::<Diff>(v).map_err(|e| e.to_string()));
-            this.update(cx, |this, cx| {
-                if this.nav.thread == Some(thread) {
-                    // A failed read leaves the counts unknown.
-                    this.inspector.diff = diff.ok();
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
     }
 
     /// Keeps the run picker's items and choice in line.

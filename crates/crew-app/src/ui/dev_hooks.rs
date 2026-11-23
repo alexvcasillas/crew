@@ -38,6 +38,13 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         }
         v
     });
+    if let (Some(open), Some(diff)) = (open_thread, review)
+        && open != diff
+    {
+        eprintln!(
+            "crew: CREW_APP_OPEN_THREAD and CREW_APP_SHOW=diff: name different threads, opening {diff}"
+        );
+    }
     DevHooks {
         open_thread,
         show,

@@ -222,15 +222,23 @@ fn hunk_range(line: &str) -> Option<(u32, u32, u32, u32)> {
 /// The two paths of `a/x b/x`. When both sides read alike the split is
 /// exact, even with spaces in the path.
 fn git_paths(rest: &str) -> (Option<String>, Option<String>) {
+    let strip = |p: String, prefix: &str| p.strip_prefix(prefix).map(String::from);
+    // A quoted old side: `"a/x y" b/z` or `"a/x y" "b/z"`.
     if rest.starts_with('"') {
-        // Quoted: `"a/x y" "b/x y"`.
-        let mut parts = rest.split("\" \"");
-        let old = parts.next().map(unquote);
-        let new = parts.next().map(|p| unquote(&format!("\"{p}")));
-        return (
-            old.and_then(|p| p.strip_prefix("a/").map(String::from)),
-            new.and_then(|p| p.strip_prefix("b/").map(String::from)),
-        );
+        let Some(end) = quoted_end(rest) else {
+            return (None, None);
+        };
+        let old = unquote(&rest[..end]);
+        let new = unquote(rest[end..].trim_start());
+        return (strip(old, "a/"), strip(new, "b/"));
+    }
+    // A quoted new side only: `a/x "b/y z"`.
+    if rest.ends_with('"')
+        && let Some(at) = rest.rfind(" \"b/")
+    {
+        let old = rest[..at].to_string();
+        let new = unquote(&rest[at + 1..]);
+        return (strip(old, "a/"), strip(new, "b/"));
     }
     let Some(body) = rest.strip_prefix("a/") else {
         return (None, None);
@@ -250,6 +258,21 @@ fn git_paths(rest: &str) -> (Option<String>, Option<String>) {
         Some((old, new)) => (Some(old.to_string()), Some(new.to_string())),
         None => (None, None),
     }
+}
+
+/// The byte just past the closing quote of the quoted string `s` starts
+/// with.
+fn quoted_end(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate().skip(1) {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The path on a `---`/`+++` line, without `prefix`. `None` for
@@ -464,6 +487,15 @@ new file mode 100644
 ";
         let files = parse(patch);
         assert_eq!(files[0].path, "café.txt");
+        // Only one side quoted, as in a binary rename with no `---` lines.
+        assert_eq!(
+            super::git_paths("\"a/tab\\there\" b/plain"),
+            (Some("tab\there".into()), Some("plain".into()))
+        );
+        assert_eq!(
+            super::git_paths("a/plain \"b/new\\tname\""),
+            (Some("plain".into()), Some("new\tname".into()))
+        );
         assert_eq!(parse("").len(), 0);
         assert_eq!(parse("not a diff\n").len(), 0);
     }
