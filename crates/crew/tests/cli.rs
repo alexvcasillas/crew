@@ -88,6 +88,7 @@ fn say_then_watch_prints_events_and_reply() {
     let lines: Vec<&str> = out.lines().collect();
     for want in [
         "you: @Scout fix it",
+        "[Scout] started (claude-haiku-4-5)",
         "[Scout] edit /work/demo/src/lib.rs",
         "[Scout] run cargo test",
         "[Scout] ✓ done",
@@ -150,4 +151,74 @@ fn missing_daemon_is_explained() {
         .assert()
         .code(1)
         .stderr("crewd isn't running. Start it with `crewd`.\n");
+}
+
+/// Starts a sleeping run and returns (thread id, short run id).
+fn start_sleeping_run(home: &Path, cwd: &Path) -> (String, String) {
+    let thread = stdout_of(crew(home, cwd).arg("init-demo"))
+        .trim()
+        .to_string();
+    stdout_of(crew(home, cwd).args(["say", &thread, "@Scout wait"]));
+    for _ in 0..100 {
+        let line = stdout_of(crew(home, cwd).arg("status"));
+        if line.contains("Working") {
+            let run8 = line.split_whitespace().next().unwrap().to_string();
+            return (thread, run8);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("run never started");
+}
+
+#[test]
+fn stop_accepts_the_short_run_id_from_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    start_crewd(
+        &home,
+        manifest_dir().join("../crewd/tests/fake/claude_sleeps.sh"),
+    );
+    let (thread, run8) = start_sleeping_run(&home, tmp.path());
+    assert_eq!(run8.len(), 8);
+
+    stdout_of(crew(&home, tmp.path()).args(["stop", &run8]));
+    let out = stdout_of(crew(&home, tmp.path()).args(["watch", &thread, "--until-idle"]));
+    assert!(out.contains("[Scout] ■ stopped"), "got:\n{out}");
+    assert!(out.contains("system: Scout stopped."), "got:\n{out}");
+}
+
+#[test]
+fn stop_thread_accepts_a_short_thread_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    start_crewd(
+        &home,
+        manifest_dir().join("../crewd/tests/fake/claude_sleeps.sh"),
+    );
+    let (thread, _) = start_sleeping_run(&home, tmp.path());
+
+    stdout_of(crew(&home, tmp.path()).args(["stop", "--thread", &thread[..8]]));
+    let out = stdout_of(crew(&home, tmp.path()).args(["watch", &thread[..8], "--until-idle"]));
+    assert!(out.contains("[Scout] ■ stopped"), "got:\n{out}");
+}
+
+#[test]
+fn unknown_and_too_short_ids_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    start_crewd(
+        &home,
+        manifest_dir().join("../crewd/tests/fake/claude_sleeps.sh"),
+    );
+    for (args, want) in [
+        (["stop", "ab"], "not a valid run id"),
+        (["watch", "ffffffff"], "Use the full thread id."),
+    ] {
+        let out = crew(&home, tmp.path()).args(args).assert().code(1);
+        let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        assert!(err.contains(want), "got: {err}");
+    }
 }
