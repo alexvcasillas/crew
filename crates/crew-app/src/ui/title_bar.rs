@@ -236,7 +236,11 @@ pub(super) fn home_relative(path: &Path) -> String {
     }
 }
 
-/// "Search threads, agents, files… ⌘K". Search itself comes later.
+/// Said by the search box and by ⌘K until search exists.
+pub(super) const SEARCH_SOON: &str = "Search is coming soon.";
+
+/// "Search threads, agents, files… ⌘K", looking off: search itself comes
+/// later.
 fn render_search_button() -> impl IntoElement {
     div()
         .id("title-search")
@@ -252,11 +256,12 @@ fn render_search_button() -> impl IntoElement {
         .border_color(color("border-200"))
         .rounded(px(6.))
         .bg(color("bg-100"))
-        .text_color(color("text-secondary"))
-        .cursor_pointer()
-        .hover(|s| s.bg(color("surface-100")))
-        .role(Role::Button)
+        .text_color(color("text-tertiary"))
         .aria_label(SEARCH_PLACEHOLDER)
+        .aria_description(SEARCH_SOON)
+        .tooltip(|window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(SEARCH_SOON).build(window, cx)
+        })
         .child(div().flex_1().child(SEARCH_PLACEHOLDER))
         .child(
             div()

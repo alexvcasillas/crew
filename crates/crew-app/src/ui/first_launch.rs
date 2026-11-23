@@ -167,7 +167,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// "I'll set things up myself": Settings › Projects.
+    /// "Set up in Settings instead": Settings › Projects.
     fn skip_first_launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.first_launch = None;
         self.open_settings(Page::Projects, window, cx);
@@ -327,8 +327,8 @@ impl Workspace {
                             .text_color(color("accent-blue"))
                             .cursor_pointer()
                             .role(Role::Link)
-                            .aria_label("I'll set things up myself")
-                            .child("I'll set things up myself")
+                            .aria_label("Set up in Settings instead")
+                            .child("Set up in Settings instead")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.skip_first_launch(window, cx);
                             }))

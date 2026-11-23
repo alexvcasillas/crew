@@ -280,7 +280,8 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
         starts(cx, window, card.clone(), "Bash allowed by you · ")
     });
 
-    // A long input starts folded; ⌘↵ from the composer allows it.
+    // A long input starts folded. ⌘↵ in the composer leaves it alone;
+    // away from the composer ⌘↵ allows it.
     let fields: serde_json::Map<String, serde_json::Value> = (0..10)
         .map(|i| (format!("key{i}"), serde_json::json!(i)))
         .collect();
@@ -296,12 +297,21 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
     assert_eq!(shown.lines().count(), 12, "{shown}");
     click(cx, window, "composer-input");
     press(cx, window, "cmd-enter");
-    assert!(answer_of(cx, &answer).allow);
+    std::thread::sleep(Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(answer.try_recv().is_err(), "not allowed from the composer");
+    assert_eq!(status_of(cx, &ws, id), ApprovalStatus::Pending);
     assert_eq!(
         ws.read_with(cx, |ws, cx| ws.composer.read(cx).text(cx)),
         "",
         "⌘↵ sent nothing"
     );
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.focus_window(window, cx));
+    })
+    .unwrap();
+    press(cx, window, "cmd-enter");
+    assert!(answer_of(cx, &answer).allow);
     wait_until(cx, "the second card to fold", |cx| {
         starts(cx, window, format!("approval-{id}"), "Bash allowed by you")
     });
@@ -362,6 +372,50 @@ fn a_pending_ask_stands_under_its_runs_card(cx: &mut TestAppContext) {
     let run_card = bounds_of(cx, window, format!("run-card-{run}")).unwrap();
     let decided = bounds_of(cx, window, card).unwrap();
     assert!(decided.bottom() <= run_card.top());
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+}
+
+#[gpui_kit::test]
+fn cmd_enter_in_the_composer_approves_handoffs_only(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    hand_off(&w, run, "Scout", "check the edit");
+    let handoff = pending(cx, &ws, w.thread);
+    let answer = ask_permission(&w, run, serde_json::json!({"command": "touch x.txt"}));
+    let mut ask = None;
+    wait_until(cx, "the permission ask", |cx| {
+        ask = ws.read_with(cx, |ws, _| {
+            ws.state()
+                .pending_approvals(w.thread)
+                .iter()
+                .map(|a| a.id)
+                .find(|id| *id != handoff)
+        });
+        ask.is_some()
+    });
+    let ask = ask.unwrap();
+    wait_until(cx, "both cards", |cx| {
+        has(cx, window, format!("approval-{ask}")) && has(cx, window, format!("approval-{handoff}"))
+    });
+
+    // The permission ask is newer, but the composer only approves handoffs.
+    click(cx, window, "composer-input");
+    press(cx, window, "cmd-enter");
+    wait_until(cx, "the handoff approved", |cx| {
+        status_of(cx, &ws, handoff) == ApprovalStatus::Approved
+    });
+    assert_eq!(status_of(cx, &ws, ask), ApprovalStatus::Pending);
+    press(cx, window, "cmd-enter");
+    std::thread::sleep(Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(status_of(cx, &ws, ask), ApprovalStatus::Pending);
+    assert!(answer.try_recv().is_err());
     std::fs::write(tmp.path().join("go"), "").unwrap();
 }
 
