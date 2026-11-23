@@ -259,3 +259,285 @@ fn status_lists_queued_runs() {
         started.elapsed()
     );
 }
+
+/// A fake claude for handoff tests. Its first run writes `file.txt` and
+/// replies with a mention of Sentinel, every later run replies "Looks fine."
+fn handoff_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-handoff.sh");
+    let script = format!(
+        r#"#!/bin/sh
+n=$(cat '{dir}/n' 2>/dev/null || echo 0)
+n=$((n + 1))
+echo $n > '{dir}/n'
+if [ "$n" = 1 ]; then
+  printf 'new\n' > file.txt
+  reply='@Sentinel please check'
+else
+  reply='Looks fine.'
+fi
+printf '{{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"m","tools":[]}}\n'
+printf '{{"type":"result","subtype":"success","is_error":false,"result":"%s","duration_ms":1,"num_turns":1,"permission_denials":[],"session_id":"s"}}\n' "$reply"
+"#,
+        dir = dir.display()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A crew home, a git project with a demo thread, and agents Forge (edits)
+/// and Sentinel (read-only).
+struct Setup {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    project: PathBuf,
+    thread: String,
+}
+
+fn setup() -> Setup {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["config", "user.name", "Test"]);
+    git(&project, &["config", "user.email", "test@example.com"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(project.join("a.txt"), "a\n").unwrap();
+    git(&project, &["add", "a.txt"]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    start_crewd(&home, handoff_script(tmp.path()));
+
+    let thread = stdout_of(crew(&home, &project).arg("init-demo"))
+        .trim()
+        .to_string();
+    stdout_of(crew(&home, &project).args([
+        "agent", "add", "Forge", "--model", "haiku", "--role", "Builds", "--edit",
+    ]));
+    stdout_of(crew(&home, &project).args([
+        "agent", "add", "Sentinel", "--model", "haiku", "--role", "Reviews",
+    ]));
+    Setup {
+        _tmp: tmp,
+        home,
+        project,
+        thread,
+    }
+}
+
+impl Setup {
+    fn crew(&self) -> Command {
+        crew(&self.home, &self.project)
+    }
+
+    /// Asks Forge to work and waits until its handoff to Sentinel is pending.
+    /// Returns the approval's short id.
+    fn forge_asks(&self) -> String {
+        stdout_of(self.crew().args(["say", &self.thread, "@Forge", "go"]));
+        let out =
+            stdout_of(
+                self.crew()
+                    .args(["watch", &self.thread, "--until-idle", "--until-ask"]),
+            );
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("[?] "))
+            .unwrap_or_else(|| panic!("no approval line in:\n{out}"));
+        assert!(
+            line.starts_with("[?] Forge wants to bring in Sentinel.  (crew approve "),
+            "got {line:?}"
+        );
+        line.trim_end_matches(')')
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+}
+
+#[test]
+fn agent_add_defaults_to_read_only() {
+    let s = setup();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let agents: Vec<(crew_core::ids::AgentId, crew_core::agent::AgentSpec)> = rt.block_on(async {
+        use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg};
+        let mut stream = tokio::net::UnixStream::connect(s.home.join("crewd.sock"))
+            .await
+            .unwrap();
+        for (id, req) in [
+            (
+                1,
+                Request::Hello {
+                    version: PROTO_VERSION,
+                },
+            ),
+            (2, Request::ListAgents),
+        ] {
+            crew_proto::write_frame(&mut stream, &ClientMsg::Request { id, req })
+                .await
+                .unwrap();
+        }
+        loop {
+            match crew_proto::read_frame::<_, ServerMsg>(&mut stream)
+                .await
+                .unwrap()
+            {
+                Some(ServerMsg::Response { id: 2, result }) => {
+                    return serde_json::from_value(result.unwrap()).unwrap();
+                }
+                Some(_) => {}
+                None => panic!("crewd hung up"),
+            }
+        }
+    });
+    use crew_core::agent::{PermissionMode, Runtime};
+    let spec = |name: &str| &agents.iter().find(|(_, a)| a.name == name).unwrap().1;
+    assert_eq!(spec("Sentinel").permission_mode, PermissionMode::ReadOnly);
+    assert_eq!(spec("Sentinel").runtime, Runtime::ClaudeCode);
+    assert_eq!(spec("Sentinel").max_run_minutes, 20);
+    assert_eq!(spec("Forge").permission_mode, PermissionMode::EditFiles);
+}
+
+#[test]
+fn approve_runs_the_handoff_and_watch_shows_the_decision() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let s = setup();
+    stdout_of(s.crew().args(["say", &s.thread, "@Forge", "go"]));
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("crew"))
+        .env("CREW_HOME", &s.home)
+        .args(["watch", &s.thread, "--until-idle"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut seen = Vec::new();
+    let id8 = loop {
+        let line = lines.next().expect("watch ended early").unwrap();
+        seen.push(line.clone());
+        if let Some(rest) = line.strip_prefix("[?] ") {
+            assert!(rest.starts_with("Forge wants to bring in Sentinel.  (crew approve "));
+            break rest
+                .trim_end_matches(')')
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .to_string();
+        }
+    };
+    assert_eq!(id8.len(), 8);
+
+    let listed = stdout_of(s.crew().arg("approvals"));
+    assert!(
+        listed.starts_with(&format!("{id8}  {}", &s.thread[..8])),
+        "got {listed:?}"
+    );
+    assert!(listed.contains("Forge wants to bring in Sentinel."));
+
+    stdout_of(s.crew().args(["approve", &id8]));
+    seen.extend(lines.map(Result::unwrap));
+    let status = child.wait().unwrap();
+    let out = seen.join("\n");
+    assert!(status.success(), "watch failed:\n{out}");
+    for want in [
+        "[✓] approved",
+        "system: Forge brought in Sentinel.",
+        "[Sentinel] ✓ done",
+        "Sentinel: Looks fine.",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    assert_eq!(
+        stdout_of(s.crew().arg("approvals")).trim(),
+        "Nothing waiting."
+    );
+}
+
+#[test]
+fn decline_drops_the_handoff() {
+    let s = setup();
+    let id8 = s.forge_asks();
+    stdout_of(s.crew().args(["decline", &id8]));
+    let out = stdout_of(s.crew().args(["watch", &s.thread, "--until-idle"]));
+    assert!(out.contains("system: Declined Sentinel."), "got:\n{out}");
+    assert!(!out.contains("[Sentinel]"), "got:\n{out}");
+}
+
+#[test]
+fn watch_waits_for_a_pending_approval_unless_asked_not_to() {
+    let s = setup();
+    s.forge_asks();
+    // Without --until-ask the thread is not idle, so watch keeps waiting.
+    let mut cmd = s.crew();
+    let out = cmd
+        .args(["watch", &s.thread, "--until-idle"])
+        .timeout(Duration::from_secs(3))
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("[?] Forge wants to bring in Sentinel."));
+}
+
+#[test]
+fn diff_commit_and_discard_work_on_the_thread_worktree() {
+    let s = setup();
+    s.forge_asks();
+
+    let stat = stdout_of(s.crew().args(["diff", &s.thread, "--stat"]));
+    assert_eq!(stat.trim(), "A file.txt +1 -0", "got {stat:?}");
+    let full = stdout_of(s.crew().args(["diff", &s.thread]));
+    assert!(full.starts_with("A file.txt +1 -0\n\n"), "got {full:?}");
+    assert!(full.contains("+new"), "got {full:?}");
+    assert!(!s.project.join("file.txt").exists(), "root must stay clean");
+
+    let sha = stdout_of(s.crew().args(["commit", &s.thread, "-m", "Add file"]));
+    assert_eq!(sha.trim().len(), 8);
+    assert_eq!(
+        stdout_of(s.crew().args(["diff", &s.thread])).trim(),
+        "No changes."
+    );
+
+    // Discard asks for confirmation first.
+    let refused = s.crew().args(["discard", &s.thread]).assert().code(1);
+    let err = String::from_utf8(refused.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("--yes"), "got {err}");
+    assert!(git(&s.project, &["branch", "--list", "crew/*"]).contains("crew/"));
+
+    stdout_of(s.crew().args(["discard", &s.thread, "--yes"]));
+    assert_eq!(git(&s.project, &["branch", "--list", "crew/*"]), "");
+    assert_eq!(
+        stdout_of(s.crew().args(["diff", &s.thread])).trim(),
+        "No changes."
+    );
+}
+
+#[test]
+fn allow_more_works_and_unknown_approval_ids_are_refused() {
+    let s = setup();
+    stdout_of(s.crew().args(["allow-more", &s.thread[..8], "2"]));
+    let err = s
+        .crew()
+        .args(["approve", "abcd"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("No approval matches")
+    );
+}
