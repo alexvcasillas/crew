@@ -10,8 +10,8 @@
 //! - the control connection, which carries requests, answered by id.
 //!
 //! Requests get their own connection because crewd closes a stream that
-//! falls behind (`Resync`). On a shared connection that would fail
-//! requests still waiting for an answer, such as a commit.
+//! falls behind (`Resync`). Only the stream is reopened then, so requests
+//! still waiting for an answer, such as a commit, keep waiting.
 
 use std::collections::HashMap;
 use std::io;
@@ -32,26 +32,35 @@ use crate::connection::{self, ConnectionConfig, PROBE_TIMEOUT};
 use crate::model::{ConnectionState, State};
 
 /// First pause before connecting again. It doubles up to [`MAX_BACKOFF`].
+/// First pause before connecting again. It doubles up to [`MAX_BACKOFF`].
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// A request made while crewd isn't connected.
-const NOT_CONNECTED: &str = "Crew's service isn't running. Start it, then try again.";
+/// A request made while nothing listens on crewd's socket.
+pub const NOT_RUNNING: &str = "Crew's service isn't running. Start it, then try again.";
+/// A request made while crewd refuses this app's protocol version.
+pub const OUT_OF_DATE: &str = "Crew's service is out of date. Restart it, then try again.";
+/// A request made between losing crewd and connecting again.
+pub const RECONNECTING: &str = "Crew is reconnecting to its service. Try again in a moment.";
 /// A request whose connection closed before it was answered.
-const LOST: &str = "Crew lost its connection to its service. Try again.";
+pub const LOST: &str = "Crew lost its connection to its service. Try again.";
 
 /// What the client tells the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
     /// Both connections are up. A `Snapshot` follows.
     Connected,
-    /// crewd isn't there, or the connection dropped. The client keeps
-    /// trying.
-    Disconnected(String),
+    /// A connection dropped or crewd misbehaved. The client is connecting
+    /// again.
+    Reconnecting(String),
+    /// Nothing listens on crewd's socket: it is missing or refuses
+    /// connections. The client keeps trying.
+    NotRunning(io::ErrorKind),
     /// crewd refused this app's protocol version. The client keeps trying,
     /// for when crewd is restarted.
     VersionMismatch { theirs: u32 },
-    /// A notice from the stream.
+    /// A notice from the stream. After the stream is reopened, a fresh
+    /// `Snapshot` and the watched threads' backlogs come again.
     Msg(ServerMsg),
 }
 
@@ -60,7 +69,8 @@ impl ClientEvent {
     pub fn apply_to(self, state: &mut State) {
         match self {
             ClientEvent::Connected => state.set_connection(ConnectionState::Connected),
-            ClientEvent::Disconnected(_) => state.set_connection(ConnectionState::NotRunning),
+            ClientEvent::Reconnecting(_) => state.set_connection(ConnectionState::Reconnecting),
+            ClientEvent::NotRunning(_) => state.set_connection(ConnectionState::NotRunning),
             ClientEvent::VersionMismatch { theirs } => {
                 state.set_connection(ConnectionState::VersionMismatch {
                     theirs,
@@ -68,6 +78,15 @@ impl ClientEvent {
                 });
             }
             ClientEvent::Msg(msg) => state.apply(msg),
+        }
+    }
+
+    /// What a request made while this is the state gets.
+    fn refusal(&self) -> &'static str {
+        match self {
+            ClientEvent::NotRunning(_) => NOT_RUNNING,
+            ClientEvent::VersionMismatch { .. } => OUT_OF_DATE,
+            _ => RECONNECTING,
         }
     }
 }
@@ -80,7 +99,7 @@ enum Command {
 }
 
 /// Talks to the client thread. Cheap to clone; the thread stops once
-/// every handle is dropped.
+/// every handle, or the event receiver, is dropped.
 #[derive(Clone)]
 pub struct ClientHandle {
     commands: mpsc::UnboundedSender<Command>,
@@ -88,8 +107,8 @@ pub struct ClientHandle {
 
 impl ClientHandle {
     /// Sends `req` on the control connection. Resolves to crewd's answer,
-    /// or an error to show if crewd isn't connected or the connection drops
-    /// first.
+    /// or an error to show if crewd isn't connected or the control
+    /// connection drops first.
     pub fn request(
         &self,
         req: Request,
@@ -138,7 +157,7 @@ pub fn spawn(conn: ConnectionConfig) -> (ClientHandle, UnboundedReceiver<ClientE
             match runtime {
                 Ok(rt) => rt.block_on(run(socket, command_rx, events)),
                 Err(e) => {
-                    let _ = events.unbounded_send(ClientEvent::Disconnected(e.to_string()));
+                    let _ = events.unbounded_send(ClientEvent::Reconnecting(e.to_string()));
                 }
             }
         })
@@ -146,8 +165,35 @@ pub fn spawn(conn: ConnectionConfig) -> (ClientHandle, UnboundedReceiver<ClientE
     (ClientHandle { commands }, event_rx)
 }
 
-/// Connects, serves the connection until it drops, waits and connects
-/// again, until every handle or the event receiver is gone.
+/// The connection status last told to the UI. The same kind of failure
+/// is told once.
+struct Status<'a> {
+    events: &'a UnboundedSender<ClientEvent>,
+    last: Option<ClientEvent>,
+}
+
+impl Status<'_> {
+    /// Tells the UI `status` unless it is a repeat. False once nobody
+    /// listens.
+    fn report(&mut self, status: ClientEvent) -> bool {
+        let repeat = self
+            .last
+            .as_ref()
+            .is_some_and(|l| std::mem::discriminant(l) == std::mem::discriminant(&status));
+        if repeat {
+            return true;
+        }
+        self.last = Some(status.clone());
+        self.events.unbounded_send(status).is_ok()
+    }
+
+    fn send(&self, event: ClientEvent) -> bool {
+        self.events.unbounded_send(event).is_ok()
+    }
+}
+
+/// Connects, serves the connections until the control one drops, waits
+/// and connects again, until every handle or the event receiver is gone.
 async fn run(
     socket: PathBuf,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -155,34 +201,26 @@ async fn run(
 ) {
     let mut watched: Vec<ThreadId> = Vec::new();
     let mut backoff = MIN_BACKOFF;
-    let mut last: Option<ClientEvent> = None;
+    let mut status = Status {
+        events: &events,
+        last: None,
+    };
     loop {
-        let outcome = match open_both(&socket).await {
-            Ok((stream, control)) => {
+        let outcome = match session(&socket, &mut commands, &mut status, &mut watched).await {
+            Ended::Shutdown => return,
+            Ended::Lost(reason) => {
                 backoff = MIN_BACKOFF;
-                if events.unbounded_send(ClientEvent::Connected).is_err() {
-                    return;
-                }
-                last = Some(ClientEvent::Connected);
-                match session(stream, control, &mut commands, &events, &mut watched).await {
-                    Ended::Shutdown => return,
-                    Ended::Lost(reason) => ClientEvent::Disconnected(reason),
-                }
+                ClientEvent::Reconnecting(reason)
             }
-            Err(Refused::Version(theirs)) => ClientEvent::VersionMismatch { theirs },
-            Err(Refused::Other(reason)) => ClientEvent::Disconnected(reason),
+            Ended::Refused(Refused::Version(theirs)) => ClientEvent::VersionMismatch { theirs },
+            Ended::Refused(Refused::NotRunning(kind)) => ClientEvent::NotRunning(kind),
+            Ended::Refused(Refused::Other(reason)) => ClientEvent::Reconnecting(reason),
         };
-        // Failing again the same way is reported once.
-        let repeat = last
-            .as_ref()
-            .is_some_and(|l| std::mem::discriminant(l) == std::mem::discriminant(&outcome));
-        if !repeat {
-            if events.unbounded_send(outcome.clone()).is_err() {
-                return;
-            }
-            last = Some(outcome);
+        let refusal = outcome.refusal();
+        if !status.report(outcome) {
+            return;
         }
-        match pause(backoff, &mut commands, &mut watched).await {
+        match pause(backoff, refusal, &mut commands, &mut watched).await {
             Pause::Shutdown => return,
             Pause::Elapsed => backoff = (backoff * 2).min(MAX_BACKOFF),
             Pause::Reconnect => backoff = MIN_BACKOFF,
@@ -193,18 +231,24 @@ async fn run(
     }
 }
 
+/// Why a connection couldn't be opened.
 enum Refused {
     Version(u32),
+    NotRunning(io::ErrorKind),
     Other(String),
 }
 
-/// Opens the stream and the control connection, each past `Hello`.
-async fn open_both(socket: &Path) -> Result<(UnixStream, UnixStream), Refused> {
-    let stream = open(socket).await?;
-    let control = open(socket).await?;
-    Ok((stream, control))
+impl Refused {
+    fn reason(self) -> String {
+        match self {
+            Refused::Version(theirs) => format!("crewd speaks protocol {theirs}."),
+            Refused::NotRunning(kind) => format!("crewd isn't running ({kind})."),
+            Refused::Other(reason) => reason,
+        }
+    }
 }
 
+/// Connects and says `Hello`.
 async fn open(socket: &Path) -> Result<UnixStream, Refused> {
     match tokio::time::timeout(PROBE_TIMEOUT, connection::hello(socket)).await {
         Ok(Ok(Some((stream, Ok(()))))) => Ok(stream),
@@ -213,6 +257,14 @@ async fn open(socket: &Path) -> Result<UnixStream, Refused> {
             None => Err(Refused::Other(refusal)),
         },
         Ok(Ok(None)) => Err(Refused::Other("crewd closed the connection.".into())),
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(Refused::NotRunning(e.kind()))
+        }
         Ok(Err(e)) => Err(Refused::Other(e.to_string())),
         Err(_) => Err(Refused::Other("crewd didn't answer.".into())),
     }
@@ -221,55 +273,96 @@ async fn open(socket: &Path) -> Result<UnixStream, Refused> {
 enum Ended {
     /// Every handle or the event receiver is gone.
     Shutdown,
+    /// Connected, then the control connection dropped, or the stream
+    /// couldn't be reopened.
     Lost(String),
+    /// Couldn't connect.
+    Refused(Refused),
 }
 
-#[derive(Clone, Copy)]
+/// Which connection a frame came from. Each stream gets a new number, so
+/// frames from a stream already replaced are told apart.
+#[derive(Clone, Copy, PartialEq)]
 enum Side {
-    Stream,
     Control,
+    Stream(u64),
 }
 
 type Frame = (Side, io::Result<Option<ServerMsg>>);
 
-/// Aborts the reader tasks when the session ends, closing their halves.
-struct Readers([JoinHandle<()>; 2]);
+/// Aborts a reader task when dropped, closing its half.
+struct Reader(JoinHandle<()>);
 
-impl Drop for Readers {
+impl Drop for Reader {
     fn drop(&mut self) {
-        for reader in &self.0 {
-            reader.abort();
-        }
+        self.0.abort();
     }
 }
 
-/// Subscribes, then forwards notices and answers requests until a
-/// connection drops.
-async fn session(
-    stream: UnixStream,
-    control: UnixStream,
-    commands: &mut mpsc::UnboundedReceiver<Command>,
-    events: &UnboundedSender<ClientEvent>,
-    watched: &mut Vec<ThreadId>,
-) -> Ended {
-    let (stream_rd, mut stream_wr) = stream.into_split();
-    let (control_rd, mut control_wr) = control.into_split();
-    // `read_frame` can't be cancelled inside `select!`, a channel can.
-    let (frames_tx, mut frames) = mpsc::unbounded_channel::<Frame>();
-    let _readers = Readers([
-        tokio::spawn(read_into(stream_rd, Side::Stream, frames_tx.clone())),
-        tokio::spawn(read_into(control_rd, Side::Control, frames_tx)),
-    ]);
-    let mut next_id = 1;
-    let mut waiting: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
+/// The stream: its write half and its reader.
+struct Stream {
+    side: Side,
+    wr: OwnedWriteHalf,
+    _reader: Reader,
+}
 
+/// Opens a stream and subscribes to everything and each watched thread.
+async fn open_stream(
+    socket: &Path,
+    number: u64,
+    frames: &mpsc::UnboundedSender<Frame>,
+    watched: &[ThreadId],
+    next_id: &mut u64,
+) -> Result<Stream, Refused> {
+    let (rd, mut wr) = open(socket).await?.into_split();
+    let side = Side::Stream(number);
+    let reader = Reader(tokio::spawn(read_into(rd, side, frames.clone())));
     let subscribe = std::iter::once(Request::SubscribeAll)
         .chain(watched.iter().map(|&thread| Request::Subscribe { thread }));
     for req in subscribe {
-        if let Err(e) = send(&mut stream_wr, &mut next_id, req).await {
-            return Ended::Lost(e.to_string());
-        }
+        send(&mut wr, next_id, req)
+            .await
+            .map_err(|e| Refused::Other(e.to_string()))?;
     }
+    Ok(Stream {
+        side,
+        wr,
+        _reader: reader,
+    })
+}
+
+/// Opens the control connection and a stream, then forwards notices and
+/// answers requests until the control connection drops. A stream that
+/// drops or falls behind (`Resync`) is reopened right away, and requests
+/// in flight keep waiting for their answers.
+async fn session(
+    socket: &Path,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    status: &mut Status<'_>,
+    watched: &mut Vec<ThreadId>,
+) -> Ended {
+    let control = match open(socket).await {
+        Ok(control) => control,
+        Err(refused) => return Ended::Refused(refused),
+    };
+    let (control_rd, mut control_wr) = control.into_split();
+    // `read_frame` can't be cancelled inside `select!`, a channel can.
+    let (frames_tx, mut frames) = mpsc::unbounded_channel::<Frame>();
+    let _control_reader = Reader(tokio::spawn(read_into(
+        control_rd,
+        Side::Control,
+        frames_tx.clone(),
+    )));
+    let mut next_id = 1;
+    let mut streams = 0;
+    let mut stream = match open_stream(socket, streams, &frames_tx, watched, &mut next_id).await {
+        Ok(stream) => stream,
+        Err(refused) => return Ended::Refused(refused),
+    };
+    if !status.report(ClientEvent::Connected) {
+        return Ended::Shutdown;
+    }
+    let mut waiting: HashMap<u64, oneshot::Sender<Result<Value, String>>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -287,39 +380,50 @@ async fn session(
                     if !watched.contains(&thread) {
                         watched.push(thread);
                         let req = Request::Subscribe { thread };
-                        if let Err(e) = send(&mut stream_wr, &mut next_id, req).await {
-                            return Ended::Lost(e.to_string());
-                        }
+                        // A failed write shows up as the stream ending.
+                        let _ = send(&mut stream.wr, &mut next_id, req).await;
                     }
                 }
                 Some(Command::Unwatch(thread)) => watched.retain(|t| *t != thread),
                 Some(Command::Reconnect) => {}
             },
             Some((side, frame)) = frames.recv() => {
-                let msg = match frame {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => return Ended::Lost("crewd closed the connection.".into()),
-                    Err(e) => return Ended::Lost(e.to_string()),
-                };
-                match (side, msg) {
-                    (Side::Control, ServerMsg::Response { id, result }) => {
+                let stream_lost = match (side, frame) {
+                    (Side::Control, Ok(Some(ServerMsg::Response { id, result }))) => {
                         if let Some(reply) = waiting.remove(&id) {
                             let _ = reply.send(result);
                         }
+                        None
                     }
-                    (Side::Control, _) => {}
-                    (Side::Stream, ServerMsg::Response { result: Err(e), .. }) => {
+                    (Side::Control, Ok(Some(_))) => None,
+                    (Side::Control, Ok(None)) => {
+                        return Ended::Lost("crewd closed the connection.".into());
+                    }
+                    (Side::Control, Err(e)) => return Ended::Lost(e.to_string()),
+                    // From a stream already replaced.
+                    (side, _) if side != stream.side => None,
+                    (_, Ok(Some(ServerMsg::Response { result: Err(e), .. }))) => {
                         eprintln!("crew: crewd refused a subscription: {e}");
+                        None
                     }
-                    (Side::Stream, ServerMsg::Response { .. }) => {}
-                    (Side::Stream, ServerMsg::Resync) => {
-                        return Ended::Lost("crewd asked to catch up.".into());
-                    }
-                    (Side::Stream, msg) => {
-                        if events.unbounded_send(ClientEvent::Msg(msg)).is_err() {
+                    (_, Ok(Some(ServerMsg::Response { .. }))) => None,
+                    (_, Ok(Some(ServerMsg::Resync))) => Some("crewd asked to catch up.".to_string()),
+                    (_, Ok(Some(msg))) => {
+                        if !status.send(ClientEvent::Msg(msg)) {
                             return Ended::Shutdown;
                         }
+                        None
                     }
+                    (_, Ok(None)) => Some("crewd closed the stream.".to_string()),
+                    (_, Err(e)) => Some(e.to_string()),
+                };
+                if let Some(reason) = stream_lost {
+                    eprintln!("crew: reopening the stream: {reason}");
+                    streams += 1;
+                    stream = match open_stream(socket, streams, &frames_tx, watched, &mut next_id).await {
+                        Ok(stream) => stream,
+                        Err(refused) => return Ended::Lost(refused.reason()),
+                    };
                 }
             }
         }
@@ -350,9 +454,11 @@ enum Pause {
 }
 
 /// Waits `time` before connecting again. Requests made meanwhile fail
-/// right away; watches are remembered for the next connection.
+/// right away with `refusal`; watches are remembered for the next
+/// connection.
 async fn pause(
     time: Duration,
+    refusal: &'static str,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     watched: &mut Vec<ThreadId>,
 ) -> Pause {
@@ -364,7 +470,7 @@ async fn pause(
             command = commands.recv() => match command {
                 None => return Pause::Shutdown,
                 Some(Command::Request(_, reply)) => {
-                    let _ = reply.send(Err(NOT_CONNECTED.into()));
+                    let _ = reply.send(Err(refusal.into()));
                 }
                 Some(Command::Watch(thread)) => {
                     if !watched.contains(&thread) {

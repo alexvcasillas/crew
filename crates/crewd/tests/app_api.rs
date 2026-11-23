@@ -212,7 +212,17 @@ fn status_of(m: &ServerMsg) -> Option<(ThreadId, RunId, RunStatus)> {
             thread,
             run,
             status,
-        } => Some((*thread, *run, status.clone())),
+            details,
+        } => {
+            // The full run comes along, as saved.
+            assert_eq!((details.id, details.thread), (*run, *thread));
+            assert_eq!(&details.status, status);
+            assert_eq!(
+                details.ended_at.is_some(),
+                !matches!(status, RunStatus::Queued | RunStatus::Working)
+            );
+            Some((*thread, *run, status.clone()))
+        }
         _ => None,
     }
 }
@@ -447,7 +457,11 @@ async fn update_agent_changes_next_run_args() {
         ..forge()
     };
     c.call(Request::UpdateAgent { agent, spec }).await.unwrap();
-    assert_eq!(app.recv().await, ServerMsg::AgentChanged { agent });
+    let ServerMsg::AgentChanged { agent: changed } = app.recv().await else {
+        panic!("expected AgentChanged");
+    };
+    assert_eq!(changed.id, agent);
+    assert_eq!(changed.spec.model, "claude-opus-4-5");
 
     let agents: Vec<StoredAgent> = c
         .ok(Request::ListAgents {
@@ -529,7 +543,13 @@ async fn delete_agent_refused_while_running() {
     app.until(|m| matches!(status_of(m), Some((_, _, RunStatus::Stopped))))
         .await;
     c.call(Request::DeleteAgent { agent }).await.unwrap();
-    app.until(|m| *m == ServerMsg::AgentChanged { agent }).await;
+    let seen = app
+        .until(|m| matches!(m, ServerMsg::AgentChanged { agent: a } if a.id == agent))
+        .await;
+    let Some(ServerMsg::AgentChanged { agent: deleted }) = seen.last() else {
+        unreachable!()
+    };
+    assert!(deleted.deleted_at.is_some(), "sent as deleted");
 
     let agents: Vec<StoredAgent> = c
         .ok(Request::ListAgents {

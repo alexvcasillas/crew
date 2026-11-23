@@ -15,6 +15,10 @@ use crew_proto::ServerMsg;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     Connected,
+    /// The connection dropped and the client is connecting again. What is
+    /// known stays shown meanwhile.
+    Reconnecting,
+    /// Nothing listens on crewd's socket.
     NotRunning,
     /// crewd answered but refused this app's protocol version.
     VersionMismatch {
@@ -35,17 +39,6 @@ pub enum ThreadStatus {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NeedsYou<'a> {
     pub approval: &'a StoredApproval,
-}
-
-/// Details the notices don't carry, to be asked for with a request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Wants {
-    /// An agent changed: ask for `ListAgents { include_deleted: true }`
-    /// and pass the answer to [`State::set_agents`].
-    pub agents: bool,
-    /// A run is known only by its status: ask for the queued and working
-    /// runs and pass them to [`State::merge_runs`].
-    pub runs: bool,
 }
 
 /// One event of a run, in a watched thread.
@@ -73,8 +66,6 @@ pub struct State {
     threads: HashMap<ThreadId, StoredThread>,
     agents: HashMap<AgentId, StoredAgent>,
     runs: HashMap<RunId, StoredRun>,
-    /// Runs heard of only through `RunStatus`: their thread and status.
-    bare_runs: HashMap<RunId, (ThreadId, RunStatus)>,
     /// Sorted by `created_at`, ties in arrival order. Complete only for
     /// watched threads: other threads have what arrived since connecting.
     messages: HashMap<ThreadId, Vec<StoredMessage>>,
@@ -82,7 +73,6 @@ pub struct State {
     approvals: HashMap<ApprovalId, StoredApproval>,
     /// One log per watched thread.
     logs: HashMap<ThreadId, EventLog>,
-    wants: Wants,
 }
 
 impl State {
@@ -115,12 +105,10 @@ impl State {
             ServerMsg::ThreadCreated { thread, .. } | ServerMsg::ThreadChanged { thread } => {
                 self.threads.insert(thread.id, thread);
             }
-            ServerMsg::AgentChanged { .. } => self.wants.agents = true,
-            ServerMsg::RunStatus {
-                thread,
-                run,
-                status,
-            } => self.run_status(thread, run, status),
+            ServerMsg::AgentChanged { agent } => {
+                self.agents.insert(agent.id, agent);
+            }
+            ServerMsg::RunStatus { details, .. } => self.run_changed(details),
             ServerMsg::Message { thread, message } => self.add_message(thread, message),
             ServerMsg::Approval { approval, .. } => self.add_approval(approval),
             ServerMsg::Event {
@@ -156,30 +144,22 @@ impl State {
         self.threads = threads.into_iter().map(|t| (t.id, t)).collect();
         self.agents = agents.into_iter().map(|a| (a.id, a)).collect();
         self.runs = runs.into_iter().map(|r| (r.id, r)).collect();
-        self.bare_runs.clear();
         self.messages.clear();
         self.approvals = approvals.into_iter().map(|a| (a.id, a)).collect();
         for log in self.logs.values_mut() {
             *log = EventLog::default();
         }
-        self.wants = Wants::default();
     }
 
-    fn run_status(&mut self, thread: ThreadId, run: RunId, status: RunStatus) {
-        if let Some(known) = self.runs.get_mut(&run) {
-            if stage(&status) >= stage(&known.status) {
-                known.status = status;
-            }
-            return;
+    /// Keeps the run as sent, unless a further-along copy is known.
+    fn run_changed(&mut self, run: StoredRun) {
+        let stale = self
+            .runs
+            .get(&run.id)
+            .is_some_and(|known| stage(&run.status) < stage(&known.status));
+        if !stale {
+            self.runs.insert(run.id, run);
         }
-        match self.bare_runs.get_mut(&run) {
-            Some((_, known)) if stage(&status) < stage(known) => {}
-            Some((_, known)) => *known = status,
-            None => {
-                self.bare_runs.insert(run, (thread, status));
-            }
-        }
-        self.wants.runs = true;
     }
 
     fn add_message(&mut self, thread: ThreadId, message: StoredMessage) {
@@ -216,31 +196,6 @@ impl State {
         self.logs.contains_key(&thread)
     }
 
-    /// What to ask crewd for, clearing it.
-    pub fn take_wants(&mut self) -> Wants {
-        std::mem::take(&mut self.wants)
-    }
-
-    /// The answer to `ListAgents { include_deleted: true }`.
-    pub fn set_agents(&mut self, agents: Vec<StoredAgent>) {
-        self.agents = agents.into_iter().map(|a| (a.id, a)).collect();
-    }
-
-    /// Runs from `ListRuns`. A run's status only moves forward, so an
-    /// answer older than a notice doesn't undo it.
-    pub fn merge_runs(&mut self, runs: Vec<StoredRun>) {
-        for mut run in runs {
-            let newer = match (self.runs.get(&run.id), self.bare_runs.remove(&run.id)) {
-                (Some(known), _) => Some(known.status.clone()),
-                (None, bare) => bare.map(|(_, status)| status),
-            };
-            if let Some(status) = newer.filter(|s| stage(s) > stage(&run.status)) {
-                run.status = status;
-            }
-            self.runs.insert(run.id, run);
-        }
-    }
-
     /// Projects, oldest first.
     pub fn projects(&self) -> Vec<&StoredProject> {
         sorted(self.projects.values(), |p| (p.created_at, p.id.0))
@@ -260,6 +215,10 @@ impl State {
             self.threads.values().filter(|t| t.channel == channel),
             |t| (t.created_at, t.id.0),
         )
+    }
+
+    pub fn run(&self, run: RunId) -> Option<&StoredRun> {
+        self.runs.get(&run)
     }
 
     pub fn thread(&self, thread: ThreadId) -> Option<&StoredThread> {
@@ -345,9 +304,7 @@ impl State {
         let working = self
             .runs
             .values()
-            .map(|r| (r.thread, &r.status))
-            .chain(self.bare_runs.values().map(|(t, s)| (*t, s)))
-            .any(|(t, s)| is_live(s) && matches(t));
+            .any(|r| is_live(&r.status) && matches(r.thread));
         if working {
             ThreadStatus::Working
         } else {
@@ -488,11 +445,22 @@ mod tests {
         }
     }
 
-    fn status(thread: ThreadId, run: RunId, status: RunStatus) -> ServerMsg {
+    fn status(run: &StoredRun) -> ServerMsg {
         ServerMsg::RunStatus {
-            thread,
-            run,
+            thread: run.thread,
+            run: run.id,
+            status: run.status.clone(),
+            details: run.clone(),
+        }
+    }
+
+    /// `run` after it moved to `status`. A terminal status ends it at 99.
+    fn moved(run: &StoredRun, status: RunStatus) -> StoredRun {
+        let ended = !matches!(status, RunStatus::Queued | RunStatus::Working);
+        StoredRun {
             status,
+            ended_at: ended.then_some(99),
+            ..run.clone()
         }
     }
 
@@ -561,49 +529,51 @@ mod tests {
     fn run_status_moves_forward_only() {
         let (mut state, _, _, t) = one_thread();
         let queued = run(t.id, RunStatus::Queued, 5);
-        state.merge_runs(vec![queued.clone()]);
+        state.apply(status(&queued));
         assert_eq!(state.thread_status(t.id), ThreadStatus::Working);
-        state.apply(status(t.id, queued.id, RunStatus::Working));
-        assert_eq!(state.running()[0].status, RunStatus::Working);
-        state.apply(status(t.id, queued.id, RunStatus::Done));
+        let working = moved(&queued, RunStatus::Working);
+        state.apply(status(&working));
+        assert_eq!(state.running(), [&working]);
+        let done = moved(&working, RunStatus::Done);
+        state.apply(status(&done));
         assert!(state.running().is_empty());
         assert_eq!(state.thread_status(t.id), ThreadStatus::Idle);
         // A late copy of an older status, as after a resubscribe, is ignored.
-        state.apply(status(t.id, queued.id, RunStatus::Working));
+        state.apply(status(&working));
         assert!(state.running().is_empty());
         assert_eq!(state.thread_status(t.id), ThreadStatus::Idle);
     }
 
     #[test]
-    fn a_run_known_only_by_status_counts_and_asks_for_details() {
+    fn a_run_status_brings_the_whole_run() {
         let (mut state, _, _, t) = one_thread();
-        assert_eq!(state.take_wants(), Wants::default());
-        let r = run(t.id, RunStatus::Queued, 5);
-        state.apply(status(t.id, r.id, RunStatus::Queued));
-        assert_eq!(state.thread_status(t.id), ThreadStatus::Working);
-        assert!(state.running().is_empty(), "no details yet");
-        assert!(state.take_wants().runs);
-        assert!(!state.take_wants().runs, "taken");
-
-        // Working by now; the list answered while it was still queued.
-        state.apply(status(t.id, r.id, RunStatus::Working));
-        state.merge_runs(vec![r.clone()]);
-        let running = state.running();
-        assert_eq!(running.len(), 1);
-        assert_eq!(running[0].id, r.id);
-        assert_eq!(running[0].status, RunStatus::Working);
+        let queued = run(t.id, RunStatus::Queued, 5);
+        state.apply(status(&queued));
+        assert_eq!(state.running(), [&queued], "known from its first status");
+        let done = moved(&queued, RunStatus::Done);
+        state.apply(status(&done));
+        assert_eq!(state.run(queued.id), Some(&done));
+        assert_eq!(state.run(queued.id).unwrap().ended_at, Some(99));
     }
 
     #[test]
-    fn agent_changes_ask_for_the_agents() {
+    fn agent_changes_bring_the_agent() {
         let (mut state, _, _, _) = one_thread();
         let forge = agent("Forge");
-        state.apply(ServerMsg::AgentChanged { agent: forge.id });
-        assert!(state.take_wants().agents);
-        state.set_agents(vec![forge.clone()]);
+        state.apply(ServerMsg::AgentChanged {
+            agent: forge.clone(),
+        });
+        assert_eq!(state.agents(), [&forge]);
+        let mut deleted = forge.clone();
+        deleted.deleted_at = Some(9);
+        state.apply(ServerMsg::AgentChanged {
+            agent: deleted.clone(),
+        });
+        assert!(state.agents().is_empty());
         assert_eq!(
-            state.agent(forge.id).map(|a| a.spec.name.as_str()),
-            Some("Forge")
+            state.agent(forge.id),
+            Some(&deleted),
+            "still names old messages"
         );
     }
 
@@ -688,7 +658,7 @@ mod tests {
             });
         }
         assert_eq!(state.project_status(p.id), ThreadStatus::Idle);
-        state.merge_runs(vec![run(busy.id, RunStatus::Working, 1)]);
+        state.apply(status(&run(busy.id, RunStatus::Working, 1)));
         assert_eq!(state.project_status(p.id), ThreadStatus::Working);
         state.apply(ServerMsg::Approval {
             thread: t.id,
@@ -704,7 +674,9 @@ mod tests {
         let b = run(t.id, RunStatus::Working, 20);
         let a = run(t.id, RunStatus::Queued, 10);
         let done = run(t.id, RunStatus::Done, 5);
-        state.merge_runs(vec![b.clone(), done, a.clone()]);
+        for r in [&b, &done, &a] {
+            state.apply(status(r));
+        }
         let ids: Vec<RunId> = state.running().iter().map(|r| r.id).collect();
         assert_eq!(ids, [a.id, b.id]);
     }
@@ -738,7 +710,7 @@ mod tests {
             thread: t.id,
             message: message(t.id, "old", 1),
         });
-        state.apply(status(t.id, RunId::new(), RunStatus::Working));
+        state.apply(status(&run(t.id, RunStatus::Working, 1)));
         state.apply(ServerMsg::Approval {
             thread: t.id,
             approval: approval(t.id, 1),
@@ -762,11 +734,17 @@ mod tests {
         assert!(state.needs_you().is_empty());
         assert_eq!(state.running()[0].id, r2.id);
         assert_eq!(state.thread_status(t.id), ThreadStatus::Idle);
-        assert_eq!(state.take_wants(), Wants::default());
         // Still watched, rebuilt from the backlog crewd resends.
         assert!(state.events(t.id).is_empty());
         state.apply(event(t.id, r, 1, "old"));
         assert_eq!(texts(&state, t.id), ["old"]);
+    }
+
+    #[test]
+    fn reconnecting_is_its_own_state() {
+        let mut state = State::default();
+        state.set_connection(ConnectionState::Reconnecting);
+        assert_eq!(state.connection(), Some(&ConnectionState::Reconnecting));
     }
 
     #[test]
