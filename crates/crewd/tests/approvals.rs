@@ -82,6 +82,7 @@ impl Daemon {
                 claude_bin: Some(claude),
                 crew_mcp_bin: None,
                 minute,
+                ..Default::default()
             };
             if let Err(e) = serve(&path, opts).await {
                 panic!("serve failed: {e:#}");
@@ -718,6 +719,7 @@ async fn permission_ask_waits_for_decision() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({ "command": "touch x.txt" }),
+            tool_use_id: None,
         })
         .await;
     let seen = until_system(&mut c, "Forge wants to run Bash: touch x.txt").await;
@@ -762,6 +764,7 @@ async fn permission_ask_waits_for_decision() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({ "command": "rm x.txt" }),
+            tool_use_id: None,
         })
         .await;
     let seen = until_system(&mut c, "Forge wants to run Bash: rm x.txt").await;
@@ -792,6 +795,7 @@ async fn stopping_run_cancels_pending_permission() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({ "command": "touch x.txt" }),
+            tool_use_id: None,
         })
         .await;
     let seen = until_system(&mut c, "Forge wants to run Bash: touch x.txt").await;
@@ -830,6 +834,7 @@ async fn stopping_run_cancels_pending_permission() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({}),
+            tool_use_id: None,
         })
         .await
         .unwrap_err();
@@ -889,6 +894,7 @@ async fn stopping_run_refuses_handoffs_and_asks() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({ "command": "touch x.txt" }),
+            tool_use_id: None,
         })
         .await;
     assert_eq!(
@@ -943,7 +949,7 @@ async fn stop_thread_drops_queued_handoff() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn waiting_on_approval_counts_toward_limit() {
-    let d = Daemon::start(Duration::from_secs(1)).await;
+    let d = Daemon::start(Duration::from_secs(4)).await;
     let mut c = d.client().await;
     let chat = setup(&d, &mut c, 1).await;
     let run = start_forge(&mut c, chat.thread).await;
@@ -954,6 +960,7 @@ async fn waiting_on_approval_counts_toward_limit() {
             run,
             tool: "Bash".into(),
             input: serde_json::json!({ "command": "touch x.txt" }),
+            tool_use_id: None,
         })
         .await;
     until_system(&mut c, "Forge wants to run Bash: touch x.txt").await;
@@ -983,4 +990,150 @@ async fn reply_handoff_prompt_has_reply_once() {
     let prompts = logged_prompts(d.dir());
     assert_eq!(prompts.len(), 2, "{prompts:?}");
     assert_eq!(prompts[1].matches(reply).count(), 1, "{prompts:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_ask_connection_cancels_the_ask() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    let run = start_forge(&mut c, chat.thread).await;
+
+    let mut mcp = d.client().await;
+    mcp.send(Request::PermissionAsk {
+        run,
+        tool: "Bash".into(),
+        input: serde_json::json!({ "command": "touch x.txt" }),
+        tool_use_id: Some("toolu_9".into()),
+    })
+    .await;
+    let ask_text = "Forge wants to run Bash: touch x.txt";
+    let seen = until_system(&mut c, ask_text).await;
+    let pending = approvals(&seen).pop().unwrap();
+    assert_eq!(
+        pending.kind,
+        ApprovalKind::Permission {
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "touch x.txt" }),
+            tool_use_id: Some("toolu_9".into()),
+        }
+    );
+    assert_eq!(
+        system_message(&seen, ask_text).unwrap().approval,
+        Some(pending.id)
+    );
+
+    // crew-mcp went away, or dropped the call when Claude cancelled it.
+    drop(mcp);
+    let gone = "Forge stopped waiting for permission.";
+    let seen = until_system(&mut c, gone).await;
+    let cancelled = approvals(&seen).pop().expect("the cancelled approval");
+    assert_eq!(cancelled.id, pending.id);
+    assert_eq!(cancelled.status, ApprovalStatus::Cancelled);
+    let note = system_message(&seen, gone).unwrap();
+    assert_eq!((note.run, note.approval), (Some(run), Some(pending.id)));
+    let listed: Vec<StoredApproval> = c.ok(Request::ListApprovals { thread: None }).await;
+    assert!(listed.is_empty());
+    // The run itself goes on.
+    let working: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Working),
+        })
+        .await;
+    assert!(working.iter().any(|r| r.id == run));
+    c.call(Request::StopAll).await.unwrap();
+}
+
+/// Where the first frame matching `f` is in `seen`.
+fn position(seen: &[ServerMsg], f: impl Fn(&ServerMsg) -> bool) -> usize {
+    seen.iter().position(f).expect("frame not found")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approvals_come_before_their_messages_live_and_in_backlog() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    let run = start_forge(&mut c, chat.thread).await;
+
+    // A handoff ask, approved.
+    let mut mcp = d.client().await;
+    handoff(&mut mcp, run, "Scout", "look").await.unwrap();
+    let ask_text = "Forge wants to bring in Scout.";
+    let live = until_system(&mut c, ask_text).await;
+    let asked = approvals(&live).pop().unwrap();
+    let is_approval = |m: &ServerMsg| matches!(m, ServerMsg::Approval { approval, .. } if approval.id == asked.id);
+    let is_msg = |body: &'static str| move |m: &ServerMsg| matches!(m, ServerMsg::Message { message, .. } if message.body == body);
+    assert!(position(&live, is_approval) < position(&live, is_msg(ask_text)));
+    c.call(Request::Decide {
+        approval: asked.id,
+        approve: true,
+        brief: None,
+    })
+    .await
+    .unwrap();
+    let done_text = "Forge brought in Scout.";
+    let live = until_system(&mut c, done_text).await;
+    assert!(position(&live, is_approval) < position(&live, is_msg(done_text)));
+    assert_eq!(
+        system_message(&live, done_text).unwrap().approval,
+        Some(asked.id)
+    );
+
+    // A late subscriber gets the decided approval once, before the first
+    // message about it.
+    let mut late = d.client().await;
+    late.call(Request::Subscribe {
+        thread: chat.thread,
+    })
+    .await
+    .unwrap();
+    late.call(Request::ListAgents).await.unwrap();
+    let backlog = std::mem::take(&mut late.pending);
+    let found: Vec<&StoredApproval> = backlog
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Approval { approval, .. } if approval.id == asked.id => Some(approval),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].status, ApprovalStatus::Approved);
+    assert!(position(&backlog, is_approval) < position(&backlog, is_msg(ask_text)));
+    c.call(Request::StopAll).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_policy_applies_when_thread_and_agent_have_none() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    c.call(Request::SetChannelHandoff {
+        channel: chat.channel,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(1),
+    })
+    .await
+    .unwrap();
+    let run = start_forge(&mut c, chat.thread).await;
+    let mut mcp = d.client().await;
+    assert_eq!(
+        handoff(&mut mcp, run, "Scout", "look").await.unwrap(),
+        "Scout will pick this up after you finish."
+    );
+    // The channel's budget of 1 is used up.
+    assert_eq!(
+        handoff(&mut mcp, run, "Triage", "check").await.unwrap(),
+        "This thread used its handoffs. Asked the user whether to continue."
+    );
+    let err = c
+        .call(Request::SetChannelHandoff {
+            channel: ChannelId::new(),
+            policy: None,
+            budget: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "channel not found");
+    c.call(Request::StopAll).await.unwrap();
 }

@@ -46,7 +46,8 @@ CREATE TABLE messages (
     body TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     ord INTEGER NOT NULL,
-    run_id TEXT REFERENCES runs(id)
+    run_id TEXT REFERENCES runs(id),
+    approval_id TEXT REFERENCES approvals(id)
 );
 CREATE INDEX messages_by_thread ON messages(thread_id, ord);
 

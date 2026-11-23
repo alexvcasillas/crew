@@ -15,7 +15,9 @@ use crew_core::ids::{AgentId, ApprovalId, MessageId, ProjectId, RunId, ThreadId}
 use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
-use crew_core::store::{Author, RunFilter, Store, StoreError, StoredProject, ThreadWorktree};
+use crew_core::store::{
+    Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, ThreadWorktree,
+};
 use crew_core::worktree::{self, Diff};
 use crew_proto::{PermissionAnswer, Request, ServerMsg};
 use serde::Serialize;
@@ -25,8 +27,8 @@ use uuid::Uuid;
 
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 
-/// Capacity of the notification channel.
-const NOTICE_BUFFER: usize = 4096;
+/// Told once per run when permission prompts can't reach crewd.
+pub const NO_CREW_MCP: &str = "Permission prompts are off: crew-mcp wasn't found next to crewd.";
 /// Name used for the user's messages in a new session's context.
 const YOU_NAME: &str = "You";
 /// Tool call id of the setup command's events.
@@ -117,7 +119,8 @@ impl Service {
     /// Wraps an open store. `claude_bin` overrides the binary for every run.
     /// Thread worktrees are made under `worktrees`. `crew_mcp` is the
     /// crew-mcp binary and crew home passed to every run, if any. A run's
-    /// time limit counts in units of `minute`.
+    /// time limit counts in units of `minute`. A subscriber may fall up to
+    /// `notice_buffer` notifications behind.
     pub fn new(
         store: Store,
         max_runs: usize,
@@ -125,12 +128,13 @@ impl Service {
         worktrees: PathBuf,
         crew_mcp: Option<(PathBuf, PathBuf)>,
         minute: Duration,
+        notice_buffer: usize,
     ) -> Service {
         // Nothing waits for permission asks of an earlier crewd any more.
         if let Err(e) = crate::approvals::cancel_stale_permissions(&store) {
             log(format!("couldn't cancel old permission asks: {e}"));
         }
-        let (tx, _) = broadcast::channel(NOTICE_BUFFER);
+        let (tx, _) = broadcast::channel(notice_buffer.max(1));
         Service(Arc::new(Inner {
             db: Mutex::new(Db { store, serial: 0 }),
             state: Mutex::new(State {
@@ -167,7 +171,8 @@ impl Service {
     }
 
     /// Handles every request except `Hello`, `Subscribe` and
-    /// `PermissionAsk`, which belong to the connection.
+    /// `PermissionAsk`, which belong to the connection. `ThreadDiff`,
+    /// `Commit` and `Discard` run git and can take a while.
     pub async fn handle(&self, req: Request) -> Reply {
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
@@ -293,6 +298,17 @@ impl Service {
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::Value::Null)
             }
+            Request::SetChannelHandoff {
+                channel,
+                policy,
+                budget,
+            } => {
+                self.db()
+                    .store
+                    .set_channel_handoff(channel, policy, budget)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
         }
     }
 
@@ -345,7 +361,9 @@ impl Service {
         }
     }
 
-    /// Removes the thread's worktree and branch, changes included.
+    /// Removes the thread's worktree, uncommitted changes included. Its
+    /// branch goes too, unless it has commits beyond the worktree's base:
+    /// then it is kept and the thread is told.
     async fn discard(&self, thread: ThreadId) -> Reply {
         let root = self
             .db()
@@ -354,14 +372,25 @@ impl Service {
             .map_err(|e| e.to_string())?
             .root;
         let wt = self.claim_for_change(thread)?;
-        let path = wt.path.clone();
-        let result = blocking(move || worktree::remove(&root, &wt.path, &wt.branch, true)).await;
+        let (path, branch) = (wt.path.clone(), wt.branch.clone());
+        let result = blocking(move || {
+            let keep = worktree::has_commits_beyond(&root, &wt.branch, &wt.base)?;
+            worktree::remove(&root, &wt.path, &wt.branch, !keep)?;
+            Ok::<_, worktree::WorktreeError>(keep)
+        })
+        .await;
         // A worktree that is gone is cleared even if deleting the branch failed.
         let cleared = if result.is_ok() || !path.exists() {
-            self.db()
-                .store
-                .set_thread_worktree(thread, None)
-                .map_err(|e| e.to_string())
+            let mut db = self.db();
+            let mut cleared = db.store.set_thread_worktree(thread, None);
+            if cleared.is_ok() && result == Ok(true) {
+                let body =
+                    format!("Kept branch {branch} because it has commits that aren't merged.");
+                cleared = self
+                    .add_message(&mut db, thread, Author::System, &body, None)
+                    .map(|_| ());
+            }
+            cleared.map_err(|e| e.to_string())
         } else {
             Ok(())
         };
@@ -408,7 +437,8 @@ impl Service {
         self.start_ready();
     }
 
-    /// Past runs (status and events from seq 0) and all messages of a thread.
+    /// Past runs (status and events from seq 0), all messages and all
+    /// approvals of a thread.
     pub fn subscribe(&self, thread: ThreadId) -> Result<Backlog, StoreError> {
         let db = self.db();
         db.store.thread_cwd(thread)?;
@@ -432,10 +462,22 @@ impl Service {
                 status: run.status,
             });
         }
+        // Each approval comes just before the first message about it, as
+        // it does live. Approvals no message is about come last.
+        let mut approvals: Vec<Option<StoredApproval>> =
+            db.store.approvals(thread)?.into_iter().map(Some).collect();
         for message in db.store.messages(thread)? {
+            if let Some(id) = message.approval {
+                let found = approvals
+                    .iter_mut()
+                    .find(|a| a.as_ref().is_some_and(|a| a.id == id));
+                if let Some(approval) = found.and_then(Option::take) {
+                    msgs.push(ServerMsg::Approval { thread, approval });
+                }
+            }
             msgs.push(ServerMsg::Message { thread, message });
         }
-        for approval in db.store.pending_approvals(Some(thread))? {
+        for approval in approvals.into_iter().flatten() {
             msgs.push(ServerMsg::Approval { thread, approval });
         }
         Ok(Backlog {
@@ -580,7 +622,8 @@ impl Service {
         self.cancel_permissions(state, &mut db, run);
     }
 
-    /// Starts the run's time limit, which counts from now.
+    /// Starts the run's time limit, which counts from now: the moment its
+    /// `claude` process starts, after any worktree setup.
     fn start_timer(&self, state: &mut State, job: &Job) {
         let minutes = self
             .db()
@@ -653,7 +696,6 @@ impl Service {
             let pending = state.pending.remove(&job.run);
             // Forget watchers that are done, so the set stays small.
             while state.watchers.try_join_next().is_some() {}
-            self.start_timer(&mut state, &job);
             if self.needs_worktree(&job) {
                 self.begin_setup(&mut state, job, pending);
             } else if let Some(watch) = self.launch(&mut state, job, pending, true) {
@@ -713,6 +755,7 @@ impl Service {
                 drop(db);
                 let (handle, rx, join) = spawn_run(inv);
                 state.live.insert(job.run, (job.thread, handle));
+                self.start_timer(state, &job);
                 Some(
                     self.clone()
                         .watch(job.thread, job.run, job.agent, name, rx, join),
@@ -1002,6 +1045,9 @@ impl Service {
         if announce {
             self.publish_status(db, job.thread, job.run, RunStatus::Working);
         }
+        if self.0.crew_mcp.is_none() && spec.permission_mode == PermissionMode::EditFiles {
+            self.add_message(db, job.thread, Author::System, NO_CREW_MCP, Some(job.run))?;
+        }
         let wiring = self.0.crew_mcp.as_ref().map(|(bin, home)| McpWiring {
             crew_mcp_bin: bin.clone(),
             run: job.run,
@@ -1150,6 +1196,29 @@ impl Service {
         run: Option<RunId>,
     ) -> Result<MessageId, StoreError> {
         let id = db.store.add_message(thread, author, body, run)?;
+        self.publish_message(db, thread, id)
+    }
+
+    /// Saves a system note about `approval`, asked by `run`, and notifies
+    /// the thread.
+    pub(crate) fn add_approval_message(
+        &self,
+        db: &mut Db,
+        thread: ThreadId,
+        body: &str,
+        run: RunId,
+        approval: ApprovalId,
+    ) -> Result<MessageId, StoreError> {
+        let id = db.store.add_approval_message(thread, body, run, approval)?;
+        self.publish_message(db, thread, id)
+    }
+
+    fn publish_message(
+        &self,
+        db: &mut Db,
+        thread: ThreadId,
+        id: MessageId,
+    ) -> Result<MessageId, StoreError> {
         let message = db
             .store
             .messages(thread)?
@@ -1244,6 +1313,8 @@ fn render_context(
 ) -> String {
     messages
         .iter()
+        // A note for you, not for the agents.
+        .filter(|m| !(m.author == Author::System && m.body == NO_CREW_MCP))
         .map(|m| {
             let who = match &m.author {
                 Author::You => YOU_NAME,

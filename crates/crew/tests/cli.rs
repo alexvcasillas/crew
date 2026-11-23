@@ -366,13 +366,12 @@ impl Setup {
     }
 }
 
-#[test]
-fn agent_add_defaults_to_read_only() {
-    let s = setup();
+/// Sends one request straight to crewd and decodes the answer.
+fn ask<T: serde::de::DeserializeOwned>(home: &Path, req: crew_proto::Request) -> T {
+    use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg};
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let agents: Vec<(crew_core::ids::AgentId, crew_core::agent::AgentSpec)> = rt.block_on(async {
-        use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg};
-        let mut stream = tokio::net::UnixStream::connect(s.home.join("crewd.sock"))
+    rt.block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(home.join("crewd.sock"))
             .await
             .unwrap();
         for (id, req) in [
@@ -382,7 +381,7 @@ fn agent_add_defaults_to_read_only() {
                     version: PROTO_VERSION,
                 },
             ),
-            (2, Request::ListAgents),
+            (2, req),
         ] {
             crew_proto::write_frame(&mut stream, &ClientMsg::Request { id, req })
                 .await
@@ -400,7 +399,14 @@ fn agent_add_defaults_to_read_only() {
                 None => panic!("crewd hung up"),
             }
         }
-    });
+    })
+}
+
+#[test]
+fn agent_add_defaults_to_read_only() {
+    let s = setup();
+    let agents: Vec<(crew_core::ids::AgentId, crew_core::agent::AgentSpec)> =
+        ask(&s.home, crew_proto::Request::ListAgents);
     use crew_core::agent::{PermissionMode, Runtime};
     let spec = |name: &str| &agents.iter().find(|(_, a)| a.name == name).unwrap().1;
     assert_eq!(spec("Sentinel").permission_mode, PermissionMode::ReadOnly);
@@ -519,7 +525,8 @@ fn watch_waits_for_a_pending_approval_unless_asked_not_to() {
 #[test]
 fn diff_commit_and_discard_work_on_the_thread_worktree() {
     let s = setup();
-    s.forge_asks();
+    let ask = s.forge_asks();
+    stdout_of(s.crew().args(["decline", &ask]));
 
     let stat = stdout_of(s.crew().args(["diff", &s.thread, "--stat"]));
     assert_eq!(stat.trim(), "A file.txt +1 -0", "got {stat:?}");
@@ -542,7 +549,16 @@ fn diff_commit_and_discard_work_on_the_thread_worktree() {
     assert!(git(&s.project, &["branch", "--list", "crew/*"]).contains("crew/"));
 
     stdout_of(s.crew().args(["discard", &s.thread, "--yes"]));
-    assert_eq!(git(&s.project, &["branch", "--list", "crew/*"]), "");
+    // The branch holds a commit that isn't merged, so it stays.
+    assert_eq!(
+        git(&s.project, &["branch", "--list", "crew/*"]),
+        "crew/demo"
+    );
+    let out = stdout_of(s.crew().args(["watch", &s.thread, "--until-idle"]));
+    assert!(
+        out.contains("system: Kept branch crew/demo because it has commits that aren't merged."),
+        "got {out}"
+    );
     assert_eq!(
         stdout_of(s.crew().args(["diff", &s.thread])).trim(),
         "No changes."
@@ -566,4 +582,78 @@ fn allow_more_works_and_unknown_approval_ids_are_refused() {
             .unwrap()
             .contains("No approval matches")
     );
+}
+
+#[test]
+fn thread_and_channel_handoff_settings_are_saved() {
+    use crew_core::policy::HandoffPolicy;
+    use crew_core::store::{StoredChannel, StoredProject, StoredThread};
+    use crew_proto::Request;
+    let s = setup();
+    stdout_of(s.crew().args([
+        "thread",
+        "handoff",
+        &s.thread[..8],
+        "budget",
+        "--budget",
+        "2",
+    ]));
+    let projects: Vec<StoredProject> = ask(&s.home, Request::ListProjects);
+    let channels: Vec<StoredChannel> = ask(
+        &s.home,
+        Request::ListChannels {
+            project: projects[0].id,
+        },
+    );
+    let channel = channels[0].id;
+    stdout_of(
+        s.crew()
+            .args(["channel", "handoff", &channel.to_string()[..8], "per-agent"]),
+    );
+
+    let threads: Vec<StoredThread> = ask(&s.home, Request::ListThreads { channel });
+    let thread = threads
+        .iter()
+        .find(|t| t.id.to_string() == s.thread)
+        .unwrap();
+    assert_eq!(thread.handoff_policy, Some(HandoffPolicy::Budget));
+    assert_eq!(thread.handoff_budget, Some(2));
+    let channels: Vec<StoredChannel> = ask(
+        &s.home,
+        Request::ListChannels {
+            project: projects[0].id,
+        },
+    );
+    assert_eq!(channels[0].handoff_policy, Some(HandoffPolicy::PerAgent));
+    assert_eq!(channels[0].handoff_budget, None);
+}
+
+#[test]
+fn agent_add_checks_budget_and_minutes() {
+    let s = setup();
+    let add = |extra: &[&str]| {
+        let mut cmd = s.crew();
+        cmd.args([
+            "agent", "add", "Quill", "--model", "haiku", "--role", "Writes",
+        ])
+        .args(extra);
+        cmd
+    };
+    let stderr = |cmd: &mut Command| {
+        String::from_utf8(cmd.assert().failure().get_output().stderr.clone()).unwrap()
+    };
+    assert!(stderr(&mut add(&["--budget", "2"])).contains("--policy"));
+    assert!(
+        stderr(&mut add(&["--policy", "ask", "--budget", "2"]))
+            .contains("--budget needs --policy budget.")
+    );
+    assert!(stderr(&mut add(&["--max-minutes", "0"])).contains("--max-minutes"));
+    stdout_of(&mut add(&[
+        "--policy",
+        "budget",
+        "--budget",
+        "2",
+        "--max-minutes",
+        "1",
+    ]));
 }

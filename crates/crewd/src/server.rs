@@ -9,11 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use crew_core::ids::ThreadId;
+use crew_core::ids::{ApprovalId, ThreadId};
 use crew_core::store::Store;
-use crew_proto::{
-    ClientMsg, PROTO_VERSION, PermissionAnswer, Request, ServerMsg, read_frame, write_frame,
-};
+use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::net::unix::OwnedWriteHalf;
@@ -22,7 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::approvals::stopped_answer;
-use crate::service::Service;
+use crate::service::{Notice, Reply, Service};
 
 /// Socket file name inside the crew home.
 pub const SOCKET_NAME: &str = "crewd.sock";
@@ -47,6 +45,9 @@ pub struct ServeOptions {
     /// How long one minute of an agent's `max_run_minutes` lasts. Tests
     /// make it short.
     pub minute: Duration,
+    /// How many notifications a subscriber may fall behind before crewd
+    /// sends it `Resync` and hangs up.
+    pub notice_buffer: usize,
 }
 
 impl Default for ServeOptions {
@@ -56,6 +57,7 @@ impl Default for ServeOptions {
             claude_bin: None,
             crew_mcp_bin: default_crew_mcp_bin(),
             minute: Duration::from_secs(60),
+            notice_buffer: 4096,
         }
     }
 }
@@ -143,16 +145,18 @@ pub async fn serve_until(
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     log(format!("listening on {}", sock.display()));
 
-    // crew-mcp runs in the agent's folder, so it gets an absolute home.
+    // crew-mcp runs in the agent's folder and git runs in the project, so
+    // both get absolute paths.
     let abs_home =
         std::fs::canonicalize(home).with_context(|| format!("resolving {}", home.display()))?;
     let service = Service::new(
         store,
         opts.max_runs,
         opts.claude_bin,
-        home.join(WORKTREES_DIR),
+        abs_home.join(WORKTREES_DIR),
         usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),
         opts.minute,
+        opts.notice_buffer,
     );
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -242,7 +246,6 @@ async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
         _ => return respond(&mut wr, id, Err("Send Hello first.".into())).await,
     }
 
-    let notices = service.notices();
     // Frames are read in their own task: `read_frame` is not safe to cancel
     // inside `select!`, a channel receive is.
     let (req_tx, req_rx) = mpsc::channel(32);
@@ -262,27 +265,62 @@ async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
             }
         }
     });
-    let result = requests_and_notices(&service, &mut wr, req_rx, notices).await;
+    let result = requests_and_notices(&service, &mut wr, req_rx).await;
     reader.abort();
     result
 }
 
+/// Permission asks made on one connection that still wait for an answer,
+/// by request id. Whatever is left when the connection ends is cancelled:
+/// nobody would hear the answer.
+struct Asks {
+    service: Service,
+    waiting: HashMap<u64, ApprovalId>,
+}
+
+impl Drop for Asks {
+    fn drop(&mut self) {
+        for (_, approval) in self.waiting.drain() {
+            self.service.abandon_permission(approval);
+        }
+    }
+}
+
+/// The next notice, or never if the connection has not subscribed.
+async fn next_notice(
+    notices: &mut Option<broadcast::Receiver<Notice>>,
+) -> Result<Notice, broadcast::error::RecvError> {
+    match notices {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Answers requests and forwards notices for subscribed threads until the
 /// client goes away. Runs keep going after that.
+///
+/// Requests that wait on a person or on git run in their own tasks and are
+/// answered when they finish, so later requests are not held up.
 async fn requests_and_notices(
     service: &Service,
     wr: &mut OwnedWriteHalf,
     mut req_rx: mpsc::Receiver<ClientMsg>,
-    mut notices: broadcast::Receiver<crate::service::Notice>,
 ) -> io::Result<()> {
     // Thread -> serial already covered by that thread's backlog.
     let mut subscribed: HashMap<ThreadId, u64> = HashMap::new();
-    // Answers to permission asks, which come whenever someone decides.
-    let (answer_tx, mut answer_rx) = mpsc::channel::<(u64, PermissionAnswer)>(8);
+    // Taken on the first Subscribe, so a connection that only asks never
+    // falls behind.
+    let mut notices: Option<broadcast::Receiver<Notice>> = None;
+    // Answers to requests handled in their own tasks.
+    let (answer_tx, mut answer_rx) = mpsc::channel::<(u64, Reply)>(8);
+    let mut asks = Asks {
+        service: service.clone(),
+        waiting: HashMap::new(),
+    };
     loop {
         tokio::select! {
-            Some((id, answer)) = answer_rx.recv() => {
-                let result = serde_json::to_value(answer).map_err(|e| e.to_string());
+            Some((id, result)) = answer_rx.recv() => {
+                asks.waiting.remove(&id);
                 respond(wr, id, result).await?;
             }
             msg = req_rx.recv() => {
@@ -290,31 +328,51 @@ async fn requests_and_notices(
                     return Ok(());
                 };
                 match req {
-                    Request::Subscribe { thread } => match service.subscribe(thread) {
-                        Ok(backlog) => {
-                            respond(wr, id, Ok(serde_json::Value::Null)).await?;
-                            for msg in &backlog.msgs {
-                                write_frame(wr, msg).await?;
+                    Request::Subscribe { thread } => {
+                        // Taken before the backlog is read, so nothing falls
+                        // between the two.
+                        notices.get_or_insert_with(|| service.notices());
+                        match service.subscribe(thread) {
+                            Ok(backlog) => {
+                                respond(wr, id, Ok(serde_json::Value::Null)).await?;
+                                for msg in &backlog.msgs {
+                                    write_frame(wr, msg).await?;
+                                }
+                                subscribed.insert(thread, backlog.serial);
                             }
-                            subscribed.insert(thread, backlog.serial);
+                            Err(e) => respond(wr, id, Err(e.to_string())).await?,
                         }
-                        Err(e) => respond(wr, id, Err(e.to_string())).await?,
-                    },
+                    }
                     Request::Hello { .. } => {
                         respond(wr, id, Err("Hello was already sent.".into())).await?;
                     }
-                    Request::PermissionAsk { run, tool, input } => {
-                        match service.ask_permission(run, &tool, input) {
-                            Ok(rx) => {
+                    Request::PermissionAsk { run, tool, input, tool_use_id } => {
+                        match service.ask_permission(run, &tool, input, tool_use_id) {
+                            Ok(wait) => {
+                                if let Some(approval) = wait.approval {
+                                    asks.waiting.insert(id, approval);
+                                }
                                 let tx = answer_tx.clone();
                                 tokio::spawn(async move {
                                     // A dropped sender means the run is gone.
-                                    let answer = rx.await.unwrap_or_else(|_| stopped_answer());
-                                    let _ = tx.send((id, answer)).await;
+                                    let answer =
+                                        wait.answer.await.unwrap_or_else(|_| stopped_answer());
+                                    let result =
+                                        serde_json::to_value(answer).map_err(|e| e.to_string());
+                                    let _ = tx.send((id, result)).await;
                                 });
                             }
                             Err(e) => respond(wr, id, Err(e)).await?,
                         }
+                    }
+                    req @ (Request::ThreadDiff { .. }
+                    | Request::Commit { .. }
+                    | Request::Discard { .. }) => {
+                        let (svc, tx) = (service.clone(), answer_tx.clone());
+                        tokio::spawn(async move {
+                            let result = svc.handle(req).await;
+                            let _ = tx.send((id, result)).await;
+                        });
                     }
                     other => {
                         let result = service.handle(other).await;
@@ -322,14 +380,17 @@ async fn requests_and_notices(
                     }
                 }
             }
-            notice = notices.recv() => match notice {
+            notice = next_notice(&mut notices) => match notice {
                 Ok(n) => {
                     if subscribed.get(&n.thread).is_some_and(|seen| n.serial > *seen) {
                         write_frame(wr, &n.msg).await?;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    log(format!("a client fell behind and missed {missed} notifications"));
+                    log(format!(
+                        "a client fell behind and missed {missed} notifications, asking it to resync"
+                    ));
+                    return write_frame(wr, &ServerMsg::Resync).await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },

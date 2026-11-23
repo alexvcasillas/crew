@@ -26,3 +26,5 @@ CREATE TABLE approvals (
     decided_at INTEGER
 );
 CREATE INDEX approvals_by_status ON approvals(status, thread_id);
+
+ALTER TABLE messages ADD COLUMN approval_id TEXT REFERENCES approvals(id);

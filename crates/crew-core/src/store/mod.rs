@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::agent::AgentSpec;
 use crate::event::{Event, RunStatus};
-use crate::ids::{AgentId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
+use crate::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crate::policy::HandoffPolicy;
 
 pub use approval::{
@@ -65,6 +65,9 @@ pub struct StoredMessage {
     /// The run that produced this message, for agent replies and system notes.
     #[serde(default)]
     pub run: Option<RunId>,
+    /// The approval a system note is about, if any.
+    #[serde(default)]
+    pub approval: Option<ApprovalId>,
 }
 
 /// A project as saved in the store.
@@ -412,6 +415,24 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the channel's handoff policy and budget. `None` falls back to
+    /// the global default.
+    pub fn set_channel_handoff(
+        &self,
+        c: ChannelId,
+        policy: Option<HandoffPolicy>,
+        budget: Option<u32>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE channels SET handoff_policy = ?2, handoff_budget = ?3 WHERE id = ?1",
+            params![c.to_string(), policy_text(policy)?, budget],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("channel"));
+        }
+        Ok(())
+    }
+
     /// Sets the thread's own handoff policy and budget. `None` falls back
     /// to the agent or channel.
     pub fn set_thread_handoff(
@@ -470,6 +491,28 @@ impl Store {
         body: &str,
         run: Option<RunId>,
     ) -> Result<MessageId> {
+        self.insert_message(t, author, body, run, None)
+    }
+
+    /// Saves a system note about `approval`, asked by run `run`.
+    pub fn add_approval_message(
+        &self,
+        t: ThreadId,
+        body: &str,
+        run: RunId,
+        approval: ApprovalId,
+    ) -> Result<MessageId> {
+        self.insert_message(t, Author::System, body, Some(run), Some(approval))
+    }
+
+    fn insert_message(
+        &self,
+        t: ThreadId,
+        author: Author,
+        body: &str,
+        run: Option<RunId>,
+        approval: Option<ApprovalId>,
+    ) -> Result<MessageId> {
         let id = MessageId::new();
         let (kind, agent) = match author {
             Author::You => ("you", None),
@@ -477,8 +520,9 @@ impl Store {
             Author::System => ("system", None),
         };
         self.conn.execute(
-            "INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, run_id, ord)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            "INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, run_id,
+                                   approval_id, ord)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                      (SELECT COALESCE(MAX(ord) + 1, 0) FROM messages WHERE thread_id = ?2))",
             params![
                 id.to_string(),
@@ -487,7 +531,8 @@ impl Store {
                 agent,
                 body,
                 now_ms(),
-                run.map(|r| r.to_string())
+                run.map(|r| r.to_string()),
+                approval.map(|a| a.to_string())
             ],
         )?;
         Ok(id)
@@ -495,7 +540,7 @@ impl Store {
 
     pub fn messages(&self, t: ThreadId) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_kind, author_agent, body, created_at, run_id
+            "SELECT id, author_kind, author_agent, body, created_at, run_id, approval_id
              FROM messages WHERE thread_id = ?1 ORDER BY ord",
         )?;
         let rows = stmt.query_map([t.to_string()], |r| {
@@ -515,6 +560,10 @@ impl Store {
                 run: r
                     .get::<_, Option<String>>(5)?
                     .map(|_| uuid_col(r, 5).map(RunId))
+                    .transpose()?,
+                approval: r
+                    .get::<_, Option<String>>(6)?
+                    .map(|_| uuid_col(r, 6).map(ApprovalId))
                     .transpose()?,
             })
         })?;

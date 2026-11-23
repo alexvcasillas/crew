@@ -183,6 +183,13 @@ pub fn remove(root: &Path, dest: &Path, branch: &str, delete_branch: bool) -> Re
     Ok(())
 }
 
+/// Whether `branch` has commits that `base` doesn't.
+pub fn has_commits_beyond(root: &Path, branch: &str, base: &str) -> Result<bool> {
+    let range = format!("{base}..refs/heads/{branch}");
+    let count = git(root, ["rev-list", "--count", range.as_str()])?;
+    Ok(count.trim() != "0")
+}
+
 /// Whether the repo at `root` has a local branch named `branch`.
 pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     let refname = format!("refs/heads/{branch}");

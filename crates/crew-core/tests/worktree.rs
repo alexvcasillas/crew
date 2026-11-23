@@ -155,6 +155,22 @@ fn remove_deletes_dir_and_branch() {
 }
 
 #[test]
+fn commits_beyond_base_are_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, dest, base) = setup(tmp.path());
+    fs::write(dest.join("a.txt"), "unsaved\n").unwrap();
+    assert!(!worktree::has_commits_beyond(&root, "crew/t", &base).unwrap());
+    worktree::commit(&dest, "feat: change a", &[]).unwrap();
+    assert!(worktree::has_commits_beyond(&root, "crew/t", &base).unwrap());
+    // Main moving on doesn't count.
+    let fresh = tmp.path().join("worktrees/demo/u");
+    let base_u = worktree::create(&root, "main", &fresh, "crew/u").unwrap();
+    fs::write(root.join("a.txt"), "on main\n").unwrap();
+    git(&root, &["commit", "-qam", "main moves"]);
+    assert!(!worktree::has_commits_beyond(&root, "crew/u", &base_u).unwrap());
+}
+
+#[test]
 fn copy_files_skips_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let (root, dest, _base) = setup(tmp.path());

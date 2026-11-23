@@ -3,9 +3,11 @@
 //! Speaks newline-delimited JSON-RPC on stdio and serves two tools,
 //! `handoff` and `approve`. Each call opens its own connection to crewd.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
@@ -17,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 /// How long reaching crewd and getting past `Hello` may take.
@@ -83,9 +86,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// Tool calls still running, by their JSON-RPC id as text.
+type Calls = Arc<Mutex<HashMap<String, AbortHandle>>>;
+
 /// Reads requests from stdin until it closes. Tool calls run in their own
-/// tasks, since `approve` can wait a long time for a person.
+/// tasks, since `approve` can wait a long time for a person. A call Claude
+/// cancels is dropped with its connection to crewd, which tells crewd that
+/// nobody waits for the answer any more.
 async fn serve(ctx: Ctx) -> std::io::Result<()> {
+    let calls: Calls = Arc::default();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -110,12 +119,20 @@ async fn serve(ctx: Ctx) -> std::io::Result<()> {
                 continue;
             }
         };
-        // Without an id it is a notification, which gets no reply.
-        let Some(id) = msg.get("id").cloned() else {
-            continue;
-        };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        // Without an id it is a notification, which gets no reply.
+        let Some(id) = msg.get("id").cloned() else {
+            if method == "notifications/cancelled"
+                && let Some(request) = params.get("requestId")
+            {
+                let call = lock(&calls).remove(&request.to_string());
+                if let Some(call) = call {
+                    call.abort();
+                }
+            }
+            continue;
+        };
         match method {
             "initialize" => {
                 let version = params
@@ -140,9 +157,18 @@ async fn serve(ctx: Ctx) -> std::io::Result<()> {
             "tools/call" => {
                 let ctx = ctx.clone();
                 let out_tx = out_tx.clone();
-                tokio::spawn(async move {
-                    let _ = out_tx.send(call_tool(&ctx, id, &params).await);
+                let key = id.to_string();
+                // Held until the call is listed, so it can't finish first.
+                let mut running = lock(&calls);
+                let task_calls = calls.clone();
+                let task_key = key.clone();
+                let task = tokio::spawn(async move {
+                    let reply = call_tool(&ctx, id, &params).await;
+                    // Removed before replying: a cancel after this is too late.
+                    lock(&task_calls).remove(&task_key);
+                    let _ = out_tx.send(reply);
                 });
+                running.insert(key, task.abort_handle());
             }
             other => {
                 let _ = out_tx.send(error(id, METHOD_NOT_FOUND, &format!("No method {other}.")));
@@ -152,6 +178,12 @@ async fn serve(ctx: Ctx) -> std::io::Result<()> {
     // stdin closed: Claude is gone, so pending calls don't matter.
     writer.abort();
     Ok(())
+}
+
+fn lock(calls: &Calls) -> std::sync::MutexGuard<'_, HashMap<String, AbortHandle>> {
+    calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn result(id: Value, result: Value) -> Value {
@@ -246,6 +278,10 @@ async fn approve(ctx: &Ctx, args: &Value) -> Value {
         run: ctx.run,
         tool: tool.to_string(),
         input: input.clone(),
+        tool_use_id: args
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(String::from),
     };
     let answer = match ask(&ctx.home, req).await {
         Ok(v) => v,

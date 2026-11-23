@@ -22,6 +22,16 @@ const RUN_STOPPED: &str = "The run was stopped.";
 /// What an agent is told when you decline its permission ask.
 const DECLINED: &str = "The user declined this.";
 
+/// What a run asked and how it will hear the answer.
+pub(crate) struct PermissionWait {
+    /// The approval made for the ask, or `None` if the run was stopping
+    /// and the answer is already in `answer`.
+    pub(crate) approval: Option<ApprovalId>,
+    /// Gets the answer once someone decides. Dropped if crewd goes away
+    /// first.
+    pub(crate) answer: oneshot::Receiver<PermissionAnswer>,
+}
+
 /// Marks permission asks left pending by an earlier crewd as cancelled.
 /// Nothing waits for them any more.
 pub(crate) fn cancel_stale_permissions(store: &Store) -> Result<(), StoreError> {
@@ -64,20 +74,23 @@ fn running(state: &State, run: RunId) -> bool {
 }
 
 impl Service {
-    /// Saves a permission ask of a live run and tells the thread. The
-    /// receiver gets the answer once someone decides, or is dropped if
-    /// crewd goes away first. A run that is stopping is denied at once.
+    /// Saves a permission ask of a live run and tells the thread. A run
+    /// that is stopping is denied at once.
     pub(crate) fn ask_permission(
         &self,
         run: RunId,
         tool: &str,
         input: serde_json::Value,
-    ) -> Result<oneshot::Receiver<PermissionAnswer>, String> {
+        tool_use_id: Option<String>,
+    ) -> Result<PermissionWait, String> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.state();
         if state.live.contains_key(&run) && !running(&state, run) {
             let _ = tx.send(stopped_answer());
-            return Ok(rx);
+            return Ok(PermissionWait {
+                approval: None,
+                answer: rx,
+            });
         }
         if !running(&state, run) {
             return Err("That run isn't running.".into());
@@ -93,16 +106,57 @@ impl Service {
         let kind = ApprovalKind::Permission {
             tool: tool.to_string(),
             input,
+            tool_use_id,
         };
         let id = db
             .store
             .create_approval(stored.thread, run, &kind)
             .map_err(store_err)?;
         self.publish_approval(&mut db, id).map_err(store_err)?;
-        self.add_message(&mut db, stored.thread, Author::System, &body, Some(run))
+        self.add_approval_message(&mut db, stored.thread, &body, run, id)
             .map_err(store_err)?;
         state.waiting.insert(id, tx);
-        Ok(rx)
+        Ok(PermissionWait {
+            approval: Some(id),
+            answer: rx,
+        })
+    }
+
+    /// Cancels a permission ask nobody waits for any more: crew-mcp went
+    /// away, or Claude gave up on the call. Does nothing once it is decided.
+    pub(crate) fn abandon_permission(&self, id: ApprovalId) {
+        let mut state = self.state();
+        let mut db = self.db();
+        state.waiting.remove(&id);
+        let pending = db
+            .store
+            .approval(id)
+            .is_ok_and(|a| a.status == ApprovalStatus::Pending);
+        if !pending {
+            return;
+        }
+        let result = db
+            .store
+            .decide_approval(id, ApprovalStatus::Cancelled, None)
+            .and_then(|cancelled| {
+                let (thread, run) = (cancelled.thread, cancelled.run);
+                self.publish(
+                    &mut db,
+                    thread,
+                    ServerMsg::Approval {
+                        thread,
+                        approval: cancelled,
+                    },
+                );
+                let agents = db.store.agents()?;
+                let agent = db.store.run(run)?.agent;
+                let name = spec_of(&agents, agent)?.name.clone();
+                let body = format!("{name} stopped waiting for permission.");
+                self.add_approval_message(&mut db, thread, &body, run, id)
+            });
+        if let Err(e) = result {
+            crate::service::log(format!("couldn't cancel an abandoned ask: {e}"));
+        }
     }
 
     /// The handoff tool: the agent of live run `run` brings in `agent`.
@@ -190,32 +244,35 @@ impl Service {
         let (thread, run) = (req.thread, req.run);
         let row = db.store.thread(thread)?;
         let inputs = policy_inputs(db, &row, Some(from_spec))?;
-        let system = |svc: &Service, db: &mut Db, body: &str| {
-            svc.add_message(db, thread, Author::System, body, Some(run))
-                .map(|_| ())
-        };
         match policy::decide(&inputs) {
             Decision::Ask => {
-                self.ask_handoff(db, req, false)?;
-                system(self, db, &handoff_ask_text(&from_name, &to_name))?;
+                let id = self.ask_handoff(db, req, false)?;
+                let body = handoff_ask_text(&from_name, &to_name);
+                self.add_approval_message(db, thread, &body, run, id)?;
                 Ok(format!("Asked the user to approve bringing in {to_name}."))
             }
             Decision::Run => {
                 db.store.bump_handoffs_used(thread)?;
                 let queued = db.store.create_run(thread, req.to)?;
-                system(self, db, &format!("{from_name} brought in {to_name}."))?;
+                let body = format!("{from_name} brought in {to_name}.");
+                self.add_message(db, thread, Author::System, &body, Some(run))?;
                 self.queue_handoff(state, db, thread, queued, req.to, req.brief);
                 Ok(format!("{to_name} will pick this up after you finish."))
             }
             Decision::Pause { budget } => {
-                self.ask_handoff(db, req, true)?;
-                system(self, db, &paused_text(budget))?;
+                let id = self.ask_handoff(db, req, true)?;
+                self.add_approval_message(db, thread, &paused_text(budget), run, id)?;
                 Ok("This thread used its handoffs. Asked the user whether to continue.".into())
             }
         }
     }
 
-    fn ask_handoff(&self, db: &mut Db, req: HandoffReq, paused: bool) -> Result<(), StoreError> {
+    fn ask_handoff(
+        &self,
+        db: &mut Db,
+        req: HandoffReq,
+        paused: bool,
+    ) -> Result<ApprovalId, StoreError> {
         let kind = ApprovalKind::Handoff {
             from: req.from,
             to: req.to,
@@ -223,7 +280,8 @@ impl Service {
             paused,
         };
         let id = db.store.create_approval(req.thread, req.run, &kind)?;
-        self.publish_approval(db, id)
+        self.publish_approval(db, id)?;
+        Ok(id)
     }
 
     /// Queues the saved run `run` of `to` with `brief` as its prompt. It
@@ -312,14 +370,8 @@ impl Service {
                         }
                         None => format!("Declined {to_name}."),
                     };
-                    self.add_message(
-                        &mut db,
-                        decided.thread,
-                        Author::System,
-                        &body,
-                        Some(decided.run),
-                    )
-                    .map_err(store_err)?;
+                    self.add_approval_message(&mut db, decided.thread, &body, decided.run, id)
+                        .map_err(store_err)?;
                 }
             }
         }
