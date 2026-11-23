@@ -58,12 +58,7 @@ pub fn decide(i: &PolicyInputs) -> Decision {
     };
     match policy {
         HandoffPolicy::Budget => {
-            let budget = i
-                .thread
-                .1
-                .or(i.agent.1)
-                .or(i.channel.1)
-                .unwrap_or(DEFAULT_BUDGET);
+            let budget = budget(i);
             if i.used < budget {
                 Decision::Run
             } else {
@@ -72,6 +67,15 @@ pub fn decide(i: &PolicyInputs) -> Decision {
         }
         _ => Decision::Ask,
     }
+}
+
+/// The handoff budget: thread, then agent, then channel, then 3.
+pub fn budget(i: &PolicyInputs) -> u32 {
+    i.thread
+        .1
+        .or(i.agent.1)
+        .or(i.channel.1)
+        .unwrap_or(DEFAULT_BUDGET)
 }
 
 /// Finds `@Agent` mentions in a reply, skipping `self_name`.

@@ -330,7 +330,7 @@ impl Followups {
 /// The key a system message counts under, if it reports a run ending.
 fn system_key(body: &str, names: &Names) -> Option<String> {
     names.agents.values().find_map(|n| {
-        if body == format!("{n} stopped.") {
+        if body == format!("{n} stopped.") || body.starts_with(&format!("{n} hit its ")) {
             Some(format!("stopped:{n}"))
         } else if body.starts_with(&format!("{n} failed: ")) {
             Some(format!("failed:{n}"))
@@ -439,7 +439,8 @@ async fn watch(home: &std::path::Path, thread: ThreadId, until_idle: bool) -> Re
                 };
                 println!("{author}: {}", message.body);
             }
-            ServerMsg::Response { .. } => {}
+            // Approvals get their own commands.
+            ServerMsg::Response { .. } | ServerMsg::Approval { .. } => {}
         }
     }
 }

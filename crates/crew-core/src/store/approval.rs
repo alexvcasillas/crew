@@ -7,7 +7,7 @@ use super::{Result, Store, StoreError, enum_text, now_ms, parse_enum, uuid_col};
 use crate::ids::{AgentId, ApprovalId, RunId, ThreadId};
 
 /// What is being asked. On the wire:
-/// `{"kind":"handoff","from":..,"to":..,"brief":..}` or
+/// `{"kind":"handoff","from":..,"to":..,"brief":..,"paused":..}` or
 /// `{"kind":"permission","tool":..,"input":..}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -16,6 +16,10 @@ pub enum ApprovalKind {
         from: AgentId,
         to: AgentId,
         brief: String,
+        /// Asked because the thread's budget was used up. Approving it
+        /// raises the budget by one, so just this handoff runs.
+        #[serde(default)]
+        paused: bool,
     },
     Permission {
         tool: String,

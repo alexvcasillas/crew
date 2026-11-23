@@ -1,0 +1,472 @@
+//! Handoffs between agents and permission asks, and the approvals they
+//! wait on.
+//!
+//! Same lock order as the rest of the service: `state` before `db`.
+
+use crew_core::agent::AgentSpec;
+use crew_core::event::RunStatus;
+use crew_core::ids::{AgentId, ApprovalId, RunId, ThreadId};
+use crew_core::policy::{self, Decision, PolicyInputs};
+use crew_core::scheduler::Job;
+use crew_core::store::{
+    ApprovalKind, ApprovalStatus, Author, Store, StoreError, StoredApproval, StoredThread,
+};
+use crew_proto::{PermissionAnswer, ServerMsg};
+use tokio::sync::oneshot;
+
+use crate::service::{Db, Service, State};
+
+/// What an agent is told when its run ends before anyone decides.
+const RUN_STOPPED: &str = "The run was stopped.";
+/// What an agent is told when you decline its permission ask.
+const DECLINED: &str = "The user declined this.";
+/// Longest tool input shown in a permission ask.
+const SHORT_INPUT: usize = 80;
+
+/// Marks permission asks left pending by an earlier crewd as cancelled.
+/// Nothing waits for them any more.
+pub(crate) fn cancel_stale_permissions(store: &Store) -> Result<(), StoreError> {
+    for approval in store.pending_approvals(None)? {
+        if matches!(approval.kind, ApprovalKind::Permission { .. }) {
+            store.decide_approval(approval.id, ApprovalStatus::Cancelled, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn store_err(e: StoreError) -> String {
+    e.to_string()
+}
+
+fn spec_of(agents: &[(AgentId, AgentSpec)], id: AgentId) -> Result<&AgentSpec, StoreError> {
+    agents
+        .iter()
+        .find(|(a, _)| *a == id)
+        .map(|(_, spec)| spec)
+        .ok_or(StoreError::NotFound("agent"))
+}
+
+impl Service {
+    /// Saves a permission ask of a live run and tells the thread. The
+    /// receiver gets the answer once someone decides, or is dropped if
+    /// crewd goes away first.
+    pub(crate) fn ask_permission(
+        &self,
+        run: RunId,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<oneshot::Receiver<PermissionAnswer>, String> {
+        let mut state = self.state();
+        if !state.live.contains_key(&run) {
+            return Err("That run isn't running.".into());
+        }
+        let mut db = self.db();
+        let stored = db.store.run(run).map_err(store_err)?;
+        let agents = db.store.agents().map_err(store_err)?;
+        let name = spec_of(&agents, stored.agent)
+            .map_err(store_err)?
+            .name
+            .clone();
+        let shown = short_input(&input);
+        let kind = ApprovalKind::Permission {
+            tool: tool.to_string(),
+            input,
+        };
+        let id = db
+            .store
+            .create_approval(stored.thread, run, &kind)
+            .map_err(store_err)?;
+        self.publish_approval(&mut db, id).map_err(store_err)?;
+        let body = if shown.is_empty() {
+            format!("{name} wants to run {tool}.")
+        } else {
+            format!("{name} wants to run {tool}: {shown}")
+        };
+        self.add_message(&mut db, stored.thread, Author::System, &body, Some(run))
+            .map_err(store_err)?;
+        let (tx, rx) = oneshot::channel();
+        state.waiting.insert(id, tx);
+        Ok(rx)
+    }
+
+    /// The handoff tool: the agent of live run `run` brings in `agent`.
+    /// Returns the text for the agent.
+    pub(crate) fn handoff(&self, run: RunId, agent: &str, brief: String) -> Result<String, String> {
+        let text = {
+            let mut state = self.state();
+            if !state.live.contains_key(&run) {
+                return Err("That run isn't running.".into());
+            }
+            let mut db = self.db();
+            let stored = db.store.run(run).map_err(store_err)?;
+            let agents = db.store.agents().map_err(store_err)?;
+            let to = agents
+                .iter()
+                .find(|(_, spec)| spec.name.eq_ignore_ascii_case(agent.trim()))
+                .map(|(id, _)| *id)
+                .ok_or_else(|| format!("There's no agent named {}.", agent.trim()))?;
+            if to == stored.agent {
+                return Err("You can't hand off to yourself.".into());
+            }
+            state.handed.entry(run).or_default().push(to);
+            self.request_handoff(
+                &mut state,
+                &mut db,
+                &agents,
+                stored.thread,
+                run,
+                stored.agent,
+                to,
+                brief,
+            )
+            .map_err(store_err)?
+        };
+        self.start_ready();
+        Ok(text)
+    }
+
+    /// Hands off from the reply of a run that ended `Done`: each agent it
+    /// mentions, minus those the run already handed off to with the tool,
+    /// gets the reply as its brief.
+    pub(crate) fn reply_handoffs(
+        &self,
+        state: &mut State,
+        db: &mut Db,
+        run: RunId,
+        agent: AgentId,
+        reply: &str,
+        handed: &[AgentId],
+    ) -> Result<(), StoreError> {
+        let agents = db.store.agents()?;
+        let names: Vec<&str> = agents.iter().map(|(_, a)| a.name.as_str()).collect();
+        let me = spec_of(&agents, agent)?.name.clone();
+        let thread = db.store.run(run)?.thread;
+        for name in policy::mentions_in_reply(reply, &names, &me) {
+            let Some((to, _)) = agents.iter().find(|(_, a)| a.name == name) else {
+                continue;
+            };
+            if handed.contains(to) {
+                continue;
+            }
+            self.request_handoff(
+                state,
+                db,
+                &agents,
+                thread,
+                run,
+                agent,
+                *to,
+                reply.to_string(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Applies the thread's handoff policy to one request and returns the
+    /// text for the requesting agent.
+    #[allow(clippy::too_many_arguments)]
+    fn request_handoff(
+        &self,
+        state: &mut State,
+        db: &mut Db,
+        agents: &[(AgentId, AgentSpec)],
+        thread: ThreadId,
+        run: RunId,
+        from: AgentId,
+        to: AgentId,
+        brief: String,
+    ) -> Result<String, StoreError> {
+        let from_spec = spec_of(agents, from)?;
+        let (from_name, to_name) = (from_spec.name.clone(), spec_of(agents, to)?.name.clone());
+        let row = db.store.thread(thread)?;
+        let inputs = policy_inputs(db, &row, Some(from_spec))?;
+        let system = |svc: &Service, db: &mut Db, body: &str| {
+            svc.add_message(db, thread, Author::System, body, Some(run))
+                .map(|_| ())
+        };
+        match policy::decide(&inputs) {
+            Decision::Ask => {
+                self.ask_handoff(db, thread, run, from, to, brief, false)?;
+                system(
+                    self,
+                    db,
+                    &format!("{from_name} wants to bring in {to_name}."),
+                )?;
+                Ok(format!("Asked the user to approve bringing in {to_name}."))
+            }
+            Decision::Run => {
+                db.store.bump_handoffs_used(thread)?;
+                system(self, db, &format!("{from_name} brought in {to_name}."))?;
+                self.enqueue_handoff(state, db, thread, to, brief)?;
+                Ok(format!("{to_name} will pick this up after you finish."))
+            }
+            Decision::Pause { budget } => {
+                self.ask_handoff(db, thread, run, from, to, brief, true)?;
+                system(
+                    self,
+                    db,
+                    &format!("Paused. This thread used its {budget} handoffs."),
+                )?;
+                Ok("This thread used its handoffs. Asked the user whether to continue.".into())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ask_handoff(
+        &self,
+        db: &mut Db,
+        thread: ThreadId,
+        run: RunId,
+        from: AgentId,
+        to: AgentId,
+        brief: String,
+        paused: bool,
+    ) -> Result<(), StoreError> {
+        let kind = ApprovalKind::Handoff {
+            from,
+            to,
+            brief,
+            paused,
+        };
+        let id = db.store.create_approval(thread, run, &kind)?;
+        self.publish_approval(db, id)
+    }
+
+    /// Queues a run of `to` in the thread with `brief` as its prompt. It
+    /// waits behind whatever runs there now.
+    fn enqueue_handoff(
+        &self,
+        state: &mut State,
+        db: &mut Db,
+        thread: ThreadId,
+        to: AgentId,
+        brief: String,
+    ) -> Result<(), StoreError> {
+        let run = db.store.create_run(thread, to)?;
+        self.publish_status(db, thread, run, RunStatus::Queued);
+        state.scheduler.enqueue(Job {
+            run,
+            thread,
+            agent: to,
+            prompt: brief,
+        });
+        Ok(())
+    }
+
+    /// Approves or declines a pending approval.
+    pub(crate) fn decide(
+        &self,
+        id: ApprovalId,
+        approve: bool,
+        brief: Option<String>,
+    ) -> Result<(), String> {
+        {
+            let mut state = self.state();
+            let mut db = self.db();
+            let current = db.store.approval(id).map_err(store_err)?;
+            if current.status != ApprovalStatus::Pending {
+                return Err("That request was already answered.".into());
+            }
+            let status = if approve {
+                ApprovalStatus::Approved
+            } else {
+                ApprovalStatus::Declined
+            };
+            let decided = db
+                .store
+                .decide_approval(id, status, brief)
+                .map_err(store_err)?;
+            self.publish(
+                &mut db,
+                decided.thread,
+                ServerMsg::Approval {
+                    thread: decided.thread,
+                    approval: decided.clone(),
+                },
+            );
+            match &decided.kind {
+                ApprovalKind::Permission { .. } => {
+                    if let Some(tx) = state.waiting.remove(&id) {
+                        let message = (!approve).then(|| DECLINED.to_string());
+                        // The ask may have gone away with its connection.
+                        let _ = tx.send(PermissionAnswer {
+                            allow: approve,
+                            message,
+                        });
+                    }
+                }
+                ApprovalKind::Handoff { .. } => self
+                    .decide_handoff(&mut state, &mut db, decided, approve)
+                    .map_err(store_err)?,
+            }
+        }
+        self.start_ready();
+        Ok(())
+    }
+
+    /// Runs or drops a decided handoff and tells the thread.
+    fn decide_handoff(
+        &self,
+        state: &mut State,
+        db: &mut Db,
+        approval: StoredApproval,
+        approve: bool,
+    ) -> Result<(), StoreError> {
+        let ApprovalKind::Handoff {
+            from,
+            to,
+            brief,
+            paused,
+        } = approval.kind
+        else {
+            return Ok(());
+        };
+        let thread = approval.thread;
+        let agents = db.store.agents()?;
+        let to_name = spec_of(&agents, to)?.name.clone();
+        let from_spec = spec_of(&agents, from)?;
+        let body = if approve {
+            if paused {
+                // One more, so exactly this handoff runs.
+                let row = db.store.thread(thread)?;
+                let budget = policy::budget(&policy_inputs(db, &row, Some(from_spec))?);
+                let raised = budget.saturating_add(1);
+                db.store
+                    .set_thread_handoff(thread, row.handoff_policy, Some(raised))?;
+            }
+            db.store.bump_handoffs_used(thread)?;
+            self.enqueue_handoff(state, db, thread, to, brief)?;
+            format!("{} brought in {to_name}.", from_spec.name)
+        } else {
+            format!("Declined {to_name}.")
+        };
+        self.add_message(db, thread, Author::System, &body, Some(approval.run))?;
+        Ok(())
+    }
+
+    /// Lets `n` more handoffs run in the thread on their own.
+    pub(crate) fn allow_more_handoffs(&self, thread: ThreadId, n: u32) -> Result<(), StoreError> {
+        let db = self.db();
+        let row = db.store.thread(thread)?;
+        let budget = policy::budget(&policy_inputs(&db, &row, None)?);
+        db.store
+            .set_thread_handoff(thread, row.handoff_policy, Some(budget.saturating_add(n)))
+    }
+
+    /// Cancels the run's pending permission asks and tells each waiting
+    /// agent the run was stopped. Handoff asks stay: they are about work
+    /// after the run.
+    pub(crate) fn cancel_permissions(&self, state: &mut State, db: &mut Db, run: RunId) {
+        let pending = match db.store.pending_approvals(None) {
+            Ok(pending) => pending,
+            Err(e) => {
+                crate::service::log(format!("couldn't read the asks of run {run}: {e}"));
+                return;
+            }
+        };
+        for approval in pending {
+            if approval.run != run || !matches!(approval.kind, ApprovalKind::Permission { .. }) {
+                continue;
+            }
+            match db
+                .store
+                .decide_approval(approval.id, ApprovalStatus::Cancelled, None)
+            {
+                Ok(cancelled) => self.publish(
+                    db,
+                    cancelled.thread,
+                    ServerMsg::Approval {
+                        thread: cancelled.thread,
+                        approval: cancelled,
+                    },
+                ),
+                Err(e) => crate::service::log(format!("couldn't cancel an ask: {e}")),
+            }
+            if let Some(tx) = state.waiting.remove(&approval.id) {
+                let _ = tx.send(stopped_answer());
+            }
+        }
+    }
+
+    fn publish_approval(&self, db: &mut Db, id: ApprovalId) -> Result<(), StoreError> {
+        let approval = db.store.approval(id)?;
+        let thread = approval.thread;
+        self.publish(db, thread, ServerMsg::Approval { thread, approval });
+        Ok(())
+    }
+}
+
+/// The answer to a permission ask whose run ended first.
+pub(crate) fn stopped_answer() -> PermissionAnswer {
+    PermissionAnswer {
+        allow: false,
+        message: Some(RUN_STOPPED.into()),
+    }
+}
+
+/// The policy layers for a handoff in `thread` asked by `agent`, if any.
+fn policy_inputs(
+    db: &Db,
+    thread: &StoredThread,
+    agent: Option<&AgentSpec>,
+) -> Result<PolicyInputs, StoreError> {
+    let project = db.store.project_of_thread(thread.id)?;
+    let channel = db
+        .store
+        .channels(project.id)?
+        .into_iter()
+        .find(|c| c.id == thread.channel)
+        .ok_or(StoreError::NotFound("channel"))?;
+    Ok(PolicyInputs {
+        thread: (thread.handoff_policy, thread.handoff_budget),
+        agent: agent.map_or((None, None), |a| (a.handoff_policy, a.handoff_budget)),
+        channel: (channel.handoff_policy, channel.handoff_budget),
+        used: thread.handoffs_used,
+    })
+}
+
+/// A short, one-line view of a tool's input: its command or path if it
+/// has one, else its JSON.
+fn short_input(input: &serde_json::Value) -> String {
+    let text = ["command", "file_path", "path", "url", "pattern"]
+        .iter()
+        .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
+        .map(String::from)
+        .unwrap_or_else(|| match input {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Object(map) if map.is_empty() => String::new(),
+            other => other.to_string(),
+        });
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let cut: String = first.chars().take(SHORT_INPUT).collect();
+    if cut.len() < first.len() || lines.next().is_some() {
+        format!("{cut}...")
+    } else {
+        cut
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn short_input_picks_the_command_and_cuts_it() {
+        assert_eq!(short_input(&json!({"command": "ls -la"})), "ls -la");
+        assert_eq!(
+            short_input(&json!({"file_path": "/work/demo/a"})),
+            "/work/demo/a"
+        );
+        assert_eq!(short_input(&json!({})), "");
+        assert_eq!(short_input(&json!({"n": 1})), r#"{"n":1}"#);
+        assert_eq!(short_input(&json!({"command": "a\nb"})), "a...");
+        let long = "x".repeat(100);
+        assert_eq!(
+            short_input(&json!({ "command": long })),
+            format!("{}...", "x".repeat(80))
+        );
+    }
+}

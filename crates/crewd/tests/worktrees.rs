@@ -109,6 +109,7 @@ impl Daemon {
                 max_runs: 4,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
+                ..Default::default()
             };
             if let Err(e) = serve(&path, opts).await {
                 panic!("serve failed: {e:#}");
