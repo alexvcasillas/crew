@@ -12,6 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{elapsed, now_ms};
+use super::inspector::NOTHING_TO_REVIEW;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
@@ -312,8 +313,11 @@ impl Workspace {
         &self,
         run: RunId,
         summary: &RunSummary,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let counts = summary.counts().unwrap_or_default();
+        let thread = self.state().run(run).map(|r| r.thread);
+        let can_review = thread.is_some_and(|t| self.can_review(t));
         card(run, "done-card")
             .child(
                 div()
@@ -341,8 +345,13 @@ impl Workspace {
                             .outline()
                             .small()
                             .label("Review changes")
-                            .disabled(true)
-                            .tooltip("Coming soon."),
+                            .disabled(!can_review)
+                            .when(!can_review, |b| b.tooltip(NOTHING_TO_REVIEW))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(thread) = thread {
+                                    this.open_review(thread, window, cx);
+                                }
+                            })),
                     ),
             )
             .child(div().flex().flex_col().px(px(12.)).pb(px(8.)).children(

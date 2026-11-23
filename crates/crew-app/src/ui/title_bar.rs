@@ -24,7 +24,24 @@ const PATH_FONT_SIZE: f32 = 11.;
 const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 
 impl Workspace {
-    pub(super) fn render_title_bar(&self, cx: &App) -> impl IntoElement + use<> {
+    pub(super) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        if let Some((left, right)) = self.render_review_title(cx) {
+            return TitleBar::new()
+                .h(px(TITLE_BAR_HEIGHT))
+                .bg(color("bg-100"))
+                .border_color(color("border-100"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .px(px(8.))
+                        .child(left),
+                )
+                .child(div().flex_none().pr(px(12.)).child(right));
+        }
         TitleBar::new()
             .h(px(TITLE_BAR_HEIGHT))
             .bg(color("bg-100"))

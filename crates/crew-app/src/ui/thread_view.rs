@@ -54,7 +54,9 @@ impl Workspace {
             {
                 let summary = summarize(events, run);
                 if !summary.files.is_empty() {
-                    items.push(indented(self.render_done_card(run, &summary)).into_any_element());
+                    items.push(
+                        indented(self.render_done_card(run, &summary, cx)).into_any_element(),
+                    );
                 }
             }
         }

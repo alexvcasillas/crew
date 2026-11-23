@@ -17,6 +17,7 @@ use gpui_kit::*;
 use super::approval_card::BriefEditor;
 use super::common::runtime_chip;
 use super::composer::{Composer, ComposerEvent};
+use super::diff_view::Review;
 use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
 use super::status_bar::StatusBar;
@@ -104,6 +105,13 @@ pub struct Workspace {
     inspector_open: Option<bool>,
     /// Whether the inspector is shown, as last drawn.
     pub(super) inspector_shown: bool,
+    /// The open review of a thread's changes, shown in place of the body.
+    pub(super) review: Option<Review>,
+    /// Files you marked as viewed, per thread, kept in memory only.
+    pub(super) viewed: HashMap<ThreadId, HashSet<String>>,
+    /// A thread whose review opens once the thread is open (debug
+    /// builds' startup hook).
+    review_pending: Option<ThreadId>,
 }
 
 impl Workspace {
@@ -118,6 +126,7 @@ impl Workspace {
                     ComposerEvent::Send(text) => this.send(text.clone(), window, cx),
                 },
             );
+        let hooks = dev_hooks();
         Self {
             conn,
             state: State::default(),
@@ -131,7 +140,7 @@ impl Workspace {
             nav: Nav::default(),
             drafts: HashMap::new(),
             creating: None,
-            open_pending: dev_open_thread(),
+            open_pending: hooks.open_thread.or(hooks.review),
             ticker: None,
             requests: HashMap::new(),
             next_request: 0,
@@ -143,6 +152,9 @@ impl Workspace {
             deciding: HashSet::new(),
             inspector_open: None,
             inspector_shown: false,
+            review: None,
+            viewed: HashMap::new(),
+            review_pending: hooks.review,
         }
     }
 
@@ -170,6 +182,10 @@ impl Workspace {
         {
             self.open_pending = None;
             self.open_thread(thread, window, cx);
+            if self.review_pending == Some(thread) {
+                self.review_pending = None;
+                self.open_review(thread, window, cx);
+            }
         }
     }
 
@@ -407,6 +423,7 @@ impl Workspace {
     }
 
     fn close_thread(&mut self) {
+        self.review = None;
         if let Some(open) = self.nav.thread.take() {
             self.unwatch_thread(open);
             self.inspector.reset();
@@ -564,15 +581,27 @@ pub(super) fn near_bottom(offset: f32, max: f32) -> bool {
     -offset >= max - NEAR_BOTTOM
 }
 
-/// `CREW_APP_OPEN_THREAD`, in debug builds only.
-fn dev_open_thread() -> Option<ThreadId> {
+/// What to open at startup: a thread and a review.
+#[derive(Default)]
+struct StartupHooks {
+    open_thread: Option<ThreadId>,
+    review: Option<ThreadId>,
+}
+
+/// `CREW_APP_OPEN_THREAD` and `CREW_APP_SHOW=diff:<thread>`, in debug
+/// builds only.
+fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
     {
-        super::dev_hooks::read(|k| std::env::var(k).ok()).open_thread
+        let hooks = super::dev_hooks::read(|k| std::env::var(k).ok());
+        StartupHooks {
+            open_thread: hooks.open_thread,
+            review: hooks.review,
+        }
     }
     #[cfg(not(debug_assertions))]
     {
-        None
+        StartupHooks::default()
     }
 }
 
@@ -610,27 +639,37 @@ impl Render for Workspace {
             .font_family(ui_font())
             .text_size(px(13.))
             .child(self.render_title_bar(cx))
+            .child(if self.review.is_some() {
+                self.render_review(cx)
+            } else {
+                self.render_body(cx)
+            })
+            .child(self.status_bar.clone())
+    }
+}
+
+impl Workspace {
+    /// The sidebar, the main area and the inspector.
+    fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .child(self.render_sidebar(cx))
             .child(
                 div()
-                    .flex()
+                    .id("main")
                     .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    .child(
-                        div()
-                            .id("main")
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(self.render_main(cx)),
-                    )
-                    .children(
-                        self.inspector_thread()
-                            .filter(|_| self.inspector_shown)
-                            .map(|t| self.render_inspector(t, cx)),
-                    ),
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_main(cx)),
             )
-            .child(self.status_bar.clone())
+            .children(
+                self.inspector_thread()
+                    .filter(|_| self.inspector_shown)
+                    .map(|t| self.render_inspector(t, cx)),
+            )
+            .into_any_element()
     }
 }
 

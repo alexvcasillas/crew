@@ -64,7 +64,7 @@ fn status_of(cx: &mut TestAppContext, ws: &Entity<Workspace>, a: ApprovalId) -> 
 }
 
 /// The agent's latest run in the thread, once it has reached `status`.
-fn run_of(
+pub(super) fn run_of(
     cx: &mut TestAppContext,
     ws: &Entity<Workspace>,
     thread: ThreadId,
@@ -551,7 +551,7 @@ fn inspector_shows_activity_changes_and_the_working_copy(cx: &mut TestAppContext
     assert!(has(cx, window, "changes-review"));
 }
 
-fn git_repo(dir: &Path) {
+pub(super) fn git_repo(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     for args in [
         &["init", "-q", "-b", "main"][..],

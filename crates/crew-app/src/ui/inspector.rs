@@ -24,6 +24,8 @@ use crate::theme::color;
 
 pub const INSPECTOR_WIDTH: f32 = 400.;
 const NO_RUNS: &str = "No runs yet. Mention an agent to start one.";
+/// Why Review changes is off.
+pub(super) const NOTHING_TO_REVIEW: &str = "No uncommitted changes in this thread.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InspectorTab {
@@ -258,12 +260,12 @@ impl Workspace {
             );
         }
 
-        if self.inspector.tab == InspectorTab::Thread {
-            let key = (thread, worktree, finished);
-            if self.inspector.diff_for.as_ref() != Some(&key) {
-                self.inspector.diff_for = Some(key);
-                self.load_diff(thread, cx);
-            }
+        // Read on every tab: the Done card and Changes need it to offer a
+        // review.
+        let key = (thread, worktree, finished);
+        if self.inspector.diff_for.as_ref() != Some(&key) {
+            self.inspector.diff_for = Some(key);
+            self.load_diff(thread, cx);
         }
     }
 
@@ -378,7 +380,7 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let body = match self.inspector.tab {
             InspectorTab::Activity => self.render_activity(thread, cx).into_any_element(),
-            InspectorTab::Changes => self.render_changes().into_any_element(),
+            InspectorTab::Changes => self.render_changes(thread, cx).into_any_element(),
             InspectorTab::Thread => self.render_thread_tab(thread, cx).into_any_element(),
         };
         div()
@@ -607,7 +609,8 @@ impl Workspace {
             )
     }
 
-    fn render_changes(&self) -> impl IntoElement + use<> {
+    fn render_changes(&self, thread: ThreadId, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let can_review = self.can_review(thread);
         let files = self.inspector.changes.clone();
         let added: u32 = files.iter().map(|f| f.added).sum();
         let removed: u32 = files.iter().map(|f| f.removed).sum();
@@ -692,8 +695,11 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Review changes")
-                        .disabled(true)
-                        .tooltip("Coming soon."),
+                        .disabled(!can_review)
+                        .when(!can_review, |b| b.tooltip(NOTHING_TO_REVIEW))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_review(thread, window, cx);
+                        })),
                 ),
             )
             .test_support()
