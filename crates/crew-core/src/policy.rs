@@ -42,11 +42,14 @@ pub enum Decision {
     Pause { budget: u32 },
 }
 
-/// Decides a handoff from the thread, agent and channel settings.
+/// Decides a handoff. The policy is the first one set of thread, then
+/// requesting agent, then channel, else `AskFirst`. `PerAgent` means the
+/// agent's own policy, and `AskFirst` if it has none or is `PerAgent`.
 pub fn decide(i: &PolicyInputs) -> Decision {
     let first = i
         .thread
         .0
+        .or(i.agent.0)
         .or(i.channel.0)
         .unwrap_or(HandoffPolicy::AskFirst);
     let policy = match first {
@@ -125,9 +128,30 @@ mod tests {
     }
 
     #[test]
-    fn agent_policy_ignored_unless_per_agent() {
+    fn agent_beats_channel() {
         let mut i = inputs();
         i.agent.0 = Some(Budget);
+        assert_eq!(decide(&i), Decision::Run);
+        i.channel.0 = Some(AskFirst);
+        assert_eq!(decide(&i), Decision::Run);
+        i.agent.0 = Some(AskFirst);
+        i.channel.0 = Some(Budget);
+        assert_eq!(decide(&i), Decision::Ask);
+    }
+
+    #[test]
+    fn thread_beats_agent() {
+        let mut i = inputs();
+        i.agent.0 = Some(Budget);
+        i.thread.0 = Some(AskFirst);
+        assert_eq!(decide(&i), Decision::Ask);
+    }
+
+    #[test]
+    fn agent_layer_per_agent_asks() {
+        let mut i = inputs();
+        i.agent.0 = Some(PerAgent);
+        i.channel.0 = Some(Budget);
         assert_eq!(decide(&i), Decision::Ask);
     }
 

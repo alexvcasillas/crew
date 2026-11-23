@@ -15,8 +15,14 @@ pub const APPROVE_TOOL: &str = "mcp__crew__approve";
 /// The handoff tool crew-mcp serves. Every wired agent may use it.
 pub const HANDOFF_TOOL: &str = "mcp__crew__handoff";
 
-/// Tools an `EditFiles` agent may use without asking when crew-mcp is wired.
-const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+/// Edits an `EditFiles` agent may make without asking when crew-mcp is
+/// wired: only under its working folder. Edits anywhere else ask.
+const EDIT_TOOLS: [&str; 4] = [
+    "Edit(./**)",
+    "Write(./**)",
+    "MultiEdit(./**)",
+    "NotebookEdit(./**)",
+];
 
 /// What a run needs to reach crewd through crew-mcp.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,8 +106,8 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 ///
 /// With `mcp`, the run gets crew-mcp as an MCP server. An `EditFiles`
 /// agent then runs in `default` mode and asks crewd through
-/// `mcp__crew__approve` before anything but file edits. Every wired
-/// agent may use `mcp__crew__handoff` without asking.
+/// `mcp__crew__approve` before anything but file edits under its working
+/// folder. Every wired agent may use `mcp__crew__handoff` without asking.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
@@ -322,7 +328,7 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.",
                 "--allowedTools",
-                "Read,Write,Grep,Edit,MultiEdit,NotebookEdit,mcp__crew__handoff",
+                "Read,Write,Grep,Edit(./**),Write(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff",
                 "--mcp-config",
                 &config,
                 "--permission-prompt-tool",
