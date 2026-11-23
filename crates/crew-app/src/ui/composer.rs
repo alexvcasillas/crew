@@ -1,9 +1,9 @@
 //! Where you write in a thread, or the first message of a new one. Typing
 //! `@` opens the mention menu.
 
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -25,6 +25,8 @@ actions!(
 /// While the menu is open, these keys drive it instead of the text.
 const MENU_CONTEXT: &str = "Mentioning";
 const COMPOSER_CONTEXT: &str = "Composer";
+/// A paperclip outline, drawn for Crew.
+const PAPERCLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 8v8.5a4 4 0 0 1-8 0V6.5a2.5 2.5 0 0 1 5 0V16a1 1 0 0 1-2 0V8"/></svg>"#;
 const REPLY_PLACEHOLDER: &str = "Reply in thread. Type @ to bring in an agent.";
 const FIRST_PLACEHOLDER: &str = "Describe the task. The first line becomes the title.";
 
@@ -66,6 +68,7 @@ pub struct Composer {
     /// The `@` whose menu you closed: it stays closed until you type
     /// another.
     dismissed: Option<usize>,
+    busy: bool,
     _input_events: Subscription,
 }
 
@@ -92,12 +95,25 @@ impl Composer {
             first_message: false,
             mention: None,
             dismissed: None,
+            busy: false,
             _input_events: events,
         }
     }
 
     pub fn text(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
+    }
+
+    /// Waiting for a new thread: Send and ↵ do nothing meanwhile.
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        if self.busy != busy {
+            self.busy = busy;
+            cx.notify();
+        }
     }
 
     pub fn menu_open(&self) -> bool {
@@ -140,14 +156,16 @@ impl Composer {
         self.input.update(cx, |input, cx| input.focus(window, cx));
     }
 
-    /// Puts `text` back, as after a send that failed, unless you already
-    /// wrote something else.
-    pub fn restore(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.text(cx).trim().is_empty() {
-            self.input.update(cx, |input, cx| {
-                input.set_value(text.to_string(), window, cx)
-            });
-        }
+    /// Replaces the text, cursor at its end, as when you come back to a
+    /// draft.
+    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(text.to_string(), window, cx);
+            input.set_selected_range(text.len()..text.len(), cx);
+        });
+        self.mention = None;
+        self.dismissed = None;
+        cx.notify();
     }
 
     fn text_changed(&mut self, cx: &mut Context<Self>) {
@@ -195,7 +213,7 @@ impl Composer {
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.text(cx);
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() || self.busy {
             return;
         }
         cx.emit(ComposerEvent::Send(text.to_string()));
@@ -310,6 +328,14 @@ impl Render for Composer {
                             })),
                     )
                     .child(
+                        Button::new("composer-attach")
+                            .ghost()
+                            .small()
+                            .icon(Icon::default().data(PAPERCLIP))
+                            .disabled(true)
+                            .tooltip("Attachments are coming soon."),
+                    )
+                    .child(
                         div()
                             .id("composer-hint")
                             .flex_1()
@@ -327,6 +353,7 @@ impl Render for Composer {
                             .primary()
                             .small()
                             .label("Send ↵")
+                            .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     ),
             )

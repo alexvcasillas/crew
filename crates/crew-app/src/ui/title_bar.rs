@@ -13,6 +13,8 @@ use crate::theme::color;
 pub const TITLE_BAR_HEIGHT: f32 = 48.;
 /// The Kit title bar's left padding for the traffic lights on macOS.
 const TRAFFIC_LIGHTS_INSET: f32 = 80.;
+/// The breadcrumb separators, dimmer than any text token.
+const SLASH: u32 = 0x3a3a3a;
 const SEARCH_WIDTH: f32 = 320.;
 const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 
@@ -69,7 +71,7 @@ impl Workspace {
             return Vec::new();
         };
         let path = home_relative(&project.root);
-        let slash = || div().flex_none().text_color(color("border-200")).child("/");
+        let slash = || div().flex_none().text_color(rgb(SLASH)).child("/");
         vec![
             slash().into_any_element(),
             div()

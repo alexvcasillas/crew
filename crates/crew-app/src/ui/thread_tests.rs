@@ -9,7 +9,8 @@ use crew_core::ids::{AgentId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::store::Author;
 use crew_proto::Request;
 use futures::channel::mpsc::UnboundedReceiver;
-use gpui_kit::{AnyWindowHandle, Entity, TestAppContext};
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 use serde::de::DeserializeOwned;
 
 use super::mention_menu::NO_AGENTS;
@@ -25,6 +26,7 @@ use crate::test_support::{Daemon, fake_claude, fixture, short_home};
 struct World {
     client: ClientHandle,
     _events: UnboundedReceiver<ClientEvent>,
+    project: ProjectId,
     channel: ChannelId,
     thread: ThreadId,
     agents: Vec<AgentId>,
@@ -106,6 +108,7 @@ fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
     World {
         client,
         _events: events,
+        project,
         channel,
         thread,
         agents,
@@ -120,24 +123,38 @@ fn open_thread(
     w: &World,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
     let (window, ws) = open(cx, home);
-    let channel = format!("channel-{}", w.channel);
+    go_to(cx, window, &ws, w.channel, w.thread);
+    assert!(shows(cx, window, "fix the login"), "the thread's title");
+    (window, ws)
+}
+
+/// Clicks the channel in the sidebar, then the thread in its list.
+fn go_to(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ws: &Entity<Workspace>,
+    channel: ChannelId,
+    thread: ThreadId,
+) {
+    let channel = format!("channel-{channel}");
     wait_until(cx, "the channel in the sidebar", |cx| {
         has(cx, window, channel.clone())
     });
     click(cx, window, channel);
-    let row = format!("thread-{}", w.thread);
+    let row = format!("thread-{thread}");
     wait_until(cx, "the thread in the list", |cx| {
         has(cx, window, row.clone())
     });
     click(cx, window, row);
-    let thread = w.thread;
     wait_until(cx, "the thread to open", |cx| {
         ws.read_with(cx, |ws, _| {
             ws.open_thread_id() == Some(thread) && ws.state().is_watched(thread)
         })
     });
-    assert!(shows(cx, window, "fix the login"), "the thread's title");
-    (window, ws)
+}
+
+fn busy(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> bool {
+    ws.read_with(cx, |ws, cx| ws.composer.read(cx).busy())
 }
 
 fn composer_text(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> String {
@@ -241,6 +258,36 @@ fn run_card_shows_steps_live_and_stop_stops_it(cx: &mut TestAppContext) {
         window,
         "Forge is working. A reply now is queued for its next turn."
     ));
+    assert_eq!(
+        label_of(cx, window, format!("run-state-{run}")).as_deref(),
+        Some("Working")
+    );
+
+    // One run per thread: the next one waits, and doesn't count as running.
+    w.post("@Forge then tidy up");
+    let mut queued = None;
+    wait_until(cx, "the queued run", |cx| {
+        queued = ws.read_with(cx, |ws, _| {
+            ws.state()
+                .live_runs(w.thread)
+                .iter()
+                .find(|r| r.status == RunStatus::Queued)
+                .map(|r| r.id)
+        });
+        queued.is_some()
+    });
+    let queued = queued.unwrap();
+    wait_until(cx, "the queued card", |cx| {
+        label_of(cx, window, format!("run-state-{queued}")).as_deref() == Some("Queued")
+    });
+    assert!(
+        !has(cx, window, format!("run-elapsed-{queued}")),
+        "no timer yet"
+    );
+    assert_eq!(
+        label_of(cx, window, "sidebar-running").as_deref(),
+        Some("1 agent running")
+    );
 
     click(cx, window, format!("run-stop-{run}"));
     wait_to_show(cx, window, "Forge stopped.");
@@ -263,6 +310,17 @@ fn mention_menu_filters_and_inserts_the_agent(cx: &mut TestAppContext) {
     assert!(menu_open(cx, &ws));
     assert!(shows_within(cx, window, "mention-menu", "Forge"));
     assert!(shows_within(cx, window, "mention-menu", "Scout"));
+    // Agents made in the same millisecond have no set order.
+    let last = label_of(cx, window, ("mention-option", 1usize)).unwrap();
+    press(cx, window, "up enter");
+    assert_eq!(
+        composer_text(cx, &ws),
+        format!("@{last} "),
+        "↑ wraps to the last"
+    );
+    press(cx, window, "cmd-a backspace");
+
+    type_text(cx, window, "@");
 
     type_text(cx, window, "sc");
     assert!(shows_within(cx, window, "mention-menu", "Scout"));
@@ -272,7 +330,6 @@ fn mention_menu_filters_and_inserts_the_agent(cx: &mut TestAppContext) {
     );
 
     press(cx, window, "backspace backspace");
-    // Agents made in the same millisecond have no set order.
     let second = label_of(cx, window, ("mention-option", 1usize)).unwrap();
     press(cx, window, "down enter");
     assert_eq!(
@@ -386,4 +443,128 @@ fn new_thread_takes_its_title_from_the_first_line(cx: &mut TestAppContext) {
         );
     });
     wait_to_show(cx, window, "Tidy the README\nIt has typos.");
+}
+
+#[gpui_kit::test]
+fn drafts_stay_with_their_thread(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let other: ThreadId = w.ask(Request::CreateThread {
+        channel: w.channel,
+        title: "second".into(),
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    type_text(cx, window, "for the first");
+    go_to(cx, window, &ws, w.channel, other);
+    assert_eq!(composer_text(cx, &ws), "", "the other thread has its own");
+    type_text(cx, window, "for the second");
+
+    go_to(cx, window, &ws, w.channel, w.thread);
+    assert_eq!(composer_text(cx, &ws), "for the first");
+    press(cx, window, "enter");
+    wait_until(cx, "the first thread's message", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(w.thread)
+                .iter()
+                .any(|m| m.body == "for the first")
+        })
+    });
+
+    go_to(cx, window, &ws, w.channel, other);
+    assert_eq!(composer_text(cx, &ws), "for the second");
+    press(cx, window, "cmd-n");
+    assert_eq!(composer_text(cx, &ws), "", "a new thread starts empty");
+    type_text(cx, window, "an idea");
+    go_to(cx, window, &ws, w.channel, other);
+    assert_eq!(composer_text(cx, &ws), "for the second");
+    press(cx, window, "cmd-n");
+    assert_eq!(
+        composer_text(cx, &ws),
+        "an idea",
+        "the new-thread draft stays"
+    );
+    ws.read_with(cx, |ws, _| {
+        assert!(
+            ws.state().messages(other).is_empty(),
+            "nothing went to the second"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_new_thread_send_waits_and_stays_put_if_you_left(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let bugs: ChannelId = w.ask(Request::CreateChannel {
+        project: w.project,
+        name: "bugs".into(),
+    });
+    let (window, ws) = open(cx, home.path());
+    let general = format!("channel-{}", w.channel);
+    let bugs_row = format!("channel-{bugs}");
+    wait_until(cx, "the channels", |cx| {
+        has(cx, window, general.clone()) && has(cx, window, bugs_row.clone())
+    });
+    click(cx, window, general.clone());
+    press(cx, window, "cmd-n");
+    type_text(cx, window, "Draft one");
+
+    // Send, then type ahead and leave, before crewd's answer is taken in:
+    // nothing here runs the app's tasks.
+    cx.update_window(window, |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    assert!(busy(cx, &ws), "Send waits for the new thread");
+    cx.update_window(window, |_, window, cx| {
+        window.input("more", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    assert_eq!(composer_text(cx, &ws), "more", "↵ is ignored meanwhile");
+    click(cx, window, bugs_row);
+
+    let mut created = None;
+    wait_until(cx, "the new thread and its message", |cx| {
+        created = ws.read_with(cx, |ws, _| {
+            let state = ws.state();
+            state
+                .threads(w.channel)
+                .iter()
+                .find(|t| t.title == "Draft one")
+                .map(|t| t.id)
+                .filter(|t| state.messages(*t).iter().any(|m| m.body == "Draft one"))
+        });
+        created.is_some() && !busy(cx, &ws)
+    });
+    ws.read_with(cx, |ws, _| {
+        assert_eq!(ws.open_thread_id(), None, "you stayed where you went");
+        assert_eq!(ws.nav.channel, Some(bugs));
+    });
+
+    click(cx, window, general);
+    press(cx, window, "cmd-n");
+    assert_eq!(composer_text(cx, &ws), "more", "the draft you left is kept");
+}
+
+#[gpui_kit::test]
+fn a_thread_named_at_startup_opens_once_known(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_when_known(w.thread, window, cx));
+    })
+    .unwrap();
+    wait_until(cx, "the thread to open", |cx| {
+        ws.read_with(cx, |ws, _| ws.open_thread_id() == Some(w.thread))
+    });
+    assert!(shows(cx, window, "fix the login"));
+    ws.read_with(cx, |ws, _| assert_eq!(ws.nav.channel, Some(w.channel)));
 }

@@ -46,7 +46,7 @@ impl Workspace {
             .into_iter()
             .map(|a| self.render_agent(a).into_any_element())
             .collect();
-        let running = state.running().len();
+        let running = state.working_agents().len();
         div()
             .id("sidebar")
             .flex()
@@ -66,11 +66,7 @@ impl Workspace {
                     .overflow_y_scroll()
                     .px(px(8.))
                     .py(px(12.))
-                    .child(section_header(
-                        "sidebar-projects",
-                        "Projects",
-                        "Add a project",
-                    ))
+                    .child(section_header("sidebar-projects", "Projects"))
                     .children(projects)
                     .child(
                         div()
@@ -79,7 +75,7 @@ impl Workspace {
                             .h(px(1.))
                             .bg(color("border-100")),
                     )
-                    .child(section_header("sidebar-agents", "Agents", "Add an agent"))
+                    .child(section_header("sidebar-agents", "Agents"))
                     .children(agents),
             )
             .when(running > 0, |sidebar| {
@@ -245,7 +241,7 @@ fn row(id: String) -> Stateful<Div> {
 }
 
 /// "Projects" or "Agents", with a plus button that comes alive later.
-fn section_header(id: &'static str, title: &'static str, add: &'static str) -> impl IntoElement {
+fn section_header(id: &'static str, title: &'static str) -> impl IntoElement {
     div()
         .flex()
         .items_center()
@@ -268,7 +264,7 @@ fn section_header(id: &'static str, title: &'static str, add: &'static str) -> i
                 .xsmall()
                 .icon(IconName::Plus)
                 .disabled(true)
-                .tooltip(add),
+                .tooltip("Coming soon."),
         )
 }
 
