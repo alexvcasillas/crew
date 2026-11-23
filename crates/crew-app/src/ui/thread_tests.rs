@@ -578,3 +578,62 @@ fn a_thread_named_at_startup_opens_once_known(cx: &mut TestAppContext) {
     assert!(shows(cx, window, "fix the login"));
     ws.read_with(cx, |ws, _| assert_eq!(ws.nav.channel, Some(w.channel)));
 }
+
+#[gpui_kit::test]
+fn a_queued_agent_shows_queued_not_working(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = fake_claude(tmp.path(), "exec sleep 60");
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let names: Vec<String> = ws.read_with(cx, |ws, _| {
+        w.agents
+            .iter()
+            .map(|a| ws.state().agent(*a).unwrap().spec.name.clone())
+            .collect()
+    });
+    let forge = w.agents[names.iter().position(|n| n == "Forge").unwrap()];
+    let scout = w.agents[names.iter().position(|n| n == "Scout").unwrap()];
+
+    // One run at a time per thread: Scout waits for Forge.
+    w.post("@Forge look around");
+    w.post("@Scout then you");
+    wait_until(cx, "Scout queued", |cx| {
+        label_of(cx, window, format!("agent-status-{scout}")).as_deref() == Some("Queued")
+    });
+    assert_eq!(
+        label_of(cx, window, format!("agent-status-{forge}")).as_deref(),
+        Some("Working")
+    );
+    assert!(shows(cx, window, "1 agent running"));
+
+    click(cx, window, "composer-input");
+    type_text(cx, window, "@");
+    assert!(menu_open(cx, &ws));
+    let mut words: Vec<(String, String)> = (0..2usize)
+        .map(|ix| {
+            (
+                label_of(cx, window, ("mention-option", ix)).unwrap(),
+                label_of(cx, window, ("mention-status", ix)).unwrap(),
+            )
+        })
+        .collect();
+    words.sort();
+    assert_eq!(
+        words,
+        [
+            ("Forge".to_string(), "Working".to_string()),
+            ("Scout".to_string(), "Queued".to_string())
+        ]
+    );
+    for run in ws.read_with(cx, |ws, _| {
+        ws.state()
+            .live_runs(w.thread)
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    }) {
+        let () = w.ask(Request::StopRun { run });
+    }
+}

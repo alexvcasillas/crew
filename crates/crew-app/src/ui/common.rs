@@ -63,6 +63,7 @@ pub fn status_word(status: ThreadStatus) -> (&'static str, &'static str) {
         ThreadStatus::Working => ("Working", "accent-blue"),
         ThreadStatus::NeedsYou => ("Needs you", "warning"),
         ThreadStatus::Idle => ("Idle", "text-tertiary"),
+        ThreadStatus::Queued => ("Queued", "text-tertiary"),
     }
 }
 

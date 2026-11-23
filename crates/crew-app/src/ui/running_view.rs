@@ -601,9 +601,10 @@ fn count(text: String, token: &str) -> impl IntoElement {
         .child(text)
 }
 
+/// A dot for urgent states only: queued runs get none.
 fn status_dot(status: ThreadStatus) -> Option<Div> {
     match status {
-        ThreadStatus::Idle => None,
+        ThreadStatus::Idle | ThreadStatus::Queued => None,
         status => Some(dot(status_word(status).1)),
     }
 }
