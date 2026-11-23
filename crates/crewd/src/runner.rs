@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crew_core::claude::{ClaudeInvocation, parse_line};
@@ -103,45 +105,63 @@ pub fn spawn_run(
     let pid = child.id();
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_task = tokio::spawn(read_events(stdout, tx));
-    let stderr_task = tokio::spawn(read_tail(stderr));
-    let join = tokio::spawn(supervise(child, pid, stop_rx, stdout_task, stderr_task));
+    let turn_ok = Arc::new(AtomicBool::new(false));
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
+    let readers = Readers {
+        stdout: tokio::spawn(read_events(stdout, tx, turn_ok.clone())),
+        stderr: tokio::spawn(read_tail(stderr, tail.clone())),
+        turn_ok,
+        tail,
+    };
+    let join = tokio::spawn(supervise(child, pid, stop_rx, readers));
 
     (RunHandle { pid, stop_tx }, rx, join)
 }
 
-/// Parses stdout into events. Returns true if a good `TurnEnd` was seen.
+/// The output readers and what they found so far. The findings live
+/// outside the tasks, so they survive when a reader is aborted.
+struct Readers {
+    /// Whether the last `TurnEnd` seen was good.
+    turn_ok: Arc<AtomicBool>,
+    /// The last stderr lines.
+    tail: Arc<Mutex<VecDeque<String>>>,
+    stdout: JoinHandle<()>,
+    stderr: JoinHandle<()>,
+}
+
+/// Parses stdout into events and records each `TurnEnd` in `turn_ok`.
 ///
 /// Keeps reading to the end even if the receiver is gone, so the child
 /// never blocks on a full pipe.
-async fn read_events(stdout: impl AsyncRead + Unpin, tx: mpsc::Sender<Event>) -> bool {
+async fn read_events(
+    stdout: impl AsyncRead + Unpin,
+    tx: mpsc::Sender<Event>,
+    turn_ok: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(stdout);
-    let mut turn_ok = false;
     let mut receiver_alive = true;
     while let Some(line) = next_line(&mut reader).await {
         for event in parse_line(&line) {
             if let Event::TurnEnd { ok, .. } = &event {
-                turn_ok = *ok;
+                turn_ok.store(*ok, Ordering::SeqCst);
             }
             if receiver_alive && tx.send(event).await.is_err() {
                 receiver_alive = false;
             }
         }
     }
-    turn_ok
 }
 
-/// Keeps the last stderr lines.
-async fn read_tail(stderr: impl AsyncRead + Unpin) -> VecDeque<String> {
+/// Keeps the last stderr lines in `tail`, updated per line.
+async fn read_tail(stderr: impl AsyncRead + Unpin, tail: Arc<Mutex<VecDeque<String>>>) {
     let mut reader = BufReader::new(stderr);
-    let mut tail = VecDeque::with_capacity(STDERR_TAIL);
     while let Some(line) = next_line(&mut reader).await {
+        let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
         if tail.len() == STDERR_TAIL {
             tail.pop_front();
         }
         tail.push_back(line);
     }
-    tail
 }
 
 /// Reads one line, replacing bad UTF-8. Returns `None` at end of input or
@@ -161,8 +181,7 @@ async fn supervise(
     mut child: Child,
     pid: Option<u32>,
     mut stop_rx: watch::Receiver<bool>,
-    stdout_task: JoinHandle<bool>,
-    stderr_task: JoinHandle<VecDeque<String>>,
+    readers: Readers,
 ) -> RunOutcome {
     let pgid = pid.map(|p| Pid::from_raw(p as i32));
 
@@ -181,7 +200,7 @@ async fn supervise(
             escalate(&mut child, pgid).await;
             signal_group(pgid, Signal::SIGKILL);
             // Ends the readers, which closes the event channel.
-            finish_readers(stdout_task, stderr_task).await;
+            finish_readers(readers).await;
             return RunOutcome::Stopped;
         }
     };
@@ -189,7 +208,7 @@ async fn supervise(
     // Clear anything the process left behind in its group.
     signal_group(pgid, Signal::SIGKILL);
 
-    let (turn_ok, tail) = finish_readers(stdout_task, stderr_task).await;
+    let (turn_ok, tail) = finish_readers(readers).await;
     match status {
         Ok(s) if s.success() && turn_ok => RunOutcome::Done,
         Ok(s) if s.success() => {
@@ -202,29 +221,22 @@ async fn supervise(
 
 /// Waits up to [`READERS_GRACE`] for the readers, then aborts them. Either
 /// way the stdout reader's sender is dropped, so the event channel closes.
-async fn finish_readers(
-    stdout_task: JoinHandle<bool>,
-    stderr_task: JoinHandle<VecDeque<String>>,
-) -> (bool, VecDeque<String>) {
+/// Returns what the readers found, including lines read before an abort.
+async fn finish_readers(readers: Readers) -> (bool, VecDeque<String>) {
     let deadline = tokio::time::Instant::now() + READERS_GRACE;
-    let turn_ok = join_until(stdout_task, deadline).await.unwrap_or(false);
-    let tail = join_until(stderr_task, deadline).await.unwrap_or_default();
+    join_until(readers.stdout, deadline).await;
+    join_until(readers.stderr, deadline).await;
+    let turn_ok = readers.turn_ok.load(Ordering::SeqCst);
+    let tail = std::mem::take(&mut *readers.tail.lock().unwrap_or_else(PoisonError::into_inner));
     (turn_ok, tail)
 }
 
-async fn join_until<T>(mut task: JoinHandle<T>, deadline: tokio::time::Instant) -> Option<T> {
-    match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(result) => result.ok(),
-        Err(_) => {
-            // After a stall the timer can fire before a reader that already
-            // hit end of input gets polled. Let it run once before giving up.
-            tokio::task::yield_now().await;
-            if task.is_finished() {
-                return task.await.ok();
-            }
-            task.abort();
-            None
-        }
+/// Waits for `task` until `deadline`, then aborts it.
+async fn join_until(mut task: JoinHandle<()>, deadline: tokio::time::Instant) {
+    if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+        task.abort();
+        // Wait for the abort so the task is gone, and with it the sender.
+        let _ = task.await;
     }
 }
 
