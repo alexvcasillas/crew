@@ -23,21 +23,21 @@ use crate::connection::ConnectionConfig;
 use crate::test_support::{Daemon, fake_claude, fixture, short_home};
 
 /// What the test sets up through a client of its own, as the CLI would.
-struct World {
-    client: ClientHandle,
+pub(super) struct World {
+    pub(super) client: ClientHandle,
     _events: UnboundedReceiver<ClientEvent>,
-    project: ProjectId,
-    channel: ChannelId,
-    thread: ThreadId,
-    agents: Vec<AgentId>,
+    pub(super) project: ProjectId,
+    pub(super) channel: ChannelId,
+    pub(super) thread: ThreadId,
+    pub(super) agents: Vec<AgentId>,
 }
 
 impl World {
-    fn ask<T: DeserializeOwned>(&self, req: Request) -> T {
+    pub(super) fn ask<T: DeserializeOwned>(&self, req: Request) -> T {
         ask(&self.client, req)
     }
 
-    fn post(&self, body: &str) {
+    pub(super) fn post(&self, body: &str) {
         let _: MessageId = self.ask(Request::PostMessage {
             thread: self.thread,
             body: body.into(),
@@ -45,12 +45,12 @@ impl World {
     }
 }
 
-fn ask<T: DeserializeOwned>(client: &ClientHandle, req: Request) -> T {
+pub(super) fn ask<T: DeserializeOwned>(client: &ClientHandle, req: Request) -> T {
     let answer = futures::executor::block_on(client.request(req)).unwrap();
     serde_json::from_value(answer).unwrap()
 }
 
-fn agent(name: &str, role: &str) -> AgentSpec {
+pub(super) fn agent(name: &str, role: &str) -> AgentSpec {
     AgentSpec {
         name: name.into(),
         role: role.into(),
@@ -67,7 +67,7 @@ fn agent(name: &str, role: &str) -> AgentSpec {
 
 /// A project rooted at `root` with `#general`, the named agents and one
 /// thread.
-fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
+pub(super) fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
     std::fs::create_dir_all(root).unwrap();
     let (client, events) = client::spawn(ConnectionConfig {
         crew_home: home.to_path_buf(),
@@ -117,7 +117,7 @@ fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
 
 /// Opens the window and goes to the world's thread through the sidebar
 /// and the channel's thread list.
-fn open_thread(
+pub(super) fn open_thread(
     cx: &mut TestAppContext,
     home: &Path,
     w: &World,
@@ -129,7 +129,7 @@ fn open_thread(
 }
 
 /// Clicks the channel in the sidebar, then the thread in its list.
-fn go_to(
+pub(super) fn go_to(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
     ws: &Entity<Workspace>,
@@ -166,7 +166,7 @@ fn menu_open(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> bool {
 }
 
 /// The first live run of `thread`, once there is one.
-fn live_run(cx: &mut TestAppContext, ws: &Entity<Workspace>, thread: ThreadId) -> RunId {
+pub(super) fn live_run(cx: &mut TestAppContext, ws: &Entity<Workspace>, thread: ThreadId) -> RunId {
     let mut run = None;
     wait_until(cx, "a live run", |cx| {
         run = ws.read_with(cx, |ws, _| {

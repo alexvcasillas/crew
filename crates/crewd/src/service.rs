@@ -503,6 +503,11 @@ impl Service {
         let cleared = if result.is_ok() || !path.exists() {
             let mut db = self.db();
             let mut cleared = db.store.set_thread_worktree(thread, None);
+            if cleared.is_ok()
+                && let Err(e) = self.thread_changed(&mut db, thread)
+            {
+                log(e);
+            }
             if cleared.is_ok() && result == Ok(true) {
                 let body =
                     format!("Kept branch {branch} because it has commits that aren't merged.");
@@ -1036,9 +1041,7 @@ impl Service {
                 })
                 .await
                 .map_err(|e| failed("Couldn't make the worktree", &e))?;
-                self.db()
-                    .store
-                    .set_thread_worktree(job.thread, Some(&wt))
+                self.save_worktree(job.thread, &wt)
                     .map_err(|e| failed("Couldn't save the worktree", &e))?;
                 wt
             }
@@ -1075,10 +1078,17 @@ impl Service {
             self.run_setup(job, &command, &wt.path, stop_rx).await?;
         }
         let ready = ThreadWorktree { ready: true, ..wt };
-        self.db()
-            .store
-            .set_thread_worktree(job.thread, Some(&ready))
+        self.save_worktree(job.thread, &ready)
             .map_err(|e| failed("Couldn't save the worktree", &e))
+    }
+
+    /// Saves the thread's worktree and tells `SubscribeAll` clients.
+    fn save_worktree(&self, thread: ThreadId, wt: &ThreadWorktree) -> Result<(), StoreError> {
+        let mut db = self.db();
+        db.store.set_thread_worktree(thread, Some(wt))?;
+        let row = db.store.thread(thread)?;
+        self.publish_global(&mut db, ServerMsg::ThreadChanged { thread: row });
+        Ok(())
     }
 
     /// Runs the project's setup command in the worktree, recording its

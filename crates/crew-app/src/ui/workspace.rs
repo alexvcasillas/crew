@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_proto::Request;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
@@ -14,11 +14,13 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
+use super::approval_card::BriefEditor;
 use super::common::runtime_chip;
 use super::composer::{Composer, ComposerEvent};
+use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
 use super::status_bar::StatusBar;
-use crate::app::NewThread;
+use crate::app::{ApproveLatest, NewThread};
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
@@ -88,6 +90,13 @@ pub struct Workspace {
     pub(super) service_task: Option<Task<()>>,
     /// The last error shown as a notification.
     pub(super) last_error: Option<SharedString>,
+    pub(super) inspector: Inspector,
+    /// The handoff brief you are editing, if any.
+    pub(super) editing: Option<BriefEditor>,
+    /// Permission asks whose whole input is shown.
+    pub(super) open_inputs: HashSet<ApprovalId>,
+    /// Approvals whose answer was sent.
+    pub(super) deciding: HashSet<ApprovalId>,
 }
 
 impl Workspace {
@@ -121,6 +130,10 @@ impl Workspace {
             next_request: 0,
             service_task: None,
             last_error: None,
+            inspector: Inspector::default(),
+            editing: None,
+            open_inputs: HashSet::new(),
+            deciding: HashSet::new(),
         }
     }
 
@@ -188,6 +201,7 @@ impl Workspace {
         self.status_bar
             .update(cx, |bar, cx| bar.set_connection(connection, cx));
         self.sync(cx);
+        self.sync_inspector(window, cx);
         self.open_if_known(window, cx);
         cx.notify();
     }
@@ -301,6 +315,7 @@ impl Workspace {
             self.nav.thread = Some(thread);
             self.nav.seen_messages = 0;
             self.nav.stick_to_bottom = true;
+            self.sync_inspector(window, cx);
         }
         self.nav.drafting = false;
         let channel = self.state.thread(thread).map(|t| t.channel);
@@ -385,6 +400,8 @@ impl Workspace {
     fn close_thread(&mut self) {
         if let Some(open) = self.nav.thread.take() {
             self.unwatch_thread(open);
+            self.inspector.reset();
+            self.editing = None;
         }
     }
 
@@ -481,7 +498,7 @@ impl Workspace {
 
     /// Runs `work`, keeping its task until it ends. An error is shown,
     /// and its text, if any, goes back to the draft it came from.
-    fn spawn_request(
+    pub(super) fn spawn_request(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -571,6 +588,9 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ApproveLatest, window, cx| this.approve_latest(window, cx)),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -592,6 +612,10 @@ impl Render for Workspace {
                             .min_w_0()
                             .h_full()
                             .child(self.render_main(cx)),
+                    )
+                    .children(
+                        self.inspector_thread()
+                            .map(|t| self.render_inspector(t, cx)),
                     ),
             )
             .child(self.status_bar.clone())
@@ -599,6 +623,17 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// The thread the inspector shows: the open one, while connected.
+    fn inspector_thread(&self) -> Option<ThreadId> {
+        let shown = matches!(
+            self.state.connection(),
+            Some(ConnectionState::Connected | ConnectionState::Reconnecting)
+        );
+        self.nav
+            .thread
+            .filter(|t| shown && self.state.thread(*t).is_some())
+    }
+
     fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
         match self.state.connection() {
             // Checking: nothing to show yet.

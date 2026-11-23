@@ -368,6 +368,26 @@ impl State {
         )
     }
 
+    /// Every known run of the thread, by start time. Watching the thread
+    /// brings its past runs.
+    pub fn thread_runs(&self, thread: ThreadId) -> Vec<&StoredRun> {
+        sorted(self.runs.values().filter(|r| r.thread == thread), |r| {
+            (r.started_at, r.id.0)
+        })
+    }
+
+    pub fn approval(&self, approval: ApprovalId) -> Option<&StoredApproval> {
+        self.approvals.get(&approval)
+    }
+
+    /// The thread's known approvals, pending and decided, oldest first.
+    pub fn thread_approvals(&self, thread: ThreadId) -> Vec<&StoredApproval> {
+        sorted(
+            self.approvals.values().filter(|a| a.thread == thread),
+            |a| (a.created_at, a.id.0),
+        )
+    }
+
     /// The thread's newest known message.
     pub fn last_message(&self, thread: ThreadId) -> Option<&StoredMessage> {
         self.messages(thread).last()
@@ -944,6 +964,32 @@ mod tests {
         }
         let ids: Vec<ApprovalId> = state.pending_approvals(t.id).iter().map(|a| a.id).collect();
         assert_eq!(ids, [ask.id]);
+    }
+
+    #[test]
+    fn a_threads_runs_and_approvals_include_finished_ones() {
+        let (mut state, _, c, t) = one_thread();
+        let other = thread(c.id, "other", 2);
+        let late = run(t.id, RunStatus::Working, 20);
+        let early = run(t.id, RunStatus::Done, 10);
+        for r in [&late, &early, &run(other.id, RunStatus::Done, 1)] {
+            state.apply(status(r));
+        }
+        let ids: Vec<RunId> = state.thread_runs(t.id).iter().map(|r| r.id).collect();
+        assert_eq!(ids, [early.id, late.id]);
+
+        let mut decided = approval(t.id, 1);
+        decided.status = ApprovalStatus::Approved;
+        let pending = approval(t.id, 2);
+        for a in [&pending, &decided, &approval(other.id, 0)] {
+            state.apply(ServerMsg::Approval {
+                thread: a.thread,
+                approval: a.clone(),
+            });
+        }
+        let ids: Vec<ApprovalId> = state.thread_approvals(t.id).iter().map(|a| a.id).collect();
+        assert_eq!(ids, [decided.id, pending.id]);
+        assert_eq!(state.approval(decided.id), Some(&decided));
     }
 
     #[test]
