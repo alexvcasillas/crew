@@ -576,7 +576,7 @@ impl Service {
         author: Author,
         body: &str,
     ) -> Result<MessageId, StoreError> {
-        let id = db.store.add_message(thread, author, body)?;
+        let id = db.store.add_message(thread, author, body, None)?;
         let message = db
             .store
             .messages(thread)?

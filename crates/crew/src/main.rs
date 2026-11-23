@@ -156,6 +156,9 @@ async fn init_demo(c: &mut Client) -> Result<()> {
                     instructions: String::new(),
                     permission_mode: PermissionMode::ReadOnly,
                     allowed_tools: vec![],
+                    handoff_policy: None,
+                    handoff_budget: None,
+                    max_run_minutes: 20,
                 },
             })
             .await?;

@@ -103,6 +103,9 @@ async fn start_long_run(c: &mut Client, root: &Path) -> ThreadId {
                 instructions: String::new(),
                 permission_mode: PermissionMode::EditFiles,
                 allowed_tools: vec![],
+                handoff_policy: None,
+                handoff_budget: None,
+                max_run_minutes: 20,
             },
         })
         .await;

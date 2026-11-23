@@ -1,4 +1,7 @@
-//! SQLite persistence for projects, channels, agents, threads, messages and runs.
+//! SQLite persistence for projects, channels, agents, threads, messages,
+//! runs and approvals.
+
+mod approval;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -11,9 +14,14 @@ use uuid::Uuid;
 use crate::agent::AgentSpec;
 use crate::event::{Event, RunStatus};
 use crate::ids::{AgentId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
+use crate::policy::HandoffPolicy;
+
+pub use approval::{ApprovalKind, ApprovalStatus, StoredApproval};
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+/// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
+const MIGRATIONS: &[&str] = &[include_str!("migrate_v2.sql")];
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +59,60 @@ pub struct StoredMessage {
     pub body: String,
     /// Unix milliseconds.
     pub created_at: i64,
+    /// The run that produced this message, for agent replies and system notes.
+    #[serde(default)]
+    pub run: Option<RunId>,
+}
+
+/// A project as saved in the store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredProject {
+    pub id: ProjectId,
+    pub name: String,
+    pub root: PathBuf,
+    pub main_branch: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Shell command run in a new worktree before its first run.
+    pub setup_command: Option<String>,
+    /// Files copied from the root into a new worktree, relative to the root.
+    pub copy_files: Vec<String>,
+}
+
+/// A channel as saved in the store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredChannel {
+    pub id: ChannelId,
+    pub project: ProjectId,
+    pub name: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    pub handoff_policy: Option<HandoffPolicy>,
+    pub handoff_budget: Option<u32>,
+}
+
+/// The git worktree a thread works in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+    /// Sha of the main branch when the worktree was made.
+    pub base: String,
+}
+
+/// A thread as saved in the store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredThread {
+    pub id: ThreadId,
+    pub channel: ChannelId,
+    pub title: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    pub worktree: Option<ThreadWorktree>,
+    pub handoff_policy: Option<HandoffPolicy>,
+    pub handoff_budget: Option<u32>,
+    /// Agent-initiated handoffs that ran in this thread.
+    pub handoffs_used: u32,
 }
 
 /// A run as saved in the store.
@@ -86,17 +148,34 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn status_text(s: &RunStatus) -> Result<String> {
-    match serde_json::to_value(s)? {
+/// The snake_case name of a unit enum variant.
+fn enum_text<T: Serialize>(v: &T) -> Result<String> {
+    match serde_json::to_value(v)? {
         serde_json::Value::String(s) => Ok(s),
-        _ => unreachable!("RunStatus serializes to a string"),
+        _ => unreachable!("unit enums serialize to a string"),
     }
 }
 
-fn parse_status(s: &str) -> Result<RunStatus> {
+fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     Ok(serde_json::from_value(serde_json::Value::String(
         s.to_string(),
     ))?)
+}
+
+fn status_text(s: &RunStatus) -> Result<String> {
+    enum_text(s)
+}
+
+fn parse_status(s: &str) -> Result<RunStatus> {
+    parse_enum(s)
+}
+
+fn policy_text(p: Option<HandoffPolicy>) -> Result<Option<String>> {
+    p.as_ref().map(enum_text).transpose()
+}
+
+fn parse_policy(s: Option<String>) -> Result<Option<HandoffPolicy>> {
+    s.as_deref().map(parse_enum).transpose()
 }
 
 fn is_terminal(s: &RunStatus) -> bool {
@@ -136,6 +215,13 @@ impl Store {
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
+        } else if version < SCHEMA_VERSION {
+            let tx = conn.unchecked_transaction()?;
+            for migration in &MIGRATIONS[version as usize - 1..] {
+                tx.execute_batch(migration)?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
         }
         Ok(Store { conn })
     }
@@ -155,6 +241,53 @@ impl Store {
         Ok(id)
     }
 
+    /// Sets what a new worktree of this project gets before its first run.
+    pub fn set_project_setup(
+        &self,
+        p: ProjectId,
+        setup_command: Option<&str>,
+        copy_files: &[String],
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET setup_command = ?2, copy_files = ?3 WHERE id = ?1",
+            params![
+                p.to_string(),
+                setup_command,
+                serde_json::to_string(copy_files)?
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(())
+    }
+
+    pub fn projects(&self) -> Result<Vec<StoredProject>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{PROJECT_COLUMNS} ORDER BY p.created_at, p.rowid"))?;
+        let rows = stmt.query_map([], read_project)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// The project a thread belongs to.
+    pub fn project_of_thread(&self, t: ThreadId) -> Result<StoredProject> {
+        let row = self
+            .conn
+            .query_row(
+                &format!(
+                    "{PROJECT_COLUMNS}
+                     JOIN channels c ON c.project_id = p.id
+                     JOIN threads t ON t.channel_id = c.id
+                     WHERE t.id = ?1"
+                ),
+                [t.to_string()],
+                read_project,
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("thread"))?
+    }
+
     pub fn create_channel(&self, p: ProjectId, name: &str) -> Result<ChannelId> {
         let id = ChannelId::new();
         self.conn.execute(
@@ -162,6 +295,29 @@ impl Store {
             params![id.to_string(), p.to_string(), name, now_ms()],
         )?;
         Ok(id)
+    }
+
+    pub fn channels(&self, p: ProjectId) -> Result<Vec<StoredChannel>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, created_at, handoff_policy, handoff_budget
+             FROM channels WHERE project_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([p.to_string()], |r| {
+            let channel = StoredChannel {
+                id: ChannelId(uuid_col(r, 0)?),
+                project: p,
+                name: r.get(1)?,
+                created_at: r.get(2)?,
+                handoff_policy: None,
+                handoff_budget: r.get(4)?,
+            };
+            let policy: Option<String> = r.get(3)?;
+            Ok(parse_policy(policy).map(|handoff_policy| StoredChannel {
+                handoff_policy,
+                ..channel
+            }))
+        })?;
+        rows.map(|r| r?).collect()
     }
 
     pub fn create_agent(&self, spec: &AgentSpec) -> Result<AgentId> {
@@ -211,6 +367,76 @@ impl Store {
         Ok(id)
     }
 
+    pub fn thread(&self, t: ThreadId) -> Result<StoredThread> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("{THREAD_COLUMNS} WHERE id = ?1"),
+                [t.to_string()],
+                read_thread,
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("thread"))?
+    }
+
+    pub fn threads(&self, c: ChannelId) -> Result<Vec<StoredThread>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{THREAD_COLUMNS} WHERE channel_id = ?1 ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([c.to_string()], read_thread)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Sets or clears the thread's worktree.
+    pub fn set_thread_worktree(&self, t: ThreadId, wt: Option<&ThreadWorktree>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET worktree_path = ?2, worktree_branch = ?3, worktree_base = ?4
+             WHERE id = ?1",
+            params![
+                t.to_string(),
+                wt.map(|w| w.path.to_string_lossy().into_owned()),
+                wt.map(|w| &w.branch),
+                wt.map(|w| &w.base)
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("thread"));
+        }
+        Ok(())
+    }
+
+    /// Sets the thread's own handoff policy and budget. `None` falls back
+    /// to the agent or channel.
+    pub fn set_thread_handoff(
+        &self,
+        t: ThreadId,
+        policy: Option<HandoffPolicy>,
+        budget: Option<u32>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET handoff_policy = ?2, handoff_budget = ?3 WHERE id = ?1",
+            params![t.to_string(), policy_text(policy)?, budget],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("thread"));
+        }
+        Ok(())
+    }
+
+    /// Counts one more handoff in the thread and returns the new total.
+    pub fn bump_handoffs_used(&self, t: ThreadId) -> Result<u32> {
+        let used: Option<u32> = self
+            .conn
+            .query_row(
+                "UPDATE threads SET handoffs_used = handoffs_used + 1 WHERE id = ?1
+                 RETURNING handoffs_used",
+                [t.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        used.ok_or(StoreError::NotFound("thread"))
+    }
+
     /// Working directory for a thread. For now this is the project root.
     pub fn thread_cwd(&self, t: ThreadId) -> Result<PathBuf> {
         let root: Option<String> = self
@@ -228,7 +454,14 @@ impl Store {
             .ok_or(StoreError::NotFound("thread"))
     }
 
-    pub fn add_message(&self, t: ThreadId, author: Author, body: &str) -> Result<MessageId> {
+    /// Saves a message. `run` is the run that produced it, if any.
+    pub fn add_message(
+        &self,
+        t: ThreadId,
+        author: Author,
+        body: &str,
+        run: Option<RunId>,
+    ) -> Result<MessageId> {
         let id = MessageId::new();
         let (kind, agent) = match author {
             Author::You => ("you", None),
@@ -236,17 +469,25 @@ impl Store {
             Author::System => ("system", None),
         };
         self.conn.execute(
-            "INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, ord)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+            "INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, run_id, ord)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                      (SELECT COALESCE(MAX(ord) + 1, 0) FROM messages WHERE thread_id = ?2))",
-            params![id.to_string(), t.to_string(), kind, agent, body, now_ms()],
+            params![
+                id.to_string(),
+                t.to_string(),
+                kind,
+                agent,
+                body,
+                now_ms(),
+                run.map(|r| r.to_string())
+            ],
         )?;
         Ok(id)
     }
 
     pub fn messages(&self, t: ThreadId) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_kind, author_agent, body, created_at
+            "SELECT id, author_kind, author_agent, body, created_at, run_id
              FROM messages WHERE thread_id = ?1 ORDER BY ord",
         )?;
         let rows = stmt.query_map([t.to_string()], |r| {
@@ -263,6 +504,10 @@ impl Store {
                 author,
                 body: r.get(3)?,
                 created_at: r.get(4)?,
+                run: r
+                    .get::<_, Option<String>>(5)?
+                    .map(|_| uuid_col(r, 5).map(RunId))
+                    .transpose()?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -378,6 +623,60 @@ impl Store {
             ],
         )?)
     }
+}
+
+const PROJECT_COLUMNS: &str = "SELECT p.id, p.name, p.root, p.main_branch, p.created_at,
+     p.setup_command, p.copy_files FROM projects p";
+
+fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
+    let copy_files: String = r.get(6)?;
+    let project = StoredProject {
+        id: ProjectId(uuid_col(r, 0)?),
+        name: r.get(1)?,
+        root: PathBuf::from(r.get::<_, String>(2)?),
+        main_branch: r.get(3)?,
+        created_at: r.get(4)?,
+        setup_command: r.get(5)?,
+        copy_files: Vec::new(),
+    };
+    Ok(serde_json::from_str(&copy_files)
+        .map(|copy_files| StoredProject {
+            copy_files,
+            ..project
+        })
+        .map_err(StoreError::from))
+}
+
+const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,
+     worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used FROM threads";
+
+fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
+    let path: Option<String> = r.get(4)?;
+    let branch: Option<String> = r.get(5)?;
+    let base: Option<String> = r.get(6)?;
+    let worktree = match (path, branch, base) {
+        (Some(path), Some(branch), Some(base)) => Some(ThreadWorktree {
+            path: PathBuf::from(path),
+            branch,
+            base,
+        }),
+        _ => None,
+    };
+    let thread = StoredThread {
+        id: ThreadId(uuid_col(r, 0)?),
+        channel: ChannelId(uuid_col(r, 1)?),
+        title: r.get(2)?,
+        created_at: r.get(3)?,
+        worktree,
+        handoff_policy: None,
+        handoff_budget: r.get(8)?,
+        handoffs_used: r.get(9)?,
+    };
+    let policy: Option<String> = r.get(7)?;
+    Ok(parse_policy(policy).map(|handoff_policy| StoredThread {
+        handoff_policy,
+        ..thread
+    }))
 }
 
 const RUN_COLUMNS: &str =
