@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
