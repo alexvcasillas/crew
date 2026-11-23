@@ -21,7 +21,8 @@ use super::test_ui::{
 };
 use super::thread_tests::{live_run, world};
 use super::workspace::Workspace;
-use crate::test_support::{Daemon, fake_claude, fixture, short_home};
+use crate::test_support::{Daemon, fake_claude, fixture, recording_proxy, short_home};
+use crew_proto::Request;
 
 /// A git repository at `dir` on branch `main`.
 fn git_repo(dir: &Path) -> PathBuf {
@@ -102,6 +103,13 @@ fn first_launch_creates_project_agent_and_lands_in_general(cx: &mut TestAppConte
         assert_eq!(projects[0].main_branch, "main");
     });
     assert!(!shows(cx, window, NOT_GIT), "the error is gone");
+    assert!(!has(cx, window, "first-launch-pick"), "step 1 is done");
+    wait_until(cx, "#general with the project", |cx| {
+        ws.read_with(cx, |ws, _| {
+            let project = ws.state().projects()[0].id;
+            ws.state().channels(project).len() == 1
+        })
+    });
 
     click(cx, window, "first-launch-starter");
     wait_until(cx, "the new thread in #general", |cx| {
@@ -243,6 +251,10 @@ fn coming_soon_runtimes_are_disabled(cx: &mut TestAppContext) {
     wait_until(cx, "the runtimes", |cx| {
         ws.read_with(cx, |ws, _| !ws.runtimes.is_empty())
     });
+    assert!(
+        shows(cx, window, "Claude Code Not installed"),
+        "the first launch's word"
+    );
 
     press(cx, window, "cmd-,");
     click(cx, window, "settings-nav-agents");
@@ -486,14 +498,52 @@ fn adding_a_project_needs_a_git_folder(cx: &mut TestAppContext) {
     wait_until(cx, "its form", |cx| {
         label_of(cx, window, "project-form-title").as_deref() == Some("Shop")
     });
+    wait_until(cx, "Shop's #general", |cx| {
+        ws.read_with(cx, |ws, _| {
+            let shop = ws
+                .state()
+                .projects()
+                .into_iter()
+                .find(|p| p.name == "Shop")
+                .unwrap()
+                .id;
+            let names: Vec<String> = ws
+                .state()
+                .channels(shop)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            names == ["general"]
+        })
+    });
+
+    // The same folder again.
+    click(cx, window, "settings-add-project");
+    wait_to_show(
+        cx,
+        window,
+        "shop is already a project. Open it from the sidebar.",
+    );
 }
 
 #[gpui_kit::test]
 fn settings_open_from_the_title_bar_and_list_shortcuts(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
+    let crewd_home = short_home();
+    let _daemon = Daemon::start(crewd_home.path().to_path_buf());
+    let w = world(crewd_home.path(), &tmp.path().join("repo"), &[]);
     let home = short_home();
-    let _daemon = Daemon::start(home.path().to_path_buf());
-    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let seen = recording_proxy(
+        &home.path().join("crewd.sock"),
+        crewd_home.path().join("crewd.sock"),
+    );
+    let asks = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Request::Runtimes))
+            .count()
+    };
     let (window, ws) = open_tall(cx, home.path());
     wait_until(cx, "the project", |cx| {
         ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
@@ -505,9 +555,213 @@ fn settings_open_from_the_title_bar_and_list_shortcuts(cx: &mut TestAppContext) 
     assert!(shows(cx, window, "Settings ⌘,"));
     click(cx, window, "settings-nav-runtimes");
     wait_to_show(cx, window, "Claude Code Not installed");
-    assert!(has(cx, window, "runtimes-refresh"));
+    assert!(shows(cx, window, "Codex Coming soon"));
+    wait_until(cx, "the first ask to end", |cx| {
+        ws.read_with(cx, |ws, _| !ws.runtimes_checking)
+    });
+    let before = asks();
+    assert!(before >= 1, "asked on connect");
     click(cx, window, "runtimes-refresh");
-    wait_to_show(cx, window, "Claude Code Not installed");
+    wait_until(cx, "a second ask", |_| asks() == before + 1);
+    wait_until(cx, "its answer", |cx| {
+        ws.read_with(cx, |ws, _| !ws.runtimes_checking)
+    });
+    assert!(shows(cx, window, "Claude Code Not installed"));
     click(cx, window, "settings-back");
     assert_eq!(page(cx, &ws), None);
+}
+
+/// A picker that waits until the test answers, counting how often it was
+/// opened.
+struct SlowPicker {
+    opened: Rc<std::cell::Cell<usize>>,
+    answer: Rc<std::cell::RefCell<Option<futures::channel::oneshot::Sender<PathBuf>>>>,
+}
+
+fn slow_picker(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> SlowPicker {
+    let opened = Rc::new(std::cell::Cell::new(0));
+    let answer = Rc::new(std::cell::RefCell::new(None));
+    let (o, a) = (opened.clone(), answer.clone());
+    ws.update(cx, |ws, _| {
+        ws.set_folder_picker(Rc::new(move |cx: &mut gpui_kit::App| {
+            o.set(o.get() + 1);
+            let (tx, rx) = futures::channel::oneshot::channel();
+            *a.borrow_mut() = Some(tx);
+            cx.spawn(async move |_| rx.await.ok())
+        }));
+    });
+    SlowPicker { opened, answer }
+}
+
+#[gpui_kit::test]
+fn choosing_a_folder_twice_adds_one_project(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let repo = git_repo(&tmp.path().join("demo"));
+    let (window, ws) = open_tall(cx, home.path());
+    wait_to_show(cx, window, "Welcome to Crew");
+    let picker = slow_picker(cx, &ws);
+
+    click(cx, window, "first-launch-pick");
+    click(cx, window, "first-launch-pick");
+    assert_eq!(picker.opened.get(), 1, "one picker at a time");
+    picker
+        .answer
+        .borrow_mut()
+        .take()
+        .unwrap()
+        .send(repo.clone())
+        .unwrap();
+    wait_to_show(cx, window, "demo added");
+    // Nothing to pick any more, and a late second answer adds nothing.
+    assert!(!has(cx, window, "first-launch-pick"));
+    ws.update(cx, |ws, _| {
+        ws.set_folder_picker(Rc::new(move |_| Task::ready(Some(repo.clone()))));
+    });
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.choose_folder(
+                super::settings::projects::FolderFor::FirstLaunch,
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    ws.read_with(cx, |ws, _| assert_eq!(ws.state().projects().len(), 1));
+
+    // Settings' Add project is off while a picker is open.
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-projects");
+    let picker = slow_picker(cx, &ws);
+    click(cx, window, "settings-add-project");
+    click(cx, window, "settings-add-project");
+    assert_eq!(picker.opened.get(), 1);
+    drop(picker.answer.borrow_mut().take());
+    wait_until(cx, "the picker to close", |cx| {
+        ws.read_with(cx, |ws, _| ws.folder_task.is_none())
+    });
+}
+
+#[gpui_kit::test]
+fn a_late_save_lands_only_on_its_own_form(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), fake_claude(tmp.path(), "exit 0"));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the runtimes", |cx| {
+        ws.read_with(cx, |ws, _| {
+            !ws.runtimes.is_empty() && ws.state().agent(forge).is_some()
+        })
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-agents");
+    click(cx, window, "settings-new-agent");
+    type_text(cx, window, "Scout");
+    // Save the new agent, then switch to Forge before crewd answers.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.save_agent(window, cx);
+            ws.edit_agent(forge, window, cx);
+        })
+    })
+    .unwrap();
+    wait_until(cx, "Scout", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agents().len() == 2)
+    });
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    ws.read_with(cx, |ws, _| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        assert_eq!(form.editing, Some(forge));
+        assert!(!form.saved, "Scout's save isn't Forge's");
+    });
+}
+
+#[gpui_kit::test]
+fn duplicate_copies_what_you_typed_and_permission_changes(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), fake_claude(tmp.path(), "exit 0"));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the runtimes", |cx| {
+        ws.read_with(cx, |ws, _| {
+            !ws.runtimes.is_empty() && ws.state().agent(forge).is_some()
+        })
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-agents");
+    assert!(shows(cx, window, "Read only (plan)"));
+
+    // The permission dropdown.
+    click(cx, window, "agent-permission");
+    assert!(
+        shows(cx, window, "Edit files, ask before commands"),
+        "the menu"
+    );
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(0usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    ws.read_with(cx, |ws, _| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        assert_eq!(form.permission, PermissionMode::EditFiles);
+    });
+
+    // An invalid longest run is copied as typed.
+    retype(cx, window, "agent-max-minutes", "0");
+    click(cx, window, "agent-duplicate");
+    assert_eq!(
+        label_of(cx, window, "agent-form-title").as_deref(),
+        Some("Forge-copy")
+    );
+    ws.read_with(cx, |ws, cx| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        assert_eq!(form.editing, None);
+        assert_eq!(form.max_minutes.read(cx).value().as_ref(), "0");
+        assert_eq!(form.permission, PermissionMode::EditFiles);
+        assert_eq!(form.role.read(cx).value().as_ref(), "Forge things");
+    });
+}
+
+#[gpui_kit::test]
+fn slow_runtimes_fill_in_later(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude-slow.sh");
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\nsleep 2\ncase \"$1\" in\n  --version) echo '9.9.9 (Claude Code)';;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_to_show(cx, window, "Welcome to Crew");
+    let started = std::time::Instant::now();
+    wait_to_show(cx, window, "Claude Code Installed");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1900),
+        "found before the CLI answered: {:?}",
+        started.elapsed()
+    );
+    wait_to_show(cx, window, "Claude Code 9.9.9 Signed in");
+    ws.read_with(cx, |ws, _| {
+        assert_eq!(ws.runtimes[0].version.as_deref(), Some("9.9.9"));
+    });
 }

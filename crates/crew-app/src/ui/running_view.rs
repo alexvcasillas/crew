@@ -196,6 +196,11 @@ impl Workspace {
         !self.state().running().is_empty()
     }
 
+    /// Whether a Stop all button works now, and its text colour.
+    pub(super) fn stop_all_look(&self) -> (bool, &'static str) {
+        stop_all_look(self.anything_live(), self.stopping_all)
+    }
+
     /// The title bar's content on Running now.
     pub(super) fn render_running_title(
         &self,
@@ -229,13 +234,15 @@ impl Workspace {
             .gap(px(8.))
             // Like the status bar's, only while connected.
             .children(self.connected().then(|| {
+                let (enabled, token) = self.stop_all_look();
                 Button::new("running-stop-all")
-                    .outline()
+                    .when(enabled, |b| b.outline())
+                    .when(!enabled, |b| b.ghost())
                     .small()
-                    .text_color(color("danger"))
+                    .text_color(color(token))
                     .icon(IconName::Square)
                     .label("Stop all ⌘⇧.")
-                    .disabled(self.stopping_all || !self.anything_live())
+                    .disabled(!enabled)
                     .on_click(cx.listener(|this, _, window, cx| this.stop_all(window, cx)))
             }))
             .children(self.render_title_actions(cx))
@@ -535,6 +542,16 @@ impl Workspace {
     }
 }
 
+/// Stop all is red and works only while something runs and no Stop all
+/// is waiting for its answer. Otherwise it is tertiary and disabled.
+pub fn stop_all_look(live: bool, stopping: bool) -> (bool, &'static str) {
+    if live && !stopping {
+        (true, "danger")
+    } else {
+        (false, "text-tertiary")
+    }
+}
+
 /// Why a queued run waits: another run in its thread, or the cap on
 /// runs at once.
 pub fn queued_line(busy_in_thread: Option<&str>) -> String {
@@ -803,7 +820,14 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
 
 #[cfg(test)]
 mod tests {
-    use super::{queued_line, summary_line};
+    use super::{queued_line, stop_all_look, summary_line};
+
+    #[test]
+    fn stop_all_is_red_only_while_it_can_stop_something() {
+        assert_eq!(stop_all_look(true, false), (true, "danger"));
+        assert_eq!(stop_all_look(false, false), (false, "text-tertiary"));
+        assert_eq!(stop_all_look(true, true), (false, "text-tertiary"));
+    }
 
     #[test]
     fn a_queued_run_says_what_it_waits_for() {

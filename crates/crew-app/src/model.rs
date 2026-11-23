@@ -139,7 +139,8 @@ impl State {
                     log.events.push(LoggedEvent { run, seq, event });
                 }
             }
-            ServerMsg::Response { .. } | ServerMsg::Resync => {}
+            // The workspace keeps the runtimes.
+            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
         }
     }
 

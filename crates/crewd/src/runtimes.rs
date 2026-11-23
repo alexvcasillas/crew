@@ -20,17 +20,41 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Claude Code, then Codex. The `claude` binary is the one runs use. A
 /// binary that is found counts as installed, even if `--version` fails.
 pub async fn detect(bins: &CliBins) -> Vec<RuntimeInfo> {
-    let claude = bins
-        .claude
-        .clone()
-        .unwrap_or_else(|| claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")));
-    let codex = bins.codex.clone().unwrap_or_else(|| PathBuf::from("codex"));
+    let (claude, codex) = names(bins);
     let (claude, codex) = tokio::join!(
         probe(Runtime::ClaudeCode, &claude, Some(&["auth", "status"])),
         // No adapter yet, so its sign-in state doesn't matter.
         probe(Runtime::Codex, &codex, None),
     );
     vec![claude, codex]
+}
+
+/// The `claude` and `codex` commands to look for.
+fn names(bins: &CliBins) -> (PathBuf, PathBuf) {
+    let claude = bins
+        .claude
+        .clone()
+        .unwrap_or_else(|| claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")));
+    let codex = bins.codex.clone().unwrap_or_else(|| PathBuf::from("codex"));
+    (claude, codex)
+}
+
+/// Which CLIs are on `PATH`, without running them: no version or sign-in.
+pub fn found(bins: &CliBins) -> Vec<RuntimeInfo> {
+    let (claude, codex) = names(bins);
+    [(Runtime::ClaudeCode, claude), (Runtime::Codex, codex)]
+        .into_iter()
+        .map(|(runtime, bin)| {
+            let path = find(&bin);
+            RuntimeInfo {
+                runtime,
+                installed: path.is_some(),
+                version: None,
+                signed_in: None,
+                path: path.map(|p| p.to_string_lossy().into_owned()),
+            }
+        })
+        .collect()
 }
 
 /// Output of a command that finished in time.

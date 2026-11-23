@@ -679,3 +679,48 @@ async fn runtimes_reports_fake_claude_version() {
     assert_eq!(list[0].path, None);
     assert!(!list[1].installed, "the default test daemon has no codex");
 }
+
+/// A CLI that is slow to say its version doesn't hold the answer back:
+/// crewd answers with what it found at once and sends the rest later.
+#[tokio::test]
+async fn slow_runtimes_answer_early_and_follow_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = script(
+        &dir.path().join("claude-slow.sh"),
+        "sleep 2\ncase \"$1 $2\" in\n\
+         '--version '*) echo '9.8.7 (Claude Code)' ;;\n\
+         'auth status') echo '{\"loggedIn\":true}' ;;\n\
+         esac\n",
+    );
+    let d = Daemon::start_with(bin.clone(), PathBuf::from("/nonexistent/codex")).await;
+    let mut app = d.client().await;
+    app.call(Request::SubscribeAll).await.unwrap();
+    let mut c = d.client().await;
+    let started = std::time::Instant::now();
+    let early: Vec<RuntimeInfo> = c.ok(Request::Runtimes).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(1800),
+        "answered in {:?}",
+        started.elapsed()
+    );
+    let claude = early
+        .iter()
+        .find(|r| r.runtime == Runtime::ClaudeCode)
+        .unwrap();
+    assert!(claude.installed);
+    assert_eq!(claude.path.as_deref(), Some(bin.to_str().unwrap()));
+    assert_eq!(claude.version, None, "not known yet");
+    let later = loop {
+        if let ServerMsg::RuntimesChanged { runtimes } = app.recv().await {
+            break runtimes;
+        }
+    };
+    let claude = later
+        .iter()
+        .find(|r| r.runtime == Runtime::ClaudeCode)
+        .unwrap();
+    assert_eq!(claude.version.as_deref(), Some("9.8.7"));
+    assert_eq!(claude.signed_in, Some(true));
+    let codex = later.iter().find(|r| r.runtime == Runtime::Codex).unwrap();
+    assert!(!codex.installed);
+}
