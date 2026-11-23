@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, ElementId, Entity, Point, TestAppContext,
+    AnyWindowHandle, AppContext as _, Bounds, ElementId, Entity, Pixels, Point, TestAppContext,
     WindowBounds, WindowOptions, px, size,
 };
 
@@ -135,6 +135,20 @@ pub fn label_of(
         window
             .try_find(id)
             .and_then(|e| e.label().map(str::to_string))
+    })
+    .unwrap()
+}
+
+/// Where the element `id` is drawn, if it is on screen.
+pub fn bounds_of(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    id: impl Into<ElementId>,
+) -> Option<Bounds<Pixels>> {
+    let id = id.into();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).map(|e| e.bounds())
     })
     .unwrap()
 }

@@ -6,7 +6,7 @@ use std::ops::Range;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ThreadId};
 use crew_core::policy::HandoffPolicy;
-use crew_core::store::{Author, StoredMessage, StoredRun};
+use crew_core::store::{ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -38,12 +38,18 @@ impl Workspace {
         let names: Vec<String> = state.agents().iter().map(|a| a.spec.name.clone()).collect();
 
         let mut items: Vec<AnyElement> = Vec::new();
-        // An approval's card stands where it was asked; later notes about
-        // it fold into the card's line.
+        let live = state.live_runs(thread);
+        let pending = state.pending_approvals(thread);
+        // A pending ask of a live run stands right under the run's card.
+        let under_run = |approval: &StoredApproval| {
+            approval.status == ApprovalStatus::Pending && live.iter().any(|r| r.id == approval.run)
+        };
+        // Any other approval's card stands where it was asked; later notes
+        // about it fold into the card's line.
         let mut carded: HashSet<ApprovalId> = HashSet::new();
         for message in state.messages(thread) {
             if let Some(approval) = message.approval.and_then(|a| state.approval(a)) {
-                if carded.insert(approval.id) {
+                if !under_run(approval) && carded.insert(approval.id) {
                     items.push(self.render_approval(approval, cx));
                 }
                 continue;
@@ -60,13 +66,16 @@ impl Workspace {
                 }
             }
         }
-        for approval in state.pending_approvals(thread) {
-            if !carded.contains(&approval.id) {
+        for approval in &pending {
+            if !carded.contains(&approval.id) && !under_run(approval) {
                 items.push(self.render_approval(approval, cx));
             }
         }
-        for run in state.live_runs(thread) {
+        for run in &live {
             items.push(self.render_live_run(run, cx).into_any_element());
+            for approval in pending.iter().filter(|a| a.run == run.id) {
+                items.push(self.render_approval(approval, cx));
+            }
         }
 
         div()
