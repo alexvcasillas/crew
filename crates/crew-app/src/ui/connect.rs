@@ -4,6 +4,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::*;
 
+use super::service_control::ServiceAction;
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
@@ -79,11 +80,12 @@ impl Workspace {
                                 .label(wording.button)
                                 .loading(self.starting())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    if restart {
-                                        this.restart_service(false, window, cx);
+                                    let action = if restart {
+                                        ServiceAction::Restart
                                     } else {
-                                        this.start_service(false, window, cx);
-                                    }
+                                        ServiceAction::Start
+                                    };
+                                    this.service(action, window, cx);
                                 })),
                         ),
                     ),

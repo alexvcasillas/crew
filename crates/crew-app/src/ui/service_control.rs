@@ -1,6 +1,10 @@
 //! "Start Crew service" and "Restart service". From the app bundle, crewd
 //! runs under launchd; a dev build runs the crewd beside it. Either way the
 //! app checks until crewd answers, then has the client connect.
+//!
+//! Anything that would stop a running crewd (a restart, reloading a
+//! changed LaunchAgent, stopping a crewd launchd doesn't manage) first
+//! counts its agents, and asks before stopping any.
 
 use std::time::{Duration, Instant};
 
@@ -11,7 +15,7 @@ use gpui_kit::*;
 
 use super::workspace::Workspace;
 use crate::connection::{self, ConnectionConfig, ConnectionState, StartError};
-use crate::launchd;
+use crate::launchd::{self, Plan};
 use crate::theme::color;
 
 /// How long "Start Crew service" waits for crewd to answer.
@@ -20,36 +24,87 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// get up to 8 s to stop.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
-/// What "Restart service" does, given how many agents are running.
-#[derive(Debug, PartialEq, Eq)]
-enum RestartPlan {
-    Go,
-    /// Ask before stopping this many agents.
-    Ask(usize),
-    /// Leave it: the restart was automatic and agents are running.
-    Stay,
+/// What was asked of the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServiceAction {
+    /// "Start Crew service", or the app opening from its bundle.
+    Start,
+    /// "Restart service". From the bundle it also asks the login shell
+    /// for `PATH` again.
+    Restart,
+    /// Restarting an out-of-date crewd on its own. Never stops agents.
+    AutoRestart,
 }
 
-fn restart_plan(running: usize, auto: bool) -> RestartPlan {
-    match (running, auto) {
-        (0, _) => RestartPlan::Go,
-        (_, true) => RestartPlan::Stay,
-        (n, false) => RestartPlan::Ask(n),
+impl ServiceAction {
+    fn restart(self) -> bool {
+        self != ServiceAction::Start
     }
 }
 
+/// What to do, given whether it would stop a running crewd and how many
+/// agents that crewd runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    Go,
+    /// Ask before stopping this many agents.
+    Ask(usize),
+    /// Leave crewd as it is.
+    Stay,
+}
+
+fn decide(stops_crewd: bool, running: usize, action: ServiceAction) -> Decision {
+    if !stops_crewd || running == 0 {
+        Decision::Go
+    } else if action == ServiceAction::AutoRestart {
+        Decision::Stay
+    } else {
+        Decision::Ask(running)
+    }
+}
+
+/// Whether the crewd answering on the socket (`peer`) is not the one
+/// launchd runs (`job`), such as one a dev build started.
+fn unmanaged(peer: Option<u32>, job: Option<u32>) -> bool {
+    peer.is_some() && peer != job
+}
+
 fn restart_ask(running: usize) -> String {
-    let agents = if running == 1 { "agent" } else { "agents" };
-    format!("Restarting stops {running} running {agents}. Their changes are kept.")
+    if running == 1 {
+        "Restarting stops 1 running agent. Its changes are kept.".into()
+    } else {
+        format!("Restarting stops {running} running agents. Their changes are kept.")
+    }
+}
+
+/// What a look at crewd found, before anything changes.
+struct Look {
+    /// The pid answering on the socket.
+    peer: Option<u32>,
+    /// Its child processes: its running agents.
+    children: usize,
+    /// From the bundle: what launchd would do.
+    plan: Option<Result<Plan, launchd::Error>>,
+}
+
+/// The work [`Workspace::run_service`] does.
+#[derive(Clone)]
+struct Work {
+    restart: bool,
+    /// From the bundle: the LaunchAgent to apply.
+    plan: Option<Plan>,
+    /// Stop the crewd on the socket first: launchd doesn't run it.
+    stop_unmanaged: bool,
+    /// Wait for a crewd that is connected, not one that only answers.
+    wait_connected: bool,
 }
 
 impl Workspace {
-    /// Restarts crewd, asking first if agents are running. An `auto`
-    /// restart (of an out-of-date crewd) doesn't ask: it leaves a busy
-    /// crewd alone.
-    pub(super) fn restart_service(
+    /// Starts or restarts crewd as `action` says, asking first if that
+    /// stops running agents.
+    pub(super) fn service(
         &mut self,
-        auto: bool,
+        action: ServiceAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -59,32 +114,83 @@ impl Workspace {
         self.starting = true;
         cx.notify();
         let conn = self.conn.clone();
+        let bundled = self.bundled_crewd.clone();
         let executor = cx.background_executor().clone();
         self.service_task = Some(cx.spawn_in(window, async move |this, cx| {
-            // crewd's own processes are its agents. What the app last saw
-            // also counts queued runs.
-            let children = executor
-                .spawn(async move { connection::crewd_children(&conn) })
+            let look = executor
+                .spawn(async move {
+                    let peer = connection::crewd_pid(&conn);
+                    Look {
+                        peer,
+                        children: peer.map_or(0, connection::children_of),
+                        plan: bundled.map(|crewd| {
+                            let fresh_path = action == ServiceAction::Restart;
+                            launchd::plan(&crewd, &conn.crew_home, fresh_path)
+                        }),
+                    }
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.starting = false;
-                let running = this.state().running().len().max(children);
-                match restart_plan(running, auto) {
-                    RestartPlan::Go => this.start_service(true, window, cx),
-                    RestartPlan::Ask(n) => this.ask_to_restart(n, window, cx),
-                    RestartPlan::Stay => {}
-                }
+                this.decide_service(action, look, window, cx);
                 cx.notify();
             })
             .ok();
         }));
     }
 
-    fn ask_to_restart(&mut self, running: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn decide_service(
+        &mut self,
+        action: ServiceAction,
+        look: Look,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let restart = action.restart();
+        let plan = match look.plan {
+            Some(Ok(plan)) => Some(plan),
+            Some(Err(e)) => {
+                let error = StartFailure::Launchd(e).message(&self.conn);
+                self.show_error(error, window, cx);
+                return;
+            }
+            None => None,
+        };
+        let stop_unmanaged = plan
+            .as_ref()
+            .is_some_and(|p| unmanaged(look.peer, p.job_pid));
+        let reloads_live = plan
+            .as_ref()
+            .is_some_and(|p| p.reloads() && look.peer.is_some());
+        let stops_crewd = restart || stop_unmanaged || reloads_live;
+        let work = Work {
+            restart,
+            plan,
+            stop_unmanaged,
+            wait_connected: stops_crewd,
+        };
+        // crewd's own processes are its agents. What the app last saw
+        // also counts queued runs.
+        let running = self.state().running().len().max(look.children);
+        match decide(stops_crewd, running, action) {
+            Decision::Go => self.run_service(work, window, cx),
+            Decision::Ask(n) => self.ask_to_restart(n, work, window, cx),
+            Decision::Stay => {}
+        }
+    }
+
+    fn ask_to_restart(
+        &mut self,
+        running: usize,
+        work: Work,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ask = restart_ask(running);
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm = this.clone();
+            let work = work.clone();
             dialog
                 .w(px(420.))
                 .title("Restart service")
@@ -110,8 +216,9 @@ impl Workspace {
                                 .label("Restart")
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
+                                    let work = work.clone();
                                     confirm
-                                        .update(cx, |this, cx| this.start_service(true, window, cx))
+                                        .update(cx, |this, cx| this.run_service(work, window, cx))
                                         .ok();
                                 }),
                         ),
@@ -119,45 +226,24 @@ impl Workspace {
         });
     }
 
-    /// Starts crewd (restarting the running one if `restart`), then
-    /// checks until it answers or the wait passes. Whatever happens, the
-    /// shown state ends up as a fresh check says.
-    pub(super) fn start_service(
-        &mut self,
-        restart: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Does `work`, then checks until crewd answers or the wait passes.
+    /// Whatever happens, the shown state ends up as a fresh check says.
+    fn run_service(&mut self, work: Work, window: &mut Window, cx: &mut Context<Self>) {
         if self.starting {
             return;
         }
         self.starting = true;
         cx.notify();
         let conn = self.conn.clone();
-        let bundled = self.bundled_crewd.clone();
         let executor = cx.background_executor().clone();
+        let wait_connected = work.wait_connected;
         self.service_task = Some(cx.spawn_in(window, async move |this, cx| {
             let start_conn = conn.clone();
             let started = executor
-                .spawn(async move {
-                    match bundled {
-                        Some(crewd) if restart => launchd::restart(&crewd, &start_conn.crew_home)
-                            .map_err(StartFailure::Launchd),
-                        Some(crewd) => launchd::ensure(&crewd, &start_conn.crew_home)
-                            .map_err(StartFailure::Launchd),
-                        None => {
-                            if restart && !connection::stop_crewd(&start_conn, STOP_WAIT) {
-                                return Err(StartFailure::StillRunning);
-                            }
-                            connection::start_crewd(&start_conn).map_err(StartFailure::Start)
-                        }
-                    }
-                })
+                .spawn(async move { do_work(&work, &start_conn) })
                 .await;
-            // A restarted crewd must be the new one; a started one only
-            // has to answer.
             let state = match &started {
-                Ok(()) if restart => {
+                Ok(()) if wait_connected => {
                     Some(wait_for_crewd(&executor, &conn, STOP_WAIT + START_WAIT, true).await)
                 }
                 Ok(()) => Some(wait_for_crewd(&executor, &conn, START_WAIT, false).await),
@@ -166,7 +252,7 @@ impl Workspace {
             this.update_in(cx, |this, window, cx| {
                 this.starting = false;
                 let error = match started {
-                    Err(e) => Some(e.message()),
+                    Err(e) => Some(e.message(&conn)),
                     Ok(()) if state == Some(ConnectionState::NotRunning) => Some(format!(
                         "Crew's service didn't start. Its log is at {}.",
                         conn.log().display()
@@ -186,6 +272,18 @@ impl Workspace {
     }
 }
 
+/// Stops what must stop and starts crewd. Blocks.
+fn do_work(work: &Work, conn: &ConnectionConfig) -> Result<(), StartFailure> {
+    let stop_first = work.stop_unmanaged || (work.restart && work.plan.is_none());
+    if stop_first && !connection::stop_crewd(conn, STOP_WAIT) {
+        return Err(StartFailure::StillRunning);
+    }
+    match &work.plan {
+        Some(plan) => launchd::apply(plan, work.restart).map_err(StartFailure::Launchd),
+        None => connection::start_crewd(conn).map_err(StartFailure::Start),
+    }
+}
+
 /// Why "Start" or "Restart" failed before crewd could be checked.
 enum StartFailure {
     StillRunning,
@@ -194,7 +292,7 @@ enum StartFailure {
 }
 
 impl StartFailure {
-    fn message(&self) -> String {
+    fn message(&self, conn: &ConnectionConfig) -> String {
         match self {
             StartFailure::StillRunning => {
                 "Crew's old service didn't stop. Quit it, then try again.".into()
@@ -205,9 +303,10 @@ impl StartFailure {
             StartFailure::Start(StartError::Io(e)) => {
                 format!("Crew's service couldn't start ({e}). Reinstall Crew.")
             }
-            StartFailure::Launchd(e) => {
-                format!("Crew's service couldn't start ({e}). Reinstall Crew.")
-            }
+            StartFailure::Launchd(e) => format!(
+                "Crew's service couldn't start ({e}). Check its log at {}.",
+                conn.log().display()
+            ),
         }
     }
 }
@@ -242,21 +341,33 @@ async fn wait_for_crewd(
 
 #[cfg(test)]
 mod tests {
-    use super::{RestartPlan, restart_ask, restart_plan};
+    use super::{Decision, ServiceAction, decide, restart_ask, unmanaged};
 
     #[test]
-    fn restart_asks_first_when_agents_run() {
-        assert_eq!(restart_plan(0, false), RestartPlan::Go);
-        assert_eq!(restart_plan(0, true), RestartPlan::Go);
-        assert_eq!(restart_plan(2, false), RestartPlan::Ask(2));
-        assert_eq!(restart_plan(2, true), RestartPlan::Stay);
+    fn stopping_a_busy_crewd_asks_first() {
+        use ServiceAction::*;
+        assert_eq!(decide(false, 3, Start), Decision::Go, "nothing stops");
+        assert_eq!(decide(true, 0, Restart), Decision::Go, "nothing runs");
+        assert_eq!(decide(true, 0, AutoRestart), Decision::Go);
+        assert_eq!(decide(true, 2, Restart), Decision::Ask(2));
+        // Opening the app over a changed LaunchAgent and busy crewd.
+        assert_eq!(decide(true, 2, Start), Decision::Ask(2));
+        assert_eq!(decide(true, 2, AutoRestart), Decision::Stay);
+    }
+
+    #[test]
+    fn a_crewd_launchd_doesnt_run_is_unmanaged() {
+        assert!(!unmanaged(None, None), "nothing answers");
+        assert!(!unmanaged(Some(812), Some(812)), "launchd's own");
+        assert!(unmanaged(Some(900), Some(812)));
+        assert!(unmanaged(Some(900), None));
     }
 
     #[test]
     fn restart_ask_counts_the_agents() {
         assert_eq!(
             restart_ask(1),
-            "Restarting stops 1 running agent. Their changes are kept."
+            "Restarting stops 1 running agent. Its changes are kept."
         );
         assert_eq!(
             restart_ask(3),

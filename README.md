@@ -8,7 +8,8 @@ You need macOS 13 or later, Rust, and Claude Code installed and signed in.
 
 ```sh
 scripts/bundle.sh --release
-open target/bundle/Crew.app
+ditto target/bundle/Crew.app /Applications/Crew.app
+open /Applications/Crew.app
 ```
 
 The app starts its background service, crewd, with launchd. It runs the

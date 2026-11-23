@@ -22,6 +22,7 @@ use super::first_launch::FirstLaunch;
 use super::inspector::Inspector;
 use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
+use super::service_control::ServiceAction;
 use super::settings::projects::{PickFolder, native_picker};
 use super::settings::{Page, SettingsView};
 use crate::app::{ApproveLatest, NewThread, OpenSettings, ShowRunning, ShowThreads, StopAll};
@@ -173,7 +174,7 @@ impl Workspace {
         if bundled_crewd.is_some() {
             // Loads crewd's LaunchAgent, which starts it if needed.
             cx.defer_in(window, |this, window, cx| {
-                this.start_service(false, window, cx)
+                this.service(ServiceAction::Start, window, cx)
             });
         }
         // Window-wide shortcuts such as Stop all need a focused element
@@ -324,7 +325,7 @@ impl Workspace {
             && !self.starting
             && !std::mem::replace(&mut self.auto_restarted, true)
         {
-            self.restart_service(true, window, cx);
+            self.service(ServiceAction::AutoRestart, window, cx);
         }
         // Only the first snapshot decides: an empty install starts with
         // the first launch.

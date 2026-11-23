@@ -6,4 +6,4 @@ mod runtimes;
 pub mod server;
 pub mod service;
 
-pub use server::{ServeOptions, serve, serve_until};
+pub use server::{AlreadyRunning, ServeOptions, serve, serve_until};

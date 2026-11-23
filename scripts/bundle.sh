@@ -6,21 +6,22 @@
 # crew-mcp and crew. The bundle is ad-hoc signed; it isn't notarised. The
 # icon comes from crates/crew-app/assets/AppIcon.icns (scripts/icon.sh
 # renders it).
-# Usage: bundle.sh [--release] [repo-root]
+# Usage: bundle.sh [--release] [repo-root], in any order
 set -euo pipefail
 
 PROFILE=debug
-while [[ "${1:-}" == --* ]]; do
-  case "$1" in
+ROOT=
+for arg in "$@"; do
+  case "$arg" in
     --release) PROFILE=release ;;
-    *)
-      echo "error: unknown option $1" >&2
+    --*)
+      echo "error: unknown option $arg" >&2
       exit 1
       ;;
+    *) ROOT="$arg" ;;
   esac
-  shift
 done
-ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 [[ "$(uname -s)" == Darwin ]] || {
   echo "error: Crew.app is macOS only" >&2
@@ -36,6 +37,8 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 # Cargo reads a relative CARGO_TARGET_DIR from where it runs: here.
 [[ "$TARGET" == /* ]] || TARGET="$PWD/$TARGET"
+# With CARGO_BUILD_TARGET set, cargo puts binaries under that triple.
+OUT="$TARGET/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}$PROFILE"
 
 ICON="$ROOT/crates/crew-app/assets/AppIcon.icns"
 [[ -f "$ICON" ]] || {
@@ -56,7 +59,7 @@ APP="$TARGET/bundle/Crew.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for bin in "${BINS[@]}"; do
-  cp "$TARGET/$PROFILE/$bin" "$APP/Contents/MacOS/$bin"
+  cp "$OUT/$bin" "$APP/Contents/MacOS/$bin"
 done
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
