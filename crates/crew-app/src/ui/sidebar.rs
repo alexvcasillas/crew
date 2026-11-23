@@ -45,7 +45,7 @@ impl Workspace {
             .into_iter()
             .map(|a| self.render_agent(a).into_any_element())
             .collect();
-        let running = state.working_agents().len();
+        let running = state.working_runs().len();
         div()
             .id("sidebar")
             .flex()

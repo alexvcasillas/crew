@@ -165,3 +165,42 @@ pub fn fake_claude(dir: &Path, run: &str) -> PathBuf {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     bin
 }
+
+/// Forwards every client on `front` to crewd on `back`, keeping each
+/// request the clients send, for as long as the test process runs.
+pub fn recording_proxy(
+    front: &Path,
+    back: PathBuf,
+) -> std::sync::Arc<std::sync::Mutex<Vec<crew_proto::Request>>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let kept = seen.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::UnixStream::connect(&back).await else {
+                    continue;
+                };
+                let (mut client_rd, mut client_wr) = client.into_split();
+                let (mut server_rd, mut server_wr) = server.into_split();
+                let kept = kept.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(msg)) = read_frame::<_, ClientMsg>(&mut client_rd).await {
+                        let ClientMsg::Request { req, .. } = &msg;
+                        kept.lock().unwrap().push(req.clone());
+                        if write_frame(&mut server_wr, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut server_rd, &mut client_wr).await;
+                });
+            }
+        });
+    });
+    seen
+}

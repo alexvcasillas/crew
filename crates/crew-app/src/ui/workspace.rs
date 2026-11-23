@@ -580,14 +580,17 @@ impl Workspace {
                     serde_json::from_value::<Vec<RuntimeInfo>>(v).map_err(|e| e.to_string())
                 });
                 // A failed ask keeps what was known; the next one may work.
-                if let Ok(runtimes) = runtimes {
-                    let kept = this.update(cx, |this, cx| {
-                        this.runtimes = runtimes;
-                        cx.notify();
-                    });
-                    if kept.is_err() {
-                        break;
+                match runtimes {
+                    Ok(runtimes) => {
+                        let kept = this.update(cx, |this, cx| {
+                            this.runtimes = runtimes;
+                            cx.notify();
+                        });
+                        if kept.is_err() {
+                            break;
+                        }
                     }
+                    Err(e) => eprintln!("crew: couldn't ask which agent CLIs are ready: {e}"),
                 }
                 cx.background_executor().timer(RUNTIMES_EVERY).await;
             }
