@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -13,6 +15,7 @@ use crew_core::event::Event;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -24,7 +27,7 @@ pub const MISSING_CLAUDE: &str = "Couldn't start `claude`. Is Claude Code instal
 const TERM_AFTER: Duration = Duration::from_secs(3);
 /// Time between SIGTERM and SIGKILL when stopping.
 const KILL_AFTER: Duration = Duration::from_secs(5);
-/// How many stderr lines a failure keeps.
+/// How many output lines a failure keeps.
 const STDERR_TAIL: usize = 20;
 /// Capacity of the event channel.
 const EVENT_BUFFER: usize = 1024;
@@ -61,6 +64,117 @@ impl RunHandle {
     /// Asks the run to stop. Safe to call more than once or after exit.
     pub fn stop(&self) {
         self.stop_tx.send_replace(true);
+    }
+
+    /// Whether a stop was asked for.
+    pub fn is_stopped(&self) -> bool {
+        *self.stop_tx.borrow()
+    }
+
+    /// A handle with no process, for work done before one starts. The
+    /// receiver sees a stop, and also the handle being dropped.
+    pub fn idle() -> (RunHandle, watch::Receiver<bool>) {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        (RunHandle { pid: None, stop_tx }, stop_rx)
+    }
+}
+
+/// Runs `command` with `sh -lc` in `cwd`, in its own process group, and
+/// streams its output lines, stdout and stderr together in order. A stop on
+/// `stop_rx` ends it the same way as a run. A failure holds the last lines.
+pub fn spawn_setup(
+    command: &str,
+    cwd: &Path,
+    mut stop_rx: watch::Receiver<bool>,
+) -> (mpsc::Receiver<String>, JoinHandle<RunOutcome>) {
+    let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    let failed = |e: &dyn std::fmt::Display| {
+        let msg = format!("Couldn't start the setup command: {e}");
+        tokio::spawn(async { RunOutcome::Failed(msg) })
+    };
+    // One pipe for both streams keeps their lines in the order written.
+    let (read, write) = match output_pipe() {
+        Ok(pipe) => pipe,
+        Err(e) => return (rx, failed(&e)),
+    };
+    let spawned = Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(write.0)
+        .stderr(write.1)
+        .process_group(0)
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => return (rx, failed(&e)),
+    };
+    let pgid = child.id().map(|p| Pid::from_raw(p as i32));
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
+    let reader = tokio::spawn(read_lines(read, tx, tail.clone()));
+
+    let join = tokio::spawn(async move {
+        let exited = tokio::select! {
+            status = child.wait() => Some(status),
+            // A stop, or the handle being dropped.
+            _ = stop_rx.wait_for(|stop| *stop) => None,
+        };
+        let Some(status) = exited else {
+            escalate(&mut child, pgid).await;
+            signal_group(pgid, Signal::SIGKILL);
+            join_until(reader, tokio::time::Instant::now() + READERS_GRACE).await;
+            return RunOutcome::Stopped;
+        };
+        signal_group(pgid, Signal::SIGKILL);
+        join_until(reader, tokio::time::Instant::now() + READERS_GRACE).await;
+        let tail = std::mem::take(&mut *tail.lock().unwrap_or_else(PoisonError::into_inner));
+        match status {
+            Ok(s) if s.success() => RunOutcome::Done,
+            Ok(s) => {
+                let head = match (s.code(), s.signal()) {
+                    (Some(code), _) => format!("The setup command exited with code {code}."),
+                    (None, Some(sig)) => format!("The setup command was ended by signal {sig}."),
+                    (None, None) => format!("The setup command exited: {s}."),
+                };
+                let mut lines = vec![head];
+                lines.extend(tail);
+                RunOutcome::Failed(lines.join("\n"))
+            }
+            Err(e) => RunOutcome::Failed(format!("Lost track of the setup command: {e}")),
+        }
+    });
+    (rx, join)
+}
+
+/// A pipe to read from and two write ends for a child's stdout and stderr.
+fn output_pipe() -> std::io::Result<(pipe::Receiver, (Stdio, Stdio))> {
+    let (read, write) = std::io::pipe()?;
+    let write2 = write.try_clone()?;
+    let read = pipe::Receiver::from_owned_fd(OwnedFd::from(read))?;
+    Ok((read, (Stdio::from(write), Stdio::from(write2))))
+}
+
+/// Sends each line to `tx` and keeps the last ones in `tail`. Keeps
+/// reading to the end even if the receiver is gone.
+async fn read_lines(
+    stream: impl AsyncRead + Unpin,
+    tx: mpsc::Sender<String>,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut receiver_alive = true;
+    while let Some(line) = next_line(&mut reader).await {
+        {
+            let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+            if tail.len() == STDERR_TAIL {
+                tail.pop_front();
+            }
+            tail.push_back(line.clone());
+        }
+        if receiver_alive && tx.send(line).await.is_err() {
+            receiver_alive = false;
+        }
     }
 }
 

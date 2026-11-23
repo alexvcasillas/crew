@@ -27,6 +27,8 @@ pub const SOCKET_NAME: &str = "crewd.sock";
 pub const LOCK_NAME: &str = "crewd.lock";
 /// Database file name inside the crew home.
 pub const DB_NAME: &str = "crew.db";
+/// Folder inside the crew home that holds thread worktrees.
+pub const WORKTREES_DIR: &str = "worktrees";
 
 /// Settings for [`serve`].
 #[derive(Debug, Clone)]
@@ -108,7 +110,12 @@ pub async fn serve_until(
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     log(format!("listening on {}", sock.display()));
 
-    let service = Service::new(store, opts.max_runs, opts.claude_bin);
+    let service = Service::new(
+        store,
+        opts.max_runs,
+        opts.claude_bin,
+        home.join(WORKTREES_DIR),
+    );
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
         let accepted = tokio::select! {
@@ -253,7 +260,7 @@ async fn requests_and_notices(
                         respond(wr, id, Err("Hello was already sent.".into())).await?;
                     }
                     other => {
-                        let result = service.handle(other);
+                        let result = service.handle(other).await;
                         respond(wr, id, result).await?;
                     }
                 }

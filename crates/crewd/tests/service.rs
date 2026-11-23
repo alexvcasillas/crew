@@ -230,8 +230,40 @@ fn forge() -> AgentSpec {
     }
 }
 
-/// Creates a project rooted in `root`, a channel, the Forge agent and `n` threads.
+/// Makes `dir` a git repo on `main` with one empty commit, so writing
+/// agents can get a worktree there.
+fn git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+}
+
+/// Makes `root` a git repo, then creates a project rooted there, a channel,
+/// the Forge agent and `n` threads.
 async fn setup(c: &mut Client, root: &Path, n: usize) -> (AgentId, Vec<ThreadId>) {
+    git_repo(root);
     let project: ProjectId = c
         .ok(Request::CreateProject {
             name: "demo".into(),

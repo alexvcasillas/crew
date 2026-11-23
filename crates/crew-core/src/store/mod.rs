@@ -437,12 +437,13 @@ impl Store {
         used.ok_or(StoreError::NotFound("thread"))
     }
 
-    /// Working directory for a thread. For now this is the project root.
+    /// Working directory for a thread: its worktree if it has one, else
+    /// the project root.
     pub fn thread_cwd(&self, t: ThreadId) -> Result<PathBuf> {
         let root: Option<String> = self
             .conn
             .query_row(
-                "SELECT p.root FROM threads t
+                "SELECT COALESCE(t.worktree_path, p.root) FROM threads t
                  JOIN channels c ON c.id = t.channel_id
                  JOIN projects p ON p.id = c.project_id
                  WHERE t.id = ?1",

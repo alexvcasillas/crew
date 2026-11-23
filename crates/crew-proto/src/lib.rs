@@ -66,6 +66,36 @@ pub enum Request {
     },
     /// Answered with `Vec<(AgentId, AgentSpec)>`.
     ListAgents,
+    /// Answered with `Vec<StoredProject>`.
+    ListProjects,
+    /// Answered with `Vec<StoredChannel>`.
+    ListChannels {
+        project: ProjectId,
+    },
+    /// Answered with `Vec<StoredThread>`.
+    ListThreads {
+        channel: ChannelId,
+    },
+    /// Sets what a new worktree of the project gets before its first run.
+    UpdateProject {
+        project: ProjectId,
+        setup_command: Option<String>,
+        copy_files: Vec<String>,
+    },
+    /// Answered with a `Diff` of the uncommitted changes in the thread's
+    /// worktree. Empty if the thread has no worktree.
+    ThreadDiff {
+        thread: ThreadId,
+    },
+    /// Commits everything in the thread's worktree. Answered with the sha.
+    Commit {
+        thread: ThreadId,
+        message: String,
+    },
+    /// Removes the thread's worktree and its branch, changes included.
+    Discard {
+        thread: ThreadId,
+    },
 }
 
 /// A message from crewd.

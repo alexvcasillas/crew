@@ -50,6 +50,12 @@ impl Scheduler {
         Some(job)
     }
 
+    /// Marks `thread` active without a job, so nothing starts there until
+    /// [`Scheduler::finished`]. Returns false if the thread is already active.
+    pub fn claim(&mut self, thread: ThreadId) -> bool {
+        self.active.insert(thread)
+    }
+
     /// Frees the slot of `thread`. Does nothing if it has no active run.
     pub fn finished(&mut self, thread: ThreadId) {
         self.active.remove(&thread);
@@ -91,6 +97,19 @@ mod tests {
         assert!(s.next_ready().is_none());
         s.finished(t);
         assert_eq!(s.next_ready().unwrap().prompt, "b");
+    }
+
+    #[test]
+    fn claimed_thread_waits() {
+        let mut s = Scheduler::new(4);
+        let t = ThreadId::new();
+        assert!(s.claim(t));
+        assert!(!s.claim(t));
+        s.enqueue(job(t, "a"));
+        assert!(s.next_ready().is_none());
+        s.finished(t);
+        assert_eq!(s.next_ready().unwrap().prompt, "a");
+        assert!(!s.claim(t));
     }
 
     #[test]

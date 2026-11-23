@@ -1,30 +1,35 @@
 //! Chat state and run handling behind the server.
 //!
-//! Lock order: `state` before `db`. Neither lock is held across an `.await`.
+//! Lock order: `state` before `db`. Neither lock is held across an `.await`,
+//! nor while git or a setup command runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crew_core::agent::AgentSpec;
+use crew_core::agent::{AgentSpec, PermissionMode};
 use crew_core::claude::{ClaudeInvocation, SessionArg, build_claude};
-use crew_core::event::{Event, RunStatus};
-use crew_core::ids::{AgentId, MessageId, RunId, ThreadId};
+use crew_core::event::{Event, RunStatus, ToolKind};
+use crew_core::ids::{AgentId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
-use crew_core::store::{Author, RunFilter, Store, StoreError};
+use crew_core::slug::slugify;
+use crew_core::store::{Author, RunFilter, Store, StoreError, StoredProject, ThreadWorktree};
+use crew_core::worktree::{self, Diff};
 use crew_proto::{Request, ServerMsg};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
-use crate::runner::{RunHandle, RunOutcome, spawn_run};
+use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 
 /// Capacity of the notification channel.
 const NOTICE_BUFFER: usize = 4096;
 /// Name used for the user's messages in a new session's context.
 const YOU_NAME: &str = "You";
+/// Tool call id of the setup command's events.
+const SETUP_ID: &str = "setup";
 
 /// A notification for subscribers of `thread`.
 ///
@@ -74,6 +79,11 @@ struct Inner {
     state: Mutex<State>,
     tx: broadcast::Sender<Notice>,
     claude_bin: Option<PathBuf>,
+    /// Where thread worktrees go, one folder per project.
+    worktrees: PathBuf,
+    /// Held while a worktree's slug is picked and the worktree made, so
+    /// two threads can't pick the same one.
+    slugs: Mutex<()>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -92,7 +102,13 @@ fn log(msg: impl std::fmt::Display) {
 
 impl Service {
     /// Wraps an open store. `claude_bin` overrides the binary for every run.
-    pub fn new(store: Store, max_runs: usize, claude_bin: Option<PathBuf>) -> Service {
+    /// Thread worktrees are made under `worktrees`.
+    pub fn new(
+        store: Store,
+        max_runs: usize,
+        claude_bin: Option<PathBuf>,
+        worktrees: PathBuf,
+    ) -> Service {
         let (tx, _) = broadcast::channel(NOTICE_BUFFER);
         Service(Arc::new(Inner {
             db: Mutex::new(Db { store, serial: 0 }),
@@ -105,6 +121,8 @@ impl Service {
             }),
             tx,
             claude_bin,
+            worktrees,
+            slugs: Mutex::new(()),
         }))
     }
 
@@ -123,7 +141,17 @@ impl Service {
 
     /// Handles every request except `Hello` and `Subscribe`, which belong
     /// to the connection.
-    pub fn handle(&self, req: Request) -> Reply {
+    pub async fn handle(&self, req: Request) -> Reply {
+        match req {
+            Request::ThreadDiff { thread } => self.thread_diff(thread).await,
+            Request::Commit { thread, message } => self.commit(thread, &message).await,
+            Request::Discard { thread } => self.discard(thread).await,
+            other => self.handle_now(other),
+        }
+    }
+
+    /// Requests that only touch the store or the scheduler.
+    fn handle_now(&self, req: Request) -> Reply {
         match req {
             Request::Hello { .. } | Request::Subscribe { .. } => {
                 Err("This request is handled by the connection.".into())
@@ -180,7 +208,132 @@ impl Service {
                 json(self.db().store.runs(filter).map_err(|e| e.to_string())?)
             }
             Request::ListAgents => json(self.db().store.agents().map_err(|e| e.to_string())?),
+            Request::ListProjects => json(self.db().store.projects().map_err(|e| e.to_string())?),
+            Request::ListChannels { project } => json(
+                self.db()
+                    .store
+                    .channels(project)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Request::ListThreads { channel } => json(
+                self.db()
+                    .store
+                    .threads(channel)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Request::UpdateProject {
+                project,
+                setup_command,
+                copy_files,
+            } => {
+                self.db()
+                    .store
+                    .set_project_setup(project, setup_command.as_deref(), &copy_files)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::ThreadDiff { .. } | Request::Commit { .. } | Request::Discard { .. } => {
+                Err("This request needs git and is handled elsewhere.".into())
+            }
         }
+    }
+
+    /// Uncommitted changes in the thread's worktree, or nothing if it has none.
+    async fn thread_diff(&self, thread: ThreadId) -> Reply {
+        let wt = self
+            .db()
+            .store
+            .thread(thread)
+            .map_err(|e| e.to_string())?
+            .worktree;
+        let Some(wt) = wt else {
+            return json(Diff::default());
+        };
+        json(blocking(move || worktree::diff(&wt.path, "HEAD")).await?)
+    }
+
+    /// Commits everything in the thread's worktree. The worktree stays.
+    async fn commit(&self, thread: ThreadId, message: &str) -> Reply {
+        let message = message.trim().to_string();
+        if message.is_empty() {
+            return Err("Write a commit message.".into());
+        }
+        let wt = self.claim_for_change(thread)?;
+        let result = blocking(move || {
+            if worktree::diff(&wt.path, "HEAD")?.files.is_empty() {
+                return Ok(None);
+            }
+            worktree::commit(&wt.path, &message).map(Some)
+        })
+        .await;
+        self.release_change(thread);
+        match result? {
+            Some(sha) => json(sha),
+            None => Err("Nothing to commit.".into()),
+        }
+    }
+
+    /// Removes the thread's worktree and branch, changes included.
+    async fn discard(&self, thread: ThreadId) -> Reply {
+        let root = self
+            .db()
+            .store
+            .project_of_thread(thread)
+            .map_err(|e| e.to_string())?
+            .root;
+        let wt = self.claim_for_change(thread)?;
+        let path = wt.path.clone();
+        let result = blocking(move || worktree::remove(&root, &wt.path, &wt.branch, true)).await;
+        // A worktree that is gone is cleared even if deleting the branch failed.
+        let cleared = if result.is_ok() || !path.exists() {
+            self.db()
+                .store
+                .set_thread_worktree(thread, None)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        self.release_change(thread);
+        result?;
+        cleared?;
+        Ok(serde_json::Value::Null)
+    }
+
+    /// Holds the thread so no run starts there while its worktree changes.
+    /// Refuses while a run in the thread is live.
+    fn claim_for_change(&self, thread: ThreadId) -> Result<ThreadWorktree, String> {
+        let mut state = self.state();
+        let db = self.db();
+        let live = state
+            .live
+            .iter()
+            .find(|(_, (t, _))| *t == thread)
+            .map(|(run, _)| *run);
+        if let Some(run) = live {
+            let agents = db.store.agents().map_err(|e| e.to_string())?;
+            let agent = db.store.run(run).map_err(|e| e.to_string())?.agent;
+            let name = agents
+                .iter()
+                .find(|(id, _)| *id == agent)
+                .map_or("the agent", |(_, spec)| spec.name.as_str());
+            return Err(format!("Wait for {name} to finish, or stop it."));
+        }
+        let wt = db
+            .store
+            .thread(thread)
+            .map_err(|e| e.to_string())?
+            .worktree
+            .ok_or("This thread has no worktree.")?;
+        if !state.scheduler.claim(thread) {
+            return Err("Another change to this thread's worktree is in progress.".into());
+        }
+        Ok(wt)
+    }
+
+    /// Lets runs start in the thread again.
+    fn release_change(&self, thread: ThreadId) {
+        self.state().scheduler.finished(thread);
+        self.start_ready();
     }
 
     /// Past runs (status and events from seq 0) and all messages of a thread.
@@ -363,37 +516,230 @@ impl Service {
         }
         while let Some(job) = state.scheduler.next_ready() {
             let pending = state.pending.remove(&job.run);
+            // Forget watchers that are done, so the set stays small.
+            while state.watchers.try_join_next().is_some() {}
+            if self.needs_worktree(&job) {
+                self.begin_setup(&mut state, job, pending);
+            } else if let Some(watch) = self.launch(&mut state, job, pending, true) {
+                state.watchers.spawn(watch);
+            }
+        }
+    }
+
+    /// Whether the job's agent may write and the thread has no worktree yet.
+    /// Store errors say no, so `prepare` reports them.
+    fn needs_worktree(&self, job: &Job) -> bool {
+        let db = self.db();
+        let writes = db.store.agents().is_ok_and(|agents| {
+            agents.iter().any(|(id, spec)| {
+                *id == job.agent && spec.permission_mode != PermissionMode::ReadOnly
+            })
+        });
+        writes
+            && db
+                .store
+                .thread(job.thread)
+                .is_ok_and(|t| t.worktree.is_none())
+    }
+
+    /// Marks the run `Working` and makes the thread's worktree in a task of
+    /// its own. The run counts as live, so it can be stopped meanwhile.
+    fn begin_setup(&self, state: &mut State, job: Job, pending: Option<Pending>) {
+        let (handle, stop_rx) = RunHandle::idle();
+        {
             let mut db = self.db();
-            match self.prepare(&mut db, &job, pending) {
-                Ok((name, inv)) => {
-                    drop(db);
-                    let (handle, rx, join) = spawn_run(inv);
-                    state.live.insert(job.run, (job.thread, handle));
-                    // Forget watchers that are done, so the set stays small.
-                    while state.watchers.try_join_next().is_some() {}
-                    let svc = self.clone();
-                    state
-                        .watchers
-                        .spawn(svc.watch(job.thread, job.run, job.agent, name, rx, join));
+            match db.store.set_run_status(job.run, RunStatus::Working) {
+                Ok(()) => self.publish_status(&mut db, job.thread, job.run, RunStatus::Working),
+                Err(e) => log(format!("couldn't mark run {} working: {e}", job.run)),
+            }
+        }
+        state.live.insert(job.run, (job.thread, handle));
+        let svc = self.clone();
+        state
+            .watchers
+            .spawn(svc.set_up_then_run(job, pending, stop_rx));
+    }
+
+    /// Spawns `claude` for a job. Returns the task that watches it, or
+    /// `None` if it couldn't start, in which case the run is marked failed.
+    /// `announce` publishes `Working`, which a run that was set up did already.
+    fn launch(
+        &self,
+        state: &mut State,
+        job: Job,
+        pending: Option<Pending>,
+        announce: bool,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let mut db = self.db();
+        match self.prepare(&mut db, &job, pending, announce) {
+            Ok((name, inv)) => {
+                drop(db);
+                let (handle, rx, join) = spawn_run(inv);
+                state.live.insert(job.run, (job.thread, handle));
+                Some(
+                    self.clone()
+                        .watch(job.thread, job.run, job.agent, name, rx, join),
+                )
+            }
+            Err(e) => {
+                log(format!(
+                    "couldn't start a run in thread {}: {e}",
+                    job.thread
+                ));
+                state.live.remove(&job.run);
+                state.scheduler.finished(job.thread);
+                match db.store.set_run_status(job.run, RunStatus::Failed) {
+                    Ok(()) => self.publish_status(&mut db, job.thread, job.run, RunStatus::Failed),
+                    Err(e) => log(e),
                 }
-                Err(e) => {
-                    log(format!(
-                        "couldn't start a run in thread {}: {e}",
-                        job.thread
-                    ));
-                    state.scheduler.finished(job.thread);
-                    match db.store.set_run_status(job.run, RunStatus::Failed) {
-                        Ok(()) => {
-                            self.publish_status(&mut db, job.thread, job.run, RunStatus::Failed)
-                        }
-                        Err(e) => log(e),
-                    }
-                    let body = format!("Couldn't start the run: {e}");
-                    if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
-                        log(e);
-                    }
+                let body = format!("Couldn't start the run: {e}");
+                if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
+                    log(e);
+                }
+                None
+            }
+        }
+    }
+
+    /// Makes the thread's worktree, then starts `claude` in it unless the
+    /// run was stopped. A failed or stopped setup ends the run.
+    async fn set_up_then_run(
+        self,
+        job: Job,
+        pending: Option<Pending>,
+        stop_rx: watch::Receiver<bool>,
+    ) {
+        let next = match self.set_up_worktree(&job, stop_rx).await {
+            Ok(()) => {
+                let mut state = self.state();
+                let stopped = state
+                    .live
+                    .get(&job.run)
+                    .is_none_or(|(_, handle)| handle.is_stopped());
+                if stopped || state.shutting_down {
+                    Err(RunOutcome::Stopped)
+                } else {
+                    Ok(self.launch(&mut state, job.clone(), pending, false))
                 }
             }
+            Err(outcome) => Err(outcome),
+        };
+        match next {
+            Ok(Some(watch)) => watch.await,
+            Ok(None) => self.start_ready(),
+            Err(outcome) => {
+                let name = self.agent_name(job.agent);
+                if let Err(e) = self.finish(
+                    job.thread,
+                    job.run,
+                    job.agent,
+                    &name,
+                    outcome,
+                    String::new(),
+                ) {
+                    log(format!("couldn't record the end of run {}: {e}", job.run));
+                }
+                self.start_ready();
+            }
+        }
+    }
+
+    fn agent_name(&self, agent: AgentId) -> String {
+        let agents = self.db().store.agents().unwrap_or_default();
+        agents
+            .into_iter()
+            .find(|(id, _)| *id == agent)
+            .map_or_else(|| "The agent".to_string(), |(_, spec)| spec.name)
+    }
+
+    /// Makes the worktree, copies the project's files into it and runs its
+    /// setup command there. The setup command's output becomes run events.
+    async fn set_up_worktree(
+        &self,
+        job: &Job,
+        stop_rx: watch::Receiver<bool>,
+    ) -> Result<(), RunOutcome> {
+        let failed =
+            |what: &str, e: &dyn std::fmt::Display| RunOutcome::Failed(format!("{what}: {e}"));
+        let (project, project_slug, title) = {
+            let db = self.db();
+            let found = db.store.project_of_thread(job.thread).and_then(|project| {
+                let projects = db.store.projects()?;
+                let title = db.store.thread(job.thread)?.title;
+                let slug = project_slug(&projects, project.id);
+                Ok((project, slug, title))
+            });
+            found.map_err(|e| failed("Couldn't make the worktree", &e))?
+        };
+
+        let dir = self.0.worktrees.join(project_slug);
+        let svc = self.clone();
+        let (root, main) = (project.root.clone(), project.main_branch.clone());
+        let wt = blocking(move || {
+            let _held = svc.0.slugs.lock().unwrap_or_else(PoisonError::into_inner);
+            let taken = |slug: &str| {
+                dir.join(slug).exists()
+                    || worktree::branch_exists(&root, &format!("crew/{slug}")).unwrap_or(false)
+            };
+            let slug = slugify(&title, &taken);
+            let path = dir.join(&slug);
+            let branch = format!("crew/{slug}");
+            let base = worktree::create(&root, &main, &path, &branch)?;
+            Ok::<_, worktree::WorktreeError>(ThreadWorktree { path, branch, base })
+        })
+        .await
+        .map_err(|e| failed("Couldn't make the worktree", &e))?;
+        self.db()
+            .store
+            .set_thread_worktree(job.thread, Some(&wt))
+            .map_err(|e| failed("Couldn't save the worktree", &e))?;
+
+        let (root, dest, files) = (project.root.clone(), wt.path.clone(), project.copy_files);
+        let skipped = blocking(move || worktree::copy_files(&root, &dest, &files))
+            .await
+            .map_err(|e| failed("Couldn't copy files into the worktree", &e))?;
+        if !skipped.is_empty() {
+            let body = format!("Skipped missing files: {}.", skipped.join(", "));
+            let mut db = self.db();
+            if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body) {
+                log(e);
+            }
+        }
+
+        let command = project.setup_command.filter(|c| !c.trim().is_empty());
+        let Some(command) = command else {
+            return Ok(());
+        };
+        if *stop_rx.borrow() || stop_rx.has_changed().is_err() {
+            return Err(RunOutcome::Stopped);
+        }
+        self.record_event(
+            job.thread,
+            job.run,
+            Event::ToolCall {
+                id: SETUP_ID.into(),
+                name: "Setup".into(),
+                kind: ToolKind::Run,
+                target: Some(command.clone()),
+                input: serde_json::json!({ "command": command }),
+            },
+        );
+        let (mut lines, join) = spawn_setup(&command, &wt.path, stop_rx);
+        while let Some(output) = lines.recv().await {
+            self.record_event(
+                job.thread,
+                job.run,
+                Event::ToolResult {
+                    id: SETUP_ID.into(),
+                    is_error: false,
+                    output,
+                },
+            );
+        }
+        match join.await {
+            Ok(RunOutcome::Done) => Ok(()),
+            Ok(outcome) => Err(outcome),
+            Err(e) => Err(RunOutcome::Failed(format!("The setup task ended: {e}"))),
         }
     }
 
@@ -404,6 +750,7 @@ impl Service {
         db: &mut Db,
         job: &Job,
         pending: Option<Pending>,
+        announce: bool,
     ) -> Result<(String, ClaudeInvocation), StoreError> {
         let agents = db.store.agents()?;
         let spec = agents
@@ -461,7 +808,9 @@ impl Service {
             }
         };
         db.store.start_run(job.run, &session_id)?;
-        self.publish_status(db, job.thread, job.run, RunStatus::Working);
+        if announce {
+            self.publish_status(db, job.thread, job.run, RunStatus::Working);
+        }
         let mut inv = build_claude(&spec, &prompt, &cwd, session);
         if let Some(bin) = &self.0.claude_bin {
             inv.bin = bin.clone();
@@ -487,20 +836,7 @@ impl Service {
                 Event::Message { text } => texts.push(text.clone()),
                 _ => {}
             }
-            let mut db = self.db();
-            match db.store.append_event(run, &event) {
-                Ok(seq) => self.publish(
-                    &mut db,
-                    thread,
-                    ServerMsg::Event {
-                        thread,
-                        run,
-                        seq,
-                        event,
-                    },
-                ),
-                Err(e) => log(format!("couldn't save an event of run {run}: {e}")),
-            }
+            self.record_event(thread, run, event);
         }
         let outcome = join
             .await
@@ -556,6 +892,24 @@ impl Service {
         Ok(())
     }
 
+    /// Saves a run's event and notifies the thread.
+    fn record_event(&self, thread: ThreadId, run: RunId, event: Event) {
+        let mut db = self.db();
+        match db.store.append_event(run, &event) {
+            Ok(seq) => self.publish(
+                &mut db,
+                thread,
+                ServerMsg::Event {
+                    thread,
+                    run,
+                    seq,
+                    event,
+                },
+            ),
+            Err(e) => log(format!("couldn't save an event of run {run}: {e}")),
+        }
+    }
+
     fn publish_status(&self, db: &mut Db, thread: ThreadId, run: RunId, status: RunStatus) {
         self.publish(
             db,
@@ -597,6 +951,32 @@ impl Service {
             msg,
         });
     }
+}
+
+/// Runs blocking work, such as git, off the async threads.
+async fn blocking<T, E>(f: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, String>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(e) => Err(format!("The task ended: {e}")),
+    }
+}
+
+/// The folder name of a project's worktrees: its name as a slug, with
+/// `-2`, `-3`, ... for projects made later under the same slug.
+fn project_slug(projects: &[StoredProject], id: ProjectId) -> String {
+    let mut taken: Vec<String> = Vec::new();
+    for project in projects {
+        let slug = slugify(&project.name, &|s| taken.iter().any(|t| t == s));
+        if project.id == id {
+            return slug;
+        }
+        taken.push(slug);
+    }
+    slugify("project", &|_| false)
 }
 
 /// Messages an agent hasn't seen since its last run started: those after
