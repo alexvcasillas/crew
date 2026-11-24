@@ -132,6 +132,7 @@ fn table(
     id: &str,
 ) -> AnyElement {
     let weights = column_weights(head, rows);
+    let mins = column_min_widths(head, rows);
     let row = |cells: &[Text], ix: usize, header: bool| {
         let row_id = format!("{id}-row-{ix}");
         div()
@@ -159,7 +160,7 @@ fn table(
                 div()
                     .flex_basis(relative(0.))
                     .flex_grow(weights.get(col).copied().unwrap_or(6.))
-                    .min_w_0()
+                    .min_w(px(mins.get(col).copied().unwrap_or(0.)))
                     .px(px(10.))
                     .py(px(6.))
                     .text_size(px(size))
@@ -203,6 +204,49 @@ fn column_weights(head: &[Text], rows: &[Vec<Text>]) -> Vec<f32> {
                 .max()
                 .unwrap_or(0)
                 .clamp(6, 40) as f32
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod table_width_tests {
+    use super::{Text, column_min_widths};
+
+    #[test]
+    fn a_column_is_never_narrower_than_its_longest_word() {
+        let t = |s: &str| Text {
+            text: s.into(),
+            spans: Vec::new(),
+        };
+        let head = vec![t("Author"), t("Status")];
+        let rows = vec![vec![
+            t("release bot"),
+            t("a-very-long-hyphenated-status-word"),
+        ]];
+        let mins = column_min_widths(&head, &rows);
+        assert_eq!(mins[0], 7.0 * 7.5 + 20.);
+        assert_eq!(mins[1], 14.0 * 7.5 + 20.);
+    }
+}
+
+/// The narrowest each column may get: room for its longest word, so a
+/// narrow table wraps between words instead of inside them. Very long
+/// words (paths, URLs) are capped and may still break.
+fn column_min_widths(head: &[Text], rows: &[Vec<Text>]) -> Vec<f32> {
+    /// Rough width of one character at 13 px, plus the cell's padding.
+    const CHAR: f32 = 7.5;
+    const PADDING: f32 = 20.;
+    const LONGEST_WORD: usize = 14;
+    (0..head.len())
+        .map(|col| {
+            let word = std::iter::once(head)
+                .chain(rows.iter().map(Vec::as_slice))
+                .filter_map(|cells| cells.get(col))
+                .flat_map(|c| c.text.split_whitespace().map(|w| w.chars().count()))
+                .max()
+                .unwrap_or(0)
+                .min(LONGEST_WORD);
+            word as f32 * CHAR + PADDING
         })
         .collect()
 }
