@@ -671,6 +671,11 @@ fn agent_add_checks_budget_and_minutes() {
 
 /// A signed-in `codex` whose app-server lists two models, Luna second.
 fn fake_codex(dir: &Path) -> PathBuf {
+    fake_codex_after(dir, 0.0)
+}
+
+/// Like [`fake_codex`], listing the models only after `delay` seconds.
+fn fake_codex_after(dir: &Path, delay: f64) -> PathBuf {
     let fake = manifest_dir().join("../crew-core/tests/fake/codex_app_server.py");
     let models = dir.join("models.json");
     let steps = serde_json::json!({"steps": [
@@ -678,6 +683,7 @@ fn fake_codex(dir: &Path) -> PathBuf {
         {"respond": "init", "result": {}},
         {"expect": "initialized"},
         {"expect": "model/list", "as": "list"},
+        {"sleep": delay},
         {"respond": "list", "result": {"data": [
             {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol", "hidden": false},
             {"id": "gpt-6-luna", "model": "gpt-6-luna", "displayName": "GPT-6-Luna", "hidden": false}
@@ -755,4 +761,29 @@ fn agent_add_makes_codex_agents_on_the_default_model() {
     assert_eq!(spec("Kit").model, "gpt-6.1-sol");
     assert_eq!(spec("Kit").permission_mode, PermissionMode::EditFiles);
     assert!(agents.iter().all(|a| a.spec.name != "Quill"));
+}
+
+/// crewd answers a slow check with what it found on `PATH`, then sends
+/// the rest; `agent add` waits for it.
+#[test]
+fn agent_add_waits_for_a_slow_codex_model_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // Well past crewd's one second quick answer.
+    start_crewd_with(
+        &home,
+        replay_script(tmp.path()),
+        Some(fake_codex_after(tmp.path(), 2.5)),
+    );
+    let out = stdout_of(crew(&home, tmp.path()).args([
+        "agent",
+        "add",
+        "Nova",
+        "--runtime",
+        "codex",
+        "--role",
+        "Builds",
+    ]));
+    assert!(out.contains("Nova uses gpt-6-luna (GPT-6-Luna)."), "{out}");
 }
