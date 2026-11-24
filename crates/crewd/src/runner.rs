@@ -17,7 +17,7 @@ use nix::unistd::Pid;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::net::unix::pipe;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Shown when the `claude` binary can't be found.
@@ -27,6 +27,10 @@ pub const MISSING_CLAUDE: &str = "Couldn't start `claude`. Is Claude Code instal
 const TERM_AFTER: Duration = Duration::from_secs(3);
 /// Time between SIGTERM and SIGKILL when stopping.
 const KILL_AFTER: Duration = Duration::from_secs(5);
+/// How long `claude` may take to exit by itself once its turn has ended.
+/// Something it started in the background can keep it alive for much
+/// longer, so after this it is ended like a stop.
+const TURN_EXIT_WAIT: Duration = Duration::from_secs(3);
 /// How many output lines a failure keeps.
 pub(crate) const STDERR_TAIL: usize = 20;
 /// Capacity of the event channel.
@@ -247,11 +251,13 @@ pub fn spawn_run(
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let turn_ok = Arc::new(AtomicBool::new(false));
+    let turn_ended = Arc::new(Notify::new());
     let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
     let readers = Readers {
-        stdout: tokio::spawn(read_events(stdout, tx, turn_ok.clone())),
+        stdout: tokio::spawn(read_events(stdout, tx, turn_ok.clone(), turn_ended.clone())),
         stderr: tokio::spawn(read_tail(stderr, tail.clone())),
         turn_ok,
+        turn_ended,
         tail,
     };
     let join = tokio::spawn(supervise(child, pid, stop_rx, readers));
@@ -268,13 +274,16 @@ pub fn spawn_run(
 struct Readers {
     /// Whether the last `TurnEnd` seen was good.
     turn_ok: Arc<AtomicBool>,
+    /// Notified once a `TurnEnd` has been read.
+    turn_ended: Arc<Notify>,
     /// The last stderr lines.
     tail: Arc<Mutex<VecDeque<String>>>,
     stdout: JoinHandle<()>,
     stderr: JoinHandle<()>,
 }
 
-/// Parses stdout into events and records each `TurnEnd` in `turn_ok`.
+/// Parses stdout into events, records each `TurnEnd` in `turn_ok` and
+/// notifies `turn_ended`.
 ///
 /// Keeps reading to the end even if the receiver is gone, so the child
 /// never blocks on a full pipe.
@@ -282,6 +291,7 @@ async fn read_events(
     stdout: impl AsyncRead + Unpin,
     tx: mpsc::Sender<Event>,
     turn_ok: Arc<AtomicBool>,
+    turn_ended: Arc<Notify>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut parser = StreamParser::new();
@@ -290,6 +300,7 @@ async fn read_events(
         for event in parser.parse(&line) {
             if let Event::TurnEnd { ok, .. } = &event {
                 turn_ok.store(*ok, Ordering::SeqCst);
+                turn_ended.notify_one();
             }
             if receiver_alive && tx.send(event).await.is_err() {
                 receiver_alive = false;
@@ -323,6 +334,14 @@ async fn next_line(reader: &mut (impl AsyncBufRead + Unpin)) -> Option<String> {
     }
 }
 
+/// What ended the wait on a run's process.
+enum Exit {
+    Exited(std::io::Result<ExitStatus>),
+    Stop,
+    /// The turn ended but the process is still running.
+    Lingered,
+}
+
 async fn supervise(
     mut child: Child,
     pid: Option<u32>,
@@ -331,23 +350,45 @@ async fn supervise(
 ) -> RunOutcome {
     let pgid = pid.map(|p| Pid::from_raw(p as i32));
 
-    let exited = tokio::select! {
-        status = child.wait() => Some(status),
-        stop = stop_rx.wait_for(|stop| *stop) => match stop {
-            Ok(_) => None,
-            // The handle was dropped: stop the run so it can't outlive its owner.
-            Err(_) => None,
-        },
+    let turn_ended = readers.turn_ended.clone();
+    let mut exited = tokio::select! {
+        status = child.wait() => Exit::Exited(status),
+        // A stop, or the handle being dropped: stop the run so it can't
+        // outlive its owner.
+        _ = stop_rx.wait_for(|stop| *stop) => Exit::Stop,
+        _ = turn_ended.notified() => Exit::Lingered,
     };
+    if matches!(exited, Exit::Lingered) {
+        // The answer is in. Give the process a moment to exit by itself.
+        exited = tokio::select! {
+            status = child.wait() => Exit::Exited(status),
+            _ = stop_rx.wait_for(|stop| *stop) => Exit::Stop,
+            _ = tokio::time::sleep(TURN_EXIT_WAIT) => Exit::Lingered,
+        };
+    }
 
     let status = match exited {
-        Some(status) => status,
-        None => {
+        Exit::Exited(status) => status,
+        Exit::Stop => {
             escalate(&mut child, pgid).await;
             signal_group(pgid, Signal::SIGKILL);
             // Ends the readers, which closes the event channel.
             finish_readers(readers).await;
             return RunOutcome::Stopped;
+        }
+        Exit::Lingered => {
+            // Something it started keeps it alive. End the whole group,
+            // and let the turn decide how the run went.
+            escalate(&mut child, pgid).await;
+            signal_group(pgid, Signal::SIGKILL);
+            let (turn_ok, tail) = finish_readers(readers).await;
+            return if turn_ok {
+                RunOutcome::Done
+            } else if tail.is_empty() {
+                RunOutcome::Failed("`claude` ended the turn without finishing it.".to_string())
+            } else {
+                RunOutcome::Failed(Vec::from(tail).join("\n"))
+            };
         }
     };
 
