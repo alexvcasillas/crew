@@ -8,9 +8,24 @@ const MAX_OUTPUT_BYTES: usize = 8192;
 /// What the auto mode safety check's refusal says in its tool result.
 pub const CLASSIFIER_DENIAL: &str = "denied by the Claude Code auto mode classifier";
 
+/// How the safety check's refusal starts.
+const CLASSIFIER_SENTENCE: &str =
+    "Permission for this action has been denied by the Claude Code auto mode classifier";
+
 /// The category in a safety check refusal (`Reason: [<Category>]`), or
-/// empty if the text has none. `None` if `text` isn't such a refusal.
+/// empty if the text has none. `None` if `text` isn't such a refusal: it
+/// must start with the refusal's sentence, so a command whose output
+/// merely quotes it is not one.
 pub fn classifier_reason(text: &str) -> Option<String> {
+    if !text.trim_start().starts_with(CLASSIFIER_SENTENCE) {
+        return None;
+    }
+    Some(bracketed_reason(text).unwrap_or_default())
+}
+
+/// Like [`classifier_reason`], with the sentence anywhere in `text`. Only
+/// for text Claude Code itself says is a denial.
+fn quoted_classifier_reason(text: &str) -> Option<String> {
     if !text.contains(CLASSIFIER_DENIAL) {
         return None;
     }
@@ -29,7 +44,7 @@ fn line_reason(v: &Value) -> Option<String> {
         let Some(text) = v.get(key).and_then(Value::as_str) else {
             continue;
         };
-        if let Some(reason) = classifier_reason(text) {
+        if let Some(reason) = quoted_classifier_reason(text) {
             return Some(reason);
         }
         if let Some(reason) = bracketed_reason(text) {
@@ -55,6 +70,10 @@ pub struct StreamParser {
     calls: HashMap<String, (String, Value)>,
     /// Denials by tool use id that wait for their tool result.
     held: Vec<(String, String, Value)>,
+    /// Failed results that quote the safety check's refusal without
+    /// starting with it, by tool use id, with the reason they give. One
+    /// is a refusal only if the result's denial list names it too.
+    quoted: HashMap<String, String>,
 }
 
 impl StreamParser {
@@ -135,7 +154,11 @@ impl StreamParser {
                     })
                     .collect();
                 let parser = &*self;
-                events.extend(parse_result(&v, |key| parser.reported(key)));
+                events.extend(parse_result(
+                    &v,
+                    |key| parser.reported(key),
+                    |id| id.and_then(|id| parser.quoted.get(id).cloned()),
+                ));
                 events
             }
             _ => parse_line(line),
@@ -145,15 +168,24 @@ impl StreamParser {
     /// The denial a tool result reports: one held for its call, or a
     /// refusal by the safety check. Nothing if it was reported already.
     fn denial_for_result(&mut self, id: &str, is_error: bool, output: &str) -> Option<Event> {
-        let reason = is_error.then(|| classifier_reason(output)).flatten();
         let held = self.held.iter().position(|(held, ..)| held == id);
+        // A denial line for the call vouches for a refusal quoted anywhere.
+        let reason = match held {
+            Some(_) => is_error.then(|| quoted_classifier_reason(output)).flatten(),
+            None => is_error.then(|| classifier_reason(output)).flatten(),
+        };
         let (tool, input) = match held {
             Some(at) => {
                 let (_, tool, input) = self.held.remove(at);
                 (tool, input)
             }
             None if reason.is_some() => self.calls.get(id).cloned()?,
-            None => return None,
+            None => {
+                if let Some(quoted) = is_error.then(|| quoted_classifier_reason(output)).flatten() {
+                    self.quoted.insert(id.to_string(), quoted);
+                }
+                return None;
+            }
         };
         let key = (Some(id.to_string()), tool.clone(), input.clone());
         if self.reported(&key) {
@@ -202,7 +234,7 @@ pub fn parse_line(line: &str) -> Vec<Event> {
         "rate_limit_event" => vec![],
         "assistant" => blocks(&v).iter().filter_map(assistant_block).collect(),
         "user" => blocks(&v).iter().filter_map(tool_result).collect(),
-        "result" => parse_result(&v, |_| false),
+        "result" => parse_result(&v, |_| false, |_| None),
         _ => raw(),
     }
 }
@@ -290,7 +322,13 @@ fn denial_key(v: &Value) -> (Option<String>, String, Value) {
 }
 
 /// Events for a `result` line, skipping denials `seen` says were reported.
-fn parse_result(v: &Value, seen: impl Fn(&(Option<String>, String, Value)) -> bool) -> Vec<Event> {
+/// `reason_of` gives the safety check's reason for a denial by tool use
+/// id, if its result quoted one.
+fn parse_result(
+    v: &Value,
+    seen: impl Fn(&(Option<String>, String, Value)) -> bool,
+    reason_of: impl Fn(Option<&str>) -> Option<String>,
+) -> Vec<Event> {
     let mut events: Vec<Event> = v
         .get("permission_denials")
         .and_then(Value::as_array)
@@ -298,10 +336,10 @@ fn parse_result(v: &Value, seen: impl Fn(&(Option<String>, String, Value)) -> bo
             d.iter()
                 .map(denial_key)
                 .filter(|key| !seen(key))
-                .map(|(_, tool, input)| Event::PermissionDenied {
+                .map(|(id, tool, input)| Event::PermissionDenied {
                     tool,
                     input,
-                    reason: None,
+                    reason: reason_of(id.as_deref()),
                 })
                 .collect()
         })

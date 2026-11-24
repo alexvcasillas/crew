@@ -1472,8 +1472,10 @@ impl Service {
                 _ => None,
             };
             self.record_event(thread, run, event);
-            if let Some((tool, input, reason)) = denied {
-                self.note_blocked(run, &tool, input, reason.unwrap_or_default());
+            // Only a refusal by the safety check, with its reason, is put to
+            // you. Any other denial is just a call that wasn't allowed.
+            if let Some((tool, input, Some(reason))) = denied {
+                self.note_blocked(run, &tool, input, reason);
             }
         }
         let outcome = join

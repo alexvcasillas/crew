@@ -25,7 +25,9 @@ const RETRY: &str = "The safety check stopped `rm -rf build`. The user allowed i
 /// A fake claude. It logs its arguments to `args.log` (each argument ends
 /// with byte 0x1e, each call with 0x1f). A prompt with `BLOCK` in it first
 /// tries `rm -rf build`, which the safety check refuses; with `COMMA` in
-/// it too, `git log --format=%h,%s` instead. One that ends
+/// it too, `git log --format=%h,%s` instead. With `DENY` a call is denied
+/// without a reason; with `QUOTE` a failed command's output quotes the
+/// refusal. One that ends
 /// with `WAIT` then waits until the file `go` exists.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude-fake.sh");
@@ -45,6 +47,13 @@ case "$last" in
     denials='{{"tool_name":"Bash","tool_input":{{"command":"'"$cmd"'"}},"tool_use_id":"toolu_01"}}'
     printf '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_01","name":"Bash","input":{{"command":"%s"}}}}]}}}}\n' "$cmd"
     printf '{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_01","is_error":true,"content":"Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions] Find another way."}}]}}}}\n'
+    ;;
+  *DENY*)
+    denials='{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"tool_use_id":"toolu_02"}}'
+    ;;
+  *QUOTE*)
+    printf '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_03","name":"Bash","input":{{"command":"cat notes.txt; false"}}}}]}}}}\n'
+    printf '{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_03","is_error":true,"content":"notes: Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions]"}}]}}}}\n'
     ;;
 esac
 case "$last" in
@@ -567,4 +576,37 @@ async fn a_stopped_call_is_stale_after_a_day() {
     let decided = until_decided(&mut c, approval.id).await;
     assert_eq!(decided.status, ApprovalStatus::Cancelled);
     assert_eq!(c.runs(thread).await.len(), 1, "nothing else ran");
+}
+
+#[tokio::test]
+async fn only_a_real_safety_check_refusal_makes_a_card() {
+    let d = Daemon::start().await;
+    let mut c = d.client().await;
+    let thread = setup(&d, &mut c).await;
+
+    let mut seen: Vec<RunId> = Vec::new();
+    for body in ["@Forge list DENY", "@Forge read QUOTE"] {
+        c.call(Request::PostMessage {
+            thread,
+            body: body.into(),
+        })
+        .await
+        .unwrap();
+        let run = c
+            .runs(thread)
+            .await
+            .into_iter()
+            .map(|r| r.id)
+            .find(|id| !seen.contains(id))
+            .unwrap();
+        c.until_done(run).await;
+        seen.push(run);
+        let all: Vec<StoredApproval> = c
+            .ok(Request::ListApprovals {
+                thread: Some(thread),
+            })
+            .await;
+        assert!(all.is_empty(), "{body}: {all:?}");
+    }
+    assert_eq!(logged_calls(d.dir()).len(), 2);
 }
