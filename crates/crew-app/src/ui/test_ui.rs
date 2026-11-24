@@ -179,6 +179,19 @@ pub fn click(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<Ele
     cx.run_until_parked();
 }
 
+/// Clicks each element in turn, redrawing between clicks but taking in
+/// nothing from crewd, as a quick hand would before any answer is back.
+pub fn click_quickly(cx: &mut TestAppContext, window: AnyWindowHandle, ids: &[ElementId]) {
+    cx.update_window(window, |_, window, cx| {
+        for id in ids {
+            window.render_frame(cx);
+            window.click(id.clone(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 /// Types `text` into whatever has focus.
 pub fn type_text(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
     cx.update_window(window, |_, window, cx| window.input(text, cx))

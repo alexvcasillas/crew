@@ -32,7 +32,7 @@ use crate::app::{
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
-use crate::model::State;
+use crate::model::{Handoff, State};
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
@@ -703,6 +703,63 @@ impl Workspace {
         self.spawn_request(window, cx, async move |_, _| {
             answer.await.map(drop).map_err(|e| (e, None))
         });
+    }
+
+    /// Sends the channel's whole handoff setting. It shows at once and
+    /// stays until crewd reports it, so quick clicks build on each other.
+    pub(super) fn send_channel_handoff(
+        &mut self,
+        channel: ChannelId,
+        (policy, budget): Handoff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.expect_channel_handoff(channel, (policy, budget));
+        let answer = self.client.request(Request::SetChannelHandoff {
+            channel,
+            policy,
+            budget,
+        });
+        self.spawn_request(window, cx, async move |this, cx| {
+            let result = answer.await.map(drop);
+            if result.is_err() {
+                this.update(cx, |this, cx| {
+                    this.state.drop_channel_handoff(channel);
+                    cx.notify();
+                })
+                .ok();
+            }
+            result.map_err(|e| (e, None))
+        });
+        cx.notify();
+    }
+
+    /// Sends the thread's whole handoff setting, as for channels.
+    pub(super) fn send_thread_handoff(
+        &mut self,
+        thread: ThreadId,
+        (policy, budget): Handoff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.expect_thread_handoff(thread, (policy, budget));
+        let answer = self.client.request(Request::SetThreadHandoff {
+            thread,
+            policy,
+            budget,
+        });
+        self.spawn_request(window, cx, async move |this, cx| {
+            let result = answer.await.map(drop);
+            if result.is_err() {
+                this.update(cx, |this, cx| {
+                    this.state.drop_thread_handoff(thread);
+                    cx.notify();
+                })
+                .ok();
+            }
+            result.map_err(|e| (e, None))
+        });
+        cx.notify();
     }
 
     /// Runs `work`, keeping its task until it ends. An error is shown,

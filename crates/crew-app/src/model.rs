@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use crew_core::agent::PermissionMode;
 use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
     StoredProject, StoredRun, StoredThread,
@@ -92,7 +93,13 @@ pub struct State {
     approvals: HashMap<ApprovalId, StoredApproval>,
     /// One log per watched thread.
     logs: HashMap<ThreadId, EventLog>,
+    /// Handoff settings sent to crewd and not yet reported back.
+    sent_channel_handoffs: HashMap<ChannelId, Handoff>,
+    sent_thread_handoffs: HashMap<ThreadId, Handoff>,
 }
+
+/// A handoff policy and budget, `None` for "fall back".
+pub type Handoff = (Option<HandoffPolicy>, Option<u32>);
 
 impl State {
     pub fn connection(&self) -> Option<&ConnectionState> {
@@ -119,9 +126,17 @@ impl State {
                 self.projects.insert(project.id, project);
             }
             ServerMsg::ChannelChanged { channel } => {
+                let reported = (channel.handoff_policy, channel.handoff_budget);
+                if self.sent_channel_handoffs.get(&channel.id) == Some(&reported) {
+                    self.sent_channel_handoffs.remove(&channel.id);
+                }
                 self.channels.insert(channel.id, channel);
             }
             ServerMsg::ThreadCreated { thread, .. } | ServerMsg::ThreadChanged { thread } => {
+                let reported = (thread.handoff_policy, thread.handoff_budget);
+                if self.sent_thread_handoffs.get(&thread.id) == Some(&reported) {
+                    self.sent_thread_handoffs.remove(&thread.id);
+                }
                 self.threads.insert(thread.id, thread);
             }
             ServerMsg::AgentChanged { agent } => {
@@ -169,6 +184,18 @@ impl State {
         for log in self.logs.values_mut() {
             *log = EventLog::default();
         }
+        let channels = &self.channels;
+        self.sent_channel_handoffs.retain(|id, sent| {
+            channels
+                .get(id)
+                .is_some_and(|c| (c.handoff_policy, c.handoff_budget) != *sent)
+        });
+        let threads = &self.threads;
+        self.sent_thread_handoffs.retain(|id, sent| {
+            threads
+                .get(id)
+                .is_some_and(|t| (t.handoff_policy, t.handoff_budget) != *sent)
+        });
     }
 
     /// Keeps the run as sent, unless a further-along copy is known.
@@ -251,6 +278,51 @@ impl State {
 
     pub fn thread(&self, thread: ThreadId) -> Option<&StoredThread> {
         self.threads.get(&thread)
+    }
+
+    /// The channel's own handoff setting: the last one sent, until crewd
+    /// reports it, else crewd's.
+    pub fn channel_handoff(&self, channel: ChannelId) -> Handoff {
+        self.sent_channel_handoffs
+            .get(&channel)
+            .copied()
+            .unwrap_or_else(|| {
+                self.channels
+                    .get(&channel)
+                    .map_or((None, None), |c| (c.handoff_policy, c.handoff_budget))
+            })
+    }
+
+    /// The thread's own handoff setting, as for [`Self::channel_handoff`].
+    pub fn thread_handoff(&self, thread: ThreadId) -> Handoff {
+        self.sent_thread_handoffs
+            .get(&thread)
+            .copied()
+            .unwrap_or_else(|| {
+                self.threads
+                    .get(&thread)
+                    .map_or((None, None), |t| (t.handoff_policy, t.handoff_budget))
+            })
+    }
+
+    /// Notes a channel handoff setting just sent to crewd.
+    pub fn expect_channel_handoff(&mut self, channel: ChannelId, handoff: Handoff) {
+        self.sent_channel_handoffs.insert(channel, handoff);
+    }
+
+    /// Notes a thread handoff setting just sent to crewd.
+    pub fn expect_thread_handoff(&mut self, thread: ThreadId, handoff: Handoff) {
+        self.sent_thread_handoffs.insert(thread, handoff);
+    }
+
+    /// Goes back to crewd's channel setting, as when sending failed.
+    pub fn drop_channel_handoff(&mut self, channel: ChannelId) {
+        self.sent_channel_handoffs.remove(&channel);
+    }
+
+    /// Goes back to crewd's thread setting, as when sending failed.
+    pub fn drop_thread_handoff(&mut self, thread: ThreadId) {
+        self.sent_thread_handoffs.remove(&thread);
     }
 
     /// Any agent, deleted ones included, so old messages can name them.
@@ -1194,5 +1266,45 @@ mod tests {
         assert_eq!(ids(&theirs.finished), [done.id]);
         assert_eq!(state.thread_project(t.id), Some(p.id));
         assert_eq!(state.thread_project(other_t.id), Some(other_p.id));
+    }
+
+    #[test]
+    fn a_sent_handoff_setting_shows_until_crewd_reports_it() {
+        use crew_core::policy::HandoffPolicy::{AskFirst, Budget};
+        let (mut state, _, c, t) = one_thread();
+        assert_eq!(state.channel_handoff(c.id), (None, None));
+        state.expect_channel_handoff(c.id, (Some(Budget), Some(5)));
+        assert_eq!(state.channel_handoff(c.id), (Some(Budget), Some(5)));
+        // An earlier click comes back first: the newer setting still shows.
+        let mut seen = c.clone();
+        seen.handoff_policy = Some(Budget);
+        seen.handoff_budget = Some(4);
+        state.apply(ServerMsg::ChannelChanged {
+            channel: seen.clone(),
+        });
+        assert_eq!(state.channel_handoff(c.id), (Some(Budget), Some(5)));
+        seen.handoff_budget = Some(5);
+        state.apply(ServerMsg::ChannelChanged { channel: seen });
+        assert_eq!(state.channel_handoff(c.id), (Some(Budget), Some(5)));
+        // Now crewd's copy is what shows, so a later change from elsewhere does too.
+        let mut other = c.clone();
+        other.handoff_policy = Some(AskFirst);
+        state.apply(ServerMsg::ChannelChanged { channel: other });
+        assert_eq!(state.channel_handoff(c.id), (Some(AskFirst), None));
+
+        state.expect_thread_handoff(t.id, (Some(Budget), Some(2)));
+        assert_eq!(state.thread_handoff(t.id), (Some(Budget), Some(2)));
+        // A failed request goes back to crewd's copy.
+        state.drop_thread_handoff(t.id);
+        assert_eq!(state.thread_handoff(t.id), (None, None));
+        state.expect_thread_handoff(t.id, (Some(Budget), Some(2)));
+        let mut done = t.clone();
+        done.handoff_policy = Some(Budget);
+        done.handoff_budget = Some(2);
+        state.apply(ServerMsg::ThreadChanged { thread: done });
+        let mut later = t.clone();
+        later.handoff_budget = Some(9);
+        state.apply(ServerMsg::ThreadChanged { thread: later });
+        assert_eq!(state.thread_handoff(t.id), (None, Some(9)));
     }
 }

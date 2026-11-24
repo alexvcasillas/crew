@@ -113,23 +113,38 @@ impl Workspace {
             .collect()
     }
 
-    pub(super) fn set_policy(
+    /// The thread's policy and budget as they apply, counting settings
+    /// sent but not yet reported back.
+    fn shown_handoff(&self, thread: ThreadId) -> Option<(HandoffPolicy, u32)> {
+        let state = self.state();
+        let t = state.thread(thread)?;
+        let (handoff_policy, handoff_budget) = state.thread_handoff(thread);
+        let shown = StoredThread {
+            handoff_policy,
+            handoff_budget,
+            ..t.clone()
+        };
+        Some(effective(&shown, state.channel_handoff(t.channel)))
+    }
+
+    /// Moves the thread's budget one step, from where it is when clicked.
+    fn step_budget(
         &mut self,
         thread: ThreadId,
-        policy: Option<HandoffPolicy>,
-        budget: Option<u32>,
+        up: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.request(
-            Request::SetThreadHandoff {
-                thread,
-                policy,
-                budget,
-            },
-            window,
-            cx,
-        );
+        let Some((_, budget)) = self.shown_handoff(thread) else {
+            return;
+        };
+        let next = if up {
+            (budget + 1).min(99)
+        } else {
+            budget.saturating_sub(1)
+        };
+        let (policy, _) = self.state().thread_handoff(thread);
+        self.send_thread_handoff(thread, (policy, Some(next)), window, cx);
     }
 
     pub(super) fn render_thread_tab(
@@ -141,12 +156,12 @@ impl Workspace {
         let Some(t) = state.thread(thread) else {
             return div().into_any_element();
         };
-        let channel = state.channel(t.channel);
-        let channel_layer = channel.map_or((None, None), |c| (c.handoff_policy, c.handoff_budget));
+        let channel_layer = state.channel_handoff(t.channel);
         let channel_default = policy_name(channel_layer.0.unwrap_or(HandoffPolicy::AskFirst));
-        let (policy, budget) = effective(t, channel_layer);
+        let (policy, budget) = self
+            .shown_handoff(thread)
+            .unwrap_or_else(|| effective(t, channel_layer));
         let used = t.handoffs_used;
-        let own_policy = t.handoff_policy;
         let participants = self.participants(thread);
         let limits: Vec<String> = participants
             .iter()
@@ -190,19 +205,17 @@ impl Workspace {
                     })
                     .child(*name)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        let budget = this.state().thread(thread).and_then(|t| t.handoff_budget);
-                        this.set_policy(thread, Some(p), budget, window, cx);
+                        let (_, budget) = this.state().thread_handoff(thread);
+                        this.send_thread_handoff(thread, (Some(p), budget), window, cx);
                     }))
                     .test_support()
             })
             .collect();
         let down = cx.listener(move |this, _, window, cx| {
-            let next = budget.saturating_sub(1);
-            this.set_policy(thread, own_policy, Some(next), window, cx);
+            this.step_budget(thread, false, window, cx);
         });
         let up = cx.listener(move |this, _, window, cx| {
-            let next = (budget + 1).min(99);
-            this.set_policy(thread, own_policy, Some(next), window, cx);
+            this.step_budget(thread, true, window, cx);
         });
         let fill = if budget == 0 {
             1.
