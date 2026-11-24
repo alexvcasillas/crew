@@ -931,6 +931,39 @@ fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
         other.latest().is_some_and(|l| l.max_runs == 2)
     });
 
+    // A pause from another app while the menu is open stays when you
+    // pick from it.
+    click(cx, window, "limits-max-runs");
+    assert!(has(cx, window, "popup-menu"));
+    let paused = crew_proto::Limits {
+        max_runs: 2,
+        paused: true,
+        ..Default::default()
+    };
+    let _: serde_json::Value = w.ask(Request::SetLimits { limits: paused });
+    wait_until(cx, "the other pause", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().limits().paused)
+    });
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(2usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    wait_until(cx, "crewd to keep 3 and the pause", |_| {
+        other.latest().is_some_and(|l| l.max_runs == 3 && l.paused)
+    });
+    let _: serde_json::Value = w.ask(Request::SetLimits {
+        limits: crew_proto::Limits {
+            max_runs: 2,
+            ..Default::default()
+        },
+    });
+    wait_until(cx, "the unpause", |cx| {
+        ws.read_with(cx, |ws, _| !ws.state().limits().paused)
+    });
+
     click(cx, window, "limits-runs-paused");
     assert!(shows(cx, window, "Paused (selected)"));
     wait_until(cx, "crewd to pause", |_| {

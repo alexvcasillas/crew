@@ -73,7 +73,11 @@ impl Workspace {
                     let (this, n) = (this.clone(), *n);
                     menu.item(
                         PopupMenuItem::new(n.to_string()).on_click(move |_, window, cx| {
+                            // Built on what is known when picked, not
+                            // when the menu was drawn, so a change from
+                            // another app since then stays.
                             this.update(cx, |this, cx| {
+                                let limits = *this.state().limits();
                                 this.set_limits(
                                     Limits {
                                         max_runs: n,
@@ -103,7 +107,11 @@ impl Workspace {
                     let (this, n) = (this.clone(), *n);
                     menu.item(
                         PopupMenuItem::new(n.to_string()).on_click(move |_, window, cx| {
+                            // Built on what is known when picked, not
+                            // when the menu was drawn, so a change from
+                            // another app since then stays.
                             this.update(cx, |this, cx| {
+                                let limits = *this.state().limits();
                                 this.set_limits(
                                     Limits {
                                         handoff_budget: n,
