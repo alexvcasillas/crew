@@ -65,6 +65,8 @@ mod terminal_tests;
 mod test_ui;
 #[cfg(test)]
 mod thread_tests;
+#[cfg(test)]
+mod threads_sidebar_tests;
 
 pub use crate::app::run;
 

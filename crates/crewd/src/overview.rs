@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{ChannelId, ThreadId};
+use crew_core::ids::{ChannelId, ProjectId, ThreadId};
 use crew_core::project_kind::{ProjectKind, WorkMode};
 use crew_core::store::{StoredRun, StoredThread, ThreadActivity, ThreadWorktree};
 use crew_core::text::clean_line;
@@ -292,6 +292,53 @@ impl Service {
             &counting,
             now_ms(),
         ))
+    }
+
+    /// Answers `ThreadSummaries`: the summaries of every thread that
+    /// isn't archived, in `project` or in every project, from all their
+    /// channels' overviews at once.
+    pub(crate) async fn thread_summaries(&self, project: Option<ProjectId>) -> Reply {
+        let (channels, archived) = self
+            .with_reader(|store| {
+                // Removed projects are left out.
+                let projects = store.projects()?;
+                let mut channels = Vec::new();
+                let mut archived = HashSet::new();
+                for p in projects
+                    .iter()
+                    .filter(|p| project.is_none_or(|id| id == p.id))
+                {
+                    for c in store.channels(p.id)? {
+                        archived.extend(
+                            store
+                                .threads(c.id)?
+                                .into_iter()
+                                .filter(|t| t.archived_at.is_some())
+                                .map(|t| t.id),
+                        );
+                        channels.push(c.id);
+                    }
+                }
+                Ok::<_, crew_core::store::StoreError>((channels, archived))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut jobs = tokio::task::JoinSet::new();
+        for (i, channel) in channels.into_iter().enumerate() {
+            let svc = self.clone();
+            jobs.spawn(async move { (i, svc.channel_overview_data(channel).await) });
+        }
+        let mut overviews = Vec::new();
+        while let Some(done) = jobs.join_next().await {
+            let (i, overview) = done.map_err(|e| format!("The overview task ended: {e}"))?;
+            overviews.push((i, overview?));
+        }
+        overviews.sort_by_key(|(i, _)| *i);
+        let summaries: Vec<ThreadSummary> = overviews
+            .into_iter()
+            .flat_map(|(_, o)| o.threads)
+            .filter(|t| !archived.contains(&t.thread))
+            .collect();
+        json(summaries)
     }
 
     /// Sends `ChannelOverviewStale` once none of `threads` is being

@@ -1,5 +1,5 @@
 //! The sidebar's bar: the filter field and its keys, the filter menu,
-//! Add project, New thread and the switch to the threads sidebar.
+//! Add project, New thread and the switch between the two sidebars.
 
 use crew_core::ids::{ChannelId, ProjectId};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 use super::super::palette::match_range;
 use super::super::workspace::{Place, Workspace};
-use crate::prefs::{ShowProjects, SortProjects};
+use crate::prefs::{ShowProjects, SidebarMode, SortProjects};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 
@@ -30,15 +30,29 @@ actions!(
     ]
 );
 
-/// Bindings that beat the filter field's own, and the menu's.
+/// Bindings that beat the filter and search fields' own, and the
+/// menus'.
 pub(crate) fn bindings() -> Vec<KeyBinding> {
+    use super::switcher::{SwitcherClose, SwitcherDown, SwitcherPick, SwitcherUp};
+    use super::threads::{ThreadsClear, ThreadsDown, ThreadsOpen, ThreadsUp};
     let field = Some("SidebarFilter > Input");
+    let search = Some("ThreadsSearch > Input");
+    let find = Some("ProjectSwitcher > Input");
     vec![
         KeyBinding::new("down", SidebarDown, field),
         KeyBinding::new("up", SidebarUp, field),
         KeyBinding::new("enter", SidebarOpen, field),
         KeyBinding::new("escape", SidebarClear, field),
         KeyBinding::new("escape", SidebarMenuClose, Some("SidebarMenu")),
+        KeyBinding::new("down", ThreadsDown, search),
+        KeyBinding::new("up", ThreadsUp, search),
+        KeyBinding::new("enter", ThreadsOpen, search),
+        KeyBinding::new("escape", ThreadsClear, search),
+        KeyBinding::new("down", SwitcherDown, find),
+        KeyBinding::new("up", SwitcherUp, find),
+        KeyBinding::new("enter", SwitcherPick, find),
+        KeyBinding::new("escape", SwitcherClose, find),
+        KeyBinding::new("escape", SwitcherClose, Some("ProjectSwitcher")),
     ]
 }
 
@@ -76,23 +90,20 @@ pub(crate) fn filter_hits(
 }
 
 /// The filter icon, from the board.
-const FUNNEL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M2 3.5h12L9.5 9v4l-3 1.5V9z"/></svg>"#;
+pub(super) const FUNNEL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M2 3.5h12L9.5 9v4l-3 1.5V9z"/></svg>"#;
 /// Add project: a folder with a plus.
-const FOLDER_PLUS_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 3.5h4.5l1.5 1.5h7v8.5h-13z"/><path d="M8 7.5v4M6 9.5h4" stroke-linecap="round"/></svg>"#;
+pub(super) const FOLDER_PLUS_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1.5 3.5h4.5l1.5 1.5h7v8.5h-13z"/><path d="M8 7.5v4M6 9.5h4" stroke-linecap="round"/></svg>"#;
 /// New thread: a pencil on a page.
-const COMPOSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M13.5 9v4.5h-11v-11H7"/><path d="M11.5 1.8l2.7 2.7-6 6H5.5V7.8z"/></svg>"#;
+pub(super) const COMPOSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M13.5 9v4.5h-11v-11H7"/><path d="M11.5 1.8l2.7 2.7-6 6H5.5V7.8z"/></svg>"#;
 /// Show threads: a list.
 const LIST_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 4h.5M2 8h.5M2 12h.5M5.5 4h8.5M5.5 8h8.5M5.5 12h8.5"/></svg>"#;
 /// The menu's check, from the board.
-const CHECK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>"#;
+pub(super) const CHECK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>"#;
 
 /// Where the filter menu sits in the sidebar, as the board has it.
 const MENU_LEFT: f32 = 96.;
 const MENU_TOP: f32 = 46.;
 const MENU_WIDTH: f32 = 208.;
-
-/// Why the switch is off for now.
-const SWITCH_LATER: &str = "Coming soon.";
 
 impl Workspace {
     /// The filter field changed: the list shows what it finds, from the
@@ -170,7 +181,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_filter_menu(
+    pub(super) fn toggle_filter_menu(
         &mut self,
         click: &ClickEvent,
         window: &mut Window,
@@ -196,9 +207,11 @@ impl Workspace {
 
     fn close_filter_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar.menu_open = false;
-        self.sidebar
-            .filter
-            .update(cx, |input, cx| input.focus(window, cx));
+        let field = match super::threads::sidebar_mode(cx) {
+            SidebarMode::Projects => self.sidebar.filter.clone(),
+            SidebarMode::Threads => self.sidebar.threads.search.clone(),
+        };
+        field.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -217,14 +230,17 @@ impl Workspace {
 
     /// New thread from the bar: in the open channel, else the first one
     /// listed.
-    fn new_thread_from_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_thread_from_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.nav.channel.is_none() {
-            let first = self.sidebar.rows.iter().find_map(|row| match row {
-                super::Row::Project(look) => {
-                    self.state().channels(look.project).first().map(|c| c.id)
-                }
-                _ => None,
-            });
+            let first = match super::threads::sidebar_mode(cx) {
+                SidebarMode::Threads => self.threads_new_thread_channel(),
+                SidebarMode::Projects => self.sidebar.rows.iter().find_map(|row| match row {
+                    super::Row::Project(look) => {
+                        self.state().channels(look.project).first().map(|c| c.id)
+                    }
+                    _ => None,
+                }),
+            };
             let Some(channel) = first else {
                 return;
             };
@@ -325,12 +341,17 @@ impl Workspace {
                     )
                     .test_support(),
             )
-            .child(switch_button())
+            .child(switch_button("Show threads", LIST_SVG, cx))
     }
 
     /// The filter menu: which projects show, their order, and whether the
-    /// agents are listed.
-    pub(super) fn render_filter_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// agents are listed. The threads sidebar has only which projects'
+    /// threads show.
+    pub(super) fn render_filter_menu(
+        &self,
+        threads: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let prefs = self.sidebar.prefs;
         let show = |id: &'static str, label: &'static str, value: ShowProjects| {
             radio(id, label, prefs.show == value)
@@ -390,21 +411,23 @@ impl Workspace {
             }))
             .child(menu_heading("Show"))
             .children(shows)
-            .child(menu_rule())
-            .child(menu_heading("Sort"))
-            .children(sorts)
-            .child(menu_rule())
-            .child(
-                menu_item("sidebar-show-agents", "Show agents")
-                    .aria_selected(prefs.agents)
-                    .child(div().w(ui_px(12.)))
-                    .child(div().flex_1().child("Show agents"))
-                    .child(toggle(prefs.agents))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_sidebar_prefs(|p| p.agents = !p.agents, cx);
-                    }))
-                    .test_support(),
-            )
+            .when(!threads, |menu| {
+                menu.child(menu_rule())
+                    .child(menu_heading("Sort"))
+                    .children(sorts)
+                    .child(menu_rule())
+                    .child(
+                        menu_item("sidebar-show-agents", "Show agents")
+                            .aria_selected(prefs.agents)
+                            .child(div().w(ui_px(12.)))
+                            .child(div().flex_1().child("Show agents"))
+                            .child(toggle(prefs.agents))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_sidebar_prefs(|p| p.agents = !p.agents, cx);
+                            }))
+                            .test_support(),
+                    )
+            })
             .test_support()
     }
 }
@@ -435,7 +458,7 @@ pub(super) fn render_hints() -> impl IntoElement {
 }
 
 /// A 24 px icon button of the bar, with its name as tooltip.
-fn icon_button(
+pub(super) fn icon_button(
     id: &'static str,
     svg: &'static [u8],
     label: &'static str,
@@ -458,9 +481,13 @@ fn icon_button(
         .child(Icon::default().data(svg).size(ui_px(14.)))
 }
 
-/// The switch to the threads sidebar, with the board's tooltip. It does
-/// nothing until that sidebar is built, and says so to assistive tech.
-fn switch_button() -> impl IntoElement {
+/// The switch to the other sidebar, last in the bar, with the board's
+/// tooltip: "Show threads · switch sidebar" or "Show projects · …".
+pub(super) fn switch_button(
+    label: &'static str,
+    svg: &'static [u8],
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
     div()
         .id("sidebar-switch")
         .flex()
@@ -469,21 +496,17 @@ fn switch_button() -> impl IntoElement {
         .justify_center()
         .size(ui_px(24.))
         .rounded(ui_px(6.))
+        .cursor_pointer()
         .text_color(color("text-secondary"))
-        .hover(|b| b.bg(color("surface-300")))
-        .aria_label("Show threads")
-        .aria_description(SWITCH_LATER)
-        .tooltip(|window, cx| {
-            Tooltip::element(|_, _| {
+        .hover(|b| b.bg(color("surface-300")).text_color(color("text-primary")))
+        .aria_label(label)
+        .tooltip(move |window, cx| {
+            Tooltip::element(move |_, _| {
                 div()
                     .flex()
                     .gap(ui_px(8.))
                     .text_size(scale::text(12.))
-                    .child(
-                        div()
-                            .text_color(color("text-primary"))
-                            .child("Show threads"),
-                    )
+                    .child(div().text_color(color("text-primary")).child(label))
                     .child(
                         div()
                             .text_color(color("text-tertiary"))
@@ -492,7 +515,8 @@ fn switch_button() -> impl IntoElement {
             })
             .build(window, cx)
         })
-        .child(Icon::default().data(LIST_SVG).size(ui_px(14.)))
+        .child(Icon::default().data(svg).size(ui_px(14.)))
+        .on_click(cx.listener(|this, _, _, cx| this.switch_sidebar(cx)))
         .test_support()
 }
 

@@ -264,10 +264,7 @@ fn the_filter_finds_projects_and_channels_and_keys_move_through_them(cx: &mut Te
         label_of(cx, window, "sidebar-switch").as_deref(),
         Some("Show threads")
     );
-    assert_eq!(
-        description_of(cx, window, "sidebar-switch").as_deref(),
-        Some("Coming soon.")
-    );
+    assert_eq!(description_of(cx, window, "sidebar-switch"), None);
 
     focus_filter(cx, window, &ws);
     type_text(cx, window, "SUP");

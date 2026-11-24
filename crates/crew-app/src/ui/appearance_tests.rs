@@ -396,12 +396,6 @@ fn the_appearance_page_shows_every_row_with_the_defaults(cx: &mut TestAppContext
         "13 · 12 mono · standard"
     );
 
-    // Threads isn't built yet: it stays off.
-    super::test_ui::click(cx, window, "appearance-sidebar-threads");
-    assert_eq!(
-        current(cx).sidebar_mode,
-        crate::prefs::SidebarMode::Projects
-    );
     assert_eq!(crate::prefs::read(home.path(), APPEARANCE_KEY), None);
 }
 

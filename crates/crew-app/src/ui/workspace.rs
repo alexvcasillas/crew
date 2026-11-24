@@ -552,6 +552,7 @@ impl Workspace {
             self.refresh_usage(cx);
             self.refresh_history(cx);
         }
+        self.threads_touched(snapshot || !touched.is_empty() || !stale.is_empty());
         self.channel_touched(&touched, &stale, snapshot);
         if !removed.is_empty() {
             self.leave_removed(&removed, window, cx);
@@ -712,7 +713,16 @@ impl Workspace {
                     .thread_project(t)
                     .is_some_and(|p| !super::folder::writers(&self.state, p).is_empty())
         });
-        if working.is_empty() && !running_ticks && !folder_ticks && !self.channel_ticks() {
+        // The threads sidebar shows how long each working thread works.
+        let threads_ticks = super::sidebar::threads::sidebar_mode(cx)
+            == crate::prefs::SidebarMode::Threads
+            && !self.state.working_runs().is_empty();
+        if working.is_empty()
+            && !running_ticks
+            && !folder_ticks
+            && !threads_ticks
+            && !self.channel_ticks()
+        {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -726,6 +736,7 @@ impl Workspace {
         }
 
         self.sync_channel(cx);
+        self.sync_thread_summaries(cx);
 
         let messages = self.nav.thread.map_or(0, |t| self.state.messages(t).len());
         if messages != self.nav.seen_messages {
@@ -1347,7 +1358,7 @@ impl Render for Workspace {
         }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
-        self.refresh_sidebar();
+        self.refresh_sidebars(cx);
         let root = div().id("workspace");
         self.add_project_drop_target(root, cx)
             .key_context("Workspace")

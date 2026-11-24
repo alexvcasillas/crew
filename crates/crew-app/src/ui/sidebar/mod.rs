@@ -1,10 +1,13 @@
-//! The sidebar's Projects form: a filter bar, the projects grouped into
-//! Pinned, Active and Other projects with their channels and terminal
-//! sessions, then the agents. Rows sit in a virtual list, so many
-//! projects stay smooth.
+//! The sidebar, in one of two forms you switch between. Projects: a
+//! filter bar, the projects grouped into Pinned, Active and Other
+//! projects with their channels and terminal sessions, then the agents.
+//! Threads: every project's threads in one list (see [`threads`]). Rows
+//! sit in virtual lists, so many projects and threads stay smooth.
 
 mod filter;
 mod projects;
+mod switcher;
+pub(crate) mod threads;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,7 +26,7 @@ use super::palette::{highlighted, match_range};
 
 use super::workspace::Workspace;
 use crate::model::ThreadStatus;
-use crate::prefs::SidebarPrefs;
+use crate::prefs::{SidebarMode, SidebarPrefs};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 pub(crate) use filter::bindings;
@@ -173,6 +176,12 @@ pub(super) struct Sidebar {
     built: Option<SidebarKey>,
     /// The open channel the list last made visible.
     revealed: Option<ChannelId>,
+    /// The list scrolls to the open channel once its rows are built.
+    scroll_pending: bool,
+    /// The form shown when last drawn.
+    mode: Option<SidebarMode>,
+    /// The Threads form.
+    pub(crate) threads: threads::ThreadsSidebar,
     /// The time grouping uses in place of now, as tests set it.
     #[cfg(test)]
     pub(super) now: Option<i64>,
@@ -200,6 +209,9 @@ impl Sidebar {
             hints: HashMap::new(),
             built: None,
             revealed: None,
+            scroll_pending: false,
+            mode: None,
+            threads: threads::ThreadsSidebar::new(window, cx),
             #[cfg(test)]
             now: None,
             _filter_events: events,
@@ -208,6 +220,27 @@ impl Sidebar {
 }
 
 impl Workspace {
+    /// Builds the rows of the form shown. Switching forms shows the open
+    /// thread or channel in the new one.
+    pub(super) fn refresh_sidebars(&mut self, cx: &mut Context<Self>) {
+        let mode = threads::sidebar_mode(cx);
+        if self.sidebar.mode.replace(mode) != Some(mode) {
+            self.sidebar.menu_open = false;
+            self.sidebar.threads.switcher.open = false;
+            self.sidebar.threads.hovered = None;
+            self.sidebar.revealed = None;
+            self.sidebar.built = None;
+            self.sidebar.threads.shown_again();
+        }
+        match mode {
+            SidebarMode::Projects => self.refresh_sidebar(),
+            SidebarMode::Threads => {
+                self.refresh_threads_sidebar();
+                self.sync_thread_summaries(cx);
+            }
+        }
+    }
+
     /// Builds the list's rows from what is known, keeping the scroll
     /// position when they change.
     pub(super) fn refresh_sidebar(&mut self) {
@@ -252,6 +285,29 @@ impl Workspace {
             });
             sidebar.rows = rows;
         }
+        if std::mem::take(&mut self.sidebar.scroll_pending) {
+            self.scroll_to_open_channel();
+        }
+    }
+
+    /// Scrolls the list so the open channel's row, or its project's,
+    /// shows.
+    fn scroll_to_open_channel(&mut self) {
+        let Some(channel) = self.nav.channel else {
+            return;
+        };
+        let project = self.state().channel(channel).map(|c| c.project);
+        let rows = &self.sidebar.rows;
+        let row = rows
+            .iter()
+            .position(|r| *r == Row::Channel(channel))
+            .or_else(|| {
+                rows.iter()
+                    .position(|r| matches!(r, Row::Project(look) if Some(look.project) == project))
+            });
+        if let Some(row) = row {
+            self.sidebar.list.scroll_to_reveal_item(row);
+        }
     }
 
     /// Now, or the time a test set.
@@ -271,6 +327,7 @@ impl Workspace {
             return;
         }
         self.sidebar.revealed = self.nav.channel;
+        self.sidebar.scroll_pending = self.nav.channel.is_some();
         let state = self.state();
         let Some(project) = self
             .nav
@@ -408,7 +465,15 @@ impl Workspace {
         }
     }
 
-    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The sidebar in the form chosen.
+    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        match threads::sidebar_mode(cx) {
+            SidebarMode::Projects => self.render_projects_sidebar(cx).into_any_element(),
+            SidebarMode::Threads => self.render_threads_sidebar(cx).into_any_element(),
+        }
+    }
+
+    fn render_projects_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let running = self.state().working_runs().len();
         let filtering = !self.sidebar.query.trim().is_empty();
         div()
@@ -442,7 +507,7 @@ impl Workspace {
                 sidebar.child(render_footer(running, self.stopping_all, cx))
             })
             .when(self.sidebar.menu_open, |sidebar| {
-                sidebar.child(deferred(self.render_filter_menu(cx)).with_priority(1))
+                sidebar.child(deferred(self.render_filter_menu(false, cx)).with_priority(1))
             })
             .test_support()
     }

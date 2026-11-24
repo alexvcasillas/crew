@@ -51,6 +51,22 @@ pub struct ProjectFacts {
     pub activity: Option<i64>,
 }
 
+/// What the threads sidebar shows and groups a thread by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadFacts {
+    /// An ask waits on you, a run works, runs wait for a slot, or none.
+    pub status: ThreadStatus,
+    /// The status of its latest known run.
+    pub last_run: Option<RunStatus>,
+    /// The CLI its latest known run ran on.
+    pub runtime: Option<crew_core::agent::Runtime>,
+    /// When its oldest working run started, in Unix ms.
+    pub working_since: Option<i64>,
+    /// When something last happened in it, in Unix ms: made, a run
+    /// started or ended, an ask, a message known.
+    pub activity: i64,
+}
+
 /// A pending approval: something waiting for you to decide.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NeedsYou<'a> {
@@ -860,6 +876,66 @@ impl State {
         facts
     }
 
+    /// Every known thread's status, latest run and activity, in one pass
+    /// over what is known.
+    pub fn thread_facts(&self) -> HashMap<ThreadId, ThreadFacts> {
+        let mut facts: HashMap<ThreadId, ThreadFacts> = self
+            .threads
+            .values()
+            .map(|t| {
+                let facts = ThreadFacts {
+                    status: ThreadStatus::Idle,
+                    last_run: None,
+                    runtime: None,
+                    working_since: None,
+                    activity: t.created_at,
+                };
+                (t.id, facts)
+            })
+            .collect();
+        let mut latest: HashMap<ThreadId, (i64, u128)> = HashMap::new();
+        for r in self.runs.values() {
+            let Some(f) = facts.get_mut(&r.thread) else {
+                continue;
+            };
+            let status = match r.status {
+                RunStatus::Working => ThreadStatus::Working,
+                RunStatus::Queued => ThreadStatus::Queued,
+                _ => ThreadStatus::Idle,
+            };
+            f.status = f.status.max(status);
+            if r.status == RunStatus::Working {
+                f.working_since = Some(
+                    f.working_since
+                        .map_or(r.started_at, |s| s.min(r.started_at)),
+                );
+            }
+            let at = r.ended_at.unwrap_or(r.started_at).max(r.started_at);
+            f.activity = f.activity.max(at);
+            let order = (r.started_at, r.id.0.as_u128());
+            if latest.get(&r.thread).is_none_or(|l| order > *l) {
+                latest.insert(r.thread, order);
+                f.last_run = Some(r.status.clone());
+                f.runtime = Some(r.runtime.clone());
+            }
+        }
+        for a in self.approvals.values() {
+            if a.status != ApprovalStatus::Pending {
+                continue;
+            }
+            if let Some(f) = facts.get_mut(&a.thread) {
+                f.status = ThreadStatus::NeedsYou;
+                f.activity = f.activity.max(a.created_at);
+            }
+        }
+        for (thread, messages) in &self.messages {
+            if let (Some(f), Some(last)) = (facts.get_mut(thread), messages.last()) {
+                f.activity = f.activity.max(last.created_at);
+            }
+        }
+        facts
+    }
+
     /// Threads whose channel `matches` accepts.
     fn thread_ids(&self, matches: impl Fn(ChannelId) -> bool) -> HashSet<ThreadId> {
         self.threads
@@ -1137,6 +1213,47 @@ mod tests {
                 activity: None,
             }
         );
+    }
+
+    #[test]
+    fn thread_facts_say_what_each_thread_does_and_when_it_last_did() {
+        let (mut state, _, _, t) = one_thread();
+        assert_eq!(
+            state.thread_facts()[&t.id],
+            ThreadFacts {
+                status: ThreadStatus::Idle,
+                last_run: None,
+                runtime: None,
+                working_since: None,
+                activity: 1,
+            }
+        );
+        let mut done = run(t.id, RunStatus::Done, 10);
+        done.ended_at = Some(20);
+        state.apply(status(&done));
+        let facts = state.thread_facts()[&t.id].clone();
+        assert_eq!(facts.last_run, Some(RunStatus::Done));
+        assert_eq!(facts.activity, 20);
+        let queued = run(t.id, RunStatus::Queued, 30);
+        state.apply(status(&queued));
+        assert_eq!(state.thread_facts()[&t.id].status, ThreadStatus::Queued);
+        let working = run(t.id, RunStatus::Working, 40);
+        state.apply(status(&working));
+        let facts = state.thread_facts()[&t.id].clone();
+        assert_eq!(facts.status, ThreadStatus::Working);
+        assert_eq!(facts.working_since, Some(40));
+        assert_eq!(facts.last_run, Some(RunStatus::Working));
+        state.apply(ServerMsg::Message {
+            thread: t.id,
+            message: message(t.id, "hello", 70),
+        });
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: approval(t.id, 60),
+        });
+        let facts = state.thread_facts()[&t.id].clone();
+        assert_eq!(facts.status, ThreadStatus::NeedsYou);
+        assert_eq!(facts.activity, 70);
     }
 
     fn texts(state: &State, thread: ThreadId) -> Vec<String> {

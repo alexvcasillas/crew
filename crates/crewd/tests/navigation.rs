@@ -12,7 +12,7 @@ use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalStatus, Author, Limits, StoredRun};
 use crew_proto::{
     AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, SearchResults,
-    ServerMsg, SetupFileSize, ThreadState, read_frame, write_frame,
+    ServerMsg, SetupFileSize, ThreadState, ThreadSummary, read_frame, write_frame,
 };
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
@@ -940,4 +940,60 @@ async fn pinning_a_project_is_broadcast_and_kept() {
         .await
         .unwrap_err();
     assert_eq!(err, crew_core::store::REMOVED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_summaries_cover_every_project_or_one() {
+    let bins = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_claude(bins.path())).await;
+    let root = d.path("demo");
+    repo(&root, &["src/lib.rs"]);
+    let shop_root = d.path("shop");
+    std::fs::create_dir_all(&shop_root).unwrap();
+
+    let mut c = d.client().await;
+    let demo = c.project("demo", &root).await;
+    let shop = c.project("shop", &shop_root).await;
+    let general = c.channel(demo, "general").await;
+    let bugs = c.channel(demo, "bugs").await;
+    let shop_general = c.channel(shop, "general").await;
+    let worked = c.thread(general, "Worked").await;
+    let archived = c.thread(bugs, "Archived").await;
+    let idle = c.thread(shop_general, "Idle").await;
+    c.agent("Forge", PermissionMode::Auto).await;
+    c.call(Request::SubscribeAll).await.unwrap();
+    c.post(worked, "@Forge go").await;
+    c.run_reaches(worked, RunStatus::Done).await;
+    c.call(Request::ArchiveThread {
+        thread: archived,
+        archived: true,
+    })
+    .await
+    .unwrap();
+
+    let all: Vec<ThreadSummary> = c.ok(Request::ThreadSummaries { project: None }).await;
+    let mut ids: Vec<ThreadId> = all.iter().map(|s| s.thread).collect();
+    ids.sort_by_key(|t| t.0);
+    let mut want = vec![worked, idle];
+    want.sort_by_key(|t| t.0);
+    assert_eq!(ids, want, "archived threads are left out");
+    let w = all.iter().find(|s| s.thread == worked).unwrap();
+    assert_eq!(w.files, 1, "file.txt in the worktree");
+    assert!(w.added > 0);
+    assert_eq!(w.runs.len(), 1);
+    assert_eq!(w.runs[0].status, RunStatus::Done);
+
+    let one: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: Some(shop),
+        })
+        .await;
+    let ids: Vec<ThreadId> = one.iter().map(|s| s.thread).collect();
+    assert_eq!(ids, [idle]);
+
+    c.call(Request::RemoveProject { project: shop })
+        .await
+        .unwrap();
+    let after: Vec<ThreadSummary> = c.ok(Request::ThreadSummaries { project: None }).await;
+    assert_eq!(after.iter().map(|s| s.thread).collect::<Vec<_>>(), [worked]);
 }

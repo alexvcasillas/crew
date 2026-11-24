@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 13;
+pub const PROTO_VERSION: u32 = 14;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -303,6 +303,14 @@ pub enum Request {
     PinProject {
         project: ProjectId,
         pinned: bool,
+    },
+    /// Answered with one [`ThreadSummary`] per thread that isn't
+    /// archived, in `project` or in every project. Counts come from the
+    /// channel overviews' cache; a [`ServerMsg::ChannelOverviewStale`]
+    /// follows for a channel whose counts were still being worked out.
+    ThreadSummaries {
+        #[serde(default)]
+        project: Option<ProjectId>,
     },
 }
 
