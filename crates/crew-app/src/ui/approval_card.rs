@@ -60,6 +60,44 @@ fn raw_input_text(input: &serde_json::Value) -> String {
     }
 }
 
+/// What a card says under a command that asks to run outside the CLI's
+/// sandbox.
+pub const OUTSIDE_SANDBOX: &str =
+    "Runs outside Claude Code's sandbox. Network and files beyond the project are open.";
+
+/// Whether a call's input asks Claude Code to run it outside its sandbox.
+pub fn outside_sandbox(input: &serde_json::Value) -> bool {
+    input.get("dangerouslyDisableSandbox") == Some(&serde_json::Value::Bool(true))
+}
+
+/// The warning line a card or row shows for a call that runs outside the
+/// sandbox.
+pub fn outside_sandbox_line(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_start()
+        .gap(px(6.))
+        .min_w_0()
+        .text_size(px(12.))
+        .text_color(color("danger"))
+        .aria_label(OUTSIDE_SANDBOX)
+        .child(
+            div().flex_none().pt(px(2.)).child(
+                Icon::new(IconName::TriangleAlert)
+                    .size(px(12.))
+                    .text_color(color("danger")),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(OUTSIDE_SANDBOX),
+        )
+}
+
 /// The full command behind a labelled ask, when the label shows less:
 /// cleaned, and at most [`COMMAND_LINES`] lines, "…" marking a cut.
 pub fn full_command(input: &serde_json::Value) -> Option<String> {
@@ -171,7 +209,8 @@ impl Workspace {
     /// the whole window, so text fields don't take it. From the composer
     /// it approves handoffs only: a permission ask is never allowed by a
     /// reflex meant to send. A call the safety check stopped is only ever
-    /// retried by its own button.
+    /// retried by its own button, and one that would run outside Claude
+    /// Code's sandbox only by its Allow button.
     pub(super) fn approve_latest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.nav.thread else {
             return;
@@ -189,10 +228,12 @@ impl Workspace {
                 .iter()
                 .rev()
                 .filter(|a| !self.deciding.contains(&a.id))
-                .find(|a| match a.kind {
+                .find(|a| match &a.kind {
                     ApprovalKind::Handoff { paused, .. } => !paused,
                     ApprovalKind::Blocked { .. } => false,
-                    ApprovalKind::Permission { .. } => !from_composer,
+                    ApprovalKind::Permission { input, .. } => {
+                        !from_composer && !outside_sandbox(input)
+                    }
                 })
                 .map(|a| a.id)
         });
@@ -504,8 +545,12 @@ impl Workspace {
         };
         let more = lines.saturating_sub(INPUT_LINES);
         let command = full_command(input);
+        let outside = outside_sandbox(input);
         let card = needs_you_card(id, &wants, &shown_wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
+            .when(outside, |card| {
+                card.child(outside_sandbox_line(format!("approval-sandbox-{id}")).test_support())
+            })
             .when_some(command, |card, command| {
                 card.child(
                     div()
@@ -547,7 +592,7 @@ impl Workspace {
                         .into_any_element(),
                     decline(id, "Deny", cx).into_any_element(),
                 ],
-                true,
+                !outside,
             ))
             .test_support();
         indented(card)

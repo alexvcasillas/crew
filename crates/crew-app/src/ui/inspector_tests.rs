@@ -285,6 +285,7 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
         label_of(cx, window, format!("approval-input-{id}")).as_deref(),
         Some("touch x.txt")
     );
+    assert!(!has(cx, window, format!("approval-sandbox-{id}")));
     click(cx, window, format!("approval-allow-{id}"));
     let got = answer_of(cx, &answer);
     assert!(got.allow, "{got:?}");
@@ -346,6 +347,48 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
         status_of(cx, &ws, id) == ApprovalStatus::Declined
             && !has(cx, window, format!("approval-{id}"))
     });
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+}
+
+/// An ask to run outside Claude Code's sandbox says so, here and in
+/// Running now, and only its button allows it.
+#[gpui_kit::test]
+fn an_ask_outside_the_sandbox_is_flagged(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = waiting_claude(tmp.path());
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    let input =
+        serde_json::json!({"command": "curl example.com", "dangerouslyDisableSandbox": true});
+    let answer = ask_permission(&w, run, input);
+    let id = pending(cx, &ws, w.thread);
+    let line = format!("approval-sandbox-{id}");
+    wait_until(cx, "the warning", |cx| has(cx, window, line.clone()));
+    assert_eq!(
+        label_of(cx, window, line).as_deref(),
+        Some(super::approval_card::OUTSIDE_SANDBOX)
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.focus_window(window, cx));
+    })
+    .unwrap();
+    press(cx, window, "cmd-enter");
+    std::thread::sleep(Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(answer.try_recv().is_err(), "⌘↵ leaves it alone");
+    assert_eq!(status_of(cx, &ws, id), ApprovalStatus::Pending);
+
+    press(cx, window, "cmd-2");
+    wait_until(cx, "the Running now row", |cx| {
+        has(cx, window, format!("running-ask-sandbox-{id}"))
+    });
+    click(cx, window, format!("running-allow-{id}"));
+    assert!(answer_of(cx, &answer).allow);
     std::fs::write(tmp.path().join("go"), "").unwrap();
 }
 
