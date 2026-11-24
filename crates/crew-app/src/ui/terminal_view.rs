@@ -95,6 +95,7 @@ pub fn terminal_rows<'a>(
                     lines: None,
                     reason: None,
                     raw: super::run_card::raw_name(name),
+                    answer: None,
                 };
                 start_turn(&mut rows);
                 let last = rows.len() - 1;

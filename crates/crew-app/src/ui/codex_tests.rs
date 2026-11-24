@@ -298,7 +298,9 @@ fn a_codex_run_shows_its_steps_and_asks_before_a_command(cx: &mut TestAppContext
         .map(|ix| label_of(cx, window, ("activity-row", ix)))
         .collect();
     assert!(
-        rows.iter().any(|r| r.as_deref() == Some("Run mkdir sub")),
+        // The answered ask tags its row.
+        rows.iter()
+            .any(|r| r.as_deref() == Some("Run mkdir sub · allowed by you")),
         "{rows:?}"
     );
     let edit = rows

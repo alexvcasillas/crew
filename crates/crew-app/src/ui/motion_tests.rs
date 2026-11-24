@@ -15,7 +15,7 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, ElementId, Entity, TestAppConte
 use super::inspector_tests::{
     answer_of, ask_permission, hand_off, pending, run_of, start_forge, waiting_claude,
 };
-use super::test_ui::{bounds_of, click, has, label_of, press, wait_until};
+use super::test_ui::{bounds_of, click, has, label_of, press, shows, wait_until};
 use super::thread_tests::{World, agent, live_run, open_thread, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, fixture, short_home};
@@ -183,13 +183,11 @@ fn approval_cards_line_up_with_message_bodies(cx: &mut TestAppContext) {
 
     click(cx, window, format!("approval-decline-{id}"));
     assert!(!answer_of(cx, &rx).allow);
-    wait_until(cx, "the folded line", |cx| {
+    wait_until(cx, "the card to go", |cx| {
         ws.read_with(cx, |ws, _| {
             ws.state().approval(id).unwrap().status == ApprovalStatus::Declined
-        }) && has(cx, window, card.clone())
+        }) && !has(cx, window, card.clone())
     });
-    let decided = bounds_of(cx, window, card).unwrap();
-    assert_eq!(decided.origin.x, body.origin.x, "the folded line too");
 
     click(cx, window, format!("run-stop-{run}"));
     wait_until(cx, "the run to end", |cx| {
@@ -393,6 +391,82 @@ fn a_long_activity_title_stays_inside_its_row(cx: &mut TestAppContext) {
             "a-server-with-a-very-long-name-for-tests · navigate to the page and wait until the network is idle"
         )
     );
+
+    click(cx, window, format!("run-stop-{run}"));
+    wait_until(cx, "the run to end", |cx| {
+        !has(cx, window, format!("live-{run}"))
+    });
+}
+
+/// A claude that makes six Bash calls, then works until it is stopped.
+fn six_calls_claude(dir: &Path) -> PathBuf {
+    let mut script = String::from(
+        "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"session_id\":\"s\",\"model\":\"m\",\"tools\":[]}'\n",
+    );
+    for i in 1..=6 {
+        script.push_str(&format!(
+            "printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_{i}\",\"name\":\"Bash\",\"input\":{{\"command\":\"echo {i}\"}}}}]}},\"session_id\":\"s\"}}'\n"
+        ));
+    }
+    script.push_str("exec sleep 60");
+    fake_claude(dir, &script)
+}
+
+#[gpui_kit::test]
+fn answered_asks_tag_their_steps_not_the_thread(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), six_calls_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge run the six");
+    let run = live_run(cx, &ws, w.thread);
+    wait_until(cx, "six steps", |cx| has(cx, window, ("run-step", 5usize)));
+    let mut ids = Vec::new();
+    for i in 1..=6 {
+        let client = w.client.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = futures::executor::block_on(client.request(Request::PermissionAsk {
+                run,
+                tool: "Bash".into(),
+                input: serde_json::json!({"command": format!("echo {i}")}),
+                // Every other ask has no id and is matched by its input.
+                tool_use_id: (i % 2 == 1).then(|| format!("toolu_{i}")),
+            }));
+            let _ = tx.send(answer.is_ok());
+        });
+        let id = pending(cx, &ws, w.thread);
+        wait_until(cx, "the card", |cx| {
+            has(cx, window, format!("approval-{id}"))
+        });
+        click(cx, window, format!("approval-allow-{id}"));
+        wait_until(cx, "the answer", |_| rx.try_recv().is_ok());
+        ids.push(id);
+    }
+    wait_until(cx, "every step tagged", |cx| {
+        (0..6usize).all(|ix| {
+            label_of(cx, window, ("run-step", ix)).is_some_and(|l| l.ends_with(" · allowed by you"))
+        })
+    });
+    for (ix, id) in ids.iter().enumerate() {
+        assert!(
+            !has(cx, window, format!("approval-{id}")),
+            "no line for ask {ix}"
+        );
+        assert_eq!(
+            label_of(cx, window, ("run-step", ix)).unwrap(),
+            format!("Running echo {} · allowed by you", ix + 1)
+        );
+    }
+
+    // Activity tags the same rows.
+    click(cx, window, "inspector-tab-activity");
+    wait_until(cx, "the tagged rows", |cx| {
+        shows(cx, window, "Run echo 1 · allowed by you")
+            && shows(cx, window, "Run echo 6 · allowed by you")
+    });
 
     click(cx, window, format!("run-stop-{run}"));
     wait_until(cx, "the run to end", |cx| {

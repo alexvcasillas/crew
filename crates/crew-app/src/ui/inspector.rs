@@ -14,9 +14,9 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, IndexPath, Sizable a
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::activity::{ActivityRow, activity_rows};
+use super::activity::{ActivityRow, activity_rows_asked};
 use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
-use super::run_card::{FileChange, summarize};
+use super::run_card::{FileChange, decided_asks, summarize};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
@@ -202,7 +202,15 @@ impl Workspace {
         let choices = run_labels(&runs);
         let shown = self.shown_run(thread).map(|r| r.id);
         let counts = events_per_run(state.events(thread));
-        let count_of = |run: RunId| counts.iter().find(|(r, _)| *r == run).map_or(0, |c| c.1);
+        let approvals = state.thread_approvals(thread);
+        let asks = shown
+            .map(|run| decided_asks(&approvals, run))
+            .unwrap_or_default();
+        // An answered ask tags a row, so it counts as a change too.
+        let count_of = |run: RunId| {
+            counts.iter().find(|(r, _)| *r == run).map_or(0, |c| c.1)
+                + if Some(run) == shown { asks.len() } else { 0 }
+        };
         let worktree = state
             .thread(thread)
             .and_then(|t| t.worktree.as_ref())
@@ -217,7 +225,7 @@ impl Workspace {
 
         match shown {
             Some(run) if self.inspector.rows_from != Some((run, count_of(run))) => {
-                let rows = activity_rows(self.state().events(thread), run);
+                let rows = activity_rows_asked(self.state().events(thread), run, &asks);
                 let same_run = self.inspector.rows_from.map(|(r, _)| r) == Some(run);
                 let old = std::mem::replace(&mut self.inspector.rows, rows);
                 let list = &self.inspector.list;

@@ -13,7 +13,7 @@ use gpui_kit::*;
 
 use super::common::{clean_line, spinner};
 use super::markdown_view::{DocKey, render_doc};
-use super::run_card::{StepState, relative};
+use super::run_card::{Answer, DecidedAsk, StepState, match_asks, relative};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::{LoggedEvent, PatchMark, patch_marks};
@@ -65,6 +65,8 @@ pub struct ToolRow {
     pub output: Option<String>,
     /// Why the safety check stopped it, as a sentence, if it did.
     pub reason: Option<String>,
+    /// How you answered the ask to run it, if it asked.
+    pub answer: Option<Answer>,
 }
 
 /// One row of the Activity tab.
@@ -98,7 +100,43 @@ pub enum ActivityRow {
 
 /// The rows for `run`'s events, in order. A tool's result fills in the
 /// row of its call.
+#[cfg(test)]
 pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
+    activity_rows_asked(events, run, &[])
+}
+
+/// Like [`activity_rows`], each call tagged with your answer if it asked.
+pub fn activity_rows_asked(
+    events: &[LoggedEvent],
+    run: RunId,
+    asks: &[DecidedAsk],
+) -> Vec<ActivityRow> {
+    let mut rows = rows_of(events, run);
+    if asks.is_empty() {
+        return rows;
+    }
+    let calls: Vec<(&str, &str, &serde_json::Value)> = events
+        .iter()
+        .filter(|e| e.run == run)
+        .filter_map(|e| match &e.event {
+            Event::ToolCall {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
+            _ => None,
+        })
+        .collect();
+    let answers = match_asks(&calls, asks);
+    for row in &mut rows {
+        if let ActivityRow::Tool(tool) = row
+            && let Some(ix) = calls.iter().position(|c| c.0 == tool.id)
+        {
+            tool.answer = answers[ix];
+        }
+    }
+    rows
+}
+
+fn rows_of(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
     let mut cwd = String::new();
     let mut rows: Vec<ActivityRow> = Vec::new();
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -134,6 +172,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     patch: patch(kind, input),
                     output: None,
                     reason: None,
+                    answer: None,
                 }));
             }
             Event::ToolResult {
@@ -518,6 +557,14 @@ impl Workspace {
                     )
                 });
         }
+        if let Some(answer) = tool.answer {
+            head = head.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(color("text-tertiary"))
+                    .child(answer.text()),
+            );
+        }
         if tool.state == StepState::Running {
             head = head.child(div().text_color(color("accent-blue")).child("running"));
         } else if let Some(detail) = &tool.detail {
@@ -761,9 +808,13 @@ pub fn row_label(row: &ActivityRow) -> String {
         ActivityRow::Said { text, .. } => format!("Said {text}"),
         ActivityRow::Tool(tool) => {
             let label = join_words(&tool.verb, &tool.target);
-            match &tool.reason {
+            let label = match &tool.reason {
                 Some(reason) if tool.state == StepState::Blocked => blocked_label(&label, reason),
                 _ => label,
+            };
+            match tool.answer {
+                Some(answer) => format!("{label} · {}", answer.text()),
+                None => label,
             }
         }
         ActivityRow::Denied {
