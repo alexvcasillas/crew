@@ -419,20 +419,14 @@ fn clashing_project_names_get_a_path_hint(cx: &mut TestAppContext) {
     let (window, _ws) = open(cx, home.path());
     wait_has(cx, window, project_row(twin));
     wait_has(cx, window, project_row(other));
-    // The folder each sits in, cut from the left to three folders.
-    let names: Vec<String> = tmp
-        .path()
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let end = names[names.len() - 2..].join("/");
+    // The temp folder's path is long: only the end that differs stays.
     assert_eq!(
-        label_of(cx, window, format!("project-hint-{}", w.project)),
-        Some(format!("· …/{end}/a"))
+        label_of(cx, window, format!("project-hint-{}", w.project)).as_deref(),
+        Some("· …/a")
     );
     assert_eq!(
-        label_of(cx, window, format!("project-hint-{twin}")),
-        Some(format!("· …/{end}/b"))
+        label_of(cx, window, format!("project-hint-{twin}")).as_deref(),
+        Some("· …/b")
     );
     assert!(!has(cx, window, format!("project-hint-{other}")));
 }

@@ -101,14 +101,15 @@ pub(crate) fn sort_projects(projects: &mut [ProjectInfo], sort: SortProjects) {
     }
 }
 
-/// Folder names a hint keeps at least, as "~/code/a" has.
-const HINT_KEEPS: usize = 3;
+/// Whole paths up to this many characters show whole.
+const HINT_SHORT: usize = 24;
 
-/// For projects whose names clash (ignoring case), the folder each one
-/// sits in, with `~` for `home`: "~/code/a". A path longer than three
-/// folders loses folders from the left ("…/acme/src/a") only while the
-/// hints still tell the projects apart. Projects in the same folder show their own path
-/// instead. Projects whose names don't clash get no hint.
+/// For projects whose names clash (ignoring case), the end of the folder
+/// each one sits in that tells them apart, with `~` for `home` and other
+/// paths as they are: "~/code/a", "…/e2e3/shop". Short paths show whole;
+/// longer ones keep only the shortest end that differs, "…/" marking the
+/// cut. Projects in the same
+/// folder use their own path. Names that don't clash get no hint.
 pub(crate) fn duplicate_hints(
     projects: &[(ProjectId, &str, &Path)],
     home: Option<&Path>,
@@ -132,34 +133,34 @@ pub(crate) fn duplicate_hints(
             .zip(&parents)
             .map(|((_, root), parent)| path_parts(if shared { root } else { parent }, home))
             .collect();
-        // Drop folders from the left while the hints stay apart.
-        let mut dropped = 0;
-        loop {
-            let next = dropped + 1;
-            let fits = parts.iter().all(|(p, _)| p.len() >= next + HINT_KEEPS);
-            if !fits || !distinct(&hint_texts(&parts, next)) {
-                break;
-            }
-            dropped = next;
-        }
-        for ((id, _), hint) in clash.iter().zip(hint_texts(&parts, dropped)) {
+        let longest = parts.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
+        let shortest = (1..=longest)
+            .find(|k| distinct(&hint_texts(&parts, *k)))
+            .unwrap_or(longest);
+        // Short whole paths show whole, as the board's "~/code/a".
+        let whole = hint_texts(&parts, longest)
+            .iter()
+            .all(|t| t.chars().count() <= HINT_SHORT);
+        let keep = if whole { longest } else { shortest };
+        for ((id, _), hint) in clash.iter().zip(hint_texts(&parts, keep)) {
             hints.insert(*id, hint);
         }
     }
     hints
 }
 
-/// Each path less its first `dropped` folders, "…/" marking the cut.
-fn hint_texts(parts: &[(Vec<OsString>, bool)], dropped: usize) -> Vec<String> {
+/// The last `keep` folders of each path, "…/" marking a cut.
+fn hint_texts(parts: &[(Vec<OsString>, bool)], keep: usize) -> Vec<String> {
     parts
         .iter()
         .map(|(p, absolute)| {
-            let joined = p[dropped..]
+            let from = p.len().saturating_sub(keep);
+            let joined = p[from..]
                 .iter()
                 .map(|s| s.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            if dropped > 0 {
+            if from > 0 {
                 format!("…/{joined}")
             } else if *absolute {
                 format!("/{joined}")
@@ -281,17 +282,27 @@ impl Workspace {
                     .test_support(),
             )
             .children(hint.map(|hint| {
-                let text = format!("· {hint}");
+                // Cut at the start if it must be: the end tells them apart.
                 div()
                     .id(SharedString::from(format!("project-hint-{id}")))
+                    .flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .gap(ui_px(4.))
                     .font_family(code_family())
                     .text_size(scale::mono(11.))
                     .text_color(color("text-tertiary"))
-                    .aria_label(text.clone())
-                    .child(text)
+                    .aria_label(format!("· {hint}"))
+                    .child(div().flex_none().child("·"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_start()
+                            .child(hint),
+                    )
                     .test_support()
             }))
             .child(render_badge(format!("project-status-{id}"), &badge))
@@ -643,7 +654,22 @@ mod tests {
     }
 
     #[test]
-    fn long_paths_lose_folders_from_the_left_only_while_still_apart() {
+    fn long_paths_keep_the_end_that_tells_them_apart() {
+        let long = "/private/tmp/claude-501/-Users-someone-code-apps-desktop/0f1e2d3c";
+        let roots: Vec<String> = ["e2e1", "e2e2", "e2e3"]
+            .iter()
+            .map(|e| format!("{long}/{e}/shop/demo"))
+            .collect();
+        let list: Vec<(&str, &str)> = roots.iter().map(|r| ("demo", r.as_str())).collect();
+        // Outside home the path stays as it is: no tilde.
+        assert_eq!(
+            hints(&list, Some("/Users/me")),
+            [
+                Some("…/e2e1/shop".into()),
+                Some("…/e2e2/shop".into()),
+                Some("…/e2e3/shop".into())
+            ]
+        );
         assert_eq!(
             hints(
                 &[
@@ -652,9 +678,9 @@ mod tests {
                 ],
                 Some("/Users/me"),
             ),
-            [Some("…/acme/src/a".into()), Some("…/acme/src/b".into())]
+            [Some("…/a".into()), Some("…/b".into())]
         );
-        // They differ further left: only what tells them apart stays.
+        // Short enough to show whole.
         assert_eq!(
             hints(
                 &[
@@ -664,9 +690,19 @@ mod tests {
                 Some("/Users/me"),
             ),
             [
-                Some("…/x/one/two/three".into()),
-                Some("…/y/one/two/three".into())
+                Some("~/x/one/two/three".into()),
+                Some("~/y/one/two/three".into())
             ]
+        );
+        assert_eq!(
+            hints(
+                &[
+                    ("demo", "/private/tmp/a/demo"),
+                    ("demo", "/private/tmp/b/demo")
+                ],
+                Some("/Users/me"),
+            ),
+            [Some("/private/tmp/a".into()), Some("/private/tmp/b".into())]
         );
     }
 }
