@@ -555,3 +555,36 @@ fn shortcuts_act_only_on_cards_in_view_and_unarchive_archived_ones(cx: &mut Test
         })
     });
 }
+
+#[gpui_kit::test]
+fn text_fields_keep_their_delete_shortcuts(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    go_to_channel(cx, window, w.channel);
+    select_card(cx, window, &ws, &w, w.thread);
+
+    press(cx, window, "cmd-n");
+    type_text(cx, window, "hello brave world");
+    press(cx, window, "alt-backspace");
+    wait_label(
+        cx,
+        window,
+        "new-thread-branch",
+        "Starts in a new worktree on branch crew/hello-brave off main",
+    );
+    press(cx, window, "cmd-backspace");
+    type_text(cx, window, "x");
+    wait_label(
+        cx,
+        window,
+        "new-thread-branch",
+        "Starts in a new worktree on branch crew/x off main",
+    );
+    assert!(
+        !dialog_shown(cx, window),
+        "⌘⌫ while typing must not archive the selected thread"
+    );
+}
