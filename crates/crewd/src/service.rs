@@ -204,14 +204,16 @@ impl Service {
         self.0.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Process ids of the live runs whose process started. Each is its
-    /// own process group.
-    pub(crate) fn live_run_pids(&self) -> Vec<i32> {
+    /// The live runs whose process started, by process id. Each process
+    /// is its own process group.
+    pub(crate) fn live_run_pids(&self) -> Vec<(i32, RunId)> {
         self.state()
             .live
-            .values()
-            .filter_map(|(_, handle)| handle.pid())
-            .filter_map(|pid| i32::try_from(pid).ok())
+            .iter()
+            .filter_map(|(run, (_, handle))| {
+                let pid = i32::try_from(handle.pid()?).ok()?;
+                Some((pid, *run))
+            })
             .collect()
     }
 

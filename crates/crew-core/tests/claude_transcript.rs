@@ -207,6 +207,8 @@ fn only_what_the_person_typed_is_a_prompt() {
             prompt("Typed with a source."),
             // Queued while the agent was busy, shown once.
             prompt("Also add a test"),
+            // Queued input shows whatever its origin says.
+            prompt("Message from a teammate"),
             prompt("Typed after"),
         ]
     );
@@ -250,4 +252,30 @@ fn queued_prompts_are_not_dropped_by_other_text() {
         prompts.take(parse(&typed("Run it"))),
         vec![prompt("Run it")]
     );
+}
+
+#[test]
+fn queued_prompts_match_once_and_expire() {
+    use crew_core::claude::transcript::Prompts;
+    let at = |second: u32| format!("2026-11-21T10:{:02}:{:02}.000Z", second / 60, second % 60);
+    let queued = |second: u32| {
+        serde_json::json!({"type": "attachment", "timestamp": at(second),
+            "attachment": {"type": "queued_command", "prompt": "Run it", "origin": {"kind": "whatever"}}})
+        .to_string()
+    };
+    let typed = |second: u32| {
+        serde_json::json!({"type": "user", "timestamp": at(second), "message": {"content": "Run it"}})
+            .to_string()
+    };
+    let mut prompts = Prompts::default();
+    assert_eq!(prompts.take(parse(&queued(0))), vec![prompt("Run it")]);
+    // The first copy within two minutes is the same prompt being sent.
+    assert!(prompts.take(parse(&typed(30))).is_empty());
+    // Consumed: the next one is typed again.
+    assert_eq!(prompts.take(parse(&typed(40))), vec![prompt("Run it")]);
+
+    // After two minutes the queued entry is gone.
+    let mut prompts = Prompts::default();
+    prompts.take(parse(&queued(0)));
+    assert_eq!(prompts.take(parse(&typed(121))), vec![prompt("Run it")]);
 }
