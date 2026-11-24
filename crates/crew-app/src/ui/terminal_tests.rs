@@ -506,3 +506,54 @@ fn a_deleted_terminal_session_goes_away(cx: &mut TestAppContext) {
         assert!(!ws.state().is_terminal_watched("s-one"));
     });
 }
+
+/// Inline code keeps the words and spaces around it, in a list item and
+/// in a paragraph, and the spaces next to it are drawn wide enough to see.
+#[gpui_kit::test]
+fn inline_code_keeps_the_spaces_around_it(cx: &mut TestAppContext) {
+    use super::markdown_view::drawn::parts;
+    let home = short_home();
+    let s = Setup::new(home.path());
+    s.write(
+        "s-code",
+        "Explain",
+        "- Returns `(total, percent)` to `cart.py`.\n\nIt reads `a` from `b`.",
+    );
+    let (window, _ws) = open_session(cx, home.path(), &s, "s-code");
+    let item = "Returns (total, percent) to cart.py.";
+    let paragraph = "It reads a from b.";
+    wait_until(cx, "the reply", |_| {
+        parts(item).is_some() && parts(paragraph).is_some()
+    });
+    // The list item reads whole.
+    assert!(shows(cx, window, item));
+    let gap = |t: &str| (t.to_string(), true, false);
+    let words = |t: &str| (t.to_string(), false, false);
+    let code = |t: &str| (t.to_string(), true, true);
+    assert_eq!(
+        parts(item).unwrap(),
+        vec![
+            words("Returns"),
+            gap(" "),
+            code("(total, percent)"),
+            gap(" "),
+            words("to"),
+            gap(" "),
+            code("cart.py"),
+            words("."),
+        ]
+    );
+    assert_eq!(
+        parts(paragraph).unwrap(),
+        vec![
+            words("It reads"),
+            gap(" "),
+            code("a"),
+            gap(" "),
+            words("from"),
+            gap(" "),
+            code("b"),
+            words("."),
+        ]
+    );
+}
