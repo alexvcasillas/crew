@@ -1,8 +1,9 @@
 //! Chat state and run handling behind the server.
 //!
 //! Lock order: `state`, then `db`, then `terminal`. The change count cache
-//! is locked on its own, never while taking another lock. No lock is held
-//! across an `.await`, nor while git, a setup command or a file read runs.
+//! and the file index are each locked on their own, never while taking
+//! another lock. No lock is held across an `.await`, nor while git, a
+//! setup command or a file read runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use uuid::Uuid;
 use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
 use crate::overview::{ChangeCache, LiveEdit};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
+use crate::search::FileIndex;
 use crate::terminal::{Cmd, TerminalState};
 
 /// Told once per run when permission prompts can't reach crewd.
@@ -133,6 +135,8 @@ struct Inner {
     count_slots: Arc<tokio::sync::Semaphore>,
     /// Extra time each count takes, in ms. Tests set it.
     count_delay_ms: std::sync::atomic::AtomicU64,
+    /// File lists of project roots and worktrees, for search.
+    files: Mutex<FileIndex>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -223,6 +227,7 @@ impl Service {
             counted: tokio::sync::Notify::new(),
             count_slots: Arc::new(tokio::sync::Semaphore::new(crate::overview::GIT_AT_ONCE)),
             count_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            files: Mutex::new(FileIndex::default()),
         }))
     }
 
@@ -278,11 +283,18 @@ impl Service {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Forgets the thread's cached change counts.
+    pub(crate) fn files(&self) -> MutexGuard<'_, FileIndex> {
+        self.0.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets the thread's cached change counts and file list.
     fn changes_may_differ(&self, thread: ThreadId) {
-        let mut cache = self.changes();
-        cache.invalidate(thread);
-        cache.forget_edits(thread);
+        {
+            let mut cache = self.changes();
+            cache.invalidate(thread);
+            cache.forget_edits(thread);
+        }
+        self.files_may_differ(thread);
     }
 
     /// Resolves the next time counts were worked out.
@@ -425,6 +437,13 @@ impl Service {
             } => self.discard(thread, delete_branch).await,
             Request::ChannelOverview { channel } => self.channel_overview(channel).await,
             Request::Runtimes => self.runtimes().await,
+            Request::Search {
+                query,
+                project,
+                limit,
+            } => self.search(query, project, limit).await,
+            Request::ProjectOverview { project } => self.project_overview(project).await,
+            Request::AgentProfile { agent } => self.agent_profile(agent).await,
             other => self.handle_now(other),
         }
     }
@@ -446,6 +465,11 @@ impl Service {
                 main_branch,
             } => {
                 let mut db = self.db();
+                let wanted = same_folder(Path::new(&root));
+                let projects = db.store.projects().map_err(|e| e.to_string())?;
+                if let Some(taken) = projects.iter().find(|p| same_folder(&p.root) == wanted) {
+                    return Err(format!("{} already uses this folder.", taken.name));
+                }
                 let project = db
                     .store
                     .create_project(&name, Path::new(&root), &main_branch)
@@ -589,7 +613,26 @@ impl Service {
             | Request::Commit { .. }
             | Request::Discard { .. }
             | Request::ChannelOverview { .. }
+            | Request::Search { .. }
+            | Request::ProjectOverview { .. }
+            | Request::AgentProfile { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
+            Request::RenameProject { project, name } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("Give the project a name.".into());
+                }
+                let mut db = self.db();
+                db.store
+                    .rename_project(project, name)
+                    .map_err(|e| e.to_string())?;
+                self.project_changed(&mut db, project)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::RemoveProject { project } => {
+                self.remove_project(project)?;
+                Ok(serde_json::Value::Null)
+            }
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -757,6 +800,76 @@ impl Service {
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
         self.agent_changed(&mut db, agent)?;
+        Ok(())
+    }
+
+    /// Removes the project from Crew. Refused while one of its runs is
+    /// live or a worktree change is under way. Its queued runs are dropped
+    /// with a note first, and its terminal sessions are no longer listed.
+    /// Nothing on disk is touched.
+    fn remove_project(&self, project: ProjectId) -> Result<(), String> {
+        let err = |e: StoreError| e.to_string();
+        let (dirs, threads) = {
+            let mut state = self.state();
+            let (stored, threads) = {
+                let db = self.db();
+                let stored = db.store.project(project).map_err(err)?;
+                (stored, db.store.project_threads(project).map_err(err)?)
+            };
+            let ids: std::collections::HashSet<ThreadId> = threads.iter().map(|t| t.id).collect();
+            if state.live.values().any(|(t, _)| ids.contains(t)) {
+                return Err(format!("Stop the agents in {} first.", stored.name));
+            }
+            if ids.iter().any(|t| state.scheduler.is_active(*t)) {
+                return Err(format!(
+                    "Wait for the worktree change in {} to finish.",
+                    stored.name
+                ));
+            }
+            let (dropped, kept): (Vec<Job>, Vec<Job>) = state
+                .scheduler
+                .clear()
+                .into_iter()
+                .partition(|j| ids.contains(&j.thread));
+            for job in kept {
+                state.scheduler.enqueue(job);
+            }
+            for job in &dropped {
+                state.pending.remove(&job.run);
+                state.retry_rules.remove(&job.run);
+            }
+            self.note_dropped(&dropped, RunStatus::Stopped)
+                .map_err(err)?;
+            let mut db = self.db();
+            db.store.remove_project(project).map_err(err)?;
+            let mut terminal = self.terminal();
+            for id in terminal.remove_project(project) {
+                self.publish_global(&mut db, ServerMsg::TerminalSessionRemoved { id });
+            }
+            drop(terminal);
+            self.publish_global(&mut db, ServerMsg::ProjectRemoved { project });
+            let mut dirs = vec![stored.root];
+            dirs.extend(
+                threads
+                    .iter()
+                    .filter_map(|t| t.worktree.as_ref().map(|w| w.path.clone())),
+            );
+            (dirs, ids)
+        };
+        {
+            let mut index = self.files();
+            for dir in &dirs {
+                index.forget(dir);
+            }
+        }
+        {
+            let mut cache = self.changes();
+            for thread in threads {
+                cache.invalidate(thread);
+                cache.forget_edits(thread);
+            }
+        }
+        self.rescan_terminal();
         Ok(())
     }
 
@@ -2013,8 +2126,16 @@ enum Invocation {
     Codex(CodexInvocation),
 }
 
+/// A folder as compared between projects: links resolved when it exists,
+/// trailing slashes dropped.
+fn same_folder(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
+}
+
 /// Runs blocking work, such as git, off the async threads.
-async fn blocking<T, E>(f: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, String>
+pub(crate) async fn blocking<T, E>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, String>
 where
     T: Send + 'static,
     E: std::fmt::Display + Send + 'static,

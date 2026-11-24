@@ -64,7 +64,8 @@ CREATE TABLE runs (
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
     ord INTEGER NOT NULL,
-    runtime TEXT NOT NULL DEFAULT 'claude_code'
+    runtime TEXT NOT NULL DEFAULT 'claude_code',
+    handed_from TEXT REFERENCES runs(id)
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);

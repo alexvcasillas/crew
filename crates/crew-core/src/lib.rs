@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod claude;
 pub mod codex;
+pub mod edits;
 pub mod event;
 pub mod ids;
 pub mod mention;

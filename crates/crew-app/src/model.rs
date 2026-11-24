@@ -88,78 +88,7 @@ impl LoggedEvent {
     }
 }
 
-/// Lines an edit or a new file adds and removes.
-pub fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Option<(u32, u32)> {
-    let lines = |v: &serde_json::Value| {
-        v.as_str()
-            .map_or(0, |s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX))
-    };
-    // Codex gives a unified diff instead of old and new text.
-    if let Some(diff) = input.get("diff").and_then(|d| d.as_str()) {
-        return match kind {
-            ToolKind::Edit => Some(patch_lines(diff)),
-            ToolKind::Create => Some((lines(&input["diff"]), 0)),
-            _ => None,
-        };
-    }
-    match kind {
-        ToolKind::Edit => {
-            let edits = match input.get("edits").and_then(|e| e.as_array()) {
-                Some(edits) => edits.iter().collect(),
-                None => vec![input],
-            };
-            Some(edits.iter().fold((0, 0), |(a, r), e| {
-                (a + lines(&e["new_string"]), r + lines(&e["old_string"]))
-            }))
-        }
-        ToolKind::Create => Some((lines(&input["content"]), 0)),
-        _ => None,
-    }
-}
-
-/// What a unified diff line is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatchMark {
-    Added,
-    Removed,
-    /// File headers, hunk heads and context.
-    Plain,
-}
-
-/// Marks each line of a unified diff. `---` and `+++` are file headers
-/// only before the first `@@`; inside a hunk they are changed lines.
-pub fn patch_marks(diff: &str) -> impl Iterator<Item = (&str, PatchMark)> {
-    let mut in_hunk = false;
-    diff.lines().map(move |line| {
-        if line.starts_with("@@") {
-            in_hunk = true;
-        }
-        let header = !in_hunk && (line.starts_with("---") || line.starts_with("+++"));
-        let mark = if header {
-            PatchMark::Plain
-        } else if line.starts_with('+') {
-            PatchMark::Added
-        } else if line.starts_with('-') {
-            PatchMark::Removed
-        } else {
-            PatchMark::Plain
-        };
-        (line, mark)
-    })
-}
-
-/// Lines a unified diff adds and removes.
-pub fn patch_lines(diff: &str) -> (u32, u32) {
-    let (mut added, mut removed) = (0u32, 0u32);
-    for (_, mark) in patch_marks(diff) {
-        match mark {
-            PatchMark::Added => added = added.saturating_add(1),
-            PatchMark::Removed => removed = removed.saturating_add(1),
-            PatchMark::Plain => {}
-        }
-    }
-    (added, removed)
-}
+pub use crew_core::edits::{PatchMark, changed_lines, patch_lines, patch_marks};
 
 /// The events of one watched thread, each `(run, seq)` once.
 #[derive(Debug, Default)]
@@ -298,6 +227,7 @@ impl State {
             ServerMsg::ProjectChanged { project } => {
                 self.projects.insert(project.id, project);
             }
+            ServerMsg::ProjectRemoved { project } => self.remove_project(project),
             ServerMsg::ChannelChanged { channel } => {
                 let reported = (channel.handoff_policy, channel.handoff_budget);
                 if self.sent_channel_handoffs.get(&channel.id) == Some(&reported) {
@@ -337,6 +267,26 @@ impl State {
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::ChannelOverviewStale { .. } => {}
         }
+    }
+
+    /// Forgets a removed project and everything in it.
+    fn remove_project(&mut self, project: ProjectId) {
+        self.projects.remove(&project);
+        self.channels.retain(|_, c| c.project != project);
+        let channels = &self.channels;
+        self.threads
+            .retain(|_, t| channels.contains_key(&t.channel));
+        let threads = &self.threads;
+        self.runs.retain(|_, r| threads.contains_key(&r.thread));
+        self.approvals
+            .retain(|_, a| threads.contains_key(&a.thread));
+        self.messages.retain(|t, _| threads.contains_key(t));
+        self.logs.retain(|t, _| threads.contains_key(t));
+        self.sent_thread_handoffs
+            .retain(|t, _| threads.contains_key(t));
+        self.sent_channel_handoffs
+            .retain(|c, _| channels.contains_key(c));
+        self.terminal.retain(|_, s| s.project != project);
     }
 
     /// Replaces everything with what a fresh `SubscribeAll` starts from.
@@ -1068,6 +1018,38 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_removed_project_takes_its_channels_threads_and_runs_along() {
+        let (mut state, p, c, t) = one_thread();
+        let keep = project(2);
+        let kept_channel = channel(keep.id);
+        let kept_thread = thread(kept_channel.id, "kept", 2);
+        state.apply(ServerMsg::ProjectChanged {
+            project: keep.clone(),
+        });
+        state.apply(ServerMsg::ChannelChanged {
+            channel: kept_channel.clone(),
+        });
+        state.apply(ServerMsg::ThreadCreated {
+            channel: kept_channel.id,
+            thread: kept_thread.clone(),
+        });
+        let r = run(t.id, RunStatus::Done, 3);
+        state.apply(status(&r));
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: approval(t.id, 4),
+        });
+        state.apply(ServerMsg::ProjectRemoved { project: p.id });
+        assert!(state.project(p.id).is_none());
+        assert!(state.channel(c.id).is_none());
+        assert!(state.thread(t.id).is_none());
+        assert!(state.runs.is_empty());
+        assert!(state.approvals.is_empty());
+        assert!(state.project(keep.id).is_some());
+        assert!(state.thread(kept_thread.id).is_some());
     }
 
     #[test]

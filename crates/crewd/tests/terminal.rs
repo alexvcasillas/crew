@@ -788,3 +788,29 @@ async fn old_and_deleted_sessions_are_not_listed() {
         .unwrap_err();
     assert!(err.contains("terminal session"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_project_takes_its_terminal_sessions_along() {
+    let p = Paths::new();
+    write_session(
+        &p.transcript(&p.root, SHOWN),
+        SHOWN,
+        &p.root,
+        "cli",
+        "Fix the login bug",
+    );
+    start(&p, no_claude()).await;
+    let mut c = Client::connect(&p).await;
+    c.snapshot().await;
+    let project = create_project(&mut c, &p.root).await;
+    c.change(SHOWN, |_| true).await;
+
+    c.call(Request::RemoveProject { project }).await.unwrap();
+    c.until(|m| matches!(m, ServerMsg::TerminalSessionRemoved { id } if id == SHOWN))
+        .await;
+    // A rescan doesn't bring it back, and the session file stays.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut other = Client::connect(&p).await;
+    assert!(other.snapshot().await.is_empty());
+    assert!(p.transcript(&p.root, SHOWN).exists());
+}

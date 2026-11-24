@@ -22,7 +22,7 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v6.sql"),
     include_str!("migrate_v7.sql"),
     include_str!("migrate_v8.sql"),
+    include_str!("migrate_v9.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -488,6 +489,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn rename_project(&self, p: ProjectId, name: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![p.to_string(), name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(())
+    }
+
+    /// Deletes the project with its channels, threads, messages, runs,
+    /// events and approvals. Nothing on disk is touched.
+    pub fn remove_project(&self, p: ProjectId) -> Result<()> {
+        const THREADS: &str = "SELECT t.id FROM threads t JOIN channels c ON c.id = t.channel_id
+             WHERE c.project_id = ?1";
+        let tx = self.conn.unchecked_transaction()?;
+        let id = p.to_string();
+        for sql in [
+            format!("DELETE FROM messages WHERE thread_id IN ({THREADS})"),
+            format!("DELETE FROM approvals WHERE thread_id IN ({THREADS})"),
+            format!(
+                "DELETE FROM events WHERE run_id IN
+                 (SELECT id FROM runs WHERE thread_id IN ({THREADS}))"
+            ),
+            format!("DELETE FROM runs WHERE thread_id IN ({THREADS})"),
+            "DELETE FROM threads WHERE channel_id IN
+             (SELECT id FROM channels WHERE project_id = ?1)"
+                .to_string(),
+            "DELETE FROM channels WHERE project_id = ?1".to_string(),
+        ] {
+            tx.execute(&sql, [&id])?;
+        }
+        let changed = tx.execute("DELETE FROM projects WHERE id = ?1", [&id])?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn projects(&self) -> Result<Vec<StoredProject>> {
         let mut stmt = self
             .conn
@@ -666,6 +708,44 @@ impl Store {
         ))?;
         let rows = stmt.query_map([c.to_string()], read_thread)?;
         rows.map(|r| r?).collect()
+    }
+
+    /// Threads that aren't archived, of one project or of all of them.
+    pub fn open_threads(&self, p: Option<ProjectId>) -> Result<Vec<StoredThread>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{THREAD_COLUMNS} WHERE archived_at IS NULL AND (?1 IS NULL OR channel_id IN
+               (SELECT id FROM channels WHERE project_id = ?1))
+             ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([p.map(|p| p.to_string())], read_thread)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Every thread of the project, archived ones included.
+    pub fn project_threads(&self, p: ProjectId) -> Result<Vec<StoredThread>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{THREAD_COLUMNS} WHERE channel_id IN (SELECT id FROM channels WHERE project_id = ?1)
+             ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([p.to_string()], read_thread)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Threads that aren't archived with a message from you or an agent
+    /// holding `needle`, which must be lowercase. Matching is ASCII case
+    /// insensitive.
+    pub fn threads_mentioning(&self, needle: &str, p: Option<ProjectId>) -> Result<Vec<ThreadId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT m.thread_id FROM messages m JOIN threads t ON t.id = m.thread_id
+             WHERE t.archived_at IS NULL AND m.author_kind <> 'system'
+               AND (?2 IS NULL OR t.channel_id IN
+                 (SELECT id FROM channels WHERE project_id = ?2))
+               AND instr(lower(m.body), ?1) > 0",
+        )?;
+        let rows = stmt.query_map(params![needle, p.map(|p| p.to_string())], |r| {
+            Ok(ThreadId(uuid_col(r, 0)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn rename_thread(&self, t: ThreadId, title: &str) -> Result<()> {
@@ -939,6 +1019,49 @@ impl Store {
             ],
         )?;
         Ok(id)
+    }
+
+    /// Adds a queued run of `a` that `from` brought in with a handoff.
+    pub fn create_handoff_run(&self, t: ThreadId, a: AgentId, from: RunId) -> Result<RunId> {
+        let id = self.create_run(t, a)?;
+        self.conn.execute(
+            "UPDATE runs SET handed_from = ?2 WHERE id = ?1",
+            params![id.to_string(), from.to_string()],
+        )?;
+        Ok(id)
+    }
+
+    /// `(from, to)` agents of each handoff run created at or after `since`
+    /// (Unix ms).
+    pub fn handoffs_since(&self, since: i64) -> Result<Vec<(AgentId, AgentId)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.agent_id, r.agent_id FROM runs r JOIN runs f ON f.id = r.handed_from
+             WHERE r.started_at >= ?1 ORDER BY r.ord",
+        )?;
+        let rows = stmt.query_map([since], |r| {
+            Ok((AgentId(uuid_col(r, 0)?), AgentId(uuid_col(r, 1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every run in the project's threads, in order.
+    pub fn project_runs(&self, p: ProjectId) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE thread_id IN (SELECT t.id FROM threads t
+               JOIN channels c ON c.id = t.channel_id WHERE c.project_id = ?1)
+             ORDER BY ord"
+        ))?;
+        let rows = stmt.query_map([p.to_string()], read_run)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Every run of the agent, in order.
+    pub fn agent_runs(&self, a: AgentId) -> Result<Vec<StoredRun>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{RUN_COLUMNS} WHERE agent_id = ?1 ORDER BY ord"))?;
+        let rows = stmt.query_map([a.to_string()], read_run)?;
+        rows.map(|r| r?).collect()
     }
 
     /// Moves a run to `Working` with the CLI that runs it and its session

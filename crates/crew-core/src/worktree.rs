@@ -259,6 +259,94 @@ pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
     }
 }
 
+/// The files git knows in a checkout, for finding them by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileList {
+    /// Tracked files and untracked ones that are not ignored, relative to
+    /// the checkout.
+    pub files: Vec<String>,
+    /// Those that differ from `HEAD`: staged, edited, deleted or new.
+    pub changed: std::collections::HashSet<String>,
+}
+
+/// Lists the files of the checkout at `dir` with `git ls-files`, so
+/// ignored folders such as `node_modules` are never read. Fails if `dir`
+/// is not a git checkout.
+pub fn list_files(dir: &Path) -> Result<FileList> {
+    let all = git(
+        dir,
+        [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let mut files: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in all.split('\0').filter(|p| !p.is_empty()) {
+        // A file with unmerged stages is listed once per stage.
+        if seen.insert(path) {
+            files.push(path.to_string());
+        }
+    }
+    let status = git(
+        dir,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
+    let changed = status
+        .split('\0')
+        .filter(|e| e.len() > 3)
+        .map(|e| e[3..].to_string())
+        .collect();
+    Ok(FileList { files, changed })
+}
+
+/// What a project's own checkout looks like.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootInfo {
+    /// Whether the folder exists. Nothing else is read when it doesn't.
+    pub exists: bool,
+    /// The checked out branch. `None` if detached or not a git checkout.
+    pub branch: Option<String>,
+    /// Files with uncommitted changes, new ones included.
+    pub uncommitted: u32,
+    /// Where `origin` points, if there is one.
+    pub remote_url: Option<String>,
+}
+
+/// Reads the root's branch, uncommitted files and `origin`. Git failures
+/// leave those parts empty.
+pub fn root_info(root: &Path) -> RootInfo {
+    if !root.is_dir() {
+        return RootInfo::default();
+    }
+    let branch = git(root, ["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty());
+    let uncommitted = git(root, ["status", "--porcelain=v1", "-z", "--no-renames"])
+        .map(|s| s.split('\0').filter(|e| e.len() > 3).count())
+        .unwrap_or(0);
+    let remote_url = git(root, ["remote", "get-url", "origin"])
+        .ok()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    RootInfo {
+        exists: true,
+        branch,
+        uncommitted: u32::try_from(uncommitted).unwrap_or(u32::MAX),
+        remote_url,
+    }
+}
+
 fn head(dir: &Path) -> Result<String> {
     Ok(git(dir, ["rev-parse", "HEAD"])?.trim().to_string())
 }
