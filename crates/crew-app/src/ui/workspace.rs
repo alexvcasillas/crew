@@ -137,6 +137,8 @@ pub struct Workspace {
     pub(super) inspector_shown: bool,
     /// The open review of a thread's changes, shown in place of the body.
     pub(super) review: Option<Review>,
+    /// Review changes shows lines side by side. Kept while the app runs.
+    pub(super) diff_split: bool,
     /// Files you marked as viewed, per thread, kept in memory only.
     pub(super) viewed: HashMap<ThreadId, HashSet<String>>,
     /// A thread whose review opens once the thread is open (debug
@@ -242,6 +244,7 @@ impl Workspace {
             inspector_open: None,
             inspector_shown: false,
             review: None,
+            diff_split: false,
             viewed: HashMap::new(),
             review_pending: hooks.review,
             commit_messages: HashMap::new(),

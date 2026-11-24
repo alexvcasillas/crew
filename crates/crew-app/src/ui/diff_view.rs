@@ -25,7 +25,7 @@ use super::markdown_view::render_doc;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
 use crate::checks::{Check, CheckState, checks};
 use crate::comments::{Comment, comments, place, reviewer_replies};
-use crate::diff_parse::{FileDiff, FileKind, LineKind, parse};
+use crate::diff_parse::{FileDiff, FileKind, Line, LineKind, parse, split_pairs};
 use crate::fonts::mono_font;
 use crate::theme::color;
 
@@ -75,6 +75,9 @@ enum Row {
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
+    /// A split row: the hunk's line on the left, by index, and the one on
+    /// the right. Context is on both sides.
+    Pair(usize, usize, Option<usize>, Option<usize>),
     /// The file's one-line note, such as for a binary file.
     Note(usize),
     /// A large file waiting for "Show diff".
@@ -92,6 +95,8 @@ pub(super) struct Review {
     loaded: bool,
     /// Parsed from the last diff read. The one source of file counts.
     files: Vec<FileDiff>,
+    /// Lines side by side, as chosen with Unified / Split.
+    split: bool,
     rows: Vec<Row>,
     /// Each file's header row.
     file_rows: Vec<usize>,
@@ -153,6 +158,7 @@ fn diff_rows(
     files: &[FileDiff],
     shown: &HashSet<String>,
     comments: &[Comment],
+    split: bool,
 ) -> (Vec<Row>, Vec<usize>) {
     let placement = place(files, |f| lines_drawn(&files[f], shown), comments);
     let mut rows = Vec::new();
@@ -171,16 +177,119 @@ fn diff_rows(
         } else {
             for (h, hunk) in file.hunks.iter().enumerate() {
                 rows.push(Row::Hunk(f, h));
-                for l in 0..hunk.lines.len() {
-                    rows.push(Row::Line(f, h, l));
+                let under = |rows: &mut Vec<Row>, l: usize| {
                     if let Some(under) = placement.under.get(&(f, h, l)) {
                         rows.extend(under.iter().map(|&c| Row::Comment(c)));
+                    }
+                };
+                if split {
+                    for (left, right) in split_pairs(hunk) {
+                        rows.push(Row::Pair(f, h, left, right));
+                        if let Some(l) = left {
+                            under(&mut rows, l);
+                        }
+                        // Context is the same line on both sides.
+                        if let Some(l) = right.filter(|&r| Some(r) != left) {
+                            under(&mut rows, l);
+                        }
+                    }
+                } else {
+                    for l in 0..hunk.lines.len() {
+                        rows.push(Row::Line(f, h, l));
+                        under(&mut rows, l);
                     }
                 }
             }
         }
     }
     (rows, starts)
+}
+
+/// Something a row stands for that survives a rebuild: a file by its
+/// path, then what is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Anchor {
+    /// The comments listed above the first file.
+    Outside,
+    File(String),
+    Hunk(String, usize),
+    Line(String, usize, usize),
+    Note(String),
+    Folded(String),
+}
+
+impl Anchor {
+    /// What to look for when this is gone.
+    fn parent(&self) -> Option<Anchor> {
+        match self {
+            Anchor::Line(path, h, _) => Some(Anchor::Hunk(path.clone(), *h)),
+            Anchor::Hunk(path, _) | Anchor::Note(path) | Anchor::Folded(path) => {
+                Some(Anchor::File(path.clone()))
+            }
+            Anchor::File(_) | Anchor::Outside => None,
+        }
+    }
+}
+
+/// What the row at `ix` stands for. A comment stands for the row above
+/// it, as the cards are not part of the diff.
+fn anchor_at(rows: &[Row], files: &[FileDiff], ix: usize) -> Option<Anchor> {
+    let mut ix = ix.min(rows.len().checked_sub(1)?);
+    while matches!(rows[ix], Row::Comment(_)) && ix > 0 {
+        ix -= 1;
+    }
+    let path = |f: usize| files.get(f).map(|f| f.path.clone());
+    match rows[ix] {
+        Row::OutsideTitle | Row::Comment(_) => Some(Anchor::Outside),
+        Row::File(f) => path(f).map(Anchor::File),
+        Row::Hunk(f, h) => path(f).map(|p| Anchor::Hunk(p, h)),
+        Row::Line(f, h, l) => path(f).map(|p| Anchor::Line(p, h, l)),
+        Row::Pair(f, h, left, right) => {
+            let l = left.or(right)?;
+            path(f).map(|p| Anchor::Line(p, h, l))
+        }
+        Row::Note(f) => path(f).map(Anchor::Note),
+        Row::Folded(f) => path(f).map(Anchor::Folded),
+    }
+}
+
+/// The row that stands for `anchor`, else for what it was part of.
+fn find_anchor(rows: &[Row], files: &[FileDiff], anchor: &Anchor) -> Option<usize> {
+    let mut anchor = Some(anchor.clone());
+    while let Some(a) = anchor {
+        let found = rows.iter().position(|row| {
+            let same_file = |f: usize, path: &String| files.get(f).is_some_and(|x| &x.path == path);
+            match (&a, *row) {
+                (Anchor::Outside, Row::OutsideTitle) => true,
+                (Anchor::File(p), Row::File(f)) => same_file(f, p),
+                (Anchor::Hunk(p, h), Row::Hunk(f, rh)) => rh == *h && same_file(f, p),
+                (Anchor::Line(p, h, l), Row::Line(f, rh, rl)) => {
+                    rh == *h && rl == *l && same_file(f, p)
+                }
+                (Anchor::Line(p, h, l), Row::Pair(f, rh, left, right)) => {
+                    rh == *h && (left == Some(*l) || right == Some(*l)) && same_file(f, p)
+                }
+                (Anchor::Note(p), Row::Note(f)) => same_file(f, p),
+                (Anchor::Folded(p), Row::Folded(f)) => same_file(f, p),
+                _ => false,
+            }
+        });
+        if found.is_some() {
+            return found;
+        }
+        anchor = a.parent();
+    }
+    None
+}
+
+/// The row at the top of the list, to come back to after a rebuild.
+struct Kept {
+    anchor: Option<Anchor>,
+    /// How far into that row the list was scrolled. Zero for a card, whose
+    /// height can change.
+    offset: Pixels,
+    /// Its place before, for when nothing matches.
+    ix: usize,
 }
 
 /// `M`, `A`, `D`, `R` and their colour tokens.
@@ -231,6 +340,7 @@ impl Workspace {
             thread,
             loaded: false,
             files: Vec::new(),
+            split: self.diff_split,
             rows: Vec::new(),
             file_rows: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(800.)),
@@ -361,6 +471,12 @@ impl Workspace {
                     let file = &review.files[f];
                     under = Some((file.path.clone(), file.hunks[h].lines[l].new));
                 }
+                Row::Pair(f, h, left, right) => {
+                    let file = &review.files[f];
+                    let lines = &file.hunks[h].lines;
+                    let line = right.map(|r| lines[r].new).or(left.map(|l| lines[l].old));
+                    under = Some((file.path.clone(), line.flatten()));
+                }
                 Row::Comment(c) => {
                     if let Some((path, line)) = under.clone() {
                         pinned.push((path, line, comment_header(&review.comments[c])));
@@ -370,6 +486,25 @@ impl Workspace {
             }
         }
         pinned
+    }
+
+    /// The list's top row.
+    #[cfg(test)]
+    pub(super) fn review_top(&self) -> Option<usize> {
+        self.review
+            .as_ref()
+            .map(|r| r.list.logical_scroll_top().item_ix)
+    }
+
+    /// Scrolls the list so row `ix` is at the top.
+    #[cfg(test)]
+    pub(super) fn scroll_review_to(&self, ix: usize) {
+        if let Some(review) = &self.review {
+            review.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+        }
     }
 
     /// The headers of the comments listed outside the diff.
@@ -469,13 +604,14 @@ impl Workspace {
                 match read {
                     Ok((diff, files)) => {
                         if let (Some(review), Some(files)) = (review, files) {
+                            let kept = keep_scroll(review);
                             review.loaded = true;
                             review.failed = None;
                             review.files = files;
                             review
                                 .shown
                                 .retain(|p| review.files.iter().any(|f| &f.path == p));
-                            rebuild_rows(review);
+                            rebuild_rows_from(review, kept);
                         }
                         this.inspector.diff = Some(diff);
                     }
@@ -496,6 +632,19 @@ impl Workspace {
         if let Some(thread) = self.review.as_ref().map(|r| r.thread) {
             self.load_thread_diff(thread, cx);
         }
+    }
+
+    /// Shows the lines side by side or one after the other, for the rest of
+    /// the session.
+    fn set_split(&mut self, split: bool, cx: &mut Context<Self>) {
+        self.diff_split = split;
+        if let Some(review) = &mut self.review
+            && review.split != split
+        {
+            review.split = split;
+            rebuild_rows(review);
+        }
+        cx.notify();
     }
 
     fn show_large_file(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -886,6 +1035,26 @@ impl Workspace {
                     .test_support()
                     .into_any_element()
             }
+            Row::Pair(f, h, left, right) => {
+                let lines = &review.files[f].hunks[h].lines;
+                let (left, right) = (left.map(|i| &lines[i]), right.map(|i| &lines[i]));
+                let label = [side_label(left, true), side_label(right, false)].join(" | ");
+                div()
+                    .id(("diff-row", ix))
+                    .w_full()
+                    .flex()
+                    .h(px(LINE_HEIGHT))
+                    .items_center()
+                    .font_family(mono_font())
+                    .text_size(px(12.))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .aria_label(label)
+                    .child(split_side(("diff-left", ix), left, true))
+                    .child(split_side(("diff-right", ix), right, false))
+                    .test_support()
+                    .into_any_element()
+            }
             Row::Note(f) => {
                 let note = review.files[f].note.clone().unwrap_or_default();
                 div()
@@ -917,11 +1086,13 @@ impl Workspace {
                 let comment = &review.comments[c];
                 let header = comment_header(comment);
                 let doc = crate::markdown::parse(&comment.body);
+                // In split view the card spans both columns.
+                let gutters = if review.split { 1. } else { 2. };
                 div()
                     .id(("diff-row", ix))
                     .w_full()
                     .py(px(6.))
-                    .pl(px(GUTTER * 2. + 16.))
+                    .pl(px(GUTTER * gutters + 16.))
                     .pr(px(16.))
                     .child(
                         div()
@@ -1066,16 +1237,17 @@ impl Workspace {
                         Button::new("review-unified")
                             .ghost()
                             .xsmall()
-                            .selected(true)
-                            .label("Unified"),
+                            .selected(!review.split)
+                            .label("Unified")
+                            .on_click(cx.listener(|this, _, _, cx| this.set_split(false, cx))),
                     )
                     .child(
                         Button::new("review-split")
                             .ghost()
                             .xsmall()
+                            .selected(review.split)
                             .label("Split")
-                            .disabled(true)
-                            .tooltip("Split view is coming soon."),
+                            .on_click(cx.listener(|this, _, _, cx| this.set_split(true, cx))),
                     ),
             )
             .child(
@@ -1505,13 +1677,118 @@ impl Workspace {
     }
 }
 
+/// Notes where the list is scrolled, before its rows or files change.
+fn keep_scroll(review: &Review) -> Kept {
+    let top = review.list.logical_scroll_top();
+    let on_card = matches!(review.rows.get(top.item_ix), Some(Row::Comment(_)));
+    Kept {
+        anchor: anchor_at(&review.rows, &review.files, top.item_ix),
+        offset: if on_card { px(0.) } else { top.offset_in_item },
+        ix: top.item_ix,
+    }
+}
+
+/// Draws the rows again, keeping the list on the row it was on.
 fn rebuild_rows(review: &mut Review) {
-    let (rows, starts) = diff_rows(&review.files, &review.shown, &review.comments);
+    let kept = keep_scroll(review);
+    rebuild_rows_from(review, kept);
+}
+
+/// [`rebuild_rows`] for a change that already replaced the files.
+fn rebuild_rows_from(review: &mut Review, kept: Kept) {
+    let (rows, starts) = diff_rows(&review.files, &review.shown, &review.comments, review.split);
     if rows != review.rows {
+        let top = kept
+            .anchor
+            .as_ref()
+            .and_then(|a| find_anchor(&rows, &review.files, a))
+            .or_else(|| kept.ix.min(rows.len().saturating_sub(1)).into());
         review.list.reset(rows.len());
+        if let Some(item_ix) = top.filter(|&ix| ix > 0 || kept.offset > px(0.)) {
+            review.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: kept.offset,
+            });
+        }
     }
     review.rows = rows;
     review.file_rows = starts;
+}
+
+/// A split side's number, sign and text, as it is read back. Empty for
+/// no line.
+fn side_label(line: Option<&Line>, left: bool) -> String {
+    let Some(line) = line else {
+        return String::new();
+    };
+    let text = line.text.replace('\t', "    ");
+    if line.kind == LineKind::NoNewline {
+        return text;
+    }
+    let number = if left { line.old } else { line.new };
+    let sign = match line.kind {
+        LineKind::Added => "+",
+        LineKind::Removed => "−",
+        _ => " ",
+    };
+    format!(
+        "{} {sign} {text}",
+        number.map_or_else(|| "·".into(), |n| n.to_string())
+    )
+}
+
+/// One column of a split row: its own number gutter, the sign and the
+/// text. No line leaves it empty.
+fn split_side(id: (&'static str, usize), line: Option<&Line>, left: bool) -> impl IntoElement {
+    let (tint, sign, sign_colour) = match line.map(|l| l.kind) {
+        Some(LineKind::Added) => (Some("success-subtle"), "+", "success"),
+        Some(LineKind::Removed) => (Some("danger-subtle"), "−", "danger"),
+        _ => (None, " ", "text-tertiary"),
+    };
+    let number = line.and_then(|l| if left { l.old } else { l.new });
+    let no_newline = line.is_some_and(|l| l.kind == LineKind::NoNewline);
+    let text = line.map(|l| l.text.replace('\t', "    "));
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .when(!left, |side| {
+            side.border_l_1().border_color(color("border-100"))
+        })
+        .when_some(tint, |side, tint| side.bg(color(tint)))
+        .aria_label(side_label(line, left))
+        .child(
+            div()
+                .flex_none()
+                .w(px(GUTTER))
+                .pr(px(8.))
+                .flex()
+                .justify_end()
+                .text_color(color("text-gutter"))
+                .children(number.map(|n| n.to_string())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(16.))
+                .text_color(color(sign_colour))
+                .child(if no_newline { "" } else { sign }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_color(color(if no_newline {
+                    "text-tertiary"
+                } else {
+                    "text-primary"
+                }))
+                .children(text),
+        )
+        .test_support()
 }
 
 /// "{Agent} · {path}:{line}".
@@ -1576,7 +1853,10 @@ fn open_folder(path: PathBuf, app: Option<String>) -> Result<(), String> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{LARGE_FILE_LINES, Row, diff_rows, draft_commit_message};
+    use super::{
+        Anchor, LARGE_FILE_LINES, Row, anchor_at, diff_rows, draft_commit_message, find_anchor,
+    };
+    use crate::comments::Comment;
     use crate::diff_parse::parse;
 
     #[test]
@@ -1605,7 +1885,7 @@ mod tests {
             LARGE_FILE_LINES + 1
         );
         let files = parse(&patch);
-        let (rows, starts) = diff_rows(&files, &HashSet::new(), &[]);
+        let (rows, starts) = diff_rows(&files, &HashSet::new(), &[], false);
         assert_eq!(
             rows,
             [
@@ -1619,7 +1899,93 @@ mod tests {
         );
         assert_eq!(starts, [0, 4]);
         let shown = HashSet::from(["big".to_string()]);
-        let (rows, _) = diff_rows(&files, &shown, &[]);
+        let (rows, _) = diff_rows(&files, &shown, &[], false);
         assert_eq!(rows.len(), 4 + 2 + LARGE_FILE_LINES + 1);
+    }
+
+    const MODIFIED: &str = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+        @@ -1,3 +1,3 @@\n one\n-two\n+deux\n three\n";
+    const ADDED: &str = "diff --git a/n b/n\nnew file mode 100644\n--- /dev/null\n+++ b/n\n\
+        @@ -0,0 +1,2 @@\n+x\n+y\n";
+    const DELETED: &str = "diff --git a/d b/d\ndeleted file mode 100644\n--- a/d\n+++ /dev/null\n\
+        @@ -1,2 +0,0 @@\n-x\n-y\n";
+
+    fn comment(path: &str, line: u32) -> Comment {
+        Comment {
+            agent: "Scout".into(),
+            path: path.into(),
+            line,
+            body: "note".into(),
+        }
+    }
+
+    #[test]
+    fn split_rows_pair_lines_and_keep_comments_under_their_pair() {
+        let files = parse(MODIFIED);
+        // Line 2 of the new file is `deux`, paired with `two`.
+        let (rows, _) = diff_rows(&files, &HashSet::new(), &[comment("a.rs", 2)], true);
+        assert_eq!(
+            rows,
+            [
+                Row::File(0),
+                Row::Hunk(0, 0),
+                Row::Pair(0, 0, Some(0), Some(0)),
+                Row::Pair(0, 0, Some(1), Some(2)),
+                Row::Comment(0),
+                Row::Pair(0, 0, Some(3), Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_of_added_and_deleted_files_has_one_empty_side() {
+        let files = parse(&format!("{ADDED}{DELETED}"));
+        // Deleted files are commented by their old line numbers.
+        let (rows, _) = diff_rows(&files, &HashSet::new(), &[comment("d", 2)], true);
+        assert_eq!(
+            rows,
+            [
+                Row::File(0),
+                Row::Hunk(0, 0),
+                Row::Pair(0, 0, None, Some(0)),
+                Row::Pair(0, 0, None, Some(1)),
+                Row::File(1),
+                Row::Hunk(1, 0),
+                Row::Pair(1, 0, Some(0), None),
+                Row::Pair(1, 0, Some(1), None),
+                Row::Comment(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_top_row_is_found_again_after_the_rows_change() {
+        let files = parse(MODIFIED);
+        let none = HashSet::new();
+        let (unified, _) = diff_rows(&files, &none, &[], false);
+        let (split, _) = diff_rows(&files, &none, &[], true);
+        // `deux` is unified row 4 and the split row 3.
+        let at = anchor_at(&unified, &files, 4).unwrap();
+        assert_eq!(at, Anchor::Line("a.rs".into(), 0, 2));
+        assert_eq!(find_anchor(&split, &files, &at), Some(3));
+        let back = anchor_at(&split, &files, 3).unwrap();
+        // The pair starts at the deletion, `two`.
+        assert_eq!(find_anchor(&unified, &files, &back), Some(3));
+        // A comment row stands for the line above it.
+        let (with, _) = diff_rows(&files, &none, &[comment("a.rs", 2)], false);
+        assert_eq!(with[5], Row::Comment(0));
+        assert_eq!(anchor_at(&with, &files, 5), Some(at.clone()));
+        assert_eq!(find_anchor(&with, &files, &at), Some(4));
+        // A line that is gone falls back to its hunk, then its file.
+        let gone = Anchor::Line("a.rs".into(), 0, 99);
+        assert_eq!(find_anchor(&unified, &files, &gone), Some(1));
+        assert_eq!(
+            find_anchor(&unified, &files, &Anchor::Folded("a.rs".into())),
+            Some(0)
+        );
+        assert_eq!(
+            find_anchor(&unified, &files, &Anchor::File("other".into())),
+            None
+        );
     }
 }

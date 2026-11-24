@@ -324,9 +324,69 @@ fn unquote(s: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// A hunk's lines as side by side rows, by line index: a run of deletions
+/// pairs in order with the run of additions after it, the longer run
+/// leaves the other side empty, and context shows on both sides. A
+/// `\ No newline` mark stays on the side of the line before it.
+pub fn split_pairs(hunk: &Hunk) -> Vec<(Option<usize>, Option<usize>)> {
+    fn flush(
+        out: &mut Vec<(Option<usize>, Option<usize>)>,
+        dels: &mut Vec<usize>,
+        adds: &mut Vec<usize>,
+    ) {
+        for i in 0..dels.len().max(adds.len()) {
+            out.push((dels.get(i).copied(), adds.get(i).copied()));
+        }
+        dels.clear();
+        adds.clear();
+    }
+    let mut out = Vec::new();
+    let (mut dels, mut adds) = (Vec::new(), Vec::new());
+    // Whether the line before was an addition.
+    let mut after_add = false;
+    for (i, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Removed => {
+                if after_add {
+                    flush(&mut out, &mut dels, &mut adds);
+                }
+                dels.push(i);
+                after_add = false;
+            }
+            LineKind::Added => {
+                adds.push(i);
+                after_add = true;
+            }
+            LineKind::NoNewline if !dels.is_empty() || !adds.is_empty() => {
+                if after_add {
+                    adds.push(i);
+                } else {
+                    dels.push(i);
+                }
+            }
+            LineKind::Context | LineKind::NoNewline => {
+                flush(&mut out, &mut dels, &mut adds);
+                out.push((Some(i), Some(i)));
+                after_add = false;
+            }
+        }
+    }
+    flush(&mut out, &mut dels, &mut adds);
+    out
+}
+
+/// [`split_pairs`] with the lines themselves.
+pub fn split_rows(hunk: &Hunk) -> Vec<(Option<Line>, Option<Line>)> {
+    let line = |i: Option<usize>| i.map(|i| hunk.lines[i].clone());
+    split_pairs(hunk)
+        .into_iter()
+        .map(|(l, r)| (line(l), line(r)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FileKind, LineKind, parse};
+    use super::{FileKind, LineKind, parse, split_pairs, split_rows};
 
     const MODIFIED: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
@@ -343,6 +403,73 @@ index 1111111..2222222 100644
  ten
 +eleven
 ";
+
+    fn hunk_of(patch: &str) -> super::Hunk {
+        let patch = format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,9 +1,9 @@\n{patch}");
+        parse(&patch).remove(0).hunks.remove(0)
+    }
+
+    fn texts(hunk: &super::Hunk) -> Vec<(Option<String>, Option<String>)> {
+        split_rows(hunk)
+            .into_iter()
+            .map(|(l, r)| (l.map(|l| l.text), r.map(|l| l.text)))
+            .collect()
+    }
+
+    fn pair(l: &str, r: &str) -> (Option<String>, Option<String>) {
+        let side = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        (side(l), side(r))
+    }
+
+    #[test]
+    fn split_pairs_a_change_and_repeats_context() {
+        let hunk = hunk_of(" a\n-b\n+B\n c\n");
+        assert_eq!(
+            texts(&hunk),
+            [pair("a", "a"), pair("b", "B"), pair("c", "c")]
+        );
+        assert_eq!(
+            split_pairs(&hunk),
+            [(Some(0), Some(0)), (Some(1), Some(2)), (Some(3), Some(3))]
+        );
+    }
+
+    #[test]
+    fn split_leaves_one_side_empty_for_additions_and_deletions() {
+        assert_eq!(texts(&hunk_of("+x\n+y\n")), [pair("", "x"), pair("", "y")]);
+        assert_eq!(texts(&hunk_of("-x\n-y\n")), [pair("x", ""), pair("y", "")]);
+    }
+
+    #[test]
+    fn split_pairs_uneven_runs_in_order() {
+        assert_eq!(
+            texts(&hunk_of("-a\n-b\n-c\n+A\n c\n+d\n+e\n")),
+            [
+                pair("a", "A"),
+                pair("b", ""),
+                pair("c", ""),
+                pair("c", "c"),
+                pair("", "d"),
+                pair("", "e"),
+            ]
+        );
+        assert_eq!(
+            texts(&hunk_of("-a\n+A\n+B\n+C\n")),
+            [pair("a", "A"), pair("", "B"), pair("", "C")]
+        );
+    }
+
+    #[test]
+    fn split_keeps_no_newline_marks_on_their_side() {
+        let hunk = hunk_of("-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n");
+        let rows = split_rows(&hunk);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.as_ref().unwrap().text, "a");
+        assert_eq!(rows[0].1.as_ref().unwrap().text, "b");
+        assert_eq!(rows[1].0.as_ref().unwrap().kind, LineKind::NoNewline);
+        assert_eq!(rows[1].1.as_ref().unwrap().kind, LineKind::NoNewline);
+        assert_eq!(split_rows(&hunk_of("")).len(), 0);
+    }
 
     #[test]
     fn hunks_number_their_lines() {

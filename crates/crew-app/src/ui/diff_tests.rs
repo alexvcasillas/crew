@@ -619,3 +619,76 @@ fn a_reviewer_reply_pins_its_comments_to_the_diff(cx: &mut TestAppContext) {
     assert!(ws.read_with(cx, |ws, _| ws.pinned_comments()).is_empty());
     assert!(!has(cx, window, "review-callout"));
 }
+
+#[gpui_kit::test]
+fn split_shows_two_columns_and_is_remembered(cx: &mut TestAppContext) {
+    let s = setup("printf 'hello\\nthere\\n' > README.md\nprintf 'one\\ntwo\\n' > new.txt");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 2);
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "· 2 + there");
+    assert!(!shows(cx, window, "2 − world | 2 + there"));
+
+    click(cx, window, "review-split");
+    // The paired change reads as one row with a gutter on each side.
+    assert!(shows(cx, window, "2 − world | 2 + there"));
+    assert!(shows(cx, window, "2 − world"));
+    assert!(shows(cx, window, "2 + there"));
+    assert!(shows(cx, window, "1   hello | 1   hello"));
+    // A new file has nothing on the left.
+    assert!(shows(cx, window, " | 1 + one"));
+    assert!(!shows(cx, window, "· 2 + there"));
+
+    // The choice is kept when the review closes and opens again.
+    press(cx, window, "escape");
+    wait_to_show(cx, window, "fix the login");
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "2 − world | 2 + there");
+
+    click(cx, window, "review-unified");
+    assert!(shows(cx, window, "· 2 + there"));
+    assert!(!shows(cx, window, "2 − world | 2 + there"));
+}
+
+#[gpui_kit::test]
+fn split_of_a_deleted_file_has_an_empty_right_side(cx: &mut TestAppContext) {
+    let s = setup("rm README.md");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "1 · − hello");
+    click(cx, window, "review-split");
+    assert!(shows(cx, window, "1 − hello | "));
+    assert!(shows(cx, window, "2 − world | "));
+}
+
+#[gpui_kit::test]
+fn the_list_keeps_its_place_when_the_rows_change(cx: &mut TestAppContext) {
+    let s = setup("seq 1 100 > README.md");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "· 1 + 1");
+    // Unified: file, hunk, two deletions, then the additions.
+    ws.read_with(cx, |ws, _| ws.scroll_review_to(50));
+    cx.run_until_parked();
+    assert_eq!(ws.read_with(cx, |ws, _| ws.review_top()), Some(50));
+
+    // The same line is two rows higher once the deletions pair up.
+    click(cx, window, "review-split");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.review_top()), Some(48));
+    click(cx, window, "review-unified");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.review_top()), Some(50));
+
+    // Reading the changes again keeps the place too.
+    click(cx, window, "review-refresh");
+    wait_until(cx, "the list to settle", |cx| {
+        ws.read_with(cx, |ws, _| ws.review_top()) == Some(50)
+    });
+}
