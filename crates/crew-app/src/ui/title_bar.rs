@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use super::common::{chip, dot};
 use super::settings::Page;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
+use crate::app;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_family, ui_px, weight};
 
 pub const TITLE_BAR_HEIGHT: f32 = 48.;
 /// The Kit title bar's left padding for the traffic lights on macOS.
@@ -20,6 +21,8 @@ const TRAFFIC_LIGHTS_INSET: f32 = 80.;
 /// The breadcrumb separators, dimmer than any text token.
 const SLASH: u32 = 0x3a3a3a;
 const SEARCH_WIDTH: f32 = 320.;
+/// Narrowest the search button gets in a crowded title bar.
+const SEARCH_MIN_WIDTH: f32 = 120.;
 /// Widest the project path chip gets before its start is cut.
 const PATH_MAX_WIDTH: f32 = 220.;
 /// The path chip's padding and border, left and right.
@@ -28,14 +31,19 @@ const PATH_FONT_SIZE: f32 = 11.;
 const SEARCH_PLACEHOLDER: &str = "Search threads, agents, files…";
 
 impl Workspace {
-    pub(super) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The title bar of a window `width` wide.
+    pub(super) fn render_title_bar(
+        &self,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let special = self
             .render_settings_title(cx)
             .or_else(|| self.render_running_title(cx))
             .or_else(|| self.render_review_title(cx));
         if let Some((left, right)) = special {
             return TitleBar::new()
-                .h(px(TITLE_BAR_HEIGHT))
+                .h(scale::chrome(TITLE_BAR_HEIGHT))
                 .bg(color("bg-100"))
                 .border_color(color("border-100"))
                 .child(
@@ -45,51 +53,67 @@ impl Workspace {
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
-                        .px(px(8.))
+                        .px(ui_px(8.))
                         .child(left),
                 )
-                .child(div().flex_none().pr(px(12.)).child(right));
+                .child(div().flex_none().pr(ui_px(12.)).child(right));
         }
+        let search = search_width(width);
+        let crowded = search < ui_px(SEARCH_WIDTH);
         TitleBar::new()
-            .h(px(TITLE_BAR_HEIGHT))
+            .h(scale::chrome(TITLE_BAR_HEIGHT))
             .bg(color("bg-100"))
             .border_color(color("border-100"))
             .child(
                 // Equal flexible sides keep the search button centred.
+                // "Crew" always shows; the breadcrumb after it is cut, and
+                // never reaches under the search button.
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .flex_1()
-                    .flex_basis(px(0.))
-                    .min_w_0()
-                    // Never reaches under the search button.
+                    .flex_basis(ui_px(0.))
+                    .min_w(app_name_width(cx) + ui_px(16.))
                     .overflow_hidden()
-                    .mr(px(12.))
-                    .px(px(8.))
+                    .mr(ui_px(12.))
+                    .px(ui_px(8.))
                     .child(
                         div()
                             .id("title-app")
                             .flex_none()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(weight(FontWeight::SEMIBOLD))
                             .aria_label("Crew")
                             .child("Crew")
                             .test_support(),
                     )
-                    .children(self.render_breadcrumb(cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(ui_px(8.))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .children(self.render_breadcrumb(cx)),
+                    ),
             )
-            .child(render_search_button(cx))
+            .child(render_search_button(search, cx))
             .child(
                 div()
                     .flex_1()
-                    .flex_basis(px(0.))
+                    .flex_basis(ui_px(0.))
                     .flex()
                     .justify_end()
-                    // Mirrors the traffic-light inset on the left.
+                    // Mirrors the traffic-light inset on the left, which
+                    // doesn't zoom, unless the bar is too crowded for it.
                     .items_center()
-                    .gap(px(8.))
-                    .pl(px(TRAFFIC_LIGHTS_INSET))
-                    .pr(px(12.))
+                    .gap(ui_px(8.))
+                    .pl(if crowded {
+                        ui_px(12.)
+                    } else {
+                        px(TRAFFIC_LIGHTS_INSET)
+                    })
+                    .pr(ui_px(12.))
                     .children(self.render_title_actions(cx)),
             )
     }
@@ -111,13 +135,13 @@ impl Workspace {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(6.))
-                .h(px(28.))
-                .px(px(10.))
+                .gap(ui_px(6.))
+                .h(scale::row(28.))
+                .px(ui_px(10.))
                 .border_1()
                 .border_color(color("border-200"))
-                .rounded(px(6.))
-                .text_size(px(12.))
+                .rounded(ui_px(6.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-secondary"))
                 .cursor_pointer()
                 .hover(|s| s.bg(color("surface-100")))
@@ -168,21 +192,22 @@ impl Workspace {
         };
         let full = home_relative(&project.root);
         let text = cx.text_system();
-        let font_id = text.resolve_font(&font(mono_font()));
+        let font_id = text.resolve_font(&font(code_family()));
         let width = |s: &str| -> f32 {
             s.chars()
-                .filter_map(|c| text.advance(font_id, px(PATH_FONT_SIZE), c).ok())
+                .filter_map(|c| text.advance(font_id, scale::mono(PATH_FONT_SIZE), c).ok())
                 .map(|size| size.width.as_f32())
                 .sum()
         };
-        let path = cut_start(&full, PATH_MAX_WIDTH - CHIP_INSET, width);
+        let path = cut_start(&full, f32::from(ui_px(PATH_MAX_WIDTH - CHIP_INSET)), width);
         let slash = || div().flex_none().text_color(rgb(SLASH)).child("/");
         vec![
             slash().into_any_element(),
             div()
                 .id("title-project")
-                .flex_none()
-                .font_weight(FontWeight::MEDIUM)
+                .min_w_0()
+                .truncate()
+                .font_weight(weight(FontWeight::MEDIUM))
                 .aria_label(project.name.clone())
                 .child(project.name.clone())
                 .test_support()
@@ -191,13 +216,16 @@ impl Workspace {
             div()
                 .id("title-channel")
                 .flex()
-                .flex_none()
-                .gap(px(2.))
-                .font_weight(FontWeight::MEDIUM)
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .gap(ui_px(2.))
+                .font_weight(weight(FontWeight::MEDIUM))
                 .aria_label(format!("#{}", channel.name))
                 .child(
                     div()
-                        .font_family(mono_font())
+                        .font_family(code_family())
+                        .text_size(scale::mono(13.))
                         .text_color(color("text-tertiary"))
                         .child("#"),
                 )
@@ -211,7 +239,7 @@ impl Workspace {
                 .justify_end()
                 .flex_shrink(1.)
                 .min_w_0()
-                .max_w(px(PATH_MAX_WIDTH))
+                .max_w(ui_px(PATH_MAX_WIDTH))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .aria_label(full)
@@ -247,38 +275,69 @@ pub(super) fn home_relative(path: &Path) -> String {
     }
 }
 
+/// How wide "Crew" is drawn in the title bar.
+fn app_name_width(cx: &App) -> Pixels {
+    let text = cx.text_system();
+    let mut name = font(ui_family());
+    name.weight = weight(FontWeight::SEMIBOLD);
+    let id = text.resolve_font(&name);
+    let size = scale::text(13.);
+    "Crew"
+        .chars()
+        .filter_map(|c| text.advance(id, size, c).ok())
+        .map(|a| a.width)
+        .fold(px(0.), |sum, w| sum + w)
+        .ceil()
+}
+
+/// The search button's width in a window `window` wide: its full width
+/// unless big text or zoom leave too little room beside it.
+fn search_width(window: Pixels) -> Pixels {
+    // The room the rest of the title bar gets in the smallest window at
+    // the default look, grown with the zoom and with bigger text.
+    let text_growth = (scale::text(1.) / ui_px(1.)).max(1.);
+    let rest = ui_px(app::WINDOW_MIN_WIDTH - SEARCH_WIDTH) * text_growth;
+    (window - rest).clamp(ui_px(SEARCH_MIN_WIDTH), ui_px(SEARCH_WIDTH))
+}
+
 /// "Search threads, agents, files… ⌘K": opens the palette.
-fn render_search_button(cx: &mut Context<Workspace>) -> impl IntoElement {
+fn render_search_button(width: Pixels, cx: &mut Context<Workspace>) -> impl IntoElement {
     div()
         .id("title-search")
         .flex()
         .flex_none()
+        .w(width)
         .items_center()
-        .gap(px(8.))
-        .w(px(SEARCH_WIDTH))
-        .h(px(32.))
-        .pl(px(10.))
-        .pr(px(8.))
+        .gap(ui_px(8.))
+        .h(ui_px(32.))
+        .pl(ui_px(10.))
+        .pr(ui_px(8.))
         .border_1()
         .border_color(color("border-200"))
-        .rounded(px(6.))
+        .rounded(ui_px(6.))
         .bg(color("bg-100"))
         .text_color(color("text-tertiary"))
         .cursor_pointer()
         .hover(|s| s.bg(color("surface-100")))
         .role(Role::Button)
         .aria_label(SEARCH_PLACEHOLDER)
-        .child(div().flex_1().child(SEARCH_PLACEHOLDER))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(SEARCH_PLACEHOLDER),
+        )
         .child(
             div()
                 .flex_none()
-                .px(px(5.))
+                .px(ui_px(5.))
                 .border_1()
                 .border_color(color("border-200"))
-                .rounded(px(4.))
+                .rounded(ui_px(4.))
                 .bg(color("surface-300"))
-                .font_family(mono_font())
-                .text_size(px(11.))
+                .font_family(code_family())
+                .text_size(scale::mono(11.))
                 .child("⌘K"),
         )
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())

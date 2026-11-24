@@ -12,9 +12,9 @@ use gpui_kit::*;
 use super::common::spinner;
 use super::inspector::InspectorTab;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px};
 
 /// Output lines a command shows, from its end, until you ask for all.
 pub const TAIL_LINES: usize = 20;
@@ -189,7 +189,7 @@ impl Workspace {
         if let Some(ix) = self.inspector.term.rows.iter().position(|c| c.id == id) {
             self.inspector.term_list.scroll_to(ListOffset {
                 item_ix: ix,
-                offset_in_item: px(0.),
+                offset_in_item: ui_px(0.),
             });
         }
     }
@@ -205,8 +205,8 @@ impl Workspace {
                 div()
                     .id("terminal-empty")
                     .flex_1()
-                    .p(px(16.))
-                    .text_size(px(12.))
+                    .p(ui_px(16.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(NO_COMMANDS)
                     .child(NO_COMMANDS)
@@ -234,12 +234,12 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(4.))
-                    .min_h(px(32.))
-                    .px(px(16.))
+                    .gap(ui_px(4.))
+                    .min_h(scale::row(32.))
+                    .px(ui_px(16.))
                     .border_t_1()
                     .border_color(color("border-100"))
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(match &cwd {
                         Some(cwd) => format!("Read only. Commands ran in {cwd}"),
@@ -248,10 +248,13 @@ impl Workspace {
                     .child("Read only.")
                     .when_some(cwd, |footer, cwd| {
                         footer.child("Commands ran in").child(
-                            div()
-                                .flex()
-                                .min_w_0()
-                                .child(div().truncate().font_family(mono_font()).child(cwd)),
+                            div().flex().min_w_0().child(
+                                div()
+                                    .truncate()
+                                    .font_family(code_family())
+                                    .text_size(scale::mono(12.))
+                                    .child(cwd),
+                            ),
                         )
                     })
                     .test_support(),
@@ -283,18 +286,18 @@ impl Workspace {
         };
         let icon = match cmd.state {
             CommandState::Running if unfinished => Icon::new(IconName::Minus)
-                .size(px(12.))
+                .size(ui_px(12.))
                 .text_color(color("text-tertiary"))
                 .into_any_element(),
             CommandState::Running => {
                 spinner(("terminal-spinner", ix), 12., "accent-blue").into_any_element()
             }
             CommandState::Passed => Icon::new(IconName::Check)
-                .size(px(12.))
+                .size(ui_px(12.))
                 .text_color(color("success"))
                 .into_any_element(),
             CommandState::Failed => Icon::new(IconName::CircleX)
-                .size(px(12.))
+                .size(ui_px(12.))
                 .text_color(color("danger"))
                 .into_any_element(),
         };
@@ -303,16 +306,16 @@ impl Workspace {
             .id(("terminal-row", ix))
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .px(px(16.))
-            .py(px(10.))
+            .gap(ui_px(6.))
+            .px(ui_px(16.))
+            .py(scale::row(10.))
             .border_b_1()
             .border_color(color("border-100"))
             .child(
                 div()
                     .id(("terminal-command", ix))
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .text_color(color("text-primary"))
                     .aria_label(prompt.clone())
                     .child(prompt)
@@ -322,14 +325,14 @@ impl Workspace {
                 row.child(
                     div()
                         .id(("terminal-output", ix))
-                        .px(px(8.))
-                        .py(px(6.))
+                        .px(ui_px(8.))
+                        .py(scale::row(6.))
                         .bg(color("bg-100"))
                         .border_1()
                         .border_color(color("border-100"))
-                        .rounded(px(6.))
-                        .font_family(mono_font())
-                        .text_size(px(11.5))
+                        .rounded(ui_px(6.))
+                        .font_family(code_family())
+                        .text_size(scale::mono(11.5))
                         .text_color(color("text-secondary"))
                         .aria_label(shown.clone())
                         .child(shown)
@@ -348,7 +351,7 @@ impl Workspace {
                 row.child(
                     div()
                         .id(("terminal-show-all", ix))
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("accent-blue"))
                         .cursor_pointer()
                         .aria_label(label.clone())
@@ -370,8 +373,8 @@ impl Workspace {
                     .id(("terminal-state", ix))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .text_size(px(12.))
+                    .gap(ui_px(6.))
+                    .text_size(scale::text(12.))
                     .text_color(color(token))
                     .aria_label(word)
                     .child(icon)

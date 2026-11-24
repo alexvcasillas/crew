@@ -15,8 +15,8 @@ use gpui_kit::*;
 use super::common::{elapsed, monogram, now_ms, runtime_badge_for, runtime_chip};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 const NO_WORKING_COPY: &str = "No working copy yet. One is made when an agent first edits files.";
 
@@ -188,19 +188,19 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .h(px(26.))
-                    .rounded(px(4.))
+                    .h(scale::row(26.))
+                    .rounded(ui_px(4.))
                     .when(selected, |s| s.bg(color("surface-300")))
                     .text_color(color(if selected {
                         "text-primary"
                     } else {
                         "text-secondary"
                     }))
-                    .font_weight(if selected {
+                    .font_weight(weight(if selected {
                         FontWeight::MEDIUM
                     } else {
                         FontWeight::NORMAL
-                    })
+                    }))
                     .cursor_pointer()
                     .role(Role::Button)
                     .aria_label(if selected {
@@ -270,10 +270,10 @@ impl Workspace {
             .flex_col()
             .size_full()
             .overflow_y_scroll()
-            .px(px(16.))
-            .py(px(12.))
-            .gap(px(20.))
-            .text_size(px(12.))
+            .px(ui_px(16.))
+            .py(scale::row(12.))
+            .gap(ui_px(20.))
+            .text_size(scale::text(12.))
             .child(
                 section("In this thread").children(if participants.is_empty() {
                     vec![help("No agent has run here yet.").into_any_element()]
@@ -285,14 +285,14 @@ impl Workspace {
                                 .id(format!("participant-{}", p.agent))
                                 .flex()
                                 .items_center()
-                                .gap(px(8.))
-                                .h(px(28.))
+                                .gap(ui_px(8.))
+                                .h(scale::row(28.))
                                 .aria_label(format!("{} {}", p.name, p.status))
                                 .child(monogram(&p.name, 20.))
                                 .child(
                                     div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_size(px(13.))
+                                        .font_weight(weight(FontWeight::MEDIUM))
+                                        .text_size(scale::text(13.))
                                         .child(p.name),
                                 )
                                 .children(
@@ -314,11 +314,11 @@ impl Workspace {
                     .child(
                         div()
                             .flex()
-                            .gap(px(2.))
-                            .p(px(2.))
+                            .gap(ui_px(2.))
+                            .p(ui_px(2.))
                             .border_1()
                             .border_color(color("border-200"))
-                            .rounded(px(6.))
+                            .rounded(ui_px(6.))
                             .children(segments),
                     ),
             )
@@ -327,7 +327,7 @@ impl Workspace {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(4.))
+                        .gap(ui_px(4.))
                         .child(
                             Button::new("budget-down")
                                 .outline()
@@ -338,10 +338,10 @@ impl Workspace {
                         .child(
                             div()
                                 .id("budget-value")
-                                .min_w(px(32.))
+                                .min_w(ui_px(32.))
                                 .text_center()
-                                .font_family(mono_font())
-                                .text_size(px(13.))
+                                .font_family(code_family())
+                                .text_size(scale::mono(13.))
                                 .aria_label(budget.to_string())
                                 .child(budget.to_string())
                                 .test_support(),
@@ -377,7 +377,7 @@ impl Workspace {
                     .child(
                         div()
                             .id("handoffs-used")
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .text_color(color("text-primary"))
                             .aria_label(format!("{used} / {budget}"))
                             .child(format!("{used} / {budget}"))
@@ -385,7 +385,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .h(px(4.))
+                            .h(ui_px(4.))
                             .w_full()
                             .rounded_full()
                             .bg(color("surface-300"))
@@ -422,10 +422,10 @@ impl Workspace {
 
 /// A titled group of the Thread tab.
 fn section(title: &str) -> Div {
-    div().flex().flex_col().gap(px(6.)).child(
+    div().flex().flex_col().gap(ui_px(6.)).child(
         div()
             .text_color(color("text-secondary"))
-            .font_weight(FontWeight::MEDIUM)
+            .font_weight(weight(FontWeight::MEDIUM))
             .child(title.to_string()),
     )
 }
@@ -438,11 +438,11 @@ fn value_row(label: &str, id: &'static str, value: String, mono: bool) -> impl I
     div()
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(24.))
+        .gap(ui_px(8.))
+        .h(scale::row(24.))
         .child(
             div()
-                .w(px(96.))
+                .w(ui_px(96.))
                 .flex_none()
                 .text_color(color("text-tertiary"))
                 .child(label.to_string()),
@@ -454,7 +454,7 @@ fn value_row(label: &str, id: &'static str, value: String, mono: bool) -> impl I
                 .min_w_0()
                 .truncate()
                 .text_color(color("text-primary"))
-                .when(mono, |v| v.font_family(mono_font()))
+                .when(mono, |v| v.font_family(code_family()))
                 .aria_label(value.clone())
                 .child(value)
                 .test_support(),

@@ -14,9 +14,9 @@ use super::common::{chip, clean_line, clean_lines, cut_start, monogram};
 use super::markdown_view::{DocCache, DocKey, render_doc};
 use super::run_card::{Step, StepState, relative, shorten, step_row, verb};
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::model::changed_lines;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// What the open session's header shows of its folder.
 const CWD_MAX: usize = 60;
@@ -316,9 +316,9 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(12.))
-                    .h(px(44.))
-                    .px(px(24.))
+                    .gap(ui_px(12.))
+                    .h(scale::row(44.))
+                    .px(scale::chrome(24.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .child(
@@ -331,15 +331,15 @@ impl Workspace {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(ui_px(8.))
                                     .min_w_0()
                                     .child(
                                         div()
                                             .id("terminal-title")
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(14.))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(scale::text(14.))
+                                            .font_weight(weight(FontWeight::SEMIBOLD))
                                             .aria_label(title.clone())
                                             .child(title)
                                             .test_support(),
@@ -355,8 +355,8 @@ impl Workspace {
                                 div()
                                     .id("terminal-cwd")
                                     .truncate()
-                                    .font_family(mono_font())
-                                    .text_size(px(12.))
+                                    .font_family(code_family())
+                                    .text_size(scale::mono(12.))
                                     .text_color(color("text-tertiary"))
                                     .aria_label(cwd.clone())
                                     .child(cut_start(&cwd, CWD_MAX))
@@ -370,13 +370,13 @@ impl Workspace {
                             .flex()
                             .flex_none()
                             .items_center()
-                            .gap(px(6.))
-                            .text_size(px(12.))
+                            .gap(ui_px(6.))
+                            .text_size(scale::text(12.))
                             .text_color(color("text-secondary"))
                             .aria_label(note)
                             .child(
                                 Icon::new(IconName::SquareTerminal)
-                                    .size(px(12.))
+                                    .size(ui_px(12.))
                                     .text_color(color("text-tertiary")),
                             )
                             .child(note)
@@ -404,7 +404,7 @@ impl Workspace {
                             cx.processor(|this, ix, _, cx| this.render_terminal_row(ix, cx)),
                         )
                         .size_full()
-                        .py(px(12.)),
+                        .py(scale::row(12.)),
                     )
                     .test_support()
                     .into_any_element()
@@ -425,13 +425,17 @@ impl Workspace {
             TerminalRow::You { text, .. } => {
                 return author_row(ix, you_avatar(), "You", None)
                     .child(
-                        div().pl(px(INDENT)).pr(px(24.)).line_height(px(20.)).child(
-                            div()
-                                .id(("terminal-you", ix))
-                                .aria_label(text.clone())
-                                .child(text.clone())
-                                .test_support(),
-                        ),
+                        div()
+                            .pl(scale::chrome(24.) + ui_px(INDENT - 24.))
+                            .pr(scale::chrome(24.))
+                            .line_height(scale::line(20.))
+                            .child(
+                                div()
+                                    .id(("terminal-you", ix))
+                                    .aria_label(text.clone())
+                                    .child(text.clone())
+                                    .test_support(),
+                            ),
                     )
                     .into_any_element();
             }
@@ -443,7 +447,7 @@ impl Workspace {
                 let doc = open.docs.get(DocKey::Terminal(*seq), text);
                 div()
                     .id(("terminal-said", ix))
-                    .line_height(px(20.))
+                    .line_height(scale::line(20.))
                     .aria_label(text.clone())
                     .child(render_doc(&doc, &[], &format!("terminal-md-{seq}")))
                     .test_support()
@@ -455,14 +459,14 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .text_size(px(12.))
+                    .gap(ui_px(2.))
+                    .text_size(scale::text(12.))
                     .child(
                         div()
                             .id(("terminal-thinking", ix))
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .cursor_pointer()
                             .text_color(color("text-secondary"))
                             .aria_label("Thinking")
@@ -472,7 +476,7 @@ impl Workspace {
                                 } else {
                                     IconName::ChevronRight
                                 })
-                                .size(px(12.))
+                                .size(ui_px(12.))
                                 .text_color(color("text-tertiary")),
                             )
                             .child("Thinking")
@@ -485,7 +489,7 @@ impl Workspace {
                         el.child(
                             div()
                                 .id(("terminal-thought", ix))
-                                .pl(px(16.))
+                                .pl(ui_px(16.))
                                 .italic()
                                 .text_color(color("text-tertiary"))
                                 .aria_label(text.clone())
@@ -499,22 +503,22 @@ impl Workspace {
                 .id(("terminal-steps", ix))
                 .flex()
                 .flex_col()
-                .max_w(px(560.))
-                .px(px(12.))
-                .py(px(4.))
+                .max_w(ui_px(560.))
+                .px(ui_px(12.))
+                .py(scale::row(4.))
                 .border_1()
                 .border_color(color("border-100"))
-                .rounded(px(8.))
+                .rounded(ui_px(8.))
                 .children(steps.iter().enumerate().map(step_row))
                 .test_support()
                 .into_any_element(),
             TerminalRow::Error(message) => div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .text_size(px(12.))
+                .gap(ui_px(6.))
+                .text_size(scale::text(12.))
                 .text_color(color("danger"))
-                .child(Icon::new(IconName::CircleX).size(px(12.)))
+                .child(Icon::new(IconName::CircleX).size(ui_px(12.)))
                 .child(
                     div()
                         .id(("terminal-error", ix))
@@ -525,9 +529,9 @@ impl Workspace {
                 .into_any_element(),
         };
         div()
-            .pl(px(INDENT))
-            .pr(px(24.))
-            .pb(px(8.))
+            .pl(scale::chrome(24.) + ui_px(INDENT - 24.))
+            .pr(scale::chrome(24.))
+            .pb(scale::row(8.))
             .child(content)
             .into_any_element()
     }
@@ -539,18 +543,18 @@ fn author_row(ix: usize, avatar: Div, name: &str, runtime: Option<&str>) -> Stat
         .id(("terminal-row", ix))
         .flex()
         .flex_col()
-        .pt(px(8.))
-        .pb(px(4.))
+        .pt(scale::row(8.))
+        .pb(scale::row(4.))
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(12.))
-                .px(px(24.))
+                .gap(ui_px(12.))
+                .px(scale::chrome(24.))
                 .child(avatar)
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(weight(FontWeight::SEMIBOLD))
                         .child(name.to_string()),
                 )
                 .when_some(runtime, |row, runtime| row.child(chip(runtime.to_string()))),
@@ -563,11 +567,11 @@ fn you_avatar() -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(32.))
+        .size(ui_px(32.))
         .rounded_full()
         .bg(color("border-200"))
-        .text_size(px(13.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(scale::text(13.))
+        .font_weight(weight(FontWeight::SEMIBOLD))
         .child("Y")
 }
 

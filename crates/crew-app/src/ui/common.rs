@@ -8,9 +8,9 @@ use crew_core::agent::{AgentSpec, Runtime};
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::*;
 
-use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// Now, in Unix milliseconds like crewd's timestamps.
 pub fn now_ms() -> i64 {
@@ -46,12 +46,12 @@ pub fn provider_icon(runtime: &Runtime, size: f32) -> impl IntoElement + use<> {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(size))
+        .size(ui_px(size))
         .aria_label(label)
         .child(
             Icon::default()
                 .data(svg)
-                .size(px(size))
+                .size(ui_px(size))
                 .text_color(color(token)),
         )
         .test_support()
@@ -68,7 +68,7 @@ pub fn runtime_badge_for(runtime: &Runtime, text: String) -> Div {
     chip_frame()
         .flex()
         .items_center()
-        .gap(px(4.))
+        .gap(ui_px(4.))
         .child(provider_icon(runtime, 12.))
         .child(text)
 }
@@ -182,13 +182,13 @@ pub fn monogram(name: &str, size: f32) -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(size))
-        .rounded(px(6.))
+        .size(ui_px(size))
+        .rounded(ui_px(6.))
         .bg(color("surface-300"))
         .border_1()
         .border_color(color("border-200"))
-        .text_size(px((size * 0.45).round().max(10.)))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(scale::text((size * 0.45).round().max(10.)))
+        .font_weight(weight(FontWeight::SEMIBOLD))
         .text_color(color("text-secondary"))
         .child(letter)
 }
@@ -201,14 +201,14 @@ pub fn chip(text: impl IntoElement) -> Div {
 fn chip_frame() -> Div {
     div()
         .flex_none()
-        .px(px(6.))
-        .py(px(1.))
-        .rounded(px(4.))
+        .px(ui_px(6.))
+        .py(scale::row(1.))
+        .rounded(ui_px(4.))
         .bg(color("surface-300"))
         .border_1()
         .border_color(color("border-100"))
-        .font_family(mono_font())
-        .text_size(px(11.))
+        .font_family(code_family())
+        .text_size(scale::mono(11.))
         .text_color(color("text-secondary"))
 }
 
@@ -216,7 +216,7 @@ fn chip_frame() -> Div {
 pub fn dot(token: &str) -> Div {
     div()
         .flex_none()
-        .size(px(6.))
+        .size(ui_px(6.))
         .rounded_full()
         .bg(color(token))
 }
@@ -232,7 +232,7 @@ const PULSE: Duration = Duration::from_millis(1600);
 /// `token`. `id` keeps its turn going across redraws.
 pub fn spinner(id: impl Into<ElementId>, size: f32, token: &str) -> impl IntoElement {
     Icon::new(IconName::LoaderCircle)
-        .size(px(size))
+        .size(ui_px(size))
         .text_color(color(token))
         .with_animation(id, Animation::new(SPIN).repeat(), |icon, turn| {
             icon.transform(Transformation::rotate(percentage(turn)))
@@ -276,8 +276,8 @@ pub fn rolling_text(id: impl Into<ElementId>, prev: &str, cur: &str) -> Stateful
         .id(id)
         .flex()
         .flex_none()
-        .h(px(ROLL_LINE))
-        .line_height(px(ROLL_LINE))
+        .h(scale::line(ROLL_LINE))
+        .line_height(scale::line(ROLL_LINE))
         .overflow_hidden();
     if prev.chars().count() != cur.chars().count() {
         return row.child(rolling_slot(0, prev.to_string(), cur.to_string(), cur));
@@ -301,18 +301,32 @@ pub fn rolling_text(id: impl Into<ElementId>, prev: &str, cur: &str) -> Stateful
 /// animation is named after the whole text `cur` so each change starts a
 /// fresh roll.
 fn rolling_slot(ix: usize, from: String, to: String, cur: &str) -> impl IntoElement {
-    div().flex_none().h(px(ROLL_LINE)).overflow_hidden().child(
-        div()
-            .flex()
-            .flex_col()
-            .child(div().h(px(ROLL_LINE)).whitespace_nowrap().child(from))
-            .child(div().h(px(ROLL_LINE)).whitespace_nowrap().child(to))
-            .with_animation(
-                SharedString::from(format!("roll-{ix}-{cur}")),
-                Animation::new(ROLL).with_easing(ease_out_cubic),
-                |column, t| column.mt(px(-ROLL_LINE * t)),
-            ),
-    )
+    div()
+        .flex_none()
+        .h(scale::line(ROLL_LINE))
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(scale::line(ROLL_LINE))
+                        .whitespace_nowrap()
+                        .child(from),
+                )
+                .child(
+                    div()
+                        .h(scale::line(ROLL_LINE))
+                        .whitespace_nowrap()
+                        .child(to),
+                )
+                .with_animation(
+                    SharedString::from(format!("roll-{ix}-{cur}")),
+                    Animation::new(ROLL).with_easing(ease_out_cubic),
+                    |column, t| column.mt(-scale::line(ROLL_LINE) * t),
+                ),
+        )
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -403,5 +417,56 @@ mod tests {
         assert!((pulse_opacity(0.5) - 0.4).abs() < 1e-6);
         assert!((pulse_opacity(1.) - 1.).abs() < 1e-6);
         assert!((pulse_opacity(0.25) - 0.7).abs() < 1e-6);
+    }
+}
+
+/// Adds a probe that records the text size and weight `el` draws with
+/// under `key`, in tests only, so they can check what the appearance
+/// settings did.
+pub fn with_font_probe<E: ParentElement>(el: E, key: impl FnOnce() -> String) -> E {
+    #[cfg(test)]
+    {
+        let key = key();
+        let mut el = el;
+        el.extend([canvas(
+            move |_, window, _| font_probe::record(key, window),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .into_any_element()]);
+        el
+    }
+    #[cfg(not(test))]
+    {
+        let _ = key;
+        el
+    }
+}
+
+#[cfg(test)]
+pub mod font_probe {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use gpui_kit::{FontWeight, Pixels, Window};
+
+    thread_local! {
+        static DRAWN: RefCell<HashMap<String, (Pixels, FontWeight)>> = RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn record(key: String, window: &Window) {
+        let style = window.text_style();
+        let size = style.font_size.to_pixels(window.rem_size());
+        DRAWN.with(|s| s.borrow_mut().insert(key, (size, style.font_weight)));
+    }
+
+    /// The text size the element probed as `key` last drew at.
+    pub fn size_of(key: &str) -> Option<Pixels> {
+        DRAWN.with(|s| s.borrow().get(key).map(|d| d.0))
+    }
+
+    /// The weight the element probed as `key` last drew its text with.
+    pub fn weight_of(key: &str) -> Option<FontWeight> {
+        DRAWN.with(|s| s.borrow().get(key).map(|d| d.1))
     }
 }

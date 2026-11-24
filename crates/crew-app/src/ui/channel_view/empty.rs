@@ -6,6 +6,7 @@ use gpui_kit::*;
 use super::super::common::{monogram, runtime_badge};
 use super::super::workspace::Workspace;
 use crate::theme::color;
+use crate::theme::scale::{self, ui_px, weight};
 
 /// The empty state's column.
 const COLUMN_MAX: f32 = 680.;
@@ -22,13 +23,13 @@ impl Workspace {
                     .id(SharedString::from(format!("bring-in-{}", agent.id)))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(ui_px(10.))
                     .min_w_0()
-                    .px(px(12.))
-                    .py(px(10.))
+                    .px(ui_px(12.))
+                    .py(scale::row(10.))
                     .border_1()
                     .border_color(color("border-100"))
-                    .rounded(px(8.))
+                    .rounded(ui_px(8.))
                     .bg(color("bg-100"))
                     .cursor_pointer()
                     .hover(|chip| {
@@ -44,11 +45,11 @@ impl Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                            .child(div().font_weight(weight(FontWeight::MEDIUM)).child(label))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-secondary"))
                                     .child(agent.spec.role.clone()),
                             ),
@@ -66,12 +67,16 @@ impl Workspace {
         let mut rows: Vec<AnyElement> = Vec::new();
         while let Some(first) = chips.next() {
             let cell = |chip: Option<AnyElement>| {
-                div().flex_1().flex_basis(px(0.)).min_w_0().children(chip)
+                div()
+                    .flex_1()
+                    .flex_basis(ui_px(0.))
+                    .min_w_0()
+                    .children(chip)
             };
             rows.push(
                 div()
                     .flex()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .child(cell(Some(first)))
                     .child(cell(chips.next()))
                     .into_any_element(),
@@ -85,26 +90,26 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_center()
-            .px(px(24.))
-            .py(px(32.))
+            .px(scale::chrome(24.))
+            .py(ui_px(32.))
             .child(
                 div()
                     .w_full()
-                    .max_w(px(COLUMN_MAX))
+                    .max_w(ui_px(COLUMN_MAX))
                     .flex()
                     .flex_col()
-                    .gap(px(20.))
+                    .gap(ui_px(20.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .child(
                                 div()
                                     .id("channel-empty-title")
-                                    .text_size(px(20.))
-                                    .line_height(px(28.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(scale::text(20.))
+                                    .line_height(scale::line(28.))
+                                    .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label("No threads yet")
                                     .child("No threads yet")
                                     .test_support(),
@@ -119,18 +124,18 @@ impl Workspace {
                             .id("bring-in")
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
+                            .gap(ui_px(8.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(scale::text(12.))
+                                    .font_weight(weight(FontWeight::MEDIUM))
                                     .text_color(color("text-secondary"))
                                     .child("Bring in"),
                             )
                             .children(rows)
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-tertiary"))
                                     .child("Picking one adds the @mention to your message. You can mention more than one."),
                             )

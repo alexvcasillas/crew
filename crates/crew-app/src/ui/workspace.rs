@@ -35,12 +35,16 @@ use crate::app::{
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
-use crate::fonts::ui_font;
 use crate::model::{Handoff, State};
+use crate::prefs::Appearance;
 use crate::recents::Recents;
 use crate::theme::color;
+use crate::theme::scale::{self, ui_family, weight};
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
+/// The most of the window's width the sidebar takes, for big text and zoom
+/// in a small window.
+const SIDEBAR_MAX_SHARE: f32 = 0.4;
 /// Narrower windows hide the inspector until you show it.
 pub const INSPECTOR_MIN_WINDOW: f32 = 1200.;
 /// Longest thread title taken from a first message.
@@ -195,6 +199,12 @@ pub struct Workspace {
     pub(super) recents: Recents,
     /// Writing the recents to the prefs file.
     recents_task: Option<Task<()>>,
+    /// Lays out again when the appearance settings change.
+    _appearance: Subscription,
+    /// The window's width as last drawn.
+    window_width: Pixels,
+    /// Where the traffic lights were put, to move them only on a change.
+    traffic_lights: Option<Point<Pixels>>,
 }
 
 /// A place the palette, and the sidebar, can take you to.
@@ -212,6 +222,11 @@ pub(super) type EditorSelect = SelectState<Vec<SharedString>>;
 
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let appearance = cx.observe_global_in::<Appearance>(window, |this, window, cx| {
+            this.remeasure_lists();
+            this.sync_font_selects(window, cx);
+            cx.notify();
+        });
         let (client, events) = client::spawn(conn.clone());
         let composer = cx.new(|cx| Composer::new(window, cx));
         let composer_events =
@@ -317,6 +332,28 @@ impl Workspace {
             palette: None,
             recents,
             recents_task: None,
+            _appearance: appearance,
+            traffic_lights: None,
+            window_width: px(f32::MAX),
+        }
+    }
+
+    /// The sidebar's width: it grows with bigger text, but never takes more
+    /// than [`SIDEBAR_MAX_SHARE`] of the window.
+    pub(super) fn sidebar_width(&self) -> Pixels {
+        scale::chrome(SIDEBAR_WIDTH).min((self.window_width * SIDEBAR_MAX_SHARE).floor())
+    }
+
+    /// Text sizes changed: the virtual lists measure their rows again.
+    fn remeasure_lists(&mut self) {
+        self.inspector.list.remeasure();
+        self.inspector.term_list.remeasure();
+        self.channel_view.list.remeasure();
+        if let Some(terminal) = &self.terminal {
+            terminal.list.remeasure();
+        }
+        if let Some(review) = &self.review {
+            review.remeasure();
         }
     }
 
@@ -1268,7 +1305,13 @@ fn working_hint(names: &[String]) -> Option<String> {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let wide = window.viewport_size().width >= px(INSPECTOR_MIN_WINDOW);
+        self.window_width = window.viewport_size().width;
+        let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
+        let lights = crate::app::traffic_lights();
+        if self.traffic_lights != Some(lights) {
+            self.traffic_lights = Some(lights);
+            window.set_traffic_light_position(lights);
+        }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
         div()
@@ -1303,9 +1346,11 @@ impl Render for Workspace {
             .flex_col()
             .bg(color("bg-100"))
             .text_color(color("text-primary"))
-            .font_family(ui_font())
-            .text_size(px(13.))
-            .child(self.render_title_bar(cx))
+            .font_family(ui_family())
+            .text_size(scale::text(13.))
+            .font_weight(weight(FontWeight::NORMAL))
+            .line_height(scale::relative_line())
+            .child(self.render_title_bar(window.viewport_size().width, cx))
             .child(if self.settings.is_some() {
                 self.render_settings(cx)
             } else if self.running.is_some() {

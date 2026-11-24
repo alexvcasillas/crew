@@ -8,8 +8,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{help, page_scroll, page_title};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 use crate::ui::common::provider_icon;
 use crate::ui::workspace::Workspace;
 
@@ -79,8 +79,8 @@ impl Workspace {
                     .id(SharedString::from(format!("runtime-row-{key}")))
                     .flex()
                     .items_center()
-                    .gap(px(12.))
-                    .min_h(px(52.))
+                    .gap(ui_px(12.))
+                    .min_h(scale::row(52.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .aria_label(format!("{name} {word}"))
@@ -91,12 +91,12 @@ impl Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                            .child(div().font_weight(weight(FontWeight::MEDIUM)).child(name))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(12.))
-                                    .font_family(mono_font())
+                                    .text_size(scale::mono(12.))
+                                    .font_family(code_family())
                                     .text_color(color("text-tertiary"))
                                     .child(detail),
                             ),
@@ -104,7 +104,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(scale::text(12.))
                             .text_color(color(token))
                             .child(word),
                     )
@@ -118,7 +118,7 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .max_w(px(760.))
+                    .max_w(ui_px(760.))
                     .child(div().flex_1().child(page_title("Runtimes")))
                     .child(
                         Button::new("runtimes-refresh")
@@ -141,7 +141,7 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(px(760.))
+                    .max_w(ui_px(760.))
                     .children(rows)
                     .when(empty, |col| {
                         col.child(help("Checking which CLIs are installed…"))

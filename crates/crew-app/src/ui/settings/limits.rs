@@ -11,6 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{Page, field, form_error, page_scroll, page_title, segment, segmented};
+use crate::theme::scale::{self, ui_px};
 use crate::ui::workspace::Workspace;
 
 /// What "Agents at once" offers.
@@ -176,33 +177,37 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(px(760.))
-                    .child(row(
+                    .max_w(ui_px(760.))
+                    .child(limit_row(
                         "limits-row-max-runs",
                         "Agents at once",
                         AT_ONCE_HELP,
                         value("limits-max-runs-value", limits.max_runs, at_once),
                     ))
-                    .child(row(
+                    .child(limit_row(
                         "limits-row-new-runs",
                         "New runs",
                         NEW_RUNS_HELP,
-                        div().flex().child(segmented(runs).w(px(240.))),
+                        div().flex().child(segmented(runs).w(ui_px(240.))),
                     ))
-                    .child(row(
+                    .child(limit_row(
                         "limits-row-policy",
                         "Bringing in other agents",
                         POLICY_HELP,
-                        div().flex().child(segmented(policies).w(px(320.))),
+                        div().flex().child(segmented(policies).w(ui_px(320.))),
                     ))
-                    .child(row(
+                    .child(limit_row(
                         "limits-row-budget",
                         "Handoffs per thread",
                         BUDGET_HELP,
                         value("limits-budget-value", limits.handoff_budget, budget),
                     ))
                     .when_some(self.limits_error.clone(), |col, error| {
-                        col.child(div().pt(px(12.)).child(form_error("limits-error", error)))
+                        col.child(
+                            div()
+                                .pt(scale::row(12.))
+                                .child(form_error("limits-error", error)),
+                        )
                     }),
             )
             .into_any_element()
@@ -210,7 +215,7 @@ impl Workspace {
 }
 
 /// A form row, labelled with its label so tests can find it.
-fn row(
+fn limit_row(
     id: &'static str,
     label: &'static str,
     help: &'static str,

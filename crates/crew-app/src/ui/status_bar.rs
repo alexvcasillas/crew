@@ -15,6 +15,7 @@ use super::settings::Page;
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
+use crate::theme::scale::{self, ui_px};
 
 pub const STATUS_BAR_HEIGHT: f32 = 28.;
 /// Names the status bar lists before "+N more".
@@ -124,7 +125,7 @@ impl Workspace {
                         .flex()
                         .flex_none()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(ui_px(6.))
                         .aria_label(text.clone())
                         .child(spinner("status-working-spinner", 12., "accent-blue"))
                         .child(text)
@@ -144,7 +145,7 @@ impl Workspace {
                         .id("status-runtimes")
                         .flex()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(ui_px(6.))
                         .aria_label(runtimes_label)
                         .children(runtime_items)
                         .test_support(),
@@ -194,7 +195,7 @@ impl Workspace {
                         .flex()
                         .flex_none()
                         .items_center()
-                        .gap(px(4.))
+                        .gap(ui_px(4.))
                         .aria_label(format!("{cap} · change"))
                         .child(cap)
                         .child(div().text_color(color("text-tertiary")).child("·"))
@@ -226,12 +227,12 @@ fn status_frame() -> Stateful<Div> {
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(16.))
-        .h(px(STATUS_BAR_HEIGHT))
-        .px(px(16.))
+        .gap(ui_px(16.))
+        .h(scale::row(STATUS_BAR_HEIGHT))
+        .px(ui_px(16.))
         .border_t_1()
         .border_color(color("border-100"))
-        .text_size(px(12.))
+        .text_size(scale::text(12.))
         .text_color(color("text-secondary"))
 }
 
@@ -242,7 +243,7 @@ fn item(id: &'static str, token: &str, text: String) -> impl IntoElement {
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(6.))
+        .gap(ui_px(6.))
         .aria_label(text.clone())
         .child(dot(token))
         .child(text)

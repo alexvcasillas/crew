@@ -17,6 +17,7 @@ use super::workspace::Workspace;
 use crate::connection::{self, ConnectionConfig, ConnectionState, StartError};
 use crate::launchd::{self, Plan};
 use crate::theme::color;
+use crate::theme::scale::ui_px;
 
 /// How long "Start Crew service" waits for crewd to answer.
 const START_WAIT: Duration = Duration::from_secs(5);
@@ -192,7 +193,7 @@ impl Workspace {
             let confirm = this.clone();
             let work = work.clone();
             dialog
-                .w(px(420.))
+                .w(ui_px(420.))
                 .title("Restart service")
                 .child(
                     div()

@@ -22,24 +22,23 @@ const FALLBACK_MONO: &str = "Menlo";
 
 static FONTS: OnceLock<(SharedString, SharedString)> = OnceLock::new();
 
-/// Registers the embedded fonts and picks the families views use. Returns
-/// the (interface, code) families.
-pub fn load(cx: &App) -> (&'static str, &'static str) {
+/// Registers the embedded fonts and picks the default families.
+pub fn load(cx: &App) {
     let fonts = EMBEDDED_FONTS.iter().map(|&b| Cow::Borrowed(b)).collect();
     if let Err(e) = cx.text_system().add_fonts(fonts) {
         eprintln!("crew: embedded fonts did not load: {e}");
     }
     let (ui, mono) = families(&cx.text_system().all_font_names());
     let _ = FONTS.set((ui.into(), mono.into()));
-    (ui, mono)
 }
 
-/// The interface font family in use.
+/// The default interface font family: Geist, or the system font without
+/// it. Views use `theme::scale::ui_family`, which follows the settings.
 pub fn ui_font() -> SharedString {
     FONTS.get().map_or(FALLBACK_UI.into(), |f| f.0.clone())
 }
 
-/// The code font family in use.
+/// The default code font family: Geist Mono, or Menlo without it.
 pub fn mono_font() -> SharedString {
     FONTS.get().map_or(FALLBACK_MONO.into(), |f| f.1.clone())
 }

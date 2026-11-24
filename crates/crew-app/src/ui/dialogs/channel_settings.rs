@@ -6,8 +6,8 @@ use gpui_kit::*;
 
 use super::super::workspace::Workspace;
 use super::{DialogKind, field_label, heading, hint};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px};
 
 impl Workspace {
     /// Asks for the channel's name and description.
@@ -58,7 +58,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(ui_px(14.))
             .child(heading(
                 "channel-settings-heading",
                 "Channel settings".into(),
@@ -70,12 +70,12 @@ impl Workspace {
                     .id("channel-settings-name")
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(ui_px(6.))
                     .child(field_label("Name"))
                     .child(
                         Input::new(name).aria_label("Name").prefix(
                             div()
-                                .font_family(mono_font())
+                                .font_family(code_family())
                                 .text_color(color("text-tertiary"))
                                 .child("#"),
                         ),
@@ -92,15 +92,15 @@ impl Workspace {
                     .id("channel-settings-description")
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(ui_px(6.))
                     .child(
                         div()
                             .flex()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .child(field_label("Description"))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-tertiary"))
                                     .child("· optional"),
                             ),
