@@ -1610,6 +1610,9 @@ impl Service {
         let db = self.db();
         match *window {
             Some(tokens) => {
+                if db.store.context_window(model).ok().flatten() == Some(tokens) {
+                    return;
+                }
                 if let Err(e) = db.store.set_context_window(model, tokens) {
                     log(format!("couldn't save the context window of {model}: {e}"));
                 }
