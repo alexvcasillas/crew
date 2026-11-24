@@ -325,7 +325,7 @@ async fn hello_with_wrong_version_is_refused() {
     let err = c.call(Request::Hello { version: 99 }).await.unwrap_err();
     assert_eq!(
         err,
-        "crewd speaks protocol 8, client speaks 99. Restart crewd."
+        "crewd speaks protocol 9, client speaks 99. Restart crewd."
     );
     assert!(c.recv().await.is_none(), "connection should be closed");
 }
@@ -410,6 +410,66 @@ async fn mention_starts_run_and_agent_replies() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].thread, thread);
     assert_eq!(runs[0].agent, agent);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_gets_the_window_remembered_for_its_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(4, replay_script(dir.path(), "usage.jsonl")).await;
+    let mut c = d.client().await;
+    let (_agent, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+
+    let mut usages = Vec::new();
+    for body in ["@Forge first", "@Forge second"] {
+        let _id: crew_core::ids::MessageId = c
+            .ok(Request::PostMessage {
+                thread,
+                body: body.into(),
+            })
+            .await;
+        let seen = c
+            .until(|m| {
+                matches!(
+                    m,
+                    ServerMsg::RunStatus {
+                        status: RunStatus::Done,
+                        ..
+                    }
+                )
+            })
+            .await;
+        usages.push(
+            seen.iter()
+                .filter_map(|m| match m {
+                    ServerMsg::Event {
+                        event:
+                            Event::Usage {
+                                context_tokens,
+                                context_window,
+                            },
+                        ..
+                    } => Some((*context_tokens, *context_window)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    // The first run learns the window from its result line only.
+    assert_eq!(
+        usages[0],
+        vec![(40_807, None), (40_825, None), (40_825, Some(1_000_000))]
+    );
+    // The second run has it from the start.
+    assert_eq!(
+        usages[1],
+        vec![
+            (40_807, Some(1_000_000)),
+            (40_825, Some(1_000_000)),
+            (40_825, Some(1_000_000))
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

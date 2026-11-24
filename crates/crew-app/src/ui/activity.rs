@@ -230,6 +230,8 @@ fn rows_of(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                 }
             }
             Event::Error { message } => rows.push(ActivityRow::Error(message.clone())),
+            // Context size shows in the inspector footer, not in the list.
+            Event::Usage { .. } => {}
             // Lines the parser didn't know, such as stream-json system
             // notes, stay in the store but aren't shown. Plain text is.
             Event::Raw { line } => {

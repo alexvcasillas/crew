@@ -1546,7 +1546,8 @@ impl Service {
         let mut texts: Vec<String> = Vec::new();
         // Whether the last turn that counts ended well.
         let mut answered = false;
-        while let Some(event) = rx.recv().await {
+        let mut model = String::new();
+        while let Some(mut event) = rx.recv().await {
             match &event {
                 // A resumed session can print an empty result before the
                 // one for its prompt. The last result that counts wins.
@@ -1555,8 +1556,18 @@ impl Service {
                     answered = *ok;
                 }
                 Event::Message { text } => texts.push(text.clone()),
-                Event::SessionStarted { session_id, .. } => self.name_session(run, session_id),
+                Event::SessionStarted {
+                    session_id,
+                    model: started,
+                    ..
+                } => {
+                    model.clone_from(started);
+                    self.name_session(run, session_id);
+                }
                 _ => {}
+            }
+            if let Event::Usage { context_window, .. } = &mut event {
+                self.remember_window(&model, context_window);
             }
             let denied = match &event {
                 Event::PermissionDenied {
@@ -1588,6 +1599,23 @@ impl Service {
             log(format!("couldn't record the end of run {run}: {e}"));
         }
         self.start_ready();
+    }
+
+    /// Keeps the context window `model` reported, or fills it in from the
+    /// last one kept when the event has none, as Claude's usage lines don't.
+    fn remember_window(&self, model: &str, window: &mut Option<u64>) {
+        if model.is_empty() {
+            return;
+        }
+        let db = self.db();
+        match *window {
+            Some(tokens) => {
+                if let Err(e) = db.store.set_context_window(model, tokens) {
+                    log(format!("couldn't save the context window of {model}: {e}"));
+                }
+            }
+            None => *window = db.store.context_window(model).ok().flatten(),
+        }
     }
 
     /// Saves the session a run started if it had none yet, as a Codex run

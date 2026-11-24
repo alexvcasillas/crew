@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crew_core::event::RunStatus;
+use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{RunId, ThreadId};
 use crew_core::store::StoredRun;
 use crew_core::worktree::Diff;
@@ -146,6 +146,26 @@ fn events_per_run(events: &[LoggedEvent]) -> Vec<(RunId, usize)> {
         }
     }
     counts
+}
+
+/// The footer's context text for `run`, from its latest `Usage`: the
+/// percent used once the window is known, else the tokens in thousands.
+/// `None` until the run reported any.
+pub(super) fn context_label(events: &[LoggedEvent], run: RunId) -> Option<String> {
+    let (tokens, window) = events.iter().rev().find_map(|e| match &e.event {
+        Event::Usage {
+            context_tokens,
+            context_window,
+        } if e.run == run => Some((*context_tokens, *context_window)),
+        _ => None,
+    })?;
+    Some(match window.filter(|w| *w > 0) {
+        Some(window) => {
+            let pct = (u128::from(tokens) * 100 / u128::from(window)).min(100);
+            format!("Context {pct}%")
+        }
+        None => format!("{}k tokens", (tokens + 500) / 1000),
+    })
 }
 
 /// Where a run is, as a word, its colour token and how long it took.
@@ -562,6 +582,9 @@ impl Workspace {
             .thread(thread)
             .and_then(|t| t.worktree.as_ref())
             .map(|wt| wt.branch.clone());
+        let context = self
+            .shown_run(thread)
+            .and_then(|run| context_label(self.state().events(thread), run.id));
         div()
             .flex()
             .flex_col()
@@ -618,6 +641,16 @@ impl Workspace {
                                 .truncate()
                                 .font_family(mono_font())
                                 .child(branch),
+                        )
+                    })
+                    .when_some(context, |footer, text| {
+                        footer.child(div().flex_1()).child(
+                            div()
+                                .id("context-usage")
+                                .flex_none()
+                                .aria_label(text.clone())
+                                .child(text)
+                                .test_support(),
                         )
                     }),
             )
@@ -722,7 +755,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{events_per_run, merge_changes, run_labels};
+    use super::{context_label, events_per_run, merge_changes, run_labels};
     use crate::model::LoggedEvent;
     use crate::ui::run_card::FileChange;
     use crew_core::event::Event;
@@ -754,6 +787,38 @@ mod tests {
         assert_eq!(events_per_run(&events), [(r1, 2), (r2, 1)]);
     }
     use crew_core::ids::RunId;
+
+    #[test]
+    fn context_label_reads_the_latest_usage_of_the_run() {
+        let (r1, r2) = (RunId::new(), RunId::new());
+        let usage = |run, seq, tokens, window| {
+            LoggedEvent::new(
+                run,
+                seq,
+                Event::Usage {
+                    context_tokens: tokens,
+                    context_window: window,
+                },
+            )
+        };
+        assert_eq!(context_label(&[], r1), None);
+        let events = [
+            usage(r1, 1, 41_500, None),
+            usage(r2, 1, 1, Some(10)),
+            usage(r1, 2, 41_499, None),
+        ];
+        assert_eq!(context_label(&events, r1).as_deref(), Some("41k tokens"));
+        let events = [
+            usage(r1, 1, 41_500, None),
+            usage(r1, 2, 250_000, Some(1_000_000)),
+        ];
+        assert_eq!(context_label(&events, r1).as_deref(), Some("Context 25%"));
+        // Rounded down, and never over 100.
+        let events = [usage(r1, 1, 99_999, Some(100_000))];
+        assert_eq!(context_label(&events, r1).as_deref(), Some("Context 99%"));
+        let events = [usage(r1, 1, 120_000, Some(100_000))];
+        assert_eq!(context_label(&events, r1).as_deref(), Some("Context 100%"));
+    }
 
     #[test]
     fn run_labels_stay_unique() {

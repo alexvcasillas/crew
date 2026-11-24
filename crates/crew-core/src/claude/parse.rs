@@ -74,6 +74,10 @@ pub struct StreamParser {
     /// starting with it, by tool use id, with the reason they give. One
     /// is a refusal only if the result's denial list names it too.
     quoted: HashMap<String, String>,
+    /// The model of the session, from its `init` line.
+    model: String,
+    /// The main agent's last reported context size.
+    last_tokens: Option<u64>,
 }
 
 impl StreamParser {
@@ -115,7 +119,8 @@ impl StreamParser {
                 }
             }
             ("assistant", _) => {
-                let events = parse_line(line);
+                let mut events = parse_line(line);
+                events.extend(self.assistant_usage(&v));
                 for event in &events {
                     if let Event::ToolCall {
                         id, name, input, ..
@@ -153,6 +158,7 @@ impl StreamParser {
                         }
                     })
                     .collect();
+                events.extend(self.result_usage(&v));
                 let parser = &*self;
                 events.extend(parse_result(
                     &v,
@@ -161,8 +167,54 @@ impl StreamParser {
                 ));
                 events
             }
+            ("system", "init") => {
+                self.model = str_at(&v, "model").to_string();
+                parse_line(line)
+            }
             _ => parse_line(line),
         }
+    }
+
+    /// A `Usage` when the main agent's context size changed. Lines from
+    /// subagents are about their own context and give nothing.
+    fn assistant_usage(&mut self, v: &Value) -> Option<Event> {
+        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return None;
+        }
+        let tokens = context_tokens(v.pointer("/message/usage")?)?;
+        if self.last_tokens == Some(tokens) {
+            return None;
+        }
+        self.last_tokens = Some(tokens);
+        Some(Event::Usage {
+            context_tokens: tokens,
+            context_window: None,
+        })
+    }
+
+    /// The `Usage` a `result` line gives: the last context size with the
+    /// window of the main model, the one that started the session.
+    fn result_usage(&self, v: &Value) -> Option<Event> {
+        let models = v.get("modelUsage")?.as_object()?;
+        let main = if models.len() == 1 {
+            models.iter().next()
+        } else {
+            let model = self.model.as_str();
+            models.iter().find(|(name, _)| {
+                !model.is_empty() && (name.starts_with(model) || model.starts_with(name.as_str()))
+            })
+        }?;
+        let window = main.1.get("contextWindow").and_then(Value::as_u64);
+        let tokens = self.last_tokens.or_else(|| {
+            let m = main.1;
+            let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let sum = n("inputTokens") + n("cacheReadInputTokens") + n("cacheCreationInputTokens");
+            (sum > 0).then_some(sum)
+        })?;
+        Some(Event::Usage {
+            context_tokens: tokens,
+            context_window: window,
+        })
     }
 
     /// The denial a tool result reports: one held for its call, or a
@@ -309,6 +361,15 @@ pub(crate) fn truncate(mut s: String) -> String {
     s.truncate(end);
     s.push_str("\n… (truncated)");
     s
+}
+
+/// Tokens in the context an API call read: input plus both cache kinds.
+fn context_tokens(usage: &Value) -> Option<u64> {
+    let n = |k: &str| usage.get(k).and_then(Value::as_u64);
+    let total = n("input_tokens")?
+        + n("cache_read_input_tokens").unwrap_or(0)
+        + n("cache_creation_input_tokens").unwrap_or(0);
+    Some(total)
 }
 
 /// Tool use id (when present), tool name and input of one denial.
