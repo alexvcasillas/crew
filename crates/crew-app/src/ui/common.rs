@@ -56,21 +56,11 @@ pub fn short_model(model: &str) -> &str {
 }
 
 /// One line of text an agent or CLI wrote, safe to draw: tabs and
-/// carriage returns become spaces, and other control and bidi characters
-/// are dropped, so they can't hide or reorder what you read.
+/// carriage returns become spaces, and other control, bidi and
+/// zero-width characters are dropped, so they can't hide or reorder what
+/// you read.
 pub fn clean_line(text: &str) -> String {
-    text.chars()
-        .filter_map(|c| match c {
-            '\t' | '\r' => Some(' '),
-            c if c.is_control() => None,
-            '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}' => None,
-            c => Some(c),
-        })
-        .collect()
+    crew_core::text::clean_line(text)
 }
 
 /// Like [`clean_line`] for each line of `text`.

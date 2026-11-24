@@ -185,3 +185,69 @@ fn local_command_echoes_are_not_prompts() {
     let line = serde_json::json!({"type": "user", "message": {"content": "why does <command-name> show?"}}).to_string();
     assert_eq!(parse_line(&line).len(), 1);
 }
+
+#[test]
+fn only_what_the_person_typed_is_a_prompt() {
+    use crew_core::claude::transcript::Prompts;
+    let text = fixture("filtered.jsonl");
+    let mut prompts = Prompts::default();
+    let items: Vec<TranscriptItem> = text
+        .lines()
+        .flat_map(|line| prompts.take(parse(line)))
+        .collect();
+    assert_eq!(
+        items,
+        vec![
+            // Text next to a tool result is not a prompt; the result is kept.
+            event(Event::ToolResult {
+                id: "toolu_09".into(),
+                is_error: false,
+                output: "ok".into(),
+            }),
+            prompt("Typed with a source."),
+            // Queued while the agent was busy, shown once.
+            prompt("Also add a test"),
+            prompt("Typed after"),
+        ]
+    );
+}
+
+#[test]
+fn wrapped_text_is_never_a_title() {
+    for text in [
+        "<system-reminder>x</system-reminder>",
+        "<task-notification>x</task-notification>",
+        "<user-prompt-submit-hook>x</user-prompt-submit-hook>",
+        "<local-command-stdout>x</local-command-stdout>",
+        "<command-message>x</command-message>",
+        "<bash-input>ls</bash-input>",
+    ] {
+        assert_eq!(title_from(text), None, "{text}");
+    }
+    // A shell command typed with `!` is still shown as the person's.
+    let line =
+        serde_json::json!({"type": "user", "message": {"content": "<bash-input>ls</bash-input>"}})
+            .to_string();
+    assert_eq!(parse_line(&line).len(), 1);
+    // Text that only looks like a tag stays a prompt.
+    for text in ["<3 thanks", "<Foo> is the type", "a <b>bold</b> ask"] {
+        assert_eq!(title_from(text).as_deref(), Some(text), "{text}");
+    }
+}
+
+#[test]
+fn queued_prompts_are_not_dropped_by_other_text() {
+    use crew_core::claude::transcript::Prompts;
+    let queued = serde_json::json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "Run it", "origin": {"kind": "human"}}}).to_string();
+    let typed =
+        |t: &str| serde_json::json!({"type": "user", "message": {"content": t}}).to_string();
+    let mut prompts = Prompts::default();
+    assert_eq!(prompts.take(parse(&queued)), vec![prompt("Run it")]);
+    assert_eq!(prompts.take(parse(&typed("Other"))), vec![prompt("Other")]);
+    assert!(prompts.take(parse(&typed("Run it"))).is_empty());
+    // Typed again later, it shows.
+    assert_eq!(
+        prompts.take(parse(&typed("Run it"))),
+        vec![prompt("Run it")]
+    );
+}

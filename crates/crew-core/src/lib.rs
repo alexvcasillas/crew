@@ -10,4 +10,5 @@ pub mod policy;
 pub mod scheduler;
 pub mod slug;
 pub mod store;
+pub mod text;
 pub mod worktree;
