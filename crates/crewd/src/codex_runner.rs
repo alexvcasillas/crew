@@ -67,6 +67,15 @@ pub type Ask = Box<
         + Sync,
 >;
 
+/// Posts a System note about the run in its thread.
+pub type Note = Box<dyn Fn(&str) + Send + Sync>;
+
+/// How a Codex run reaches the rest of Crew.
+pub struct Hooks {
+    pub ask: Ask,
+    pub note: Note,
+}
+
 /// A Codex thread to continue.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resume {
@@ -149,6 +158,8 @@ impl CodexInvocation {
                 "type": "workspaceWrite",
                 "writableRoots": [self.cwd_text()],
                 "networkAccess": false,
+                // Temp folders stay writable, as by Codex's default:
+                // compilers and test tools need them.
                 "excludeTmpdirEnvVar": false,
                 "excludeSlashTmp": false,
             }),
@@ -212,17 +223,17 @@ impl CodexInvocation {
 /// after the sign-in check.
 pub fn spawn_codex_run(
     inv: CodexInvocation,
-    ask: Ask,
+    hooks: Hooks,
 ) -> (RunHandle, mpsc::Receiver<Event>, JoinHandle<RunOutcome>) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let (handle, stop_rx) = RunHandle::idle();
-    let join = tokio::spawn(run(inv, ask, tx, stop_rx));
+    let join = tokio::spawn(run(inv, hooks, tx, stop_rx));
     (handle, rx, join)
 }
 
 async fn run(
     inv: CodexInvocation,
-    ask: Ask,
+    hooks: Hooks,
     tx: mpsc::Sender<Event>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> RunOutcome {
@@ -266,7 +277,7 @@ async fn run(
     let (conn, incoming) = CodexConn::from_io(stdout, stdin);
 
     // The connection is gone once this returns, which closes stdin.
-    let driven = Driver::new(&inv, &ask, conn, &tx)
+    let driven = Driver::new(&inv, &hooks, conn, &tx)
         .drive(incoming, &mut child, &mut stop_rx)
         .await;
     drop(tx);
@@ -398,7 +409,7 @@ async fn start_turn(conn: &CodexConn, inv: &CodexInvocation) -> Result<Started, 
 /// Talks to one app-server for one turn.
 struct Driver<'a> {
     inv: &'a CodexInvocation,
-    ask: &'a Ask,
+    hooks: &'a Hooks,
     conn: CodexConn,
     tx: &'a mpsc::Sender<Event>,
     /// False once nobody listens for events.
@@ -413,13 +424,13 @@ struct Driver<'a> {
 impl<'a> Driver<'a> {
     fn new(
         inv: &'a CodexInvocation,
-        ask: &'a Ask,
+        hooks: &'a Hooks,
         conn: CodexConn,
         tx: &'a mpsc::Sender<Event>,
     ) -> Self {
         Driver {
             inv,
-            ask,
+            hooks,
             conn,
             tx,
             listening: true,
@@ -589,9 +600,14 @@ impl<'a> Driver<'a> {
             tool,
             input,
             item,
-        } = match map_request(method, params, &self.files, wired) {
+        } = match map_request(method, params, &self.files, wired, &self.inv.cwd) {
             Mapped::Reply(result) => {
                 let _ = self.conn.reply(id, result).await;
+                return;
+            }
+            Mapped::Declined { reply, note } => {
+                let _ = self.conn.reply(id, reply).await;
+                (self.hooks.note)(&note);
                 return;
             }
             Mapped::Refuse(msg) => {
@@ -600,7 +616,7 @@ impl<'a> Driver<'a> {
             }
             Mapped::Ask(ask) => ask,
         };
-        match (self.ask)(&tool, input, item) {
+        match (self.hooks.ask)(&tool, input, item) {
             Ok(answer) => {
                 self.asked.push((id.clone(), kind));
                 let (replies, stop) = (replies.clone(), stop.clone());

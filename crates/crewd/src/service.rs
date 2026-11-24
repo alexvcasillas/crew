@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
-use crate::codex_runner::{Ask, CodexInvocation, Resume, spawn_codex_run};
+use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 
 /// Told once per run when permission prompts can't reach crewd.
@@ -925,13 +925,22 @@ impl Service {
     }
 
     /// Puts a Codex run's approval requests to you, like a Claude run's
-    /// permission asks.
-    fn asker(&self, run: RunId) -> Ask {
-        let svc = self.clone();
-        Box::new(move |tool, input, item| {
-            svc.ask_permission(run, tool, input, item)
-                .map(|wait| wait.answer)
-        })
+    /// permission asks, and lets it post notes in its thread.
+    fn codex_hooks(&self, thread: ThreadId, run: RunId) -> Hooks {
+        let (asks, notes) = (self.clone(), self.clone());
+        Hooks {
+            ask: Box::new(move |tool, input, item| {
+                asks.ask_permission(run, tool, input, item)
+                    .map(|wait| wait.answer)
+            }),
+            note: Box::new(move |body| {
+                let mut db = notes.db();
+                if let Err(e) = notes.add_message(&mut db, thread, Author::System, body, Some(run))
+                {
+                    log(format!("couldn't post a note of run {run}: {e}"));
+                }
+            }),
+        }
     }
 
     /// Spawns the agent's CLI for a job. Returns the task that watches it, or
@@ -950,7 +959,9 @@ impl Service {
                 drop(db);
                 let (handle, rx, join) = match inv {
                     Invocation::Claude(inv) => spawn_run(inv),
-                    Invocation::Codex(inv) => spawn_codex_run(inv, self.asker(job.run)),
+                    Invocation::Codex(inv) => {
+                        spawn_codex_run(inv, self.codex_hooks(job.thread, job.run))
+                    }
                 };
                 state.live.insert(job.run, (job.thread, handle));
                 self.start_timer(state, &job);
