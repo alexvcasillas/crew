@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 
-use crew_core::event::{Event, ToolKind};
+use crew_core::claude::parse::classifier_reason;
+use crew_core::event::{Event, ToolKind, humanize_reason};
 use crew_core::ids::RunId;
 use crew_core::store::StoredRun;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -28,6 +29,8 @@ pub enum StepState {
     Done,
     Running,
     Failed,
+    /// Claude Code's auto mode safety check stopped it.
+    Blocked,
 }
 
 /// One tool call of a run.
@@ -38,6 +41,8 @@ pub struct Step {
     pub target: String,
     /// Lines added and removed, for edits and new files.
     pub lines: Option<(u32, u32)>,
+    /// Why the safety check stopped it, as a sentence, if it did.
+    pub reason: Option<String>,
 }
 
 impl Step {
@@ -103,6 +108,7 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
     let mut cwd = String::new();
     let mut calls: Vec<Call> = Vec::new();
     let mut ends: HashMap<String, bool> = HashMap::new();
+    let mut blocked: HashMap<String, String> = HashMap::new();
     for logged in events.iter().filter(|e| e.run == run) {
         match &logged.event {
             Event::SessionStarted { cwd: dir, .. } => cwd = dir.clone(),
@@ -123,8 +129,28 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
                     lines: logged.lines,
                 });
             }
-            Event::ToolResult { id, is_error, .. } => {
+            Event::ToolResult {
+                id,
+                is_error,
+                output,
+            } => {
                 ends.insert(id.clone(), *is_error);
+                if let Some(reason) = is_error.then(|| classifier_reason(output)).flatten() {
+                    blocked.entry(id.clone()).or_insert(reason);
+                }
+            }
+            Event::PermissionDenied {
+                tool,
+                reason: Some(reason),
+                ..
+            } => {
+                let call = calls
+                    .iter()
+                    .rev()
+                    .find(|c| c.name == *tool && !ends.contains_key(&c.id));
+                if let Some(call) = call {
+                    blocked.insert(call.id.clone(), reason.clone());
+                }
             }
             _ => {}
         }
@@ -153,16 +179,25 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
         .into_iter()
         .skip(skip)
         .map(|call| {
-            let state = match ends.get(&call.id) {
-                None => StepState::Running,
-                Some(false) => StepState::Done,
-                Some(true) => StepState::Failed,
+            let reason = blocked.get(&call.id).map(|r| humanize_reason(r));
+            let state = match (ends.get(&call.id), &reason) {
+                (_, Some(_)) => StepState::Blocked,
+                (None, None) => StepState::Running,
+                (Some(false), None) => StepState::Done,
+                (Some(true), None) => StepState::Failed,
+            };
+            // A stopped call never ran: it reads as what it would have done.
+            let verb = if state == StepState::Blocked {
+                super::activity::verb(&call.kind, &call.name).to_string()
+            } else {
+                verb(&call.kind, &call.name, state == StepState::Running)
             };
             Step {
-                verb: verb(&call.kind, &call.name, state == StepState::Running),
+                verb,
                 state,
                 lines: call.lines.filter(|_| state == StepState::Done),
                 target: call.target,
+                reason,
             }
         })
         .collect();
@@ -421,8 +456,18 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
             .size(px(12.))
             .text_color(color("danger"))
             .into_any_element(),
+        StepState::Blocked => Icon::new(IconName::Ban)
+            .size(px(12.))
+            .text_color(color("danger"))
+            .into_any_element(),
     };
-    let text = step.text();
+    let text = match (&step.state, &step.reason) {
+        (StepState::Blocked, Some(reason)) if !reason.is_empty() => {
+            format!("{} · Blocked · {reason}", step.text())
+        }
+        (StepState::Blocked, _) => format!("{} · Blocked", step.text()),
+        _ => step.text(),
+    };
     div()
         .id(("run-step", ix))
         .flex()
@@ -449,6 +494,26 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
         })
         .when_some(step.lines, |row, (added, removed)| {
             row.child(plus_minus(added, removed))
+        })
+        .when(step.state == StepState::Blocked, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_color(color("danger"))
+                    .child("Blocked"),
+            )
+            .when_some(
+                step.reason.clone().filter(|r| !r.is_empty()),
+                |row, reason| {
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(color("text-tertiary"))
+                            .child(reason),
+                    )
+                },
+            )
         })
         .test_support()
 }
@@ -612,6 +677,43 @@ mod tests {
         assert_eq!(summary.steps.len(), 1, "system lines aren't steps");
         assert_eq!(summary.steps[0].target, "");
         assert_eq!(summary.steps[0].text(), "ToolSearch");
+    }
+
+    #[test]
+    fn a_call_the_safety_check_stopped_is_a_blocked_step() {
+        let run = RunId::new();
+        let rm = serde_json::json!({"command": "rm -rf build"});
+        let denied = LoggedEvent::new(
+            run,
+            2,
+            Event::PermissionDenied {
+                tool: "Bash".into(),
+                input: rm.clone(),
+                reason: Some("Destructive or unwanted actions".into()),
+            },
+        );
+        let refused = LoggedEvent::new(
+            run,
+            3,
+            Event::ToolResult {
+                id: "t1".into(),
+                is_error: true,
+                output: "Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions]".into(),
+            },
+        );
+        let events = vec![call(run, 1, "t1", "Bash", rm), denied, refused.clone()];
+        for events in [events.clone(), vec![events[0].clone(), refused]] {
+            let step = summarize(&events, run).steps.remove(0);
+            assert_eq!(step.state, StepState::Blocked);
+            assert_eq!(step.text(), "Run rm -rf build");
+            assert_eq!(
+                step.reason.as_deref(),
+                Some("Destructive or unwanted actions")
+            );
+        }
+        // Before its result comes, the denial alone says so.
+        let step = summarize(&events[..2], run).steps.remove(0);
+        assert_eq!(step.state, StepState::Blocked);
     }
 
     #[test]

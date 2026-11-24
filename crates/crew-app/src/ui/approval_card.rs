@@ -1,8 +1,9 @@
 //! Cards for what waits on you in a thread: a handoff to approve, a tool
-//! to allow, or a used-up handoff budget. Once decided, a card folds into
-//! one line.
+//! to allow, a call the safety check stopped, or a used-up handoff
+//! budget. Once decided, a card folds into one line.
 
 use crew_core::agent::PermissionMode;
+use crew_core::event::humanize_reason;
 use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval};
 use crew_proto::Request;
@@ -104,6 +105,10 @@ pub fn decided_text(approval: &StoredApproval, name_of: impl Fn(AgentId) -> Stri
             format!("{tool} denied by you")
         }
         (ApprovalKind::Permission { tool, .. }, _) => format!("{tool} no longer needed"),
+        (ApprovalKind::Blocked { .. }, ApprovalStatus::Approved) => {
+            "Allowed and retried by you".to_string()
+        }
+        (ApprovalKind::Blocked { .. }, ApprovalStatus::Declined) => "Dismissed by you".to_string(),
         (ApprovalKind::Blocked { tool, .. }, _) => format!("{tool} no longer needed"),
     };
     if time.is_empty() {
@@ -160,7 +165,8 @@ impl Workspace {
     /// handoff or permission ask in the open thread (⌘↵). ⌘↵ is bound for
     /// the whole window, so text fields don't take it. From the composer
     /// it approves handoffs only: a permission ask is never allowed by a
-    /// reflex meant to send.
+    /// reflex meant to send. A call the safety check stopped is only ever
+    /// retried by its own button.
     pub(super) fn approve_latest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.nav.thread else {
             return;
@@ -180,7 +186,8 @@ impl Workspace {
                 .filter(|a| !self.deciding.contains(&a.id))
                 .find(|a| match a.kind {
                     ApprovalKind::Handoff { paused, .. } => !paused,
-                    _ => !from_composer,
+                    ApprovalKind::Blocked { .. } => false,
+                    ApprovalKind::Permission { .. } => !from_composer,
                 })
                 .map(|a| a.id)
         });
@@ -232,11 +239,77 @@ impl Workspace {
             } => self
                 .render_handoff(approval, *from, *to, brief, cx)
                 .into_any_element(),
-            ApprovalKind::Permission { tool, input, .. }
-            | ApprovalKind::Blocked { tool, input, .. } => self
+            ApprovalKind::Permission { tool, input, .. } => self
                 .render_permission(approval, tool, input, cx)
                 .into_any_element(),
+            ApprovalKind::Blocked { input, reason, .. } => self
+                .render_blocked(approval, input, reason, cx)
+                .into_any_element(),
         }
+    }
+
+    /// A call Claude's safety check stopped. The run went on without it;
+    /// "Allow and retry" starts a run that may make it once.
+    fn render_blocked(
+        &self,
+        approval: &StoredApproval,
+        input: &serde_json::Value,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let id = approval.id;
+        let agent = self
+            .state()
+            .run(approval.run)
+            .map_or_else(|| "An agent".to_string(), |r| self.name_of(r.agent));
+        let wants = format!("Claude's safety check stopped {agent}");
+        let text = input_text(input);
+        let shown = if text.lines().count() > INPUT_LINES {
+            let mut cut = text
+                .lines()
+                .take(INPUT_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            cut.push('…');
+            cut
+        } else {
+            text
+        };
+        let reason = humanize_reason(reason);
+        let deciding = self.deciding.contains(&id);
+        let card = needs_you_card(id, &wants)
+            .child(mono_box(format!("approval-input-{id}"), shown))
+            .when(!reason.is_empty(), |card| {
+                let line = format!("Reason: {reason}");
+                card.child(
+                    div()
+                        .id(format!("approval-reason-{id}"))
+                        .text_size(px(12.))
+                        .text_color(color("text-secondary"))
+                        .aria_label(line.clone())
+                        .child(line)
+                        .test_support(),
+                )
+            })
+            .child(card_footer(
+                vec![
+                    Button::new(format!("approval-retry-{id}"))
+                        .primary()
+                        .small()
+                        .label("Allow and retry")
+                        .disabled(deciding)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.decide(id, true, None, window, cx);
+                        }))
+                        .into_any_element(),
+                    decline(id, "Dismiss", cx)
+                        .disabled(deciding)
+                        .into_any_element(),
+                ],
+                false,
+            ))
+            .test_support();
+        indented(card)
     }
 
     fn render_decided(&self, approval: &StoredApproval) -> impl IntoElement + use<> {
@@ -718,5 +791,16 @@ mod tests {
             decided_text(&a, name),
             format!("Bash allowed by you · {at}")
         );
+        a.kind = ApprovalKind::Blocked {
+            tool: "Bash".into(),
+            input: serde_json::Value::Null,
+            reason: String::new(),
+        };
+        assert_eq!(
+            decided_text(&a, name),
+            format!("Allowed and retried by you · {at}")
+        );
+        a.status = ApprovalStatus::Declined;
+        assert_eq!(decided_text(&a, name), format!("Dismissed by you · {at}"));
     }
 }

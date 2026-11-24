@@ -642,12 +642,16 @@ impl State {
     }
 
     /// What counts as running everywhere: working runs that don't wait
-    /// on you, by start time. Queued runs don't count.
+    /// on you, by start time. Queued runs don't count. A call the safety
+    /// check stopped doesn't hold its run up.
     pub fn working_runs(&self) -> Vec<&StoredRun> {
         let waiting: HashSet<RunId> = self
             .approvals
             .values()
-            .filter(|a| a.status == ApprovalStatus::Pending)
+            .filter(|a| {
+                a.status == ApprovalStatus::Pending
+                    && !matches!(a.kind, crew_core::store::ApprovalKind::Blocked { .. })
+            })
             .map(|a| a.run)
             .collect();
         self.running()

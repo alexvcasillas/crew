@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 
-use crew_core::event::{Event, ToolKind};
+use crew_core::claude::parse::classifier_reason;
+use crew_core::event::{Event, ToolKind, humanize_reason};
 use crew_core::ids::RunId;
 use crew_core::store::short_input;
 use gpui_kit::component::{Icon, IconName};
@@ -45,6 +46,8 @@ pub struct PatchLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRow {
     pub id: String,
+    /// The tool's own name, such as `Bash`.
+    pub name: String,
     pub kind: ToolKind,
     /// `Read`, `Edit` and so on, or the tool's own name.
     pub verb: String,
@@ -60,6 +63,8 @@ pub struct ToolRow {
     pub patch: Option<Vec<PatchLine>>,
     /// A command's output.
     pub output: Option<String>,
+    /// Why the safety check stopped it, as a sentence, if it did.
+    pub reason: Option<String>,
 }
 
 /// One row of the Activity tab.
@@ -72,9 +77,12 @@ pub enum ActivityRow {
         text: String,
     },
     Tool(ToolRow),
+    /// A refused call with no row of its own. `reason` is set when the
+    /// safety check stopped it.
     Denied {
         tool: String,
         input: String,
+        reason: Option<String>,
     },
     Error(String),
     /// The run's end, with its event's number and the agent's summary.
@@ -112,6 +120,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                 let target = target.as_deref().map(|t| relative(t, &cwd));
                 rows.push(ActivityRow::Tool(ToolRow {
                     id: id.clone(),
+                    name: name.clone(),
                     kind: kind.clone(),
                     verb: verb(kind, name).to_string(),
                     target: target.unwrap_or_else(|| short_input(input)),
@@ -121,6 +130,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     diff: mini_diff(kind, input),
                     patch: patch(kind, input),
                     output: None,
+                    reason: None,
                 }));
             }
             Event::ToolResult {
@@ -130,6 +140,13 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
             } => {
                 if let Some(ActivityRow::Tool(row)) = calls.get(id).and_then(|ix| rows.get_mut(*ix))
                 {
+                    if row.state == StepState::Blocked {
+                        continue;
+                    }
+                    if let Some(reason) = is_error.then(|| classifier_reason(output)).flatten() {
+                        block(row, &reason);
+                        continue;
+                    }
                     row.state = if *is_error {
                         StepState::Failed
                     } else {
@@ -141,10 +158,31 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     }
                 }
             }
-            Event::PermissionDenied { tool, input, .. } => rows.push(ActivityRow::Denied {
-                tool: tool.clone(),
-                input: short_input(input),
-            }),
+            Event::PermissionDenied {
+                tool,
+                input,
+                reason,
+            } => {
+                // A call the safety check stopped shows on its own row.
+                let call = reason.as_ref().and_then(|_| {
+                    rows.iter_mut().rev().find_map(|row| match row {
+                        ActivityRow::Tool(t)
+                            if t.name == *tool && t.state == StepState::Running =>
+                        {
+                            Some(t)
+                        }
+                        _ => None,
+                    })
+                });
+                match (call, reason) {
+                    (Some(row), Some(reason)) => block(row, reason),
+                    _ => rows.push(ActivityRow::Denied {
+                        tool: tool.clone(),
+                        input: short_input(input),
+                        reason: reason.as_deref().map(humanize_reason),
+                    }),
+                }
+            }
             Event::Error { message } => rows.push(ActivityRow::Error(message.clone())),
             // Lines the parser didn't know, such as stream-json system
             // notes, stay in the store but aren't shown.
@@ -159,7 +197,15 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
     rows
 }
 
-fn verb<'a>(kind: &ToolKind, name: &'a str) -> &'a str {
+/// Marks a call as stopped by the safety check.
+fn block(row: &mut ToolRow, reason: &str) {
+    row.state = StepState::Blocked;
+    row.detail = Some("Blocked".into());
+    row.reason = Some(humanize_reason(reason));
+    row.output = None;
+}
+
+pub(super) fn verb<'a>(kind: &ToolKind, name: &'a str) -> &'a str {
     match kind {
         ToolKind::Read => "Read",
         ToolKind::Search => "Search",
@@ -275,20 +321,37 @@ impl Workspace {
                     self.render_tool(ix, tool, cx).into_any_element(),
                 )
             }
-            ActivityRow::Denied { tool, input } => (
+            ActivityRow::Denied {
+                tool,
+                input,
+                reason,
+            } => (
                 IconName::Ban,
                 "danger",
                 div()
                     .flex()
-                    .flex_wrap()
-                    .gap(px(6.))
+                    .flex_col()
                     .child(
                         div()
-                            .text_color(color("text-secondary"))
-                            .child(format!("Not allowed: {tool}")),
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .child(div().text_color(color("text-secondary")).child(
+                                if reason.is_some() {
+                                    tool.clone()
+                                } else {
+                                    format!("Not allowed: {tool}")
+                                },
+                            ))
+                            .when(!input.trim().is_empty(), |row| {
+                                row.child(code(input.clone()))
+                            })
+                            .when(reason.is_some(), |row| {
+                                row.child(div().text_color(color("danger")).child("Blocked"))
+                            }),
                     )
-                    .when(!input.trim().is_empty(), |row| {
-                        row.child(code(input.clone()))
+                    .when_some(reason.clone().filter(|r| !r.is_empty()), |col, reason| {
+                        col.child(reason_line(reason))
                     })
                     .into_any_element(),
             ),
@@ -394,7 +457,7 @@ impl Workspace {
         if tool.state == StepState::Running {
             head = head.child(div().text_color(color("accent-blue")).child("running"));
         } else if let Some(detail) = &tool.detail {
-            let token = if tool.state == StepState::Failed {
+            let token = if matches!(tool.state, StepState::Failed | StepState::Blocked) {
                 "danger"
             } else {
                 "text-tertiary"
@@ -499,10 +562,16 @@ impl Workspace {
                     )
                 })
         });
+        let reason = tool
+            .reason
+            .clone()
+            .filter(|r| tool.state == StepState::Blocked && !r.is_empty())
+            .map(reason_line);
         div()
             .flex()
             .flex_col()
             .child(head)
+            .children(reason)
             .children(diff)
             .children(patch)
             .children(output)
@@ -590,9 +659,20 @@ impl Workspace {
     }
 }
 
+/// The safety check's reason under a blocked call.
+fn reason_line(reason: String) -> impl IntoElement {
+    div()
+        .mt(px(2.))
+        .text_size(px(12.))
+        .text_color(color("text-secondary"))
+        .child(format!("Reason: {reason}"))
+}
+
 fn tool_icon(tool: &ToolRow) -> (IconName, &'static str) {
-    if tool.state == StepState::Failed {
-        return (IconName::CircleX, "danger");
+    match tool.state {
+        StepState::Failed => return (IconName::CircleX, "danger"),
+        StepState::Blocked => return (IconName::Ban, "danger"),
+        _ => {}
     }
     let icon = match tool.kind {
         ToolKind::Read => IconName::FileText,
@@ -615,8 +695,21 @@ pub fn row_label(row: &ActivityRow) -> String {
     match row {
         ActivityRow::Thinking(text) => format!("Thinking {text}"),
         ActivityRow::Said { text, .. } => format!("Said {text}"),
-        ActivityRow::Tool(tool) => join_words(&tool.verb, &tool.target),
-        ActivityRow::Denied { tool, input } => join_words(&format!("Not allowed: {tool}"), input),
+        ActivityRow::Tool(tool) => {
+            let label = join_words(&tool.verb, &tool.target);
+            match &tool.reason {
+                Some(reason) if tool.state == StepState::Blocked => blocked_label(&label, reason),
+                _ => label,
+            }
+        }
+        ActivityRow::Denied {
+            tool,
+            input,
+            reason: Some(reason),
+        } => blocked_label(&join_words(tool, input), reason),
+        ActivityRow::Denied { tool, input, .. } => {
+            join_words(&format!("Not allowed: {tool}"), input)
+        }
         ActivityRow::Error(message) => message.clone(),
         ActivityRow::Finished {
             ok: true, summary, ..
@@ -624,6 +717,14 @@ pub fn row_label(row: &ActivityRow) -> String {
         ActivityRow::Finished {
             ok: false, summary, ..
         } => format!("Failed {summary}"),
+    }
+}
+
+fn blocked_label(head: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("{head} · Blocked")
+    } else {
+        format!("{head} · Blocked · Reason: {reason}")
     }
 }
 
@@ -796,7 +897,8 @@ mod tests {
             rows[5],
             ActivityRow::Denied {
                 tool: "Bash".into(),
-                input: "rm -rf x".into()
+                input: "rm -rf x".into(),
+                reason: None,
             }
         );
 
@@ -845,6 +947,7 @@ mod tests {
         let denied = ActivityRow::Denied {
             tool: "Bash".into(),
             input: String::new(),
+            reason: None,
         };
         assert_eq!(super::row_label(&denied), "Not allowed: Bash");
     }
@@ -890,6 +993,59 @@ mod tests {
                 // Control and bidi characters never reach the screen.
                 (" same  endx", None),
             ]
+        );
+    }
+
+    #[test]
+    fn a_call_the_safety_check_stopped_is_blocked_with_its_reason() {
+        let run = RunId::new();
+        let refusal = "Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions] Find another way.";
+        let input = serde_json::json!({"command": "rm -rf build"});
+        let events = vec![
+            at(
+                run,
+                0,
+                call("Bash", "t1", Some("rm -rf build"), input.clone()),
+            ),
+            at(
+                run,
+                1,
+                Event::PermissionDenied {
+                    tool: "Bash".into(),
+                    input: input.clone(),
+                    reason: Some("Destructive or unwanted actions".into()),
+                },
+            ),
+            at(run, 2, result("t1", true, refusal)),
+        ];
+        let rows = activity_rows(&events, run);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let ActivityRow::Tool(bash) = &rows[0] else {
+            panic!("a run row")
+        };
+        assert_eq!(bash.state, StepState::Blocked);
+        assert_eq!(bash.detail.as_deref(), Some("Blocked"));
+        assert_eq!(
+            bash.reason.as_deref(),
+            Some("Destructive or unwanted actions")
+        );
+        assert_eq!(
+            super::row_label(&rows[0]),
+            "Run rm -rf build · Blocked · Reason: Destructive or unwanted actions"
+        );
+
+        // The refused result alone says as much.
+        let rows = activity_rows(&[events[0].clone(), events[2].clone()], run);
+        let ActivityRow::Tool(bash) = &rows[0] else {
+            panic!("a run row")
+        };
+        assert_eq!(bash.state, StepState::Blocked);
+
+        // A denial without its call gets a row of its own.
+        let rows = activity_rows(&[events[1].clone()], run);
+        assert_eq!(
+            super::row_label(&rows[0]),
+            "Bash rm -rf build · Blocked · Reason: Destructive or unwanted actions"
         );
     }
 
