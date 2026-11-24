@@ -1446,3 +1446,75 @@ async fn run_stopped_before_it_answered_posts_no_answer() {
         vec![(Author::System, "Forge stopped.".to_string())]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unmentioned_reply_goes_to_the_last_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, log) = logging_replay_script(dir.path(), "read_file.jsonl");
+    let d = Daemon::start(4, script).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let mut triage = forge();
+    triage.name = "Triage".into();
+    let triage: AgentId = c.ok(Request::CreateAgent { spec: triage }).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+
+    // Nobody ran here yet, so this one goes to no one.
+    c.call(Request::PostMessage {
+        thread,
+        body: "hello".into(),
+    })
+    .await
+    .unwrap();
+    for body in [
+        "@Forge look at it",
+        "@Triage check it",
+        "what's the status?",
+    ] {
+        c.call(Request::PostMessage {
+            thread,
+            body: body.into(),
+        })
+        .await
+        .unwrap();
+        c.until(|m| is_status(m, RunStatus::Done)).await;
+    }
+
+    let calls = logged_calls(&log);
+    assert_eq!(calls.len(), 3);
+    let session = arg_after(&calls[1], "--session-id").unwrap();
+    assert_eq!(arg_after(&calls[2], "--resume"), Some(session));
+    assert_eq!(prompt_of(&calls[2]), "what's the status?");
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[2].agent, triage);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unmentioned_reply_waits_while_an_agent_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(4, fake("claude_sleeps.sh")).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge wait".into(),
+    })
+    .await
+    .unwrap();
+    c.until(|m| is_status(m, RunStatus::Working)).await;
+    c.call(Request::PostMessage {
+        thread,
+        body: "one more thing".into(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs.len(), 1, "the reply is context, not a new run");
+    c.call(Request::StopThread { thread }).await.unwrap();
+    c.until(|m| is_status(m, RunStatus::Stopped)).await;
+}

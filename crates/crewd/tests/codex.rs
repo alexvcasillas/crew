@@ -745,13 +745,8 @@ async fn a_later_run_resumes_the_codex_thread() {
     let run1 = ask_forge(&mut c, thread, "@Forge one").await;
     let seen = c.until_ended(run1).await;
     assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
-    c.call(Request::PostMessage {
-        thread,
-        body: "a note for later".into(),
-    })
-    .await
-    .unwrap();
-    let run2 = ask_forge(&mut c, thread, "@Forge two").await;
+    // No mention: it goes to Forge, who ran last.
+    let run2 = ask_forge(&mut c, thread, "and two").await;
     let seen = c.until_ended(run2).await;
     assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
     let sessions = events_of(&seen, run2)
@@ -771,13 +766,10 @@ async fn a_later_run_resumes_the_codex_thread() {
         "{instructions}"
     );
     assert!(instructions.ends_with("\n\nBe brief."), "{instructions}");
-    // Only what Forge missed, then the new prompt.
+    // Forge missed nothing, so just the new prompt.
     let turn = &find(&msgs, "turn/start")["params"];
     assert_eq!(turn["threadId"], TID);
-    assert_eq!(
-        turn["input"][0]["text"],
-        "You: a note for later\n\n@Forge two"
-    );
+    assert_eq!(turn["input"][0]["text"], "and two");
     let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
     assert!(runs.iter().all(|r| r.session_id == TID), "{runs:?}");
 }
