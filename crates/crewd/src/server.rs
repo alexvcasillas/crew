@@ -190,6 +190,7 @@ pub async fn serve_until(
         opts.minute,
         opts.notice_buffer,
     );
+    let sweeper = service.sweep_blocked();
     let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
     let terminal = opts
         .claude_home
@@ -217,6 +218,7 @@ pub async fn serve_until(
     }
 
     log("shutting down, stopping all runs");
+    sweeper.abort();
     drop(listener);
     // We still hold the lock, so the socket is ours to remove.
     if let Err(e) = std::fs::remove_file(&sock) {

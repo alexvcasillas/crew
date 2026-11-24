@@ -363,3 +363,29 @@ fn a_call_no_rule_matches_exactly_can_only_be_dismissed(cx: &mut TestAppContext)
         status_of(cx, &ws, id) == ApprovalStatus::Declined
     });
 }
+
+#[gpui_kit::test]
+fn a_later_run_makes_a_stopped_call_go_away(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), checked_claude(tmp.path()));
+    let (w, forge) = auto_world(home.path(), &tmp.path().join("repo"));
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge clean up the build");
+    let id = blocked_ask(cx, &ws, &w);
+    let first = run_of(cx, &ws, w.thread, forge, RunStatus::Done);
+    wait_until(cx, "the card", |cx| {
+        has(cx, window, format!("approval-{id}"))
+    });
+
+    w.post("@Forge carry on");
+    wait_for_run(cx, &ws, &w, forge, first.id);
+    wait_until(cx, "the call to go stale", |cx| {
+        status_of(cx, &ws, id) == ApprovalStatus::Cancelled
+    });
+    wait_until(cx, "the card to go", |cx| {
+        !has(cx, window, format!("approval-{id}"))
+    });
+    assert!(!has(cx, window, "status-needs"), "nothing needs you");
+}
