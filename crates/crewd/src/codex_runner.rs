@@ -103,6 +103,8 @@ pub struct CodexInvocation {
     /// thread starts with `prompt`.
     pub resume: Option<Resume>,
     pub mcp: Option<McpWiring>,
+    /// Extra environment for the app-server.
+    pub env: Vec<(String, String)>,
 }
 
 impl CodexInvocation {
@@ -271,6 +273,7 @@ async fn run(
 
     let spawned = Command::new(&inv.bin)
         .args(inv.args())
+        .envs(inv.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&inv.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -735,6 +738,7 @@ mod tests {
             prompt: "go".into(),
             resume: None,
             mcp: None,
+            env: Vec::new(),
         }
     }
 

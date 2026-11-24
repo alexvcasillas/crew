@@ -255,6 +255,8 @@ pub struct ClaudeInvocation {
     pub bin: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Extra environment for the process.
+    pub env: Vec<(String, String)>,
 }
 
 /// Picks the binary: the given override if set, else `claude` on `PATH`.
@@ -385,6 +387,7 @@ pub fn build_claude(
         bin: claude_bin_from(std::env::var_os("CREW_CLAUDE_BIN")),
         args,
         cwd: cwd.to_path_buf(),
+        env: Vec::new(),
     }
 }
 

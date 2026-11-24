@@ -34,6 +34,7 @@ sessions.
   as the real gate.
 - Worktree setup commands come from your own project settings and run with
   your permissions.
+- Agent CLIs run with `CREW_RUN_ID` set, so your hooks can skip Crew runs.
 
 ## Uninstall
 

@@ -27,6 +27,7 @@ fn invocation(bin: PathBuf, args: Vec<String>) -> ClaudeInvocation {
         bin,
         args,
         cwd: manifest_dir(),
+        env: Vec::new(),
     }
 }
 
@@ -386,4 +387,27 @@ async fn turn_end_then_exit_is_done_without_waiting() {
         started.elapsed() < Duration::from_secs(2),
         "a process that exits by itself is not waited on"
     );
+}
+
+#[tokio::test]
+async fn env_reaches_the_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("env.txt");
+    let script = tmp.path().join("claude-env.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$CREW_RUN_ID\" > '{}'\nexec '{}' '{}'\n",
+            out.display(),
+            fake("claude_ok.sh").display(),
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut inv = invocation(script, vec![]);
+    inv.env.push(("CREW_RUN_ID".into(), "run-42".into()));
+    let (_handle, _rx, join) = spawn_run(inv);
+    assert_eq!(join.await.unwrap(), RunOutcome::Done);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "run-42");
 }
