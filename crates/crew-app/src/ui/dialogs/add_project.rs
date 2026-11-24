@@ -30,23 +30,30 @@ const NAMED_REPOS: usize = 3;
 const MAX_COUNTED: u32 = 10_000;
 
 pub(super) const NO_NAME: &str = "Give the project a name.";
-pub(super) const NOT_A_FOLDER: &str = "That isn't a folder. Choose another one.";
+pub(crate) const NOT_A_FOLDER: &str = "That isn't a folder. Choose another one.";
 const PICK_A_FOLDER: &str =
     "Pick a folder. A git repo, a folder of repos and a plain folder all work.";
+const READING: &str = "Reading folder…";
 const WARNING: &str = "Agents edit your files directly. There's no undo outside git.";
 
 /// What the Add project dialog holds.
 pub(crate) struct AddProject {
     /// The folder picked, once crewd said what it holds.
     pub(super) picked: Option<Picked>,
+    /// The folder crewd is being asked about, shown as "Reading folder…".
+    pub(super) reading: Option<PathBuf>,
     /// Counts the folders asked about, so only the last answer lands.
-    seq: u64,
+    pub(super) seq: u64,
     /// Asking crewd about a folder, or looking at a setup file you added.
     task: Option<Task<()>>,
 }
 
 pub(super) struct Picked {
+    /// The folder to add: the repo's top folder when you picked a folder
+    /// inside a repo.
     pub(super) path: PathBuf,
+    /// You picked a folder inside the repo at `path`.
+    pub(super) inside_repo: bool,
     pub(super) info: FolderInfo,
     pub(super) name: Entity<InputState>,
     pub(super) mode: WorkMode,
@@ -220,12 +227,24 @@ impl Workspace {
         self.show_dialog(
             DialogKind::AddProject(Box::new(AddProject {
                 picked: None,
+                reading: None,
                 seq: 0,
                 task: None,
             })),
             window,
             cx,
         );
+    }
+
+    /// Opens Add project and its folder picker at once, as the first
+    /// launch does.
+    pub(crate) fn open_add_project_and_pick(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_add_project(window, cx);
+        self.add_project_choose(window, cx);
     }
 
     fn add_project(&mut self) -> Option<&mut AddProject> {
@@ -236,10 +255,19 @@ impl Workspace {
     }
 
     /// Whether Add project can add the folder shown.
-    pub(super) fn add_project_ready(&self) -> bool {
+    pub(in crate::ui) fn add_project_ready(&self) -> bool {
         match self.dialog.as_ref().map(|d| &d.kind) {
             Some(DialogKind::AddProject(add)) => add.picked.as_ref().is_some_and(Picked::valid),
             _ => false,
+        }
+    }
+
+    /// How many folders Add project asked crewd about.
+    #[cfg(test)]
+    pub(crate) fn add_project_seq(&self) -> u64 {
+        match self.dialog.as_ref().map(|d| &d.kind) {
+            Some(DialogKind::AddProject(add)) => add.seq,
+            _ => 0,
         }
     }
 
@@ -275,6 +303,44 @@ impl Workspace {
         }));
     }
 
+    /// While Add project is open, a folder dropped anywhere on the window,
+    /// the whole dialog included, is picked. The dialog's layer sits above
+    /// the window, so the drop is followed from the window's root: drag
+    /// moves note the paths, and the mouse up that ends the drag picks
+    /// them.
+    pub(in crate::ui) fn add_project_drop_target(
+        &self,
+        root: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if !matches!(
+            self.dialog.as_ref().map(|d| &d.kind),
+            Some(DialogKind::AddProject(_))
+        ) {
+            return root;
+        }
+        root.on_drag_move(
+            cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                this.dragged_paths = Some(event.drag(cx).clone());
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| this.add_project_drag_ended(window, cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| this.add_project_drag_ended(window, cx)),
+        )
+    }
+
+    fn add_project_drag_ended(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dragged = self.dragged_paths.take();
+        if let Some(paths) = dragged.filter(|_| cx.has_active_drag()) {
+            self.add_project_dropped(&paths, window, cx);
+        }
+    }
+
     /// A folder dropped on the dialog.
     fn add_project_dropped(
         &mut self,
@@ -288,12 +354,24 @@ impl Workspace {
     }
 
     /// Asks crewd what `path` holds and shows it.
-    fn add_project_inspect(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::ui) fn add_project_inspect(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(add) = self.add_project() else {
             return;
         };
         add.seq += 1;
         let seq = add.seq;
+        // What showed is gone: Add stays off until this answer lands.
+        add.picked = None;
+        add.reading = Some(path.clone());
+        if let Some(open) = &mut self.dialog {
+            open.error = None;
+        }
+        cx.notify();
         let answer = self.client.request(Request::InspectFolder {
             path: path.to_string_lossy().into_owned(),
         });
@@ -302,15 +380,30 @@ impl Workspace {
                 .await
                 .and_then(|v| serde_json::from_value::<FolderInfo>(v).map_err(|e| e.to_string()));
             this.update_in(cx, |this, window, cx| {
-                if this.add_project().is_some_and(|a| a.seq == seq) {
-                    this.add_project_inspected(path, info, window, cx);
-                }
+                this.add_project_answer(seq, path, info, window, cx)
             })
             .ok();
         });
         if let Some(add) = self.add_project() {
             add.task = Some(task);
         }
+    }
+
+    /// crewd's answer about the folder asked `seq`-th. A later ask makes
+    /// it stale, and it is dropped.
+    pub(in crate::ui) fn add_project_answer(
+        &mut self,
+        seq: u64,
+        path: PathBuf,
+        info: Result<FolderInfo, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(add) = self.add_project().filter(|a| a.seq == seq) else {
+            return;
+        };
+        add.reading = None;
+        self.add_project_inspected(path, info, window, cx);
     }
 
     fn add_project_inspected(
@@ -325,6 +418,13 @@ impl Workspace {
             Ok(_) => return self.add_project_error(NOT_A_FOLDER.into(), cx),
             Err(e) => return self.add_project_error(e, cx),
         };
+        let root = if info.root.is_empty() {
+            path.clone()
+        } else {
+            PathBuf::from(&info.root)
+        };
+        let inside_repo = root != path;
+        let path = root;
         if self.recents.picked_folder(&path, info.kind.clone()) {
             self.save_recents(cx);
         }
@@ -348,6 +448,7 @@ impl Workspace {
         if let Some(add) = self.add_project() {
             add.picked = Some(Picked {
                 path,
+                inside_repo,
                 info,
                 name: name.clone(),
                 mode,
@@ -457,6 +558,17 @@ impl Workspace {
     ) {
         self.dialog = None;
         window.close_dialog(cx);
+        if self.first_launch.is_some()
+            && let Some(stored) = self.state().project(project).cloned()
+        {
+            let added = AddedFolder {
+                name: stored.name,
+                branch: (!stored.main_branch.is_empty()).then_some(stored.main_branch),
+                root: stored.root,
+            };
+            self.first_launch_added(project, None, added, window, cx);
+            return;
+        }
         self.open_place(Place::Project(project), window, cx);
     }
 
@@ -563,7 +675,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.first_launch.is_some() {
-            self.first_launch_added(project, channel, added, cx);
+            self.first_launch_added(project, channel, added, window, cx);
             return;
         }
         match channel {
@@ -575,19 +687,17 @@ impl Workspace {
     /// The dialog's body: the drop zone and recent folders, or what the
     /// folder picked holds and how agents work there.
     pub(super) fn add_project_body(&self, add: &AddProject, this: WeakEntity<Self>) -> AnyElement {
-        let dropped = this.clone();
-        let body = div()
-            .id("add-project")
-            .flex()
-            .flex_col()
-            .gap(ui_px(16.))
-            .on_drop(move |paths: &ExternalPaths, window, cx| {
-                dropped
-                    .update(cx, |ws, cx| ws.add_project_dropped(paths, window, cx))
-                    .ok();
-            });
-        let body = match &add.picked {
-            None => body
+        let body = div().id("add-project").flex().flex_col().gap(ui_px(16.));
+        let body = match (&add.picked, &add.reading) {
+            (None, Some(path)) => body
+                .child(heading(
+                    "add-project-heading",
+                    "Add project".into(),
+                    None,
+                    "Add project".into(),
+                ))
+                .child(folder_with(path, false, reading_line(), this)),
+            (None, None) => body
                 .child(heading(
                     "add-project-heading",
                     "Add project".into(),
@@ -603,7 +713,7 @@ impl Workspace {
                 ))
                 .child(drop_zone(this.clone()))
                 .children(self.recent_folders(this)),
-            Some(picked) => body
+            (Some(picked), _) => body
                 .child(heading(
                     "add-project-heading",
                     "Add project".into(),
@@ -716,57 +826,6 @@ impl Workspace {
     /// The folder's path with Change, and what it holds or who has it.
     fn folder_field(&self, picked: &Picked, this: WeakEntity<Self>) -> AnyElement {
         let taken = picked.info.already_added;
-        let change = this.clone();
-        let path_row = div()
-            .id("add-project-folder")
-            .flex()
-            .items_center()
-            .gap(ui_px(8.))
-            .h(scale::row(32.))
-            .pl(ui_px(10.))
-            .pr(ui_px(4.))
-            .border_1()
-            .border_color(color(if taken.is_some() {
-                "danger"
-            } else {
-                "border-200"
-            }))
-            .rounded(ui_px(6.))
-            .bg(color("bg-100"))
-            .aria_label(picked.path.to_string_lossy().into_owned())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(code_family())
-                    .text_size(scale::mono(12.))
-                    .child(home_relative(&picked.path)),
-            )
-            .child(
-                Button::new("add-project-change")
-                    .ghost()
-                    .small()
-                    .label("Change")
-                    .on_click(move |_, window, cx| {
-                        change
-                            .update(cx, |ws, cx| ws.add_project_choose(window, cx))
-                            .ok();
-                    }),
-            )
-            .test_support();
-        // The board's focus ring, in red.
-        let path_row = if taken.is_some() {
-            div()
-                .rounded(ui_px(8.))
-                .p(ui_px(3.))
-                .m(ui_px(-3.))
-                .bg(color("danger").opacity(0.2))
-                .child(path_row)
-                .into_any_element()
-        } else {
-            path_row.into_any_element()
-        };
         let below = match taken {
             Some(project) => {
                 let name = self
@@ -774,19 +833,109 @@ impl Workspace {
                     .project(project)
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| picked.info.name_suggestion.clone());
-                taken_line(project, name, this)
+                taken_line(project, name, this.clone())
             }
+            None if picked.inside_repo => inside_repo_line(&picked.path),
             None => about_line(&picked.info),
         };
-        div()
-            .flex()
-            .flex_col()
-            .gap(ui_px(6.))
-            .child(label("Folder"))
-            .child(path_row)
-            .child(below)
-            .into_any_element()
+        folder_with(&picked.path, taken.is_some(), below, this)
     }
+}
+
+/// The Folder field: label, the path with Change, and `below`.
+fn folder_with(
+    path: &Path,
+    taken: bool,
+    below: AnyElement,
+    this: WeakEntity<Workspace>,
+) -> AnyElement {
+    let path_row = div()
+        .id("add-project-folder")
+        .flex()
+        .items_center()
+        .gap(ui_px(8.))
+        .h(scale::row(32.))
+        .pl(ui_px(10.))
+        .pr(ui_px(4.))
+        .border_1()
+        .border_color(color(if taken { "danger" } else { "border-200" }))
+        .rounded(ui_px(6.))
+        .bg(color("bg-100"))
+        .aria_label(path.to_string_lossy().into_owned())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(code_family())
+                .text_size(scale::mono(12.))
+                .child(home_relative(path)),
+        )
+        .child(
+            Button::new("add-project-change")
+                .ghost()
+                .small()
+                .label("Change")
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |ws, cx| ws.add_project_choose(window, cx))
+                        .ok();
+                }),
+        )
+        .test_support();
+    // The board's focus ring, in red.
+    let path_row = if taken {
+        div()
+            .rounded(ui_px(8.))
+            .p(ui_px(3.))
+            .m(ui_px(-3.))
+            .bg(color("danger").opacity(0.2))
+            .child(path_row)
+            .into_any_element()
+    } else {
+        path_row.into_any_element()
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(ui_px(6.))
+        .child(label("Folder"))
+        .child(path_row)
+        .child(below)
+        .into_any_element()
+}
+
+/// Under the folder while crewd reads it.
+fn reading_line() -> AnyElement {
+    hint()
+        .id("add-project-reading")
+        .aria_label(READING)
+        .child(READING)
+        .test_support()
+        .into_any_element()
+}
+
+/// Under the folder when you picked a folder inside a repo.
+fn inside_repo_line(root: &Path) -> AnyElement {
+    let text = inside_repo_note(&folder_name(root));
+    hint()
+        .id("add-project-about")
+        .flex()
+        .items_center()
+        .gap(ui_px(6.))
+        .aria_label(text.clone())
+        .child(
+            Icon::new(IconName::Check)
+                .size(ui_px(12.))
+                .text_color(color("success")),
+        )
+        .child(text)
+        .test_support()
+        .into_any_element()
+}
+
+/// The note for a folder inside the repo `repo`.
+pub fn inside_repo_note(repo: &str) -> String {
+    format!("Inside the {repo} repo, so Crew adds the whole repo.")
 }
 
 /// A field's label, findable by its text.
@@ -1238,7 +1387,17 @@ mod tests {
     use crew_core::project_kind::{ProjectKind, WorkMode};
     use crew_proto::{SetupFile, SetupFileSize};
 
-    use super::{file_note, kind_chip, mode_copy, repos_line, short_remote, size_label};
+    use super::{
+        file_note, inside_repo_note, kind_chip, mode_copy, repos_line, short_remote, size_label,
+    };
+
+    #[test]
+    fn a_folder_inside_a_repo_names_the_repo() {
+        assert_eq!(
+            inside_repo_note("api"),
+            "Inside the api repo, so Crew adds the whole repo."
+        );
+    }
 
     #[test]
     fn sizes_read_like_the_board() {

@@ -378,16 +378,37 @@ fn left_note(paths: &[String]) -> String {
     )
 }
 
+/// The top folder of the git checkout `dir` is in.
+fn repo_toplevel(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .ok()?;
+    let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !top.is_empty()).then(|| PathBuf::from(top))
+}
+
 impl Service {
     /// Answers `InspectFolder`, off the async threads.
     pub(crate) async fn inspect_folder(&self, path: String) -> Reply {
         let projects = self.db().store.projects().map_err(|e| e.to_string())?;
         let info = blocking(move || {
-            let root = PathBuf::from(&path);
-            if !root.is_dir() {
+            let picked = PathBuf::from(&path);
+            if !picked.is_dir() {
                 return Ok::<_, String>(FolderInfo::default());
             }
-            let kind = detect_kind(&root);
+            let kind = detect_kind(&picked);
+            // A folder inside a repo stands for the whole repo.
+            let root = match kind {
+                ProjectKind::Repo if !picked.join(".git").exists() => {
+                    repo_toplevel(&picked).unwrap_or(picked)
+                }
+                _ => picked,
+            };
             let (branch, remote) = if kind == ProjectKind::Repo {
                 let info = worktree::root_info(&root);
                 (info.branch, info.remote_url)
@@ -397,6 +418,7 @@ impl Service {
             let wanted = same_folder(&root);
             Ok(FolderInfo {
                 exists: true,
+                root: root.to_string_lossy().into_owned(),
                 name_suggestion: same_folder(&root)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())

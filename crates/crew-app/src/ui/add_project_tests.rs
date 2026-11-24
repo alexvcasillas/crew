@@ -7,12 +7,14 @@ use std::rc::Rc;
 
 use crew_core::project_kind::{NEEDS_REPO, ProjectKind, WorkMode};
 use crew_core::store::StoredProject;
+use crew_proto::FolderInfo;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     AnyWindowHandle, AppContext as _, Entity, ExternalPaths, FileDropEvent, InputEvent as _,
-    Modifiers, MouseMoveEvent, Task, TestAppContext,
+    Modifiers, MouseMoveEvent, Pixels, Point, Task, TestAppContext, point, px,
 };
 
+use super::dialogs::NOT_A_FOLDER;
 use super::test_ui::{
     bounds_of, click, has, label_of, open_tall, press, shows, shows_within, type_text,
     wait_to_show, wait_until,
@@ -380,24 +382,18 @@ fn a_folder_already_added_offers_to_open_it(cx: &mut TestAppContext) {
     wait_in_general(cx, &ws, &demo);
 }
 
-#[gpui_kit::test]
-fn dropping_a_folder_on_the_dialog_picks_it(cx: &mut TestAppContext) {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = short_home();
-    let _daemon = Daemon::start(home.path().to_path_buf());
-    let shop = git_repo(&tmp.path().join("shop"));
-    let (window, ws, _) = app_with_a_project(cx, home.path(), tmp.path());
-
-    // From the palette's Add project…, the last row.
-    press(cx, window, "cmd-k");
-    wait_until(cx, "the palette", |cx| has(cx, window, "palette"));
-    press(cx, window, "up enter");
-    wait_until(cx, "the dialog", |cx| dialog_open(cx, window));
-    let zone = bounds_of(cx, window, "add-project-drop").unwrap();
-    let position = zone.center();
+/// Drags `path` in from outside the window and drops it at `position`.
+fn drop_path(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    path: &Path,
+    position: Point<Pixels>,
+) {
+    let path = path.to_path_buf();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        // The pointer comes in from outside: the palette was driven by keys.
+        // The pointer comes in from outside: the dialog may have been
+        // reached by keys.
         window.dispatch_event(
             MouseMoveEvent {
                 position,
@@ -410,7 +406,7 @@ fn dropping_a_folder_on_the_dialog_picks_it(cx: &mut TestAppContext) {
         window.dispatch_event(
             FileDropEvent::Entered {
                 position,
-                paths: ExternalPaths([shop.clone()].into_iter().collect()),
+                paths: ExternalPaths([path].into_iter().collect()),
             }
             .to_platform_input(),
             cx,
@@ -421,13 +417,132 @@ fn dropping_a_folder_on_the_dialog_picks_it(cx: &mut TestAppContext) {
         window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
     })
     .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn dropping_a_folder_on_the_dialog_picks_it(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let shop = git_repo(&tmp.path().join("shop"));
+    let notes = tmp.path().join("notes.md");
+    std::fs::write(&notes, "# Notes\n").unwrap();
+    let (window, ws, _) = app_with_a_project(cx, home.path(), tmp.path());
+
+    // From the palette's Add project…, the last row.
+    press(cx, window, "cmd-k");
+    wait_until(cx, "the palette", |cx| has(cx, window, "palette"));
+    press(cx, window, "up enter");
+    wait_until(cx, "the dialog", |cx| dialog_open(cx, window));
+
+    // A file is not a folder: the error shows and Add stays off.
+    let zone = bounds_of(cx, window, "add-project-drop").unwrap();
+    drop_path(cx, window, &notes, zone.center());
+    wait_to_show(cx, window, NOT_A_FOLDER);
+    click(cx, window, "dialog-confirm");
+    assert!(dialog_open(cx, window), "Add project is off");
+    assert!(!ws.read_with(cx, |ws, _| ws.add_project_ready()));
+
+    // The whole dialog takes a drop, the footer beside Cancel too.
+    let cancel = bounds_of(cx, window, "dialog-cancel").unwrap();
+    let footer = point(cancel.origin.x - px(60.), cancel.center().y);
+    drop_path(cx, window, &shop, footer);
     wait_to_show(cx, window, "Git repo on main");
+    assert!(!shows(cx, window, NOT_A_FOLDER), "the error is gone");
     assert_eq!(
         label_of(cx, window, "add-project-folder").as_deref(),
         Some(shop.to_string_lossy().as_ref())
     );
     press(cx, window, "enter");
     wait_in_general(cx, &ws, &shop);
+}
+
+#[gpui_kit::test]
+fn a_folder_inside_a_repo_adds_the_whole_repo(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let api = git_repo(&tmp.path().join("api"));
+    std::fs::create_dir_all(api.join("src/parse")).unwrap();
+    let (window, ws, _) = app_with_a_project(cx, home.path(), tmp.path());
+
+    open_dialog(cx, window);
+    picks(cx, &ws, &api.join("src/parse"));
+    click(cx, window, "add-project-choose");
+    wait_to_show(
+        cx,
+        window,
+        "Inside the api repo, so Crew adds the whole repo.",
+    );
+    assert_eq!(
+        label_of(cx, window, "add-project-folder").as_deref(),
+        Some(api.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        ws.read_with(cx, |ws, cx| ws.add_project_name(cx))
+            .as_deref(),
+        Some("api")
+    );
+    click(cx, window, "dialog-confirm");
+    let project = wait_in_general(cx, &ws, &api);
+    assert_eq!(project.kind, ProjectKind::Repo);
+
+    // Another folder inside it is the same repo, added already.
+    open_dialog(cx, window);
+    picks(cx, &ws, &api.join("src"));
+    click(cx, window, "add-project-choose");
+    wait_to_show(cx, window, "Already added as api.");
+}
+
+#[gpui_kit::test]
+fn a_late_answer_for_an_earlier_folder_is_dropped(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let first = git_repo(&tmp.path().join("first"));
+    let second = tmp.path().join("second");
+    std::fs::create_dir_all(&second).unwrap();
+    let second = second.canonicalize().unwrap();
+    let (window, ws, _) = app_with_a_project(cx, home.path(), tmp.path());
+
+    open_dialog(cx, window);
+    picks(cx, &ws, &first);
+    click(cx, window, "add-project-choose");
+    wait_to_show(cx, window, "Git repo on main");
+
+    // A second ask clears what showed: Add is off while crewd reads.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.add_project_inspect(second.clone(), window, cx)
+        })
+    })
+    .unwrap();
+    assert!(shows(cx, window, "Reading folder…"));
+    assert!(!shows(cx, window, "Git repo on main"));
+    assert!(!ws.read_with(cx, |ws, _| ws.add_project_ready()));
+    wait_to_show(cx, window, "Plain folder, no git");
+    assert!(!shows(cx, window, "Reading folder…"));
+
+    // An answer for the first ask, landing late, changes nothing.
+    let stale = ws.read_with(cx, |ws, _| ws.add_project_seq()) - 1;
+    let info = FolderInfo {
+        exists: true,
+        root: first.to_string_lossy().into_owned(),
+        name_suggestion: "first".into(),
+        ..FolderInfo::default()
+    };
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.add_project_answer(stale, first.clone(), Ok(info), window, cx)
+        })
+    })
+    .unwrap();
+    assert!(shows(cx, window, "Plain folder, no git"));
+    assert_eq!(
+        label_of(cx, window, "add-project-folder").as_deref(),
+        Some(second.to_string_lossy().as_ref())
+    );
 }
 
 #[gpui_kit::test]
@@ -441,10 +556,9 @@ fn the_first_launch_adds_its_project_through_the_dialog(cx: &mut TestAppContext)
     let (window, ws) = open_tall(cx, home.path());
     wait_to_show(cx, window, "Welcome to Crew");
 
+    // The picker opens with the dialog.
     picks(cx, &ws, &notes);
     click(cx, window, "first-launch-pick");
-    wait_until(cx, "the dialog", |cx| dialog_open(cx, window));
-    click(cx, window, "add-project-choose");
     wait_to_show(cx, window, "Plain folder, no git");
     click(cx, window, "dialog-confirm");
     wait_closed(cx, window, &ws);

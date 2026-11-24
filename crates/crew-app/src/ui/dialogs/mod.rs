@@ -23,10 +23,16 @@ use super::workspace::Workspace;
 use crate::theme::color;
 
 use crate::theme::scale::{self, ui_px, weight};
+#[cfg(test)]
+pub(crate) use add_project::NOT_A_FOLDER;
 use discard::discard_label;
 
 /// The dialogs' width.
 const WIDTH: f32 = 420.;
+/// Space at the dialogs' sides, as the board has it.
+const PADDING_X: f32 = 20.;
+/// Space above and below the footer's buttons.
+const FOOTER_Y: f32 = 12.;
 
 /// The dialog on screen.
 pub(super) struct OpenDialog {
@@ -70,9 +76,9 @@ impl Workspace {
             busy: false,
             task: None,
         });
-        let (width, padding) = match self.dialog.as_ref().map(|d| &d.kind) {
-            Some(DialogKind::AddProject(_)) => (add_project::WIDTH, 20.),
-            _ => (WIDTH, 16.),
+        let width = match self.dialog.as_ref().map(|d| &d.kind) {
+            Some(DialogKind::AddProject(_)) => add_project::WIDTH,
+            _ => WIDTH,
         };
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -80,7 +86,8 @@ impl Workspace {
             let confirmed = this.clone();
             let dialog = dialog
                 .w(ui_px(width))
-                .px(ui_px(padding))
+                .px(ui_px(PADDING_X))
+                .pb(ui_px(FOOTER_Y))
                 // ↵ confirms. The dialog closes once crewd says it's done.
                 .on_ok(move |_, window, cx| {
                     confirmed
@@ -152,7 +159,13 @@ impl Workspace {
                     .test_support(),
             )
             .footer(
+                // Full width with a line above it, as the board has it.
                 DialogFooter::new()
+                    .mx(ui_px(-PADDING_X))
+                    .px(ui_px(PADDING_X))
+                    .pt(ui_px(FOOTER_Y))
+                    .border_t_1()
+                    .border_color(color("border-100"))
                     .child(
                         Button::new("dialog-cancel")
                             .ghost()

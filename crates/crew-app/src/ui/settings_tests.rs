@@ -89,7 +89,6 @@ fn first_launch_creates_project_agent_and_lands_in_general(cx: &mut TestAppConte
     // Step 1 adds the project through the Add project dialog.
     picks(cx, &ws, &plain);
     click(cx, window, "first-launch-pick");
-    click(cx, window, "add-project-choose");
     wait_to_show(cx, window, "Plain folder, no git");
     picks(cx, &ws, &repo);
     click(cx, window, "add-project-change");
@@ -566,10 +565,10 @@ fn choosing_a_folder_twice_adds_one_project(cx: &mut TestAppContext) {
     let repo = git_repo(&tmp.path().join("demo"));
     let (window, ws) = open_tall(cx, home.path());
     wait_to_show(cx, window, "Welcome to Crew");
-    click(cx, window, "first-launch-pick");
     let picker = slow_picker(cx, &ws);
 
-    click(cx, window, "add-project-choose");
+    // The first launch opens the picker with the dialog.
+    click(cx, window, "first-launch-pick");
     click(cx, window, "add-project-choose");
     assert_eq!(picker.opened.get(), 1, "one picker at a time");
     picker

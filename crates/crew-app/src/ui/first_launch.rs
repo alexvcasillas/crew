@@ -17,7 +17,7 @@ use super::settings::agents::{INSTALL_CLAUDE, blank_spec, default_codex_model, m
 use super::settings::projects::FIRST_CHANNEL;
 use super::settings::runtimes::{runtime_name, runtime_state};
 use super::title_bar::home_relative;
-use super::workspace::Workspace;
+use super::workspace::{Place, Workspace};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 
@@ -103,20 +103,32 @@ pub struct AddedFolder {
 }
 
 impl Workspace {
-    /// The Add project dialog added `project` while the first launch
-    /// shows: step 1 is done.
+    /// The Add project dialog added `project`, or opened one that has the
+    /// folder, while the first launch shows: step 1 is done. If step 1
+    /// was done already, the first launch ends and `project` opens.
     pub(super) fn first_launch_added(
         &mut self,
         project: ProjectId,
         channel: Option<ChannelId>,
         added: AddedFolder,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(first) = self.first_launch.as_mut().filter(|f| f.project.is_none()) {
-            first.project = Some(project);
-            first.channel = channel;
-            first.added = Some(added);
-            first.error = None;
+        match self.first_launch.as_mut() {
+            Some(first) if first.project.is_none() => {
+                first.project = Some(project);
+                first.channel = channel;
+                first.added = Some(added);
+                first.error = None;
+            }
+            _ => {
+                self.first_launch = None;
+                let place = match channel {
+                    Some(channel) => Place::Channel(channel),
+                    None => Place::Project(project),
+                };
+                self.open_place(place, window, cx);
+            }
         }
         cx.notify();
     }
@@ -239,7 +251,7 @@ impl Workspace {
                         .label("Choose a folder…")
                         .disabled(first.busy)
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_add_project(window, cx);
+                            this.open_add_project_and_pick(window, cx);
                         })),
                 )
                 .into_any_element(),

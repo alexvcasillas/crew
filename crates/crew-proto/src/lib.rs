@@ -447,6 +447,9 @@ pub struct SetupFile {
 pub struct FolderInfo {
     /// Whether the path is a folder. When not, the rest stays empty.
     pub exists: bool,
+    /// The folder to add: the repo's top folder when the path is a
+    /// folder inside a repo, else the path itself.
+    pub root: String,
     pub kind: ProjectKind,
     /// The folder's name.
     pub name_suggestion: String,

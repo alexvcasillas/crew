@@ -453,6 +453,29 @@ async fn inspect_folder_says_what_a_folder_holds() {
     assert!(info.setup_files.iter().all(|f| f.ignored));
     assert_eq!(info.setup_files[0].size, SetupFileSize::File { bytes: 4 });
     assert_eq!(info.setup_files[2].size, SetupFileSize::Folder { files: 2 });
+    assert_eq!(info.root, api.to_string_lossy());
+
+    // A folder inside the repo is the whole repo.
+    std::fs::create_dir_all(api.join("src/parse")).unwrap();
+    let inside: FolderInfo = c
+        .ok(Request::InspectFolder {
+            path: api.join("src/parse").to_string_lossy().into_owned(),
+        })
+        .await;
+    assert_eq!(inside.kind, ProjectKind::Repo);
+    assert_eq!(
+        std::path::Path::new(&inside.root).canonicalize().unwrap(),
+        api.canonicalize().unwrap()
+    );
+    assert_eq!(inside.name_suggestion, "api");
+    assert_eq!(inside.setup_files, info.setup_files);
+    let (api_project, _) = add_project(&mut c, &api, None).await;
+    let inside: FolderInfo = c
+        .ok(Request::InspectFolder {
+            path: api.join("src").to_string_lossy().into_owned(),
+        })
+        .await;
+    assert_eq!(inside.already_added, Some(api_project));
 
     // A folder of repos lists each repo's files under it.
     let root = platform(d.tmp.path());

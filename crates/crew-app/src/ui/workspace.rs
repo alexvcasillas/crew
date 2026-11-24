@@ -182,6 +182,8 @@ pub struct Workspace {
     pub(super) pick_file: PickFolder,
     /// Picking a folder or a setup file.
     pub(super) folder_task: Option<Task<()>>,
+    /// Folders being dragged over the window from outside.
+    pub(super) dragged_paths: Option<ExternalPaths>,
     /// The editor you chose in settings, if you did.
     pub(super) editor_choice: Option<String>,
     /// The editors found on this Mac.
@@ -325,6 +327,7 @@ impl Workspace {
             pick_folder: native_picker(),
             pick_file: native_file_picker(),
             folder_task: None,
+            dragged_paths: None,
             editor_choice,
             editors,
             opener: crate::editor::system_opener(),
@@ -1323,8 +1326,8 @@ impl Render for Workspace {
         }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
-        div()
-            .id("workspace")
+        let root = div().id("workspace");
+        self.add_project_drop_target(root, cx)
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(window, cx)))
