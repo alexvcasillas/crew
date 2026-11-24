@@ -208,6 +208,25 @@ impl Service {
         self.0.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How long one minute of a run's time limit lasts.
+    pub(crate) fn minute(&self) -> Duration {
+        self.0.minute
+    }
+
+    /// Expires old stopped calls now and then every twenty-fourth of
+    /// their lifetime, an hour in real time.
+    pub(crate) fn sweep_blocked(&self) -> tokio::task::JoinHandle<()> {
+        let svc = self.clone();
+        let every = (self.blocked_ttl() / 24).max(Duration::from_millis(10));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                svc.expire_old_blocked();
+            }
+        })
+    }
+
     /// The live runs whose process started, by process id. Each process
     /// is its own process group.
     pub(crate) fn live_run_pids(&self) -> Vec<(i32, RunId)> {
@@ -1502,6 +1521,7 @@ impl Service {
         state.scheduler.finished(thread);
         let mut db = self.db();
         self.cancel_permissions(&mut state, &mut db, run);
+        self.expire_blocked_after(&mut db, thread, agent, run);
         let done = matches!(outcome, RunOutcome::Done);
         let (status, author, body) = match outcome {
             RunOutcome::Stopped if state.shutting_down => (
@@ -1815,4 +1835,11 @@ mod tests {
         .unwrap();
         assert_eq!(runs, [recent, old], "each run once");
     }
+}
+
+/// Now, in Unix ms.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

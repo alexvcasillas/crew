@@ -98,6 +98,12 @@ struct Daemon {
 
 impl Daemon {
     async fn start() -> Daemon {
+        Daemon::start_with(Duration::from_secs(60)).await
+    }
+
+    /// With a time limit minute of `minute`. A stopped call is no longer
+    /// needed after 1440 of them.
+    async fn start_with(minute: Duration) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
         let claude = fake_claude(tmp.path());
@@ -107,6 +113,7 @@ impl Daemon {
                 max_runs: 4,
                 claude_bin: Some(claude),
                 crew_mcp_bin: None,
+                minute,
                 ..Default::default()
             };
             if let Err(e) = serve(&path, opts).await {
@@ -219,7 +226,7 @@ fn agent(name: &str, mode: PermissionMode) -> AgentSpec {
         allowed_tools: vec![],
         handoff_policy: None,
         handoff_budget: None,
-        max_run_minutes: 20,
+        max_run_minutes: 0,
     }
 }
 
@@ -489,4 +496,75 @@ async fn a_call_no_rule_matches_exactly_is_never_retried() {
         .await;
     assert_eq!(pending.len(), 1, "still yours to dismiss");
     decide(&mut c, approval.id, false).await;
+}
+
+/// Waits until `approval` is no longer pending and returns it.
+async fn until_decided(c: &mut Client, approval: ApprovalId) -> StoredApproval {
+    let seen = c
+        .until(|m| {
+            matches!(m, ServerMsg::Approval { approval: a, .. }
+                if a.id == approval && a.status != ApprovalStatus::Pending)
+        })
+        .await;
+    let Some(ServerMsg::Approval { approval, .. }) = seen.last() else {
+        unreachable!()
+    };
+    approval.clone()
+}
+
+#[tokio::test]
+async fn a_later_run_of_the_agent_makes_a_stopped_call_stale() {
+    let d = Daemon::start().await;
+    let mut c = d.client().await;
+    let thread = setup(&d, &mut c).await;
+
+    let (approval, run) = blocked(&mut c, thread, "@Forge clean up BLOCK").await;
+    c.until_done(run).await;
+    // Scout's run is someone else's: the call still waits.
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Scout have a look".into(),
+    })
+    .await
+    .unwrap();
+    let scout = until_logged(d.dir(), 2).await;
+    assert!(scout[1].last().unwrap().contains("have a look"));
+    let runs = c.runs(thread).await;
+    let scout_run = runs.iter().find(|r| r.id != run).unwrap().id;
+    c.until_done(scout_run).await;
+    let pending: Vec<StoredApproval> = c
+        .ok(Request::ListApprovals {
+            thread: Some(thread),
+        })
+        .await;
+    assert_eq!(pending.len(), 1);
+
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge carry on".into(),
+    })
+    .await
+    .unwrap();
+    let decided = until_decided(&mut c, approval.id).await;
+    assert_eq!(decided.status, ApprovalStatus::Cancelled);
+    let pending: Vec<StoredApproval> = c
+        .ok(Request::ListApprovals {
+            thread: Some(thread),
+        })
+        .await;
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn a_stopped_call_is_stale_after_a_day() {
+    // A minute lasts 1 ms, so a day is 1.44 s.
+    let d = Daemon::start_with(Duration::from_millis(1)).await;
+    let mut c = d.client().await;
+    let thread = setup(&d, &mut c).await;
+
+    let (approval, run) = blocked(&mut c, thread, "@Forge clean up BLOCK").await;
+    c.until_done(run).await;
+    let decided = until_decided(&mut c, approval.id).await;
+    assert_eq!(decided.status, ApprovalStatus::Cancelled);
+    assert_eq!(c.runs(thread).await.len(), 1, "nothing else ran");
 }

@@ -55,9 +55,12 @@ impl Workspace {
         for message in state.messages(thread) {
             if let Some(approval) = message.approval.and_then(|a| state.approval(a)) {
                 // An answered permission ask tags its run's step instead,
-                // and one no longer needed shows nowhere.
-                let answered = matches!(approval.kind, ApprovalKind::Permission { .. })
-                    && approval.status != ApprovalStatus::Pending;
+                // and an ask or stopped call no longer needed shows nowhere.
+                let answered = match approval.kind {
+                    ApprovalKind::Permission { .. } => approval.status != ApprovalStatus::Pending,
+                    ApprovalKind::Blocked { .. } => approval.status == ApprovalStatus::Cancelled,
+                    ApprovalKind::Handoff { .. } => false,
+                };
                 if !answered && !under_run(approval) && carded.insert(approval.id) {
                     items.push(self.render_approval(approval, cx));
                 }

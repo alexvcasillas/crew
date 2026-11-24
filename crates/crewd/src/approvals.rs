@@ -20,6 +20,8 @@ use crate::service::{Db, Service, State};
 
 /// What an agent is told when its run ends before anyone decides.
 const RUN_STOPPED: &str = "The run was stopped.";
+/// A stopped call is no longer needed after a day: this many minutes.
+const BLOCKED_TTL_MINUTES: u32 = 24 * 60;
 /// What an agent is told when you decline its permission ask.
 const DECLINED: &str = "The user declined this.";
 
@@ -559,6 +561,77 @@ impl Service {
                 let _ = tx.send(stopped_answer());
             }
         }
+    }
+
+    /// How long a stopped call waits for you before it is no longer
+    /// needed: a day, in units of the time limit's minute.
+    pub(crate) fn blocked_ttl(&self) -> std::time::Duration {
+        self.minute().saturating_mul(BLOCKED_TTL_MINUTES)
+    }
+
+    /// Cancels the thread's pending stopped calls of `agent` that a later
+    /// run of it, `ended`, has now outlived. That run went on from where
+    /// the stopped one left off, so the call is no longer needed.
+    pub(crate) fn expire_blocked_after(
+        &self,
+        db: &mut Db,
+        thread: ThreadId,
+        agent: AgentId,
+        ended: RunId,
+    ) {
+        let result = (|| -> Result<(), StoreError> {
+            let started = db.store.run(ended)?.started_at;
+            for approval in db.store.pending_approvals(Some(thread))? {
+                if !matches!(approval.kind, ApprovalKind::Blocked { .. })
+                    || approval.run == ended
+                    || approval.created_at > started
+                    || db.store.run(approval.run)?.agent != agent
+                {
+                    continue;
+                }
+                self.cancel_blocked(db, approval.id)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            crate::service::log(format!("couldn't expire stopped calls: {e}"));
+        }
+    }
+
+    /// Cancels pending stopped calls older than [`Service::blocked_ttl`].
+    pub(crate) fn expire_old_blocked(&self) {
+        let mut db = self.db();
+        let ttl = i64::try_from(self.blocked_ttl().as_millis()).unwrap_or(i64::MAX);
+        let before = crate::service::now_ms().saturating_sub(ttl);
+        let result = (|| -> Result<(), StoreError> {
+            for approval in db.store.pending_approvals(None)? {
+                if matches!(approval.kind, ApprovalKind::Blocked { .. })
+                    && approval.created_at <= before
+                {
+                    self.cancel_blocked(&mut db, approval.id)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            crate::service::log(format!("couldn't expire old stopped calls: {e}"));
+        }
+    }
+
+    fn cancel_blocked(&self, db: &mut Db, id: ApprovalId) -> Result<(), StoreError> {
+        let cancelled = db
+            .store
+            .decide_approval(id, ApprovalStatus::Cancelled, None)?;
+        let thread = cancelled.thread;
+        self.publish(
+            db,
+            thread,
+            ServerMsg::Approval {
+                thread,
+                approval: cancelled,
+            },
+        );
+        Ok(())
     }
 
     fn publish_approval(&self, db: &mut Db, id: ApprovalId) -> Result<(), StoreError> {
