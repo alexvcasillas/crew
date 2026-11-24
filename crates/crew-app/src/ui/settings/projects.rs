@@ -486,25 +486,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_channel_handoff(
-        &mut self,
-        channel: ChannelId,
-        policy: Option<HandoffPolicy>,
-        budget: Option<u32>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.request(
-            Request::SetChannelHandoff {
-                channel,
-                policy,
-                budget,
-            },
-            window,
-            cx,
-        );
-    }
-
     pub(super) fn render_projects_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let page = self.settings.as_ref().map(|s| &s.projects);
         let main = match page {
@@ -842,10 +823,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = channel.id;
-        let policy = channel.handoff_policy.unwrap_or(HandoffPolicy::AskFirst);
-        let budget = channel.handoff_budget.unwrap_or(DEFAULT_BUDGET);
-        let own_policy = channel.handoff_policy;
-        let own_budget = channel.handoff_budget;
+        let (own_policy, own_budget) = self.state().channel_handoff(id);
+        let policy = own_policy.unwrap_or(HandoffPolicy::AskFirst);
+        let budget = own_budget.unwrap_or(DEFAULT_BUDGET);
+        // Clicks build on the setting as it is when clicked, which may be
+        // ahead of this drawing.
+        let step = move |this: &mut Self, up: bool, window: &mut Window, cx: &mut Context<Self>| {
+            let (policy, budget) = this.state().channel_handoff(id);
+            let budget = budget.unwrap_or(DEFAULT_BUDGET);
+            let next = if up {
+                (budget + 1).min(99)
+            } else {
+                budget.saturating_sub(1)
+            };
+            this.send_channel_handoff(id, (policy, Some(next)), window, cx);
+        };
         let segments: Vec<AnyElement> = CHANNEL_POLICIES
             .iter()
             .map(|(p, key)| {
@@ -856,7 +848,8 @@ impl Workspace {
                     p == policy,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_channel_handoff(id, Some(p), own_budget, window, cx);
+                    let (_, budget) = this.state().channel_handoff(id);
+                    this.send_channel_handoff(id, (Some(p), budget), window, cx);
                 }))
                 .test_support()
                 .into_any_element()
@@ -883,10 +876,9 @@ impl Workspace {
                     .xsmall()
                     .icon(IconName::Minus)
                     .disabled(budget == 0)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let next = budget.saturating_sub(1);
-                        this.set_channel_handoff(id, own_policy, Some(next), window, cx);
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| step(this, false, window, cx)),
+                    ),
             )
             .child(
                 div()
@@ -903,10 +895,7 @@ impl Workspace {
                     .outline()
                     .xsmall()
                     .icon(IconName::Plus)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let next = (budget + 1).min(99);
-                        this.set_channel_handoff(id, own_policy, Some(next), window, cx);
-                    })),
+                    .on_click(cx.listener(move |this, _, window, cx| step(this, true, window, cx))),
             )
             .test_support()
     }

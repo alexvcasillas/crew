@@ -16,8 +16,8 @@ use super::settings::agents::{COMING_RUNTIMES, CREDENTIALS, INSTALL_CLAUDE};
 use super::settings::projects::NOT_GIT;
 use super::settings::runtimes::runtime_state;
 use super::test_ui::{
-    click, has, label_of, notifications, open_tall, press, shows, type_text, wait_to_show,
-    wait_until,
+    click, click_quickly, has, label_of, notifications, open_tall, press, shows, type_text,
+    wait_to_show, wait_until,
 };
 use super::thread_tests::{live_run, world};
 use super::workspace::Workspace;
@@ -456,19 +456,25 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
                 .any(|c| c.name == "bugs")
         })
     });
-    click(cx, window, format!("channel-policy-{}-budget", w.channel));
-    // Each button sends the channel's whole setting as last drawn, so the
-    // policy has to be back from crewd before the budget goes up.
-    wait_until(cx, "#general's policy", |cx| {
-        ws.read_with(cx, |ws, _| {
-            ws.state().channel(w.channel).unwrap().handoff_policy == Some(HandoffPolicy::Budget)
-        })
-    });
-    click(cx, window, format!("channel-budget-up-{}", w.channel));
+    // Quick clicks, without waiting for crewd, build on each other.
+    let up = format!("channel-budget-up-{}", w.channel);
+    click_quickly(
+        cx,
+        window,
+        &[
+            format!("channel-policy-{}-budget", w.channel).into(),
+            up.clone().into(),
+            up.into(),
+        ],
+    );
+    assert_eq!(
+        label_of(cx, window, format!("channel-budget-{}", w.channel)).as_deref(),
+        Some("5")
+    );
     wait_until(cx, "#general's handoffs", |cx| {
         ws.read_with(cx, |ws, _| {
             let c = ws.state().channel(w.channel).unwrap();
-            c.handoff_policy == Some(HandoffPolicy::Budget) && c.handoff_budget == Some(4)
+            c.handoff_policy == Some(HandoffPolicy::Budget) && c.handoff_budget == Some(5)
         })
     });
 }

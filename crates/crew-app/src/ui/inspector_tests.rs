@@ -16,8 +16,8 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, ListOffset, TestAppContext, px};
 
 use super::test_ui::{
-    WAIT, bounds_of, click, has, label_of, notifications, open_sized, press, shows, type_text,
-    wait_to_show, wait_until,
+    WAIT, bounds_of, click, click_quickly, has, label_of, notifications, open_sized, press, shows,
+    type_text, wait_to_show, wait_until,
 };
 use super::thread_tests::{World, agent, ask, go_to, live_run, open_thread, world};
 use super::workspace::Workspace;
@@ -468,6 +468,9 @@ fn policy_switch_to_budget_runs_without_asking(cx: &mut TestAppContext) {
     click(cx, window, "budget-up");
     wait_until(cx, "the budget to rise", |cx| {
         label_of(cx, window, "budget-value").as_deref() == Some("4")
+            && ws.read_with(cx, |ws, _| {
+                ws.state().thread(w.thread).unwrap().handoff_budget == Some(4)
+            })
     });
     ws.read_with(cx, |ws, _| {
         let t = ws.state().thread(w.thread).unwrap();
@@ -482,6 +485,41 @@ fn policy_switch_to_budget_runs_without_asking(cx: &mut TestAppContext) {
     click(cx, window, "stop-thread");
     run_of(cx, &ws, w.thread, forge, RunStatus::Stopped);
     run_of(cx, &ws, w.thread, scout, RunStatus::Stopped);
+}
+
+#[gpui_kit::test]
+fn quick_handoff_clicks_build_on_each_other(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    click(cx, window, "inspector-tab-thread");
+    assert_eq!(label_of(cx, window, "budget-value").as_deref(), Some("3"));
+
+    // No waiting for crewd between clicks.
+    click_quickly(
+        cx,
+        window,
+        &[
+            "policy-budget".into(),
+            "budget-up".into(),
+            "budget-up".into(),
+        ],
+    );
+    assert_eq!(
+        label_of(cx, window, "budget-value").as_deref(),
+        Some("5"),
+        "each click shows at once"
+    );
+    wait_until(cx, "crewd to have both", |cx| {
+        ws.read_with(cx, |ws, _| {
+            let t = ws.state().thread(w.thread).unwrap();
+            (t.handoff_policy, t.handoff_budget) == (Some(HandoffPolicy::Budget), Some(5))
+        })
+    });
+    assert!(shows(cx, window, "Run with budget (selected)"));
+    assert_eq!(label_of(cx, window, "budget-value").as_deref(), Some("5"));
 }
 
 /// A recorded session of `n` Bash calls, each with its output. The first

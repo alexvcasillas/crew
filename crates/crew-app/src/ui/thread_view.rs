@@ -33,9 +33,10 @@ impl Workspace {
         };
         let channel = state.channel(t.channel);
         let channel_name = channel.map(|c| c.name.clone()).unwrap_or_default();
-        let policy = t
-            .handoff_policy
-            .or_else(|| channel.and_then(|c| c.handoff_policy));
+        let policy = state
+            .thread_handoff(thread)
+            .0
+            .or(state.channel_handoff(t.channel).0);
         let events = state.events(thread);
         let names: Vec<String> = state.agents().iter().map(|a| a.spec.name.clone()).collect();
 
