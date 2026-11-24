@@ -467,3 +467,44 @@ fn result_without_a_matching_model_gives_no_window() {
     );
     assert!(!events.iter().any(|e| matches!(e, Event::Usage { .. })));
 }
+
+fn result_events(model: &str, assistant: bool, model_usage: &str) -> Vec<Event> {
+    let mut parser = StreamParser::new();
+    parser.parse(&format!(
+        r#"{{"type":"system","subtype":"init","session_id":"s","model":"{model}","cwd":"/w"}}"#
+    ));
+    if assistant {
+        parser.parse(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}}}"#,
+        );
+    }
+    parser.parse(&format!(
+        r#"{{"type":"result","subtype":"success","num_turns":1,"result":"ok","modelUsage":{model_usage}}}"#
+    ))
+}
+
+#[test]
+fn result_without_assistant_usage_gives_no_usage() {
+    let events = result_events(
+        "claude-x",
+        false,
+        r#"{"claude-x":{"inputTokens":900,"contextWindow":10}}"#,
+    );
+    assert!(!events.iter().any(|e| matches!(e, Event::Usage { .. })));
+}
+
+#[test]
+fn a_single_model_usage_entry_must_match_the_main_model() {
+    let other = r#"{"claude-y":{"inputTokens":1,"contextWindow":10}}"#;
+    let events = result_events("claude-x", true, other);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::Usage {
+            context_window: Some(_),
+            ..
+        }
+    )));
+    let same = r#"{"claude-x[1m]":{"inputTokens":1,"contextWindow":10}}"#;
+    let events = result_events("claude-x", true, same);
+    assert!(events.contains(&usage(10, Some(10))));
+}

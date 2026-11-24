@@ -196,21 +196,12 @@ impl StreamParser {
     /// window of the main model, the one that started the session.
     fn result_usage(&self, v: &Value) -> Option<Event> {
         let models = v.get("modelUsage")?.as_object()?;
-        let main = if models.len() == 1 {
-            models.iter().next()
-        } else {
-            let model = self.model.as_str();
-            models.iter().find(|(name, _)| {
-                !model.is_empty() && (name.starts_with(model) || model.starts_with(name.as_str()))
-            })
-        }?;
-        let window = main.1.get("contextWindow").and_then(Value::as_u64);
-        let tokens = self.last_tokens.or_else(|| {
-            let m = main.1;
-            let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
-            let sum = n("inputTokens") + n("cacheReadInputTokens") + n("cacheCreationInputTokens");
-            (sum > 0).then_some(sum)
+        let model = self.model.as_str();
+        let main = models.iter().find(|(name, _)| {
+            !model.is_empty() && (name.starts_with(model) || model.starts_with(name.as_str()))
         })?;
+        let window = main.1.get("contextWindow").and_then(Value::as_u64);
+        let tokens = self.last_tokens?;
         Some(Event::Usage {
             context_tokens: tokens,
             context_window: window,
