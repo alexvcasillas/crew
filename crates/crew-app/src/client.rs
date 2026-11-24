@@ -5,8 +5,9 @@
 //! [`ClientEvent`]s through an unbounded channel.
 //!
 //! The client keeps two connections to crewd:
-//! - the stream, which subscribes to everything (`SubscribeAll`) and to
-//!   each watched thread (`Subscribe`), and
+//! - the stream, which subscribes to everything (`SubscribeAll`), to
+//!   each watched thread (`Subscribe`) and to each watched terminal
+//!   session (`SubscribeTerminal`), and
 //! - the control connection, which carries requests, answered by id.
 //!
 //! Requests get their own connection because crewd closes a stream that
@@ -94,7 +95,60 @@ enum Command {
     Request(Request, oneshot::Sender<Result<Value, String>>),
     Watch(ThreadId),
     Unwatch(ThreadId),
+    WatchTerminal(String),
+    UnwatchTerminal(String),
     Reconnect,
+}
+
+/// What the stream subscribes to, besides everything.
+#[derive(Default)]
+struct Watched {
+    threads: Vec<ThreadId>,
+    terminals: Vec<String>,
+}
+
+impl Watched {
+    /// Notes a watch command. Returns the request to send on an open
+    /// stream, if any. Other commands change nothing.
+    fn take(&mut self, command: Command) -> Option<Request> {
+        match command {
+            Command::Watch(thread) => (!self.threads.contains(&thread)).then(|| {
+                self.threads.push(thread);
+                Request::Subscribe { thread }
+            }),
+            Command::Unwatch(thread) => {
+                self.threads.retain(|t| *t != thread);
+                None
+            }
+            Command::WatchTerminal(session) => (!self.terminals.contains(&session)).then(|| {
+                self.terminals.push(session.clone());
+                Request::SubscribeTerminal { session }
+            }),
+            Command::UnwatchTerminal(session) => {
+                let watched = self.terminals.contains(&session);
+                self.terminals.retain(|s| *s != session);
+                watched.then_some(Request::UnsubscribeTerminal { session })
+            }
+            Command::Request(..) | Command::Reconnect => None,
+        }
+    }
+
+    /// Everything a new stream subscribes to, in order.
+    fn requests(&self) -> impl Iterator<Item = Request> + '_ {
+        let threads = self
+            .threads
+            .iter()
+            .map(|&thread| Request::Subscribe { thread });
+        let terminals = self
+            .terminals
+            .iter()
+            .map(|session| Request::SubscribeTerminal {
+                session: session.clone(),
+            });
+        std::iter::once(Request::SubscribeAll)
+            .chain(threads)
+            .chain(terminals)
+    }
 }
 
 /// Talks to the client thread. Cheap to clone; the thread stops once
@@ -132,6 +186,17 @@ impl ClientHandle {
     /// events keep coming on this connection; the model drops them.
     pub fn unwatch_thread(&self, thread: ThreadId) {
         let _ = self.commands.send(Command::Unwatch(thread));
+    }
+
+    /// Subscribes to a terminal session, now, after every reconnect and
+    /// after crewd resets it. crewd sends its last items, then new ones.
+    pub fn watch_terminal(&self, session: String) {
+        let _ = self.commands.send(Command::WatchTerminal(session));
+    }
+
+    /// Unsubscribes from a terminal session.
+    pub fn unwatch_terminal(&self, session: String) {
+        let _ = self.commands.send(Command::UnwatchTerminal(session));
     }
 
     /// Connects now instead of waiting out the backoff, as after starting
@@ -198,7 +263,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: UnboundedSender<ClientEvent>,
 ) {
-    let mut watched: Vec<ThreadId> = Vec::new();
+    let mut watched = Watched::default();
     let mut backoff = MIN_BACKOFF;
     let mut status = Status {
         events: &events,
@@ -305,20 +370,19 @@ struct Stream {
     _reader: Reader,
 }
 
-/// Opens a stream and subscribes to everything and each watched thread.
+/// Opens a stream and subscribes to everything, each watched thread and
+/// each watched terminal session.
 async fn open_stream(
     socket: &Path,
     number: u64,
     frames: &mpsc::UnboundedSender<Frame>,
-    watched: &[ThreadId],
+    watched: &Watched,
     next_id: &mut u64,
 ) -> Result<Stream, Refused> {
     let (rd, mut wr) = open(socket).await?.into_split();
     let side = Side::Stream(number);
     let reader = Reader(tokio::spawn(read_into(rd, side, frames.clone())));
-    let subscribe = std::iter::once(Request::SubscribeAll)
-        .chain(watched.iter().map(|&thread| Request::Subscribe { thread }));
-    for req in subscribe {
+    for req in watched.requests() {
         send(&mut wr, next_id, req)
             .await
             .map_err(|e| Refused::Other(e.to_string()))?;
@@ -339,7 +403,7 @@ async fn session(
     socket: &Path,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     status: &mut Status<'_>,
-    watched: &mut Vec<ThreadId>,
+    watched: &mut Watched,
 ) -> Ended {
     let control = match open(socket).await {
         Ok(control) => control,
@@ -377,16 +441,13 @@ async fn session(
                     }
                     waiting.insert(id, reply);
                 }
-                Some(Command::Watch(thread)) => {
-                    if !watched.contains(&thread) {
-                        watched.push(thread);
-                        let req = Request::Subscribe { thread };
+                Some(Command::Reconnect) => {}
+                Some(command) => {
+                    if let Some(req) = watched.take(command) {
                         // A failed write shows up as the stream ending.
                         let _ = send(&mut stream.wr, &mut next_id, req).await;
                     }
                 }
-                Some(Command::Unwatch(thread)) => watched.retain(|t| *t != thread),
-                Some(Command::Reconnect) => {}
             },
             Some((side, frame)) = frames.recv() => {
                 let stream_lost = match (side, frame) {
@@ -409,6 +470,20 @@ async fn session(
                     }
                     (_, Ok(Some(ServerMsg::Response { .. }))) => None,
                     (_, Ok(Some(ServerMsg::Resync))) => Some("crewd asked to catch up.".to_string()),
+                    (_, Ok(Some(ServerMsg::TerminalSessionReset { session })))
+                        if watched.terminals.contains(&session) =>
+                    {
+                        let reset = ServerMsg::TerminalSessionReset {
+                            session: session.clone(),
+                        };
+                        if !status.send(ClientEvent::Msg(reset)) {
+                            return Ended::Shutdown;
+                        }
+                        // Its new backlog follows the reset.
+                        let req = Request::SubscribeTerminal { session };
+                        let _ = send(&mut stream.wr, &mut next_id, req).await;
+                        None
+                    }
                     (_, Ok(Some(msg))) => {
                         if !status.send(ClientEvent::Msg(msg)) {
                             return Ended::Shutdown;
@@ -466,7 +541,7 @@ async fn pause(
     time: Duration,
     refusal: &'static str,
     commands: &mut mpsc::UnboundedReceiver<Command>,
-    watched: &mut Vec<ThreadId>,
+    watched: &mut Watched,
 ) -> Pause {
     let sleep = tokio::time::sleep(time);
     tokio::pin!(sleep);
@@ -478,13 +553,10 @@ async fn pause(
                 Some(Command::Request(_, reply)) => {
                     let _ = reply.send(Err(refusal.into()));
                 }
-                Some(Command::Watch(thread)) => {
-                    if !watched.contains(&thread) {
-                        watched.push(thread);
-                    }
-                }
-                Some(Command::Unwatch(thread)) => watched.retain(|t| *t != thread),
                 Some(Command::Reconnect) => return Pause::Reconnect,
+                Some(command) => {
+                    let _ = watched.take(command);
+                }
             },
         }
     }

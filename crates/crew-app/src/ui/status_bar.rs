@@ -1,5 +1,6 @@
 //! The status bar: the connection when it isn't up, who is working, what
-//! waits on you, which agent CLIs are ready, and Stop all.
+//! waits on you, live terminal sessions, which agent CLIs are ready, and
+//! Stop all.
 
 use crew_core::agent::Runtime;
 use crew_proto::RuntimeInfo;
@@ -76,6 +77,9 @@ impl Workspace {
         let working = working_line(&names).filter(|_| connected);
         let needs = state.needs_you().len();
         let needs = (connected && needs > 0).then(|| format!("{needs} need you"));
+        // Not Crew runs, so counted on their own.
+        let terminal = state.live_terminal_sessions().len();
+        let terminal = (connected && terminal > 0).then(|| format!("{terminal} in terminal"));
         let runtimes = if connected {
             runtime_words(&self.runtimes)
         } else {
@@ -124,6 +128,9 @@ impl Workspace {
             })
             .when_some(needs, |bar, text| {
                 bar.child(item("status-needs", "warning", text))
+            })
+            .when_some(terminal, |bar, text| {
+                bar.child(item("status-terminal", "accent-blue", text))
             })
             .child(div().flex_1())
             .when(!runtime_items.is_empty(), |bar| {

@@ -1,13 +1,15 @@
-//! The sidebar: projects with their channels, then the agents.
+//! The sidebar: projects with their channels and terminal sessions, then
+//! the agents.
 
 use crew_core::ids::{ChannelId, ProjectId};
 use crew_core::store::{StoredAgent, StoredChannel, StoredProject};
+use crew_proto::TerminalSession;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{dot, monogram, status_word};
+use super::common::{ago, dot, monogram, now_ms, status_word};
 use super::settings::Page;
 use super::settings::projects::FolderFor;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
@@ -106,7 +108,7 @@ impl Workspace {
         let id = project.id;
         let open = !self.nav.collapsed.contains(&id);
         let status = state.project_status(id);
-        let channels: Vec<AnyElement> = if open {
+        let mut channels: Vec<AnyElement> = if open {
             state
                 .channels(id)
                 .into_iter()
@@ -115,6 +117,9 @@ impl Workspace {
         } else {
             Vec::new()
         };
+        if open {
+            channels.extend(self.render_terminal_group(id, cx));
+        }
         div()
             .flex()
             .flex_col()
@@ -179,6 +184,107 @@ impl Workspace {
                 this.select_channel(id, window, cx);
             }))
             .test_support()
+    }
+
+    /// "In terminal · N" under a project with terminal sessions, and the
+    /// sessions once you open it.
+    fn render_terminal_group(&self, project: ProjectId, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let sessions = self.state().terminal_sessions(project);
+        if sessions.is_empty() {
+            return Vec::new();
+        }
+        let open = self.nav.terminal_groups.contains(&project);
+        let label = format!("In terminal · {}", sessions.len());
+        let mut rows = vec![
+            row(format!("terminal-group-{project}"))
+                .pl(px(28.))
+                .gap(px(4.))
+                .text_color(color("text-secondary"))
+                .aria_label(label.clone())
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(12.))
+                    .text_color(color("text-tertiary")),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_terminal_group(project, cx);
+                }))
+                .test_support()
+                .into_any_element(),
+        ];
+        if open {
+            let now = now_ms();
+            rows.extend(
+                sessions
+                    .into_iter()
+                    .map(|s| self.render_terminal_session(s, now, cx).into_any_element()),
+            );
+        }
+        rows
+    }
+
+    fn render_terminal_session(
+        &self,
+        session: &TerminalSession,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = session.id.clone();
+        let selected = self.terminal.as_ref().is_some_and(|t| t.session == id);
+        let title = if session.title.is_empty() {
+            "Untitled session".to_string()
+        } else {
+            session.title.clone()
+        };
+        let open = id.clone();
+        row(format!("terminal-session-{id}"))
+            .pl(px(44.))
+            .gap(px(6.))
+            .when(selected, |row| row.bg(color("surface-300")))
+            .text_color(color(if selected {
+                "text-primary"
+            } else {
+                "text-secondary"
+            }))
+            .aria_label(title.clone())
+            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(color("text-tertiary"))
+                    .child(ago(session.last_active_at, now)),
+            )
+            .when(session.live, |row| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("terminal-live-{id}")))
+                        .flex_none()
+                        .p(px(2.))
+                        .aria_label("live")
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("live").build(window, cx)
+                        })
+                        .child(dot("accent-blue"))
+                        .test_support(),
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_terminal(open.clone(), window, cx);
+            }))
+            .test_support()
+    }
+
+    fn toggle_terminal_group(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        if !self.nav.terminal_groups.remove(&project) {
+            self.nav.terminal_groups.insert(project);
+        }
+        cx.notify();
     }
 
     /// The badge of `channel`'s row: urgent states first, then unread

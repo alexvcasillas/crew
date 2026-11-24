@@ -413,6 +413,79 @@ fn unwatching_then_watching_again_rebuilds_the_log() {
     assert!(events_sent.values().all(|n| *n == 1), "{events_sent:?}");
 }
 
+/// crewd reading a synthetic claude home at `claude_home`. Never the
+/// real one.
+fn terminal_daemon(home: &Path, claude_home: &Path) -> Daemon {
+    Daemon::start_with_options(
+        home.to_path_buf(),
+        crewd::ServeOptions {
+            claude_bin: Some(PathBuf::from("/nonexistent/claude")),
+            claude_home: Some(claude_home.to_path_buf()),
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn a_watched_terminal_session_is_subscribed_again_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let (root, claude_home) = (base.join("repo"), base.join("claude"));
+    let folder: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = claude_home.join("projects").join(folder);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(claude_home.join("sessions")).unwrap();
+    let line = |kind: &str, content: Value| {
+        serde_json::json!({
+            "type": kind,
+            "message": {"role": kind, "content": content},
+            "sessionId": "s1",
+            "timestamp": "2026-11-20T10:00:01.000Z",
+            "cwd": root,
+            "entrypoint": "cli",
+        })
+        .to_string()
+    };
+    let lines = [
+        line("user", Value::from("Fix the test")),
+        line(
+            "assistant",
+            serde_json::json!([{"type": "text", "text": "On it."}]),
+        ),
+    ];
+    std::fs::write(dir.join("s1.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let home = short_home();
+    let daemon = terminal_daemon(home.path(), &claude_home);
+    let (client, mut w) = connect(home.path());
+    setup(&client, &root);
+    w.until("the session", |w| w.state.terminal_session("s1").is_some());
+    w.state.watch_terminal("s1");
+    client.watch_terminal("s1".into());
+    w.until("its items", |w| w.state.terminal_items("s1").count() == 2);
+
+    drop(daemon);
+    w.until("crewd to be gone", |w| {
+        w.state.connection() == Some(&ConnectionState::NotRunning)
+    });
+    assert_eq!(w.state.terminal_items("s1").count(), 2, "kept meanwhile");
+    let _daemon = terminal_daemon(home.path(), &claude_home);
+    w.until("the reconnect", |w| w.connected() && w.snapshots() == 2);
+    w.until("its items again", |w| {
+        w.state.terminal_items("s1").count() == 2
+    });
+
+    // Unwatched, nothing more comes for it.
+    w.state.unwatch_terminal("s1");
+    client.unwatch_terminal("s1".into());
+    w.settle(Duration::from_millis(300));
+    assert_eq!(w.state.terminal_items("s1").count(), 0);
+}
+
 #[test]
 fn requests_to_an_out_of_date_crewd_say_so() {
     let home = short_home();

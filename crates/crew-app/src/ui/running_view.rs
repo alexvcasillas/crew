@@ -1,19 +1,20 @@
 //! Running now: every agent in every project, in place of the body, with
-//! stop controls. Groups are Needs you, Working, Queued and Finished in
-//! the last hour.
+//! stop controls. Groups are Needs you, Working, In terminal, Queued and
+//! Finished in the last hour.
 
 use std::collections::HashSet;
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ApprovalId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalKind, StoredApproval, StoredRun};
+use crew_proto::TerminalSession;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::approval_card::input_text;
-use super::common::{chip, dot, elapsed, monogram, now_ms, runtime_chip, status_word};
+use super::common::{chip, cut_start, dot, elapsed, monogram, now_ms, runtime_chip, status_word};
 use super::inspector::run_state;
 use super::run_card::summarize;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
@@ -413,6 +414,28 @@ impl Workspace {
             ("finished", "FINISHED IN THE LAST HOUR", "success", finished),
         ];
         for (key, title, token, rows) in shown {
+            // Claude Code at work in a terminal, after Crew's own runs.
+            if key == "queued" && !view.needs_only {
+                let sessions: Vec<&TerminalSession> = state
+                    .live_terminal_sessions()
+                    .into_iter()
+                    .filter(|s| view.project.is_none_or(|p| p == s.project))
+                    .collect();
+                if !sessions.is_empty() {
+                    main = main.child(group_header(
+                        "terminal",
+                        "IN TERMINAL",
+                        "accent-blue",
+                        sessions.len(),
+                    ));
+                    for session in sessions {
+                        let project = state
+                            .project(session.project)
+                            .map_or_else(String::new, |p| p.name.clone());
+                        main = main.child(render_terminal_row(session, project, cx));
+                    }
+                }
+            }
             if rows.is_empty() || (view.needs_only && key != "needs") {
                 continue;
             }
@@ -744,6 +767,106 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .gap(px(6.))
                 .w(px(ACTIONS_COL))
                 .children(actions),
+        )
+        .test_support()
+}
+
+/// A live terminal session: project and folder, title, "live" and Open.
+fn render_terminal_row(
+    session: &TerminalSession,
+    project: String,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let id = session.id.clone();
+    let title = if session.title.is_empty() {
+        "Untitled session".to_string()
+    } else {
+        session.title.clone()
+    };
+    let place = format!("{project} · {}", cut_start(&session.cwd, 40));
+    let open = id.clone();
+    div()
+        .id(SharedString::from(format!("running-terminal-{id}")))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .min_h(px(ROW_MIN_HEIGHT))
+        .px(px(12.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(color("border-100"))
+        .aria_label(format!("{project} · {title}"))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(10.))
+                .w(px(AGENT_COL))
+                .child(monogram("Claude", 24.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(project),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .font_family(mono_font())
+                                .text_size(px(12.))
+                                .text_color(color("text-tertiary"))
+                                .child(place),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(div().truncate().child(title))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(color("text-secondary"))
+                        .child("Claude Code in your terminal"),
+                ),
+        )
+        .child(div().flex_none().w(px(RUNTIME_COL)).child(chip("terminal")))
+        .child(
+            div()
+                .id(SharedString::from(format!("running-terminal-state-{id}")))
+                .flex_none()
+                .w(px(STATUS_COL))
+                .text_size(px(12.))
+                .text_color(color("accent-blue"))
+                .aria_label("live")
+                .child("live")
+                .test_support(),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .justify_end()
+                .w(px(ACTIONS_COL))
+                .child(
+                    Button::new(SharedString::from(format!("running-terminal-open-{id}")))
+                        .ghost()
+                        .small()
+                        .label("Open")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_terminal(open.clone(), window, cx);
+                        })),
+                ),
         )
         .test_support()
 }

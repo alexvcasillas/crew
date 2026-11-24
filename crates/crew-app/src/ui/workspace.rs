@@ -26,6 +26,7 @@ use super::running_view::RunningView;
 use super::service_control::ServiceAction;
 use super::settings::projects::{PickFolder, native_picker};
 use super::settings::{Page, SettingsView};
+use super::terminal_view::TerminalView;
 use crate::app::{
     ApproveLatest, NewThread, OpenSettings, Search, ShowRunning, ShowThreads, StopAll,
 };
@@ -46,6 +47,8 @@ pub const TITLE_MAX: usize = 80;
 pub(super) struct Nav {
     /// Projects whose channels are hidden.
     pub(super) collapsed: HashSet<ProjectId>,
+    /// Projects whose "In terminal" sessions are listed.
+    pub(super) terminal_groups: HashSet<ProjectId>,
     pub(super) channel: Option<ChannelId>,
     /// The open, watched thread.
     pub(super) thread: Option<ThreadId>,
@@ -93,6 +96,11 @@ pub struct Workspace {
     creating: Option<ChannelId>,
     /// A thread to open once it is known (debug builds' startup hook).
     open_pending: Option<ThreadId>,
+    /// The open terminal session, shown read-only in the main area.
+    pub(super) terminal: Option<TerminalView>,
+    /// A terminal session to open once it is known (debug builds'
+    /// startup hook).
+    terminal_pending: Option<String>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Requests waiting for their answers, by a number of their own.
@@ -208,6 +216,8 @@ impl Workspace {
             drafts: HashMap::new(),
             creating: None,
             open_pending: hooks.review.or(hooks.open_thread),
+            terminal: None,
+            terminal_pending: hooks.terminal,
             ticker: None,
             requests: HashMap::new(),
             next_request: 0,
@@ -259,6 +269,15 @@ impl Workspace {
         &self.state
     }
 
+    pub(super) fn state_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+
+    /// Whether a snapshot came since the app started.
+    pub(super) fn snapshot_seen(&self) -> bool {
+        self.snapshot_seen
+    }
+
     /// Opens `thread` now if it is known, else as soon as it arrives, as
     /// the debug startup hook does.
     #[cfg(test)]
@@ -273,6 +292,13 @@ impl Workspace {
     }
 
     fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = &self.terminal_pending
+            && self.state.terminal_session(session).is_some()
+        {
+            let session = session.clone();
+            self.terminal_pending = None;
+            self.open_terminal(session, window, cx);
+        }
         if let Some(thread) = self.open_pending
             && self.state.thread(thread).is_some()
         {
@@ -353,6 +379,7 @@ impl Workspace {
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
         self.open_if_known(window, cx);
+        self.sync_terminal(cx);
         cx.notify();
     }
 
@@ -553,7 +580,17 @@ impl Workspace {
         }
     }
 
+    /// Leaves the open thread, draft or channel for a terminal session.
+    pub(super) fn leave_for_terminal(&mut self, cx: &mut Context<Self>) {
+        self.stash_draft(cx);
+        self.close_thread(cx);
+        self.nav.drafting = false;
+        self.look_at(None);
+        self.sync(cx);
+    }
+
     fn close_thread(&mut self, cx: &App) {
+        self.close_terminal();
         self.drop_review(cx);
         if let Some(open) = self.nav.thread.take() {
             self.unwatch_thread(open);
@@ -828,10 +865,12 @@ struct StartupHooks {
     review: Option<ThreadId>,
     running: bool,
     settings: Option<Page>,
+    terminal: Option<String>,
 }
 
-/// `CREW_APP_OPEN_THREAD` and `CREW_APP_SHOW=diff:<thread>|running`, in
-/// debug builds only.
+/// `CREW_APP_OPEN_THREAD` and
+/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>`, in debug
+/// builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
     {
@@ -841,6 +880,7 @@ fn dev_hooks() -> StartupHooks {
             review: hooks.review,
             running: hooks.running,
             settings: hooks.settings,
+            terminal: hooks.terminal,
         }
     }
     #[cfg(not(debug_assertions))]
@@ -976,6 +1016,9 @@ impl Workspace {
             None => div().into_any_element(),
             // Reconnecting keeps what is known on screen.
             Some(ConnectionState::Connected | ConnectionState::Reconnecting) => {
+                if self.terminal.is_some() {
+                    return self.render_terminal(cx);
+                }
                 match (self.nav.thread, self.nav.channel) {
                     (Some(thread), _) if self.state.thread(thread).is_some() => {
                         self.render_thread(thread, cx).into_any_element()
