@@ -1,5 +1,6 @@
 //! Crew: a macOS app where coding-agent CLIs work as chat members.
 
+pub mod checks;
 pub mod client;
 pub mod connection;
 pub mod diff_parse;

@@ -62,15 +62,16 @@ struct Setup {
 }
 
 fn setup(script: &str) -> Setup {
+    setup_with(script, "edit_and_test.jsonl")
+}
+
+fn setup_with(script: &str, replay: &str) -> Setup {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
     repo_with_readme(&root);
     let claude = fake_claude(
         tmp.path(),
-        &format!(
-            "{script}\ncat '{}'",
-            fixture("edit_and_test.jsonl").display()
-        ),
+        &format!("{script}\ncat '{}'", fixture(replay).display()),
     );
     let home = short_home();
     let daemon = Daemon::start_with(home.path().to_path_buf(), claude);
@@ -456,4 +457,39 @@ fn a_read_only_reply_after_the_edits_keeps_the_editor_on_the_review(cx: &mut Tes
         ws.read_with(cx, |ws, cx| ws.composer.read(cx).text(cx)),
         "@Forge "
     );
+}
+
+#[gpui_kit::test]
+fn checks_the_agent_ran_are_listed_and_open_the_run(cx: &mut TestAppContext) {
+    let s = setup_with("printf 'one\\n' > new.txt", "edit_and_test_ok.jsonl");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    let run = run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done).id;
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+
+    wait_to_show(cx, window, "Checks Forge ran");
+    assert_eq!(
+        label_of(cx, window, ("review-check", 0usize)).as_deref(),
+        Some("Passed cargo test")
+    );
+    assert!(!has(cx, window, ("review-check", 1usize)));
+
+    click(cx, window, ("review-check", 0usize));
+    assert!(has(cx, window, "thread-view"), "back at the thread");
+    assert!(!shows(cx, window, "Forge's changes"));
+    assert!(has(cx, window, "inspector"));
+    let shown = ws.read_with(cx, |ws, _| ws.shown_run(s.w.thread).map(|r| r.id));
+    assert_eq!(shown, Some(run));
+}
+
+#[gpui_kit::test]
+fn a_failed_check_shows_as_failed(cx: &mut TestAppContext) {
+    let s = setup("printf 'one\\n' > new.txt");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "Failed cargo test");
 }

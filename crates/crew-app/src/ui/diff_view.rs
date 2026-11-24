@@ -15,13 +15,14 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Disableable as _, IconName, Selectable as _, Sizable as _};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::dot;
+use super::common::{dot, spinner};
 use super::inspector::INSPECTOR_WIDTH;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
+use crate::checks::{Check, CheckState, checks};
 use crate::diff_parse::{FileDiff, FileKind, LineKind, parse};
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -300,6 +301,27 @@ impl Workspace {
             .or(ran)
             .and_then(|a| state.agent(a))
             .map(|a| a.spec.name.clone())
+    }
+
+    /// The checks the thread's agents ran. One that never ended, because
+    /// its run is over, is left out.
+    fn review_checks(&self, thread: ThreadId) -> Vec<Check> {
+        let state = self.state();
+        let live: Vec<_> = state.live_runs(thread).iter().map(|r| r.id).collect();
+        checks(state.events(thread))
+            .into_iter()
+            .filter(|c| c.state != CheckState::Running || live.contains(&c.run))
+            .collect()
+    }
+
+    /// Goes back to the thread with the inspector on the run that ran a
+    /// check.
+    fn open_check(&mut self, check: &Check, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        self.close_review(window, cx);
+        self.show_run_activity(thread, check.run, window, cx);
     }
 
     /// Reads the open thread's uncommitted changes, for the inspector and
@@ -937,6 +959,10 @@ impl Workspace {
         let removed: u32 = files.iter().map(|f| f.3).sum();
         let n = files.len();
         let summary = format!("{n} {} changed · +{added} −{removed}", files_word(n));
+        let ran = review
+            .map(|r| (r.thread, self.review_checks(r.thread)))
+            .filter(|(_, c)| !c.is_empty());
+        let ran = ran.and_then(|(thread, list)| Some((self.review_agent(thread)?, list)));
         div()
             .id("review-files")
             .flex()
@@ -1013,6 +1039,74 @@ impl Workspace {
                             .test_support()
                     }),
             )
+            .when_some(ran, |col, (agent, list)| {
+                col.child(
+                    div()
+                        .id("review-checks")
+                        .flex()
+                        .flex_col()
+                        .mt(px(8.))
+                        .child(
+                            div()
+                                .id("review-checks-title")
+                                .aria_label(format!("Checks {agent} ran"))
+                                .test_support()
+                                .h(px(32.))
+                                .px(px(16.))
+                                .flex()
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(color("text-secondary"))
+                                .child(format!("Checks {agent} ran")),
+                        )
+                        .children(list.into_iter().enumerate().map(|(ix, check)| {
+                            let word = match check.state {
+                                CheckState::Running => "Running",
+                                CheckState::Passed => "Passed",
+                                CheckState::Failed => "Failed",
+                            };
+                            let icon = match check.state {
+                                CheckState::Running => {
+                                    spinner(("review-check-spinner", ix), 12., "accent-blue")
+                                        .into_any_element()
+                                }
+                                CheckState::Passed => Icon::new(IconName::Check)
+                                    .size(px(12.))
+                                    .text_color(color("success"))
+                                    .into_any_element(),
+                                CheckState::Failed => Icon::new(IconName::CircleX)
+                                    .size(px(12.))
+                                    .text_color(color("danger"))
+                                    .into_any_element(),
+                            };
+                            div()
+                                .id(("review-check", ix))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .h(px(28.))
+                                .px(px(16.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(color("surface-100")))
+                                .aria_label(format!("{word} {}", check.command))
+                                .child(div().flex_none().child(icon))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(mono_font())
+                                        .text_size(px(12.))
+                                        .text_color(color("text-primary"))
+                                        .child(check.command.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_check(&check, window, cx);
+                                }))
+                                .test_support()
+                        })),
+                )
+            })
     }
 
     fn render_review_diff(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

@@ -365,6 +365,22 @@ impl Workspace {
         }
     }
 
+    /// Shows `run`'s activity in the inspector.
+    pub(super) fn show_run_activity(
+        &mut self,
+        thread: ThreadId,
+        run: RunId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state().thread_runs(thread).iter().any(|r| r.id == run) {
+            self.inspector.picked = Some(run);
+        }
+        self.inspector.tab = InspectorTab::Activity;
+        self.sync_inspector(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn show_tab(
         &mut self,
         tab: InspectorTab,
