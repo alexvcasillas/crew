@@ -1,6 +1,5 @@
 //! The parts of Review changes only a folder project has: files by
-//! repo, a commit per repo, files outside git and the bar over the
-//! diff.
+//! repo, a commit per repo and files outside git.
 
 use super::*;
 
@@ -82,39 +81,6 @@ pub(super) fn in_repo<'a>(repo: &str, path: &'a str) -> &'a str {
     path.strip_prefix(repo)
         .and_then(|rest| rest.strip_prefix('/'))
         .unwrap_or(path)
-}
-
-/// The file a diff row belongs to.
-fn row_file(row: Row) -> Option<usize> {
-    match row {
-        Row::File(f)
-        | Row::Hunk(f, _)
-        | Row::Line(f, _, _)
-        | Row::Pair(f, _, _, _)
-        | Row::Note(f)
-        | Row::Folded(f) => Some(f),
-        Row::OutsideTitle | Row::Comment(_) => None,
-    }
-}
-
-/// The file the diff shows at its top. A file picked in the list wins
-/// when the list can't scroll it up that far.
-fn shown_file(review: &Review) -> Option<usize> {
-    let rows = &review.rows;
-    let top = review
-        .list
-        .logical_scroll_top()
-        .item_ix
-        .min(rows.len().checked_sub(1)?);
-    let at = (0..=top)
-        .rev()
-        .find_map(|ix| row_file(rows[ix]))
-        .or_else(|| rows.iter().find_map(|r| row_file(*r)))?;
-    let picked = review
-        .current_file
-        .as_ref()
-        .and_then(|p| review.files.iter().position(|f| &f.path == p));
-    Some(picked.filter(|&p| p > at).unwrap_or(at))
 }
 
 impl Workspace {
@@ -482,78 +448,6 @@ impl Workspace {
             rows.push(group_rows(outside));
         }
         rows
-    }
-
-    /// A folder review's bar over the diff: the shown file's repo on a
-    /// chip, its folder and name, and Viewed.
-    pub(super) fn render_file_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let review = self.review.as_ref()?;
-        let folder = review.folder.as_ref()?;
-        let ix = shown_file(review)?;
-        let file = review.files.get(ix)?;
-        let group = folder.groups.iter().find(|g| g.files.contains(&ix));
-        let repo = group.map(|g| g.repo.clone()).unwrap_or_default();
-        let path = in_repo(&repo, &file.path);
-        let (dir, name) = match path.rfind('/') {
-            Some(cut) => (path[..=cut].to_string(), path[cut + 1..].to_string()),
-            None => (String::new(), path.to_string()),
-        };
-        let label = if repo.is_empty() {
-            format!("{dir}{name}")
-        } else {
-            format!("{repo} · {dir}{name}")
-        };
-        let checked = self
-            .viewed
-            .get(&review.thread)
-            .is_some_and(|v| v.contains(&file.path));
-        Some(
-            div()
-                .id("review-file-bar")
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(ui_px(8.))
-                .h(scale::row(40.))
-                .px(ui_px(16.))
-                .border_b_1()
-                .border_color(color("border-100"))
-                .text_size(scale::text(12.))
-                .text_color(color("text-secondary"))
-                .whitespace_nowrap()
-                .aria_label(label)
-                .when(!repo.is_empty(), |bar| {
-                    bar.child(mode_chip(
-                        "review-file-bar-repo",
-                        repo,
-                        "text-secondary",
-                        "surface-300",
-                    ))
-                })
-                .when(!dir.is_empty(), |bar| {
-                    bar.child(div().min_w_0().truncate().child(dir))
-                })
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(code_family())
-                        .text_size(scale::mono(12.))
-                        .text_color(color("text-primary"))
-                        .child(name),
-                )
-                .child(div().flex_1())
-                .child(
-                    Checkbox::new("review-top-viewed")
-                        .small()
-                        .label("Viewed")
-                        .checked(checked)
-                        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                            this.set_viewed(ix, *checked, cx);
-                        })),
-                )
-                .test_support()
-                .into_any_element(),
-        )
     }
 
     /// What next for a folder project: a commit per repo, what git can't
