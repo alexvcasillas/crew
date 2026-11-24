@@ -1,15 +1,16 @@
 //! Draws a parsed Markdown message: paragraphs, headings, lists, code
-//! blocks and styled text with `@Agent` mentions and links.
+//! blocks, tables and styled text with `@Agent` mentions and links.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crew_core::ids::{MessageId, RunId};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::fonts::{mono_font, ui_font};
-use crate::markdown::{Block, Doc, Text, opens, parse, with_code_gaps, with_mentions};
+use crate::markdown::{Align, Block, Doc, Text, opens, parse, with_code_gaps, with_mentions};
 use crate::theme::color;
 
 /// What a cached parse belongs to.
@@ -117,12 +118,104 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
                     .test_support()
             }))
             .into_any_element(),
+        Block::Table { aligns, head, rows } => table(aligns, head, rows, names, &key),
     }
+}
+
+/// A table in a bordered box as wide as the space it has. Columns share
+/// that width by how long their longest cell is, and cells wrap.
+fn table(
+    aligns: &[Align],
+    head: &[Text],
+    rows: &[Vec<Text>],
+    names: &[String],
+    id: &str,
+) -> AnyElement {
+    let weights = column_weights(head, rows);
+    let row = |cells: &[Text], ix: usize, header: bool| {
+        let row_id = format!("{id}-row-{ix}");
+        div()
+            .id(SharedString::from(row_id.clone()))
+            .flex()
+            .w_full()
+            .role(Role::Row)
+            .aria_label(
+                cells
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+            .when(header, |d| d.bg(color("surface-100")))
+            .when(ix > 0, |d| d.border_t_1().border_color(color("border-100")))
+            .children(cells.iter().enumerate().map(|(col, cell)| {
+                let cell_id = format!("{row_id}-{col}");
+                let (weight, token, size, line) = if header {
+                    (FontWeight::SEMIBOLD, "text-secondary", 12., 18.)
+                } else {
+                    (FontWeight::NORMAL, "text-primary", 13., 20.)
+                };
+                let align = aligns.get(col).copied().unwrap_or_default();
+                div()
+                    .flex_basis(relative(0.))
+                    .flex_grow(weights.get(col).copied().unwrap_or(6.))
+                    .min_w_0()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_size(px(size))
+                    .line_height(px(line))
+                    .when(align == Align::Center, |d| d.text_center())
+                    .when(align == Align::Right, |d| d.text_right())
+                    .child(rich_text_in(cell, names, &cell_id, weight, token))
+            }))
+            .test_support()
+    };
+    div()
+        .id(SharedString::from(format!("{id}-table")))
+        .flex()
+        .flex_col()
+        .w_full()
+        .max_w_full()
+        .border_1()
+        .border_color(color("border-100"))
+        .rounded(px(8.))
+        .overflow_hidden()
+        .role(Role::Table)
+        .child(row(head, 0, true))
+        .children(
+            rows.iter()
+                .enumerate()
+                .map(|(ix, cells)| row(cells, ix + 1, false)),
+        )
+        .test_support()
+        .into_any_element()
+}
+
+/// Each column's share of a table's width: its longest cell in
+/// characters, kept between 6 and 40.
+fn column_weights(head: &[Text], rows: &[Vec<Text>]) -> Vec<f32> {
+    (0..head.len())
+        .map(|col| {
+            std::iter::once(head)
+                .chain(rows.iter().map(Vec::as_slice))
+                .filter_map(|cells| cells.get(col))
+                .map(|c| c.text.chars().count())
+                .max()
+                .unwrap_or(0)
+                .clamp(6, 40) as f32
+        })
+        .collect()
 }
 
 /// Text in its styles: bold, italic, `code` in mono on a background,
 /// mentions and links in blue. Clicking a web link opens it.
 fn rich_text(text: &Text, names: &[String], id: &str, weight: FontWeight) -> Div {
+    rich_text_in(text, names, id, weight, "text-primary")
+}
+
+/// [`rich_text`] with plain text in the color `token`.
+fn rich_text_in(text: &Text, names: &[String], id: &str, weight: FontWeight, token: &str) -> Div {
+    let plain = token;
     let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let runs: Vec<TextRun> = with_code_gaps(&text.text, with_mentions(text, names))
         .into_iter()
@@ -143,7 +236,7 @@ fn rich_text(text: &Text, names: &[String], id: &str, weight: FontWeight) -> Div
             let token = if style.mention || style.link.is_some() {
                 "accent-blue"
             } else {
-                "text-primary"
+                plain
             };
             if let Some(url) = style.link {
                 links.push((span.range.clone(), url));
@@ -210,6 +303,12 @@ fn plain_text(blocks: &[Block]) -> String {
             Block::Paragraph(t) | Block::Heading(t) => words.push(t.text.clone()),
             Block::Code(code) => words.push(code.clone()),
             Block::List { items, .. } => words.extend(items.iter().map(|i| plain_text(i))),
+            Block::Table { head, rows, .. } => words.extend(
+                std::iter::once(head)
+                    .chain(rows)
+                    .flatten()
+                    .map(|c| c.text.clone()),
+            ),
         }
     }
     words.join(" ")

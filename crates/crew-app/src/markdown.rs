@@ -22,6 +22,34 @@ pub enum Block {
     },
     /// A fenced or indented code block, without its last newline.
     Code(String),
+    /// A table. Every row has one cell per column.
+    Table {
+        aligns: Vec<Align>,
+        head: Vec<Text>,
+        rows: Vec<Vec<Text>>,
+    },
+}
+
+/// How a table column lines up its text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+impl From<pulldown_cmark::Alignment> for Align {
+    fn from(a: pulldown_cmark::Alignment) -> Self {
+        use pulldown_cmark::Alignment;
+        match a {
+            Alignment::None => Align::None,
+            Alignment::Left => Align::Left,
+            Alignment::Center => Align::Center,
+            Alignment::Right => Align::Right,
+        }
+    }
 }
 
 /// Text and how each stretch of it looks. The spans cover all of `text`
@@ -85,6 +113,16 @@ enum Frame {
     Item(Vec<Block>),
 }
 
+/// A table still being read.
+#[derive(Default)]
+struct TableFrame {
+    aligns: Vec<Align>,
+    head: Vec<Text>,
+    rows: Vec<Vec<Text>>,
+    row: Vec<Text>,
+    cell: Option<Text>,
+}
+
 /// The state of a parse: open containers, open text and inline styles.
 #[derive(Default)]
 struct Reader {
@@ -92,6 +130,7 @@ struct Reader {
     frames: Vec<Frame>,
     text: Option<(Open, Text)>,
     code: Option<String>,
+    table: Option<TableFrame>,
     bold: usize,
     italic: usize,
     links: Vec<String>,
@@ -110,6 +149,12 @@ impl Reader {
     fn add_text(&mut self, s: &str, style: Style) {
         if let Some(code) = &mut self.code {
             code.push_str(s);
+            return;
+        }
+        if let Some(table) = &mut self.table {
+            if let Some(cell) = &mut table.cell {
+                cell.push(s, style);
+            }
             return;
         }
         // A tight list item's text comes without a paragraph around it.
@@ -163,6 +208,18 @@ impl Reader {
                 self.close();
                 self.frames.push(Frame::Item(Vec::new()));
             }
+            Tag::Table(aligns) => {
+                self.close();
+                self.table = Some(TableFrame {
+                    aligns: aligns.into_iter().map(Align::from).collect(),
+                    ..TableFrame::default()
+                });
+            }
+            Tag::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.cell = Some(Text::default());
+                }
+            }
             Tag::Strong => self.bold += 1,
             Tag::Emphasis => self.italic += 1,
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
@@ -202,6 +259,43 @@ impl Reader {
                     self.push(Block::List { start, items });
                 }
             }
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table {
+                    let cell = table.cell.take().unwrap_or_default();
+                    table.row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.head = std::mem::take(&mut table.row);
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = &mut self.table {
+                    let row = std::mem::take(&mut table.row);
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    let width = t.head.len();
+                    let rows = t
+                        .rows
+                        .into_iter()
+                        .map(|mut row| {
+                            row.resize_with(width, Text::default);
+                            row
+                        })
+                        .collect();
+                    let mut aligns = t.aligns;
+                    aligns.resize(width, Align::None);
+                    self.push(Block::Table {
+                        aligns,
+                        head: t.head,
+                        rows,
+                    });
+                }
+            }
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Link => {
@@ -224,9 +318,9 @@ fn trim_end(text: &mut Text) {
 
 /// Reads `source` as Markdown.
 pub fn parse(source: &str) -> Doc {
-    use pulldown_cmark::{Event, Parser};
+    use pulldown_cmark::{Event, Options, Parser};
     let mut reader = Reader::default();
-    for event in Parser::new(source) {
+    for event in Parser::new_ext(source, Options::ENABLE_TABLES) {
         match event {
             Event::Start(tag) => reader.start(tag),
             Event::End(tag) => reader.end(tag),
@@ -379,7 +473,8 @@ pub fn opens(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, Doc, Span, Style, Text, mention_spans, opens, parse, with_code_gaps, with_mentions,
+        Align, Block, Doc, Span, Style, Text, mention_spans, opens, parse, with_code_gaps,
+        with_mentions,
     };
 
     /// Each stretch of `text` with a short tag for its style.
@@ -618,6 +713,74 @@ mod tests {
         let names = ["Forge".to_string()];
         let body = "@forge read a.txt, not @nobody or me@forge";
         assert_eq!(mention_spans(body, &names), vec![0..6_usize]);
+    }
+
+    fn table(doc: &Doc, ix: usize) -> (&[Align], &[Text], &[Vec<Text>]) {
+        match &doc.blocks[ix] {
+            Block::Table { aligns, head, rows } => (aligns, head, rows),
+            other => panic!("a table, got {other:?}"),
+        }
+    }
+
+    fn words(cells: &[Text]) -> Vec<&str> {
+        cells.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    #[test]
+    fn tables_hold_a_header_and_rows() {
+        let doc = parse(
+            "Open MRs:\n\n| MR | Author | Status |\n|---|---|---|\n| !12 | sam | open |\n| !13 | kim | merged |\n\nafter",
+        );
+        assert_eq!(doc.blocks.len(), 3);
+        assert_eq!(paragraph(&doc, 0).text, "Open MRs:");
+        let (aligns, head, rows) = table(&doc, 1);
+        assert_eq!(aligns, [Align::None; 3]);
+        assert_eq!(words(head), ["MR", "Author", "Status"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(words(&rows[0]), ["!12", "sam", "open"]);
+        assert_eq!(words(&rows[1]), ["!13", "kim", "merged"]);
+        assert_eq!(paragraph(&doc, 2).text, "after");
+    }
+
+    #[test]
+    fn table_cells_keep_inline_styles() {
+        let doc = parse(
+            "| File | Note |\n|---|---|\n| `a.rs` | see [docs](https://example.com) **now** |",
+        );
+        let (_, _, rows) = table(&doc, 0);
+        assert_eq!(styled(&rows[0][0]), [("a.rs", "code")]);
+        assert_eq!(
+            styled(&rows[0][1]),
+            [
+                ("see ", "plain"),
+                ("docs", "link"),
+                (" ", "plain"),
+                ("now", "bold")
+            ]
+        );
+        assert_eq!(
+            rows[0][1].spans[1].style.link.as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn short_table_rows_are_padded() {
+        let doc = parse("| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |");
+        let (_, head, rows) = table(&doc, 0);
+        assert_eq!(head.len(), 3);
+        assert_eq!(words(&rows[0]), ["1", "", ""]);
+        assert_eq!(words(&rows[1]), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn table_columns_keep_their_alignment() {
+        let doc = parse("| a | b | c | d |\n|:--|:-:|--:|---|\n| 1 | 2 | 3 | 4 |");
+        let (aligns, _, _) = table(&doc, 0);
+        assert_eq!(
+            aligns,
+            [Align::Left, Align::Center, Align::Right, Align::None]
+        );
     }
 
     fn plain(text: &str) -> Text {
