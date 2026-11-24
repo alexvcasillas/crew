@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crew_core::ids::ThreadId;
+use crew_core::ids::{AgentId, ThreadId};
 use crew_core::store::Author;
 use crew_core::worktree::Diff;
 use crew_proto::Request;
@@ -285,6 +285,11 @@ impl Workspace {
     /// may have changed files, else the latest to reply, else the latest
     /// to run.
     fn review_agent(&self, thread: ThreadId) -> Option<String> {
+        let id = self.review_agent_id(thread)?;
+        self.state().agent(id).map(|a| a.spec.name.clone())
+    }
+
+    fn review_agent_id(&self, thread: ThreadId) -> Option<AgentId> {
         let state = self.state();
         let edited = state.editing_run(thread).map(|r| r.agent);
         let replied = state
@@ -296,22 +301,24 @@ impl Workspace {
                 _ => None,
             });
         let ran = state.thread_runs(thread).last().map(|r| r.agent);
-        edited
-            .or(replied)
-            .or(ran)
-            .and_then(|a| state.agent(a))
-            .map(|a| a.spec.name.clone())
+        edited.or(replied).or(ran)
     }
 
-    /// The checks the thread's agents ran. One that never ended, because
+    /// The checks the titled agent ran. One that never ended, because
     /// its run is over, is left out.
     fn review_checks(&self, thread: ThreadId) -> Vec<Check> {
         let state = self.state();
+        let Some(agent) = self.review_agent_id(thread) else {
+            return Vec::new();
+        };
+        let runs: Vec<_> = state
+            .thread_runs(thread)
+            .iter()
+            .filter(|r| r.agent == agent)
+            .map(|r| r.id)
+            .collect();
         let live: Vec<_> = state.live_runs(thread).iter().map(|r| r.id).collect();
-        checks(state.events(thread))
-            .into_iter()
-            .filter(|c| c.state != CheckState::Running || live.contains(&c.run))
-            .collect()
+        checks(state.events(thread), &runs, &live)
     }
 
     /// Goes back to the thread with the inspector on the run that ran a

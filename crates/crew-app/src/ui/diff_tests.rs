@@ -467,6 +467,8 @@ fn checks_the_agent_ran_are_listed_and_open_the_run(cx: &mut TestAppContext) {
     let run = run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done).id;
     wait_for_changes(cx, &ws, 1);
     review_from_inspector(cx, window);
+    // Hidden before, the inspector comes back for the command.
+    ws.update(cx, |ws, _| ws.inspector_open = Some(false));
 
     wait_to_show(cx, window, "Checks Forge ran");
     assert_eq!(
@@ -479,6 +481,7 @@ fn checks_the_agent_ran_are_listed_and_open_the_run(cx: &mut TestAppContext) {
     assert!(has(cx, window, "thread-view"), "back at the thread");
     assert!(!shows(cx, window, "Forge's changes"));
     assert!(has(cx, window, "inspector"));
+    wait_to_show(cx, window, "$ cargo test");
     let shown = ws.read_with(cx, |ws, _| ws.shown_run(s.w.thread).map(|r| r.id));
     assert_eq!(shown, Some(run));
 }
@@ -492,4 +495,40 @@ fn a_failed_check_shows_as_failed(cx: &mut TestAppContext) {
     wait_for_changes(cx, &ws, 1);
     review_from_inspector(cx, window);
     wait_to_show(cx, window, "Failed cargo test");
+}
+
+#[gpui_kit::test]
+fn a_running_check_shows_running_then_passes(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let go = tmp.path().join("go");
+    let sid = r#""session_id":"00000000-0000-4000-8000-000000000001""#;
+    let call = format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_09","name":"Bash","input":{{"command":"npm test"}}}}]}},{sid}}}"#
+    );
+    let done = format!(
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_09","content":"ok"}}]}},{sid}}}"#
+    );
+    let s = setup_with(
+        &format!(
+            "printf 'one\\n' > new.txt\ncat <<'EOF'\n{call}\nEOF\nwhile [ ! -e '{}' ]; do sleep 0.02; done\ncat <<'EOF'\n{done}\nEOF",
+            go.display()
+        ),
+        "edit_and_test_ok.jsonl",
+    );
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Working);
+    wait_until(cx, "the worktree", |cx| {
+        worktree(cx, &ws, s.w.thread).is_some_and(|p| p.join("new.txt").exists())
+    });
+    let thread = s.w.thread;
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_review(thread, window, cx));
+    })
+    .unwrap();
+    wait_to_show(cx, window, "Running npm test");
+
+    std::fs::write(&go, "").unwrap();
+    wait_to_show(cx, window, "Passed npm test");
+    assert!(!shows(cx, window, "Running npm test"));
 }

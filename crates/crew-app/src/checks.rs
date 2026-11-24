@@ -1,6 +1,8 @@
 //! The checks an agent ran: test, lint and build commands found in a
 //! thread's events, with whether each one passed.
 
+use std::collections::HashMap;
+
 use crew_core::event::{Event, ToolKind};
 use crew_core::ids::RunId;
 
@@ -21,25 +23,65 @@ pub struct Check {
     pub state: CheckState,
     /// The run that ran it last.
     pub run: RunId,
+    /// The tool call id of that run.
+    pub call: String,
 }
 
-/// `cd <dir> &&` prefixes dropped.
-fn without_cd(mut command: &str) -> &str {
+/// The shell command inside `sh -c '...'`, `/bin/zsh -lc "..."` and the
+/// like, else `command` itself.
+fn unwrap_shell(command: &str) -> &str {
+    let command = command.trim();
+    let mut words = command.splitn(3, char::is_whitespace);
+    let (Some(shell), Some(flag), Some(rest)) = (words.next(), words.next(), words.next()) else {
+        return command;
+    };
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    let is_flag = flag.starts_with('-') && flag.ends_with('c') && !flag.starts_with("--");
+    if !["sh", "bash", "zsh"].contains(&name) || !is_flag {
+        return command;
+    }
+    let rest = rest.trim();
+    for quote in ['\'', '"'] {
+        if let Some(inner) = rest.strip_prefix(quote).and_then(|r| r.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    rest
+}
+
+/// Whether `word` is a `NAME=value` environment assignment.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The command that does the work: shell wrappers, `cd <dir> &&` (or
+/// `;`) prefixes and leading `NAME=value` assignments dropped.
+fn core_command(command: &str) -> &str {
+    let mut command = unwrap_shell(command);
     loop {
         let trimmed = command.trim_start();
-        let Some(rest) = trimmed.strip_prefix("cd ") else {
-            return trimmed;
-        };
-        match rest.split_once("&&") {
-            Some((_, after)) => command = after,
-            None => return trimmed,
+        if let Some(rest) = trimmed.strip_prefix("cd ")
+            && let Some((_, after)) = rest.split_once("&&").or_else(|| rest.split_once(';'))
+        {
+            command = unwrap_shell(after);
+            continue;
         }
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        if is_assignment(first) {
+            command = unwrap_shell(&trimmed[first.len()..]);
+            continue;
+        }
+        return trimmed;
     }
 }
 
 /// Whether `command` runs a test, lint, type check or build.
 pub fn is_check(command: &str) -> bool {
-    let command = without_cd(command);
+    let command = core_command(command);
     let mut words = command.split_whitespace();
     let Some(first) = words.next() else {
         return false;
@@ -58,7 +100,10 @@ pub fn is_check(command: &str) -> bool {
             };
             sub.is_some_and(|w| ["test", "lint", "build", "typecheck", "check"].contains(w))
         }
-        "npx" | "bunx" => second(&["tsc", "eslint", "vitest", "jest", "biome", "prettier"]),
+        "npx" | "bunx" => rest
+            .iter()
+            .find(|w| !w.starts_with('-'))
+            .is_some_and(|w| ["tsc", "eslint", "vitest", "jest", "biome", "prettier"].contains(w)),
         "tsc" | "eslint" | "vitest" | "jest" | "pytest" | "ruff" | "mypy" => true,
         "go" => second(&["test", "vet", "build"]),
         "swift" => second(&["test", "build"]),
@@ -69,9 +114,16 @@ pub fn is_check(command: &str) -> bool {
 }
 
 /// The checks in `events`, in the order they last ran. A command that ran
-/// again counts once, with its latest state.
-pub fn checks(events: &[LoggedEvent]) -> Vec<Check> {
-    let mut found: Vec<(String, Check)> = Vec::new();
+/// again counts once, with its latest state. Only calls of `runs` count. A call with no result whose
+/// run is not in `live` never ended and is ignored.
+pub fn checks(events: &[LoggedEvent], runs: &[RunId], live: &[RunId]) -> Vec<Check> {
+    let mut results: HashMap<(RunId, &str), bool> = HashMap::new();
+    for logged in events {
+        if let Event::ToolResult { id, is_error, .. } = &logged.event {
+            results.insert((logged.run, id), *is_error);
+        }
+    }
+    let mut found: Vec<Check> = Vec::new();
     for logged in events {
         let Event::ToolCall {
             id,
@@ -82,33 +134,24 @@ pub fn checks(events: &[LoggedEvent]) -> Vec<Check> {
         else {
             continue;
         };
-        if !is_check(command) {
+        if !runs.contains(&logged.run) || !is_check(command) {
             continue;
         }
-        let state = events
-            .iter()
-            .find_map(|e| match &e.event {
-                Event::ToolResult {
-                    id: got, is_error, ..
-                } if e.run == logged.run && got == id => Some(if *is_error {
-                    CheckState::Failed
-                } else {
-                    CheckState::Passed
-                }),
-                _ => None,
-            })
-            .unwrap_or(CheckState::Running);
-        found.retain(|(c, _)| c != command);
-        found.push((
-            command.clone(),
-            Check {
-                command: command.clone(),
-                state,
-                run: logged.run,
-            },
-        ));
+        let state = match results.get(&(logged.run, id.as_str())) {
+            Some(true) => CheckState::Failed,
+            Some(false) => CheckState::Passed,
+            None if live.contains(&logged.run) => CheckState::Running,
+            None => continue,
+        };
+        found.retain(|c| c.command != *command);
+        found.push(Check {
+            command: command.clone(),
+            state,
+            run: logged.run,
+            call: id.clone(),
+        });
     }
-    found.into_iter().map(|(_, c)| c).collect()
+    found
 }
 
 #[cfg(test)]
@@ -172,6 +215,15 @@ mod tests {
             "xcodebuild -scheme App test",
             "cd crates/app && cargo test",
             "cd a && cd b && npm run lint",
+            "cd x; cargo test",
+            "FOO=1 cargo test",
+            "CI=1 NODE_ENV=test npm test",
+            "cd x && RUST_LOG=debug cargo clippy",
+            "npx -y tsc --noEmit",
+            "bunx --bun vitest",
+            "/bin/zsh -lc 'cargo test --workspace'",
+            "bash -c \"cd app && npm run lint\"",
+            "sh -lc 'FOO=1 pytest'",
         ] {
             assert!(is_check(command), "{command}");
         }
@@ -194,6 +246,10 @@ mod tests {
             "echo cargo test",
             "cd x",
             "cd x && ls",
+            "FOO=1 ls",
+            "npx -y create-app",
+            "/bin/zsh -lc 'mkdir sub'",
+            "zsh -lc 'echo cargo test'",
         ] {
             assert!(!is_check(command), "{command}");
         }
@@ -209,7 +265,7 @@ mod tests {
             result(run, 4, "b", true),
             call(run, 5, "c", "npm run lint"),
         ];
-        let got: Vec<_> = checks(&events)
+        let got: Vec<_> = checks(&events, &[run], &[run])
             .into_iter()
             .map(|c| (c.command, c.state))
             .collect();
@@ -235,7 +291,7 @@ mod tests {
             call(b, 1, "x", "cargo test"),
             result(b, 2, "x", false),
         ];
-        let got = checks(&events);
+        let got = checks(&events, &[a, b], &[a, b]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].command, "cargo fmt");
         assert_eq!(got[1].command, "cargo test");
@@ -260,6 +316,51 @@ mod tests {
                 },
             ),
         ];
-        assert!(checks(&events).is_empty());
+        assert!(checks(&events, &[run], &[run]).is_empty());
+    }
+
+    #[test]
+    fn a_call_that_never_ended_in_a_finished_run_is_ignored() {
+        let (a, b) = (RunId::new(), RunId::new());
+        let events = [
+            call(a, 1, "x", "cargo test"),
+            result(a, 2, "x", false),
+            // The rerun was interrupted: no result, and its run is over.
+            call(b, 1, "x", "cargo test"),
+        ];
+        let got = checks(&events, &[a, b], &[]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].state, CheckState::Passed);
+        assert_eq!(got[0].run, a);
+        // While its run is live, the rerun shows as running.
+        let got = checks(&events, &[a, b], &[b]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].state, CheckState::Running);
+    }
+
+    #[test]
+    fn a_running_check_passes_when_its_result_arrives() {
+        let run = RunId::new();
+        let mut events = vec![call(run, 1, "a", "cargo test")];
+        assert_eq!(
+            checks(&events, &[run], &[run])[0].state,
+            CheckState::Running
+        );
+        events.push(result(run, 2, "a", false));
+        assert_eq!(checks(&events, &[run], &[run])[0].state, CheckState::Passed);
+    }
+
+    #[test]
+    fn only_the_given_runs_count() {
+        let (mine, other) = (RunId::new(), RunId::new());
+        let events = [
+            call(mine, 1, "a", "cargo test"),
+            result(mine, 2, "a", false),
+            call(other, 1, "b", "npm test"),
+            result(other, 2, "b", false),
+        ];
+        let got = checks(&events, &[mine], &[]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].command, "cargo test");
     }
 }
