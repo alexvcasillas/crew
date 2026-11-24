@@ -10,7 +10,8 @@ use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun, StoredThread,
 };
 use crew_proto::{
-    ClientMsg, Limits, PROTO_VERSION, PermissionAnswer, Request, ServerMsg, read_frame, write_frame,
+    AgentProfile, ClientMsg, Limits, PROTO_VERSION, PermissionAnswer, Request, ServerMsg,
+    read_frame, write_frame,
 };
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
@@ -650,6 +651,15 @@ async fn budget_runs_then_pauses() {
         text,
         "This thread used its handoffs. Asked the user whether to continue."
     );
+    // Both handoffs that ran count in the profiles, the one under the
+    // budget and the approved one.
+    let handoffs = |p: AgentProfile| (p.stats.handoffs_sent_week, p.stats.handoffs_received_week);
+    let forge: AgentProfile = c.ok(Request::AgentProfile { agent: chat.forge }).await;
+    assert_eq!(handoffs(forge), (2, 0));
+    let scout: AgentProfile = c.ok(Request::AgentProfile { agent: chat.scout }).await;
+    assert_eq!(handoffs(scout), (0, 1));
+    let triage: AgentProfile = c.ok(Request::AgentProfile { agent: chat.triage }).await;
+    assert_eq!(handoffs(triage), (0, 1));
     c.call(Request::StopAll).await.unwrap();
 }
 

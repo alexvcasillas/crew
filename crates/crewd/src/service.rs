@@ -1,8 +1,9 @@
 //! Chat state and run handling behind the server.
 //!
 //! Lock order: `state`, then `db`, then `terminal`. The change count cache
-//! is locked on its own, never while taking another lock. No lock is held
-//! across an `.await`, nor while git, a setup command or a file read runs.
+//! and the file index are each locked on their own, never while taking
+//! another lock. No lock is held across an `.await`, nor while git, a
+//! setup command or a file read runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,8 @@ use crew_core::mention::parse_mentions;
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{
-    Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun, ThreadWorktree,
+    ApprovalStatus, Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun,
+    ThreadWorktree,
 };
 use crew_core::worktree::{self, Diff};
 use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg};
@@ -31,12 +33,15 @@ use uuid::Uuid;
 use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
 use crate::overview::{ChangeCache, LiveEdit};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
+use crate::search::FileIndex;
 use crate::terminal::{Cmd, TerminalState};
 
 /// Told once per run when permission prompts can't reach crewd.
 pub const NO_CREW_MCP: &str = "Permission prompts are off: crew-mcp wasn't found next to crewd.";
 /// Name used for the user's messages in a new session's context.
 const YOU_NAME: &str = "You";
+/// The note on an approval closed because its project was removed.
+const PROJECT_GONE: &str = "Closed because the project was removed.";
 /// Tool call id of the setup command's events.
 const SETUP_ID: &str = "setup";
 /// Longest channel description, in characters.
@@ -109,6 +114,9 @@ pub(crate) struct State {
 
 struct Inner {
     db: Mutex<Db>,
+    /// A read-only connection for search, so it never holds `db`. `None`
+    /// for an in-memory store, where search reads through `db`.
+    reader: Option<Mutex<Store>>,
     state: Mutex<State>,
     tx: broadcast::Sender<Notice>,
     bins: CliBins,
@@ -119,6 +127,9 @@ struct Inner {
     /// Held while a worktree's slug is picked and the worktree made, so
     /// two threads can't pick the same one.
     slugs: Mutex<()>,
+    /// Held while a project is checked against the others and made, so
+    /// two can't take one folder at once.
+    adding_project: Mutex<()>,
     /// How long one minute of a run's time limit lasts.
     minute: Duration,
     /// Terminal sessions. Locked after `db` when both are.
@@ -133,6 +144,8 @@ struct Inner {
     count_slots: Arc<tokio::sync::Semaphore>,
     /// Extra time each count takes, in ms. Tests set it.
     count_delay_ms: std::sync::atomic::AtomicU64,
+    /// File lists of project roots and worktrees, for search.
+    files: Mutex<FileIndex>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -197,7 +210,12 @@ impl Service {
         let mut scheduler = Scheduler::new(limits.max_runs as usize);
         scheduler.set_paused(limits.paused);
         let (tx, _) = broadcast::channel(notice_buffer.max(1));
+        let reader = store.open_reader().unwrap_or_else(|e| {
+            log(format!("couldn't open a reader for search: {e}"));
+            None
+        });
         Service(Arc::new(Inner {
+            reader: reader.map(Mutex::new),
             db: Mutex::new(Db { store, serial: 0 }),
             state: Mutex::new(State {
                 scheduler,
@@ -216,6 +234,7 @@ impl Service {
             worktrees,
             crew_mcp,
             slugs: Mutex::new(()),
+            adding_project: Mutex::new(()),
             minute,
             terminal: Mutex::new(TerminalState::default()),
             terminal_cmd: OnceLock::new(),
@@ -223,6 +242,7 @@ impl Service {
             counted: tokio::sync::Notify::new(),
             count_slots: Arc::new(tokio::sync::Semaphore::new(crate::overview::GIT_AT_ONCE)),
             count_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            files: Mutex::new(FileIndex::default()),
         }))
     }
 
@@ -278,11 +298,27 @@ impl Service {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Forgets the thread's cached change counts.
+    /// Runs `f` on the search reader, or on the main store when there is
+    /// none.
+    pub(crate) fn with_reader<T>(&self, f: impl FnOnce(&Store) -> T) -> T {
+        match &self.0.reader {
+            Some(reader) => f(&reader.lock().unwrap_or_else(PoisonError::into_inner)),
+            None => f(&self.db().store),
+        }
+    }
+
+    pub(crate) fn files(&self) -> MutexGuard<'_, FileIndex> {
+        self.0.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets the thread's cached change counts and file list.
     fn changes_may_differ(&self, thread: ThreadId) {
-        let mut cache = self.changes();
-        cache.invalidate(thread);
-        cache.forget_edits(thread);
+        {
+            let mut cache = self.changes();
+            cache.invalidate(thread);
+            cache.forget_edits(thread);
+        }
+        self.files_may_differ(thread);
     }
 
     /// Resolves the next time counts were worked out.
@@ -416,6 +452,7 @@ impl Service {
     /// `Commit`, `Discard` and `ChannelOverview` run git and `Runtimes`
     /// runs the agent CLIs, so they can take a while.
     pub async fn handle(&self, req: Request) -> Reply {
+        self.refuse_removed(&req)?;
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
@@ -425,8 +462,39 @@ impl Service {
             } => self.discard(thread, delete_branch).await,
             Request::ChannelOverview { channel } => self.channel_overview(channel).await,
             Request::Runtimes => self.runtimes().await,
+            Request::Search {
+                query,
+                project,
+                limit,
+            } => self.search(query, project, limit).await,
+            Request::ProjectOverview { project } => self.project_overview(project).await,
+            Request::AgentProfile { agent } => self.agent_profile(agent).await,
             other => self.handle_now(other),
         }
+    }
+
+    /// Refuses a write into a removed project. The writes that start runs
+    /// check again under the lock they write with.
+    fn refuse_removed(&self, req: &Request) -> Result<(), String> {
+        let db = self.db();
+        let open = match req {
+            Request::PostMessage { thread, .. }
+            | Request::RenameThread { thread, .. }
+            | Request::ArchiveThread { thread, .. }
+            | Request::SetThreadHandoff { thread, .. }
+            | Request::AllowMoreHandoffs { thread, .. }
+            | Request::Commit { thread, .. }
+            | Request::Discard { thread, .. } => db.store.ensure_thread_open(*thread),
+            Request::CreateThread { channel, .. }
+            | Request::UpdateChannel { channel, .. }
+            | Request::SetChannelHandoff { channel, .. } => db.store.ensure_channel_open(*channel),
+            Request::CreateChannel { project, .. }
+            | Request::UpdateProject { project, .. }
+            | Request::RenameProject { project, .. }
+            | Request::RemoveProject { project } => db.store.ensure_project_open(*project),
+            _ => Ok(()),
+        };
+        open.map_err(|e| e.to_string())
     }
 
     /// Requests that only touch the store or the scheduler.
@@ -444,17 +512,12 @@ impl Service {
                 name,
                 root,
                 main_branch,
-            } => {
-                let mut db = self.db();
-                let project = db
-                    .store
-                    .create_project(&name, Path::new(&root), &main_branch)
-                    .map_err(|e| e.to_string())?;
-                self.project_changed(&mut db, project)?;
-                json(project)
-            }
+            } => json(self.create_project(&name, Path::new(&root), &main_branch)?),
             Request::CreateChannel { project, name } => {
                 let mut db = self.db();
+                db.store
+                    .ensure_project_open(project)
+                    .map_err(|e| e.to_string())?;
                 let channel = db
                     .store
                     .create_channel(project, &name)
@@ -589,7 +652,26 @@ impl Service {
             | Request::Commit { .. }
             | Request::Discard { .. }
             | Request::ChannelOverview { .. }
+            | Request::Search { .. }
+            | Request::ProjectOverview { .. }
+            | Request::AgentProfile { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
+            Request::RenameProject { project, name } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("Give the project a name.".into());
+                }
+                let mut db = self.db();
+                db.store
+                    .rename_project(project, name)
+                    .map_err(|e| e.to_string())?;
+                self.project_changed(&mut db, project)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::RemoveProject { project } => {
+                self.remove_project(project)?;
+                Ok(serde_json::Value::Null)
+            }
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -732,6 +814,7 @@ impl Service {
     /// Saves a thread and tells `SubscribeAll` clients.
     fn create_thread(&self, channel: ChannelId, title: &str) -> Result<ThreadId, StoreError> {
         let mut db = self.db();
+        db.store.ensure_channel_open(channel)?;
         let id = db.store.create_thread(channel, title)?;
         let thread = db.store.thread(id)?;
         self.publish_global(&mut db, ServerMsg::ThreadCreated { channel, thread });
@@ -757,6 +840,167 @@ impl Service {
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
         self.agent_changed(&mut db, agent)?;
+        Ok(())
+    }
+
+    /// Adds a project, unless another one uses the folder. A removed
+    /// project with the folder comes back instead, the most recently
+    /// removed one, with its channels and threads. Folders are compared
+    /// with links resolved, which reads the disk, so not under a lock.
+    fn create_project(&self, name: &str, root: &Path, main: &str) -> Result<ProjectId, String> {
+        let err = |e: StoreError| e.to_string();
+        let _adding = self
+            .0
+            .adding_project
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let wanted = same_folder(root);
+        let (active, removed) = {
+            let db = self.db();
+            (
+                db.store.projects().map_err(err)?,
+                db.store.removed_projects().map_err(err)?,
+            )
+        };
+        if let Some(taken) = active.iter().find(|p| same_folder(&p.root) == wanted) {
+            return Err(format!("{} already uses this folder.", taken.name));
+        }
+        let revived = removed.iter().find(|p| same_folder(&p.root) == wanted);
+        let mut db = self.db();
+        let Some(old) = revived else {
+            let project = db.store.create_project(name, root, main).map_err(err)?;
+            self.project_changed(&mut db, project)?;
+            return Ok(project);
+        };
+        db.store.restore_project(old.id, name).map_err(err)?;
+        self.project_changed(&mut db, old.id)?;
+        for channel in db.store.channels(old.id).map_err(err)? {
+            self.channel_changed(&mut db, channel.id)?;
+        }
+        for thread in db.store.project_threads(old.id).map_err(err)? {
+            self.publish_global(&mut db, ServerMsg::ThreadChanged { thread });
+        }
+        // Runs that ended lately, as a snapshot would bring them.
+        let since = now_ms() - RECENT_RUNS_MS;
+        for run in db.store.project_runs(old.id).map_err(err)? {
+            if run.ended_at.is_some_and(|e| e >= since) {
+                self.publish_status(&mut db, run.thread, run.id, run.status.clone());
+            }
+        }
+        Ok(old.id)
+    }
+
+    /// Removes the project from Crew. Refused while one of its runs is
+    /// live or a worktree change is under way. In one transaction, its
+    /// queued runs are dropped with a note, its pending approvals closed
+    /// with a note, and the project marked removed. Its threads and runs
+    /// stay for history; its terminal sessions are no longer listed.
+    /// Nothing on disk is touched.
+    fn remove_project(&self, project: ProjectId) -> Result<(), String> {
+        let err = |e: StoreError| e.to_string();
+        let (dirs, threads) = {
+            let mut state = self.state();
+            let mut db = self.db();
+            let stored = db.store.project(project).map_err(err)?;
+            let threads = db.store.project_threads(project).map_err(err)?;
+            let ids: std::collections::HashSet<ThreadId> = threads.iter().map(|t| t.id).collect();
+            if state.live.values().any(|(t, _)| ids.contains(t)) {
+                return Err(format!("Stop the agents in {} first.", stored.name));
+            }
+            if ids.iter().any(|t| state.scheduler.is_active(*t)) {
+                return Err(format!(
+                    "Wait for the worktree change in {} to finish.",
+                    stored.name
+                ));
+            }
+            let pending: Vec<StoredApproval> = db
+                .store
+                .pending_approvals(None)
+                .map_err(err)?
+                .into_iter()
+                .filter(|a| ids.contains(&a.thread))
+                .collect();
+            let queue = state.scheduler.clear();
+            let dropped: Vec<&Job> = queue.iter().filter(|j| ids.contains(&j.thread)).collect();
+            let saved = db.store.in_transaction(|s| {
+                let mut notes = Vec::new();
+                let mut noted = Vec::new();
+                for job in &dropped {
+                    s.set_run_status(job.run, RunStatus::Stopped)?;
+                    if !noted.contains(&job.thread) {
+                        noted.push(job.thread);
+                    }
+                }
+                for thread in noted {
+                    let body = "Stopped before starting.";
+                    notes.push((thread, s.add_message(thread, Author::System, body, None)?));
+                }
+                let mut closed = Vec::new();
+                for a in &pending {
+                    closed.push(s.decide_approval(a.id, ApprovalStatus::Cancelled, None)?);
+                    let id = s.add_message(a.thread, Author::System, PROJECT_GONE, Some(a.run))?;
+                    notes.push((a.thread, id));
+                }
+                s.remove_project(project)?;
+                Ok((notes, closed))
+            });
+            let (notes, closed) = match saved {
+                Ok(saved) => saved,
+                Err(e) => {
+                    for job in queue {
+                        state.scheduler.enqueue(job);
+                    }
+                    return Err(e.to_string());
+                }
+            };
+            let dropped: Vec<Job> = dropped.into_iter().cloned().collect();
+            for job in queue {
+                if !ids.contains(&job.thread) {
+                    state.scheduler.enqueue(job);
+                }
+            }
+            for job in &dropped {
+                state.pending.remove(&job.run);
+                state.retry_rules.remove(&job.run);
+                self.publish_status(&mut db, job.thread, job.run, RunStatus::Stopped);
+            }
+            for approval in closed {
+                let thread = approval.thread;
+                self.publish(&mut db, thread, ServerMsg::Approval { thread, approval });
+            }
+            for (thread, id) in notes {
+                if let Err(e) = self.publish_message(&mut db, thread, id) {
+                    log(format!("couldn't send a note of thread {thread}: {e}"));
+                }
+            }
+            let mut terminal = self.terminal();
+            for id in terminal.remove_project(project) {
+                self.publish_global(&mut db, ServerMsg::TerminalSessionRemoved { id });
+            }
+            drop(terminal);
+            self.publish_global(&mut db, ServerMsg::ProjectRemoved { project });
+            let mut dirs = vec![stored.root];
+            dirs.extend(
+                threads
+                    .iter()
+                    .filter_map(|t| t.worktree.as_ref().map(|w| w.path.clone())),
+            );
+            (dirs, ids)
+        };
+        {
+            let mut index = self.files();
+            for dir in &dirs {
+                index.forget(dir);
+            }
+        }
+        {
+            let mut cache = self.changes();
+            for thread in threads {
+                cache.invalidate(thread);
+                cache.forget_edits(thread);
+            }
+        }
+        self.rescan_terminal();
         Ok(())
     }
 
@@ -993,6 +1237,7 @@ impl Service {
         let id = {
             let mut state = self.state();
             let mut db = self.db();
+            db.store.ensure_thread_open(thread)?;
             let earlier = db.store.messages(thread)?;
             let agents = db.store.agents()?;
             let id = self.add_message(&mut db, thread, Author::You, body, None)?;
@@ -1438,7 +1683,8 @@ impl Service {
         let (project, project_slug, thread) = {
             let db = self.db();
             let found = db.store.project_of_thread(job.thread).and_then(|project| {
-                let projects = db.store.projects()?;
+                // Removed ones too, so slugs stay as they were.
+                let projects = db.store.all_projects()?;
                 let thread = db.store.thread(job.thread)?;
                 let slug = project_slug(&projects, project.id);
                 Ok((project, slug, thread))
@@ -1592,6 +1838,7 @@ impl Service {
         announce: bool,
         extra_allowed: &[String],
     ) -> Result<(String, Invocation), StoreError> {
+        db.store.ensure_thread_open(job.thread)?;
         let agents = db.store.agents_with_deleted()?;
         let spec = db.store.agent(job.agent)?;
         if spec.deleted_at.is_some() {
@@ -2013,8 +2260,16 @@ enum Invocation {
     Codex(CodexInvocation),
 }
 
+/// A folder as compared between projects: links resolved when it exists,
+/// trailing slashes dropped.
+fn same_folder(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
+}
+
 /// Runs blocking work, such as git, off the async threads.
-async fn blocking<T, E>(f: impl FnOnce() -> Result<T, E> + Send + 'static) -> Result<T, String>
+pub(crate) async fn blocking<T, E>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, String>
 where
     T: Send + 'static,
     E: std::fmt::Display + Send + 'static,

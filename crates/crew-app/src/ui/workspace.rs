@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_proto::{Request, RuntimeInfo};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
@@ -37,6 +37,7 @@ use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
 use crate::model::{Handoff, State};
+use crate::recents::Recents;
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
@@ -188,6 +189,22 @@ pub struct Workspace {
     pub(super) channel_view: ChannelView,
     /// The thread or channel dialog on screen, if any.
     pub(super) dialog: Option<super::dialogs::OpenDialog>,
+    /// The ⌘K palette, while it is open.
+    pub(super) palette: Option<Entity<super::palette::Palette>>,
+    /// What you opened lately, for the palette.
+    pub(super) recents: Recents,
+    /// Writing the recents to the prefs file.
+    recents_task: Option<Task<()>>,
+}
+
+/// A place the palette, and the sidebar, can take you to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Place {
+    Thread(ThreadId),
+    Channel(ChannelId),
+    Agent(AgentId),
+    /// Its first channel for now; the project overview later.
+    Project(ProjectId),
 }
 
 /// The Editor select of General.
@@ -211,6 +228,7 @@ impl Workspace {
                 },
             );
         let editor_choice = crate::editor::load_choice(&conn.crew_home);
+        let recents = Recents::load(&conn.crew_home);
         let editors = crate::editor::detect_installed();
         let editor_select = cx.new(|cx| {
             let (labels, ix) = editor_items(editor_choice.as_deref(), &editors);
@@ -296,6 +314,9 @@ impl Workspace {
             _editor_events: editor_events,
             channel_view,
             dialog: None,
+            palette: None,
+            recents,
+            recents_task: None,
         }
     }
 
@@ -414,6 +435,7 @@ impl Workspace {
         let mut snapshot = false;
         let mut terminal_gone = false;
         let mut run_ended = false;
+        let mut removed = Vec::new();
         let mut touched = Vec::new();
         let mut stale = Vec::new();
         for event in events {
@@ -431,6 +453,9 @@ impl Workspace {
                 && self.terminal.as_ref().is_some_and(|t| t.session == *id)
             {
                 terminal_gone = true;
+            }
+            if let ClientEvent::Msg(crew_proto::ServerMsg::ProjectRemoved { project }) = &event {
+                removed.push(*project);
             }
             if let ClientEvent::Msg(crew_proto::ServerMsg::RunStatus { status, .. }) = &event {
                 run_ended |= !matches!(status, RunStatus::Queued | RunStatus::Working);
@@ -471,6 +496,9 @@ impl Workspace {
             self.refresh_history(cx);
         }
         self.channel_touched(&touched, &stale, snapshot);
+        if !removed.is_empty() {
+            self.leave_removed(&removed, window, cx);
+        }
         self.sync_composer_mode(window, cx);
         self.sync_settings(window, cx);
         self.sync(cx);
@@ -485,6 +513,62 @@ impl Workspace {
         self.sync_terminal();
         self.sync_terminal_ticker(cx);
         cx.notify();
+    }
+
+    /// Leaves what belonged to removed projects: an open review or terminal
+    /// session closes, an open thread or channel gives way to the first
+    /// channel left (or nothing selected), and the palette searches every
+    /// project.
+    fn leave_removed(
+        &mut self,
+        removed: &[ProjectId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|t| self.state.terminal_session(&t.session).is_none())
+        {
+            self.close_terminal();
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|r| self.state.thread(r.thread).is_none())
+        {
+            self.drop_review(cx);
+        }
+        let thread_gone = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread(t).is_none());
+        let channel_gone = self
+            .nav
+            .channel
+            .is_some_and(|c| self.state.channel(c).is_none());
+        if thread_gone || channel_gone {
+            let next = self
+                .state
+                .projects()
+                .into_iter()
+                .find_map(|p| self.state.channels(p.id).first().map(|c| c.id));
+            match next {
+                Some(channel) => self.select_channel(channel, window, cx),
+                None => {
+                    self.close_thread(cx);
+                    self.nav.channel = None;
+                    self.nav.drafting = false;
+                }
+            }
+        }
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| {
+                for project in removed {
+                    palette.project_removed(*project, cx);
+                }
+            });
+        }
     }
 
     /// The name of the agent that ran last in the open thread, if it still
@@ -609,6 +693,9 @@ impl Workspace {
         self.close_thread(cx);
         self.nav.drafting = false;
         self.look_at(Some(channel));
+        if self.recents.visited_channel(channel) {
+            self.save_recents(cx);
+        }
         self.reset_channel_view(channel, window, cx);
         self.sync_composer_mode(window, cx);
         if self.composer_mode() != ComposerMode::Empty {
@@ -640,12 +727,68 @@ impl Workspace {
         self.nav.drafting = false;
         let channel = self.state.thread(thread).map(|t| t.channel);
         self.look_at(channel.or(self.nav.channel));
+        if self.recents.opened_thread(thread) {
+            self.save_recents(cx);
+        }
         self.sync_composer_mode(window, cx);
         self.composer
             .update(cx, |composer, cx| composer.focus(window, cx));
         self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Takes you to `place`, leaving settings, Running now or a review.
+    /// Every way to a thread, channel, agent or project from the palette
+    /// goes through here. For now an agent opens its settings and a
+    /// project its first channel.
+    pub(super) fn open_place(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_pages(cx);
+        match place {
+            Place::Thread(thread) => self.open_thread(thread, window, cx),
+            Place::Channel(channel) => self.select_channel(channel, window, cx),
+            Place::Agent(agent) => {
+                if self.recents.visited_agent(agent) {
+                    self.save_recents(cx);
+                }
+                self.open_settings(Page::Agents, window, cx);
+                self.edit_agent(agent, window, cx);
+            }
+            Place::Project(project) => {
+                if self.recents.visited_project(project) {
+                    self.save_recents(cx);
+                }
+                let first = self.state.channels(project).first().map(|c| c.id);
+                if let Some(channel) = first {
+                    self.select_channel(channel, window, cx);
+                }
+            }
+        }
+    }
+
+    /// Closes settings, Running now and the review, which show in place
+    /// of the body.
+    pub(super) fn leave_pages(&mut self, cx: &mut Context<Self>) {
+        self.settings = None;
+        self.running = None;
+        self.drop_review(cx);
+        cx.notify();
+    }
+
+    /// Writes the recents to the prefs file, off the UI thread, after any
+    /// write still pending, so none is dropped and the latest lands last.
+    fn save_recents(&mut self, cx: &mut Context<Self>) {
+        let recents = self.recents.clone();
+        let home = self.conn.crew_home.clone();
+        let pending = self.recents_task.take();
+        self.recents_task = Some(cx.background_executor().spawn(async move {
+            if let Some(pending) = pending {
+                pending.await;
+            }
+            if let Err(e) = recents.save(&home) {
+                eprintln!("crew: couldn't save recent places: {e}");
+            }
+        }));
     }
 
     /// Starts a new thread in the selected channel: the composer takes its
@@ -1151,13 +1294,7 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
-            .on_action(cx.listener(|_, _: &Search, window, cx| {
-                struct SearchSoon;
-                window.push_notification(
-                    Notification::info(super::title_bar::SEARCH_SOON).id::<SearchSoon>(),
-                    cx,
-                );
-            }))
+            .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(Page::General, window, cx);
             }))
@@ -1392,15 +1529,13 @@ mod tests {
 
 #[cfg(test)]
 mod gpui_tests {
-    use super::super::test_ui::{
-        click, description_of, has, notifications, open, press, shows, wait_to_show, wait_until,
-    };
+    use super::super::test_ui::{click, has, notifications, open, shows, wait_to_show, wait_until};
     use crate::client;
     use crate::connection::ConnectionConfig;
     use crate::test_support::{Daemon, refuse_hello, short_home};
     use crew_core::ids::{ChannelId, ProjectId, ThreadId};
     use crew_proto::Request;
-    use gpui_kit::{Entity, TestAppContext};
+    use gpui_kit::{AppContext as _, Entity, TestAppContext};
 
     use super::Workspace;
     use crate::connection::ConnectionState;
@@ -1422,21 +1557,6 @@ mod gpui_tests {
         assert!(shows(cx, window, "Crew"), "the app name");
         assert!(shows(cx, window, "Search threads, agents, files…"));
         assert!(shows(cx, window, "Projects"), "the sidebar");
-    }
-
-    #[gpui_kit::test]
-    fn search_says_it_is_coming_soon(cx: &mut TestAppContext) {
-        let home = short_home();
-        let (window, _) = open(cx, home.path());
-        assert_eq!(
-            description_of(cx, window, "title-search").as_deref(),
-            Some("Search is coming soon.")
-        );
-        assert_eq!(notifications(cx, window), 0);
-        press(cx, window, "cmd-k");
-        assert_eq!(notifications(cx, window), 1);
-        press(cx, window, "cmd-k");
-        assert_eq!(notifications(cx, window), 1, "said once");
     }
 
     #[gpui_kit::test]
@@ -1546,6 +1666,72 @@ mod gpui_tests {
             window,
             "Crew's background service isn't running."
         ));
+    }
+
+    #[gpui_kit::test]
+    fn a_removed_project_closes_what_was_open_in_it(cx: &mut TestAppContext) {
+        let home = short_home();
+        let _daemon = Daemon::start(home.path().to_path_buf());
+        let (other, _other_events) = client::spawn(ConnectionConfig {
+            crew_home: home.path().to_path_buf(),
+        });
+        let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
+        let add = |name: &str, root: &str| -> (ProjectId, ChannelId) {
+            let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
+                name: name.into(),
+                root: root.into(),
+                main_branch: "main".into(),
+            }))
+            .unwrap();
+            let channel = serde_json::from_value(ask(Request::CreateChannel {
+                project,
+                name: "general".into(),
+            }))
+            .unwrap();
+            (project, channel)
+        };
+        let (gone, gone_channel) = add("gone", "/work/gone");
+        let (kept, kept_channel) = add("kept", "/work/kept");
+        let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
+            channel: gone_channel,
+            title: "fix the login".into(),
+        }))
+        .unwrap();
+
+        let (window, ws) = open(cx, home.path());
+        wait_connected(cx, &ws);
+        wait_until(cx, "the thread", |cx| {
+            ws.read_with(cx, |ws, _| ws.state().thread(thread).is_some())
+        });
+        cx.update_window(window, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.open_thread(thread, window, cx);
+                ws.open_review(thread, window, cx);
+                ws.open_palette(window, cx);
+            });
+        })
+        .unwrap();
+        ws.read_with(cx, |ws, cx| {
+            assert!(ws.review.is_some());
+            assert_eq!(ws.palette().unwrap().read(cx).scope(), Some(gone));
+        });
+
+        ask(Request::RemoveProject { project: gone });
+        wait_until(cx, "leaving the removed project", |cx| {
+            ws.read_with(cx, |ws, _| ws.nav.thread.is_none())
+        });
+        ws.read_with(cx, |ws, cx| {
+            assert_eq!(ws.nav.channel, Some(kept_channel), "the first channel left");
+            assert!(ws.review.is_none());
+            assert_eq!(ws.palette().unwrap().read(cx).scope(), None, "all projects");
+        });
+
+        // With nothing left, nothing is selected.
+        ask(Request::RemoveProject { project: kept });
+        wait_until(cx, "nothing selected", |cx| {
+            ws.read_with(cx, |ws, _| ws.nav.channel.is_none())
+        });
+        ws.read_with(cx, |ws, _| assert!(ws.nav.thread.is_none()));
     }
 
     #[gpui_kit::test]

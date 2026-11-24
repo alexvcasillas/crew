@@ -14,12 +14,13 @@ use crew_core::store::{
     StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
     StoredThread,
 };
+pub use crew_core::worktree::RootInfo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 10;
+pub const PROTO_VERSION: u32 = 11;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -37,6 +38,8 @@ pub enum Request {
     Hello {
         version: u32,
     },
+    /// Answered with the project's id. Refused if another project uses
+    /// the folder; a removed one with the folder comes back instead.
     CreateProject {
         name: String,
         root: String,
@@ -232,6 +235,245 @@ pub enum Request {
     UnsubscribeTerminal {
         session: String,
     },
+    /// Finds threads, channels, agents and files whose name holds `query`,
+    /// ignoring case. Answered with [`SearchResults`]: each section best
+    /// first, at most `limit` (1 to 200) long. `project` narrows it to one
+    /// project; agents are found in any.
+    Search {
+        query: String,
+        #[serde(default)]
+        project: Option<ProjectId>,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
+    /// Answered with a [`ProjectOverview`].
+    ProjectOverview {
+        project: ProjectId,
+    },
+    /// Answered with an [`AgentProfile`]. Deleted agents have one too.
+    AgentProfile {
+        agent: AgentId,
+    },
+    /// Answered with null; every client gets a [`ServerMsg::ProjectChanged`].
+    RenameProject {
+        project: ProjectId,
+        name: String,
+    },
+    /// Removes the project from Crew. It leaves the snapshot, search and
+    /// overviews; its runs stay in the run history. Its folder, branches
+    /// and worktrees stay on disk. Refused while one of its runs is live;
+    /// queued ones are dropped and pending approvals closed, each with a
+    /// note. Adding its folder again brings it back with its channels and
+    /// threads. Answered with null; every client gets a
+    /// [`ServerMsg::ProjectRemoved`].
+    RemoveProject {
+        project: ProjectId,
+    },
+}
+
+fn default_search_limit() -> u32 {
+    50
+}
+
+/// Where a thread stands, for a row or a status pill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadState {
+    /// No runs yet.
+    #[default]
+    Idle,
+    /// An approval waits for you.
+    NeedsYou,
+    Working {
+        agent: AgentId,
+    },
+    Queued {
+        agent: AgentId,
+    },
+    /// The last run ended like this.
+    Done,
+    Stopped,
+    Failed,
+}
+
+/// The answer to [`Request::Search`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchResults {
+    /// Archived threads are left out. Title matches come first, then
+    /// threads whose messages hold the query.
+    pub threads: Vec<ThreadHit>,
+    pub channels: Vec<ChannelId>,
+    /// Deleted agents are left out.
+    pub agents: Vec<AgentId>,
+    /// From git: tracked files and new ones that aren't ignored, in each
+    /// project root and each worktree of a thread that isn't archived. A
+    /// file that is unchanged in a worktree comes once per project.
+    pub files: Vec<FileHit>,
+    /// How many matched in each section before `limit`.
+    pub totals: SearchTotals,
+}
+
+/// Matches per section of [`SearchResults`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchTotals {
+    pub threads: u32,
+    pub channels: u32,
+    pub agents: u32,
+    pub files: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadHit {
+    pub thread: ThreadId,
+    pub title: String,
+    pub channel: ChannelId,
+    #[serde(default)]
+    pub state: ThreadState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileHit {
+    pub project: ProjectId,
+    /// The thread whose worktree holds it. `None` is the project root.
+    pub thread: Option<ThreadId>,
+    /// Relative to the root or worktree.
+    pub path: String,
+    /// It has uncommitted changes there, or is new.
+    #[serde(default)]
+    pub changed: bool,
+}
+
+/// The answer to [`Request::ProjectOverview`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectOverview {
+    /// The project's own folder. When it no longer exists, only `exists`
+    /// is set.
+    pub root: RootInfo,
+    /// Worktrees of its threads that are on disk.
+    pub worktrees: u32,
+    /// One per channel, in sidebar order.
+    pub channels: Vec<ChannelRow>,
+    /// The 10 threads with the latest activity, archived ones left out.
+    pub recent_threads: Vec<RecentThread>,
+    /// Agents with runs in the project, most runs this week first.
+    /// Deleted agents included.
+    pub agents: Vec<AgentUse>,
+    /// The project's `copy_files`, as found in its folder.
+    pub setup_files: Vec<SetupFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelRow {
+    pub channel: ChannelId,
+    #[serde(default)]
+    pub stats: ChannelStats,
+    /// Change counts are still being worked out; a
+    /// [`ServerMsg::ChannelOverviewStale`] follows once they are.
+    #[serde(default)]
+    pub counting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentThread {
+    pub thread: ThreadId,
+    pub channel: ChannelId,
+    /// Agents with runs there, in the order they first ran.
+    #[serde(default)]
+    pub agents: Vec<AgentId>,
+    /// Unix milliseconds.
+    #[serde(default)]
+    pub last_activity_at: i64,
+    #[serde(default)]
+    pub state: ThreadState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentUse {
+    pub agent: AgentId,
+    #[serde(default)]
+    pub runs_week: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupFile {
+    /// As set in `copy_files`.
+    pub path: String,
+    #[serde(default)]
+    pub size: SetupFileSize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SetupFileSize {
+    /// Not in the project folder.
+    #[default]
+    Missing,
+    File {
+        bytes: u64,
+    },
+    Folder {
+        files: u32,
+    },
+}
+
+/// The answer to [`Request::AgentProfile`]. "Week" means the last 7
+/// days, "last week" the 7 before.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentProfile {
+    pub stats: AgentStats,
+    /// Projects it has runs in, removed ones left out.
+    pub projects: u32,
+    /// Its 20 latest runs that started, newest first. Runs in removed
+    /// projects stay here.
+    pub recent_runs: Vec<RunRow>,
+    /// Threads it has runs in that aren't archived, of projects that
+    /// aren't removed, latest activity first.
+    pub threads: Vec<ThreadId>,
+}
+
+/// Numbers of an agent's profile. Runs count once they started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentStats {
+    /// Runs that ended this week or are working.
+    pub runs_week: u32,
+    pub runs_last_week: u32,
+    /// Runs that ended this week, and those of them that ended `Done`.
+    pub finished_week: u32,
+    pub clean_week: u32,
+    /// Average time of the runs that ended this week, in ms.
+    pub avg_run_ms: i64,
+    /// What this week's runs edited, by their tool calls.
+    pub files_week: u32,
+    pub added_week: u32,
+    pub removed_week: u32,
+    /// Handoffs this week from this agent, and to it.
+    pub handoffs_sent_week: u32,
+    pub handoffs_received_week: u32,
+}
+
+/// One run in an agent's profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunRow {
+    pub run: StoredRun,
+    /// How long it ran, or has run so far.
+    #[serde(default)]
+    pub ms: i64,
+    /// What its edit and write calls touched. All zero for a run that
+    /// only answered.
+    #[serde(default)]
+    pub files: u32,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub removed: u32,
+    /// An approval of this run waits for you.
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 /// A Claude Code session someone runs in their own terminal, inside one of
@@ -470,6 +712,9 @@ pub enum ServerMsg {
     },
     /// A project was created or its settings changed.
     ProjectChanged { project: StoredProject },
+    /// A project was removed from Crew: drop it with its channels and
+    /// threads.
+    ProjectRemoved { project: ProjectId },
     /// A channel was created or its settings changed.
     ChannelChanged { channel: StoredChannel },
     /// A thread was created.
@@ -678,6 +923,89 @@ mod tests {
             serde_json::from_value::<ChannelOverview>(json).unwrap(),
             overview
         );
+    }
+
+    #[test]
+    fn navigation_messages_round_trip() {
+        let project = ProjectId::new();
+        let reqs = vec![
+            Request::Search {
+                query: "parse".into(),
+                project: Some(project),
+                limit: 5,
+            },
+            Request::ProjectOverview { project },
+            Request::AgentProfile {
+                agent: AgentId::new(),
+            },
+            Request::RenameProject {
+                project,
+                name: "Demo".into(),
+            },
+            Request::RemoveProject { project },
+        ];
+        for req in reqs {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+        let msg = ServerMsg::ProjectRemoved { project };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
+
+        let agent = AgentId::new();
+        let results = SearchResults {
+            threads: vec![ThreadHit {
+                thread: ThreadId::new(),
+                title: "Fix the parser".into(),
+                channel: ChannelId::new(),
+                state: ThreadState::Working { agent },
+            }],
+            files: vec![FileHit {
+                project,
+                thread: None,
+                path: "src/parser.rs".into(),
+                changed: true,
+            }],
+            totals: SearchTotals {
+                threads: 7,
+                ..SearchTotals::default()
+            },
+            ..SearchResults::default()
+        };
+        let json = serde_json::to_value(&results).unwrap();
+        assert_eq!(
+            json["threads"][0]["state"],
+            serde_json::json!({ "state": "working", "agent": agent })
+        );
+        assert_eq!(
+            serde_json::from_value::<SearchResults>(json).unwrap(),
+            results
+        );
+        // A search without a project searches them all.
+        let req: Request =
+            serde_json::from_str(r#"{"type":"search","query":"x","limit":3}"#).unwrap();
+        assert!(matches!(req, Request::Search { project: None, .. }));
+        let req: Request = serde_json::from_str(r#"{"type":"search","query":"x"}"#).unwrap();
+        assert!(matches!(req, Request::Search { limit: 50, .. }));
+
+        let overview = ProjectOverview {
+            setup_files: vec![SetupFile {
+                path: ".env".into(),
+                size: SetupFileSize::File { bytes: 3 },
+            }],
+            ..ProjectOverview::default()
+        };
+        let json = serde_json::to_value(&overview).unwrap();
+        assert_eq!(
+            json["setup_files"][0]["size"],
+            serde_json::json!({ "kind": "file", "bytes": 3 })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProjectOverview>(json).unwrap(),
+            overview
+        );
+        let profile: AgentProfile = serde_json::from_str("{}").unwrap();
+        assert_eq!(profile, AgentProfile::default());
     }
 
     #[test]

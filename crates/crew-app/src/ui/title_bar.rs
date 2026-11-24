@@ -78,7 +78,7 @@ impl Workspace {
                     )
                     .children(self.render_breadcrumb(cx)),
             )
-            .child(render_search_button())
+            .child(render_search_button(cx))
             .child(
                 div()
                     .flex_1()
@@ -247,12 +247,8 @@ pub(super) fn home_relative(path: &Path) -> String {
     }
 }
 
-/// Said by the search box and by ⌘K until search exists.
-pub(super) const SEARCH_SOON: &str = "Search is coming soon.";
-
-/// "Search threads, agents, files… ⌘K", looking off: search itself comes
-/// later.
-fn render_search_button() -> impl IntoElement {
+/// "Search threads, agents, files… ⌘K": opens the palette.
+fn render_search_button(cx: &mut Context<Workspace>) -> impl IntoElement {
     div()
         .id("title-search")
         .flex()
@@ -268,11 +264,10 @@ fn render_search_button() -> impl IntoElement {
         .rounded(px(6.))
         .bg(color("bg-100"))
         .text_color(color("text-tertiary"))
+        .cursor_pointer()
+        .hover(|s| s.bg(color("surface-100")))
+        .role(Role::Button)
         .aria_label(SEARCH_PLACEHOLDER)
-        .aria_description(SEARCH_SOON)
-        .tooltip(|window, cx| {
-            gpui_kit::component::tooltip::Tooltip::new(SEARCH_SOON).build(window, cx)
-        })
         .child(div().flex_1().child(SEARCH_PLACEHOLDER))
         .child(
             div()
@@ -287,6 +282,7 @@ fn render_search_button() -> impl IntoElement {
                 .child("⌘K"),
         )
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
         .test_support()
 }
 

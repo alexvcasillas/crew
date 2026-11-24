@@ -8,6 +8,8 @@ pub mod diff_parse;
 pub mod editor;
 pub mod markdown;
 pub mod model;
+pub mod prefs;
+pub mod recents;
 
 #[cfg(test)]
 mod test_support;

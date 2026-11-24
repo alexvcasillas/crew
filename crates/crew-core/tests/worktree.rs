@@ -299,3 +299,100 @@ fn channel_names_are_lowercase_numbers_and_dashes() {
         assert_eq!(channel_name(bad), Err(BAD_CHANNEL_NAME), "{bad:?}");
     }
 }
+
+#[test]
+fn listed_files_come_from_git_and_skip_ignored_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    repo(&root);
+    fs::write(root.join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+    git(&root, &["add", ".gitignore"]);
+    git(&root, &["commit", "-q", "-m", "ignore"]);
+    for dir in ["node_modules/pkg", "target/debug"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+        fs::write(root.join(dir).join("index.js"), "x").unwrap();
+    }
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/new.rs"), "new").unwrap();
+    fs::write(root.join("a.txt"), "edited\n").unwrap();
+    fs::write(root.join("staged.txt"), "s").unwrap();
+    git(&root, &["add", "staged.txt"]);
+
+    let mut list = worktree::list_files(&root).unwrap();
+    list.files.sort();
+    assert_eq!(
+        list.files,
+        [".gitignore", "a.txt", "b.txt", "src/new.rs", "staged.txt"]
+    );
+    let mut changed: Vec<&String> = list.changed.iter().collect();
+    changed.sort();
+    assert_eq!(changed, ["a.txt", "src/new.rs", "staged.txt"]);
+
+    // Not a repo: an error, not a walk.
+    let plain = tmp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    assert!(worktree::list_files(&plain).is_err());
+}
+
+#[test]
+fn root_info_reads_branch_changes_and_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    repo(&root);
+    let info = worktree::root_info(&root);
+    assert!(info.exists);
+    assert_eq!(info.branch.as_deref(), Some("main"));
+    assert_eq!(info.uncommitted, 0);
+    assert_eq!(info.remote_url, None);
+
+    fs::write(root.join("a.txt"), "edited\n").unwrap();
+    fs::write(root.join("new.txt"), "n").unwrap();
+    git(
+        &root,
+        &["remote", "add", "origin", "https://example.com/demo.git"],
+    );
+    let info = worktree::root_info(&root);
+    assert_eq!(info.uncommitted, 2);
+    assert_eq!(
+        info.remote_url.as_deref(),
+        Some("https://example.com/demo.git")
+    );
+
+    let gone = worktree::root_info(&tmp.path().join("gone"));
+    assert!(!gone.exists);
+    assert_eq!(gone.branch, None);
+
+    let plain = tmp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let info = worktree::root_info(&plain);
+    assert!(info.exists);
+    assert!(!info.is_repo);
+    // An older answer without the field reads as a repo.
+    let old: worktree::RootInfo = serde_json::from_str(r#"{"exists":true}"#).unwrap();
+    assert!(old.is_repo);
+}
+
+#[test]
+fn a_root_inside_a_repo_lists_and_counts_only_its_own_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("root");
+    repo(&repo_dir);
+    let app = repo_dir.join("app");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(app.join("main.rs"), "m").unwrap();
+    git(&repo_dir, &["add", "-A"]);
+    git(&repo_dir, &["commit", "-q", "-m", "app"]);
+    fs::write(app.join("main.rs"), "edited").unwrap();
+    fs::write(app.join("src/new.rs"), "n").unwrap();
+    fs::write(repo_dir.join("a.txt"), "outside").unwrap();
+
+    let mut list = worktree::list_files(&app).unwrap();
+    list.files.sort();
+    assert_eq!(list.files, ["main.rs", "src/new.rs"]);
+    let mut changed: Vec<&String> = list.changed.iter().collect();
+    changed.sort();
+    assert_eq!(changed, ["main.rs", "src/new.rs"]);
+    let info = worktree::root_info(&app);
+    assert!(info.is_repo);
+    assert_eq!(info.uncommitted, 2, "the edit outside app doesn't count");
+}

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
+use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, Limits, RunFilter, Store, StoreError, ThreadWorktree,
@@ -415,7 +416,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -791,7 +792,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -845,7 +846,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -878,7 +879,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -951,7 +952,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -990,7 +991,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1221,7 +1222,7 @@ fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1332,4 +1333,273 @@ fn thread_activity_counts_messages_and_finds_excerpts() {
     assert_eq!(b.pending_ask, None);
     assert!(!b.needs_you);
     assert_eq!(store.channel_runs(c).unwrap().len(), 1);
+}
+
+const SCHEMA_V8: &str = include_str!("../src/store/schema_v8.sql");
+
+#[test]
+fn migrates_v8_db_to_v9_keeping_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V8).unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, main_branch, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000001', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000002',
+                        '00000000-0000-4000-8000-000000000001', 'general', 2);
+             INSERT INTO threads (id, channel_id, title, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000003',
+                        '00000000-0000-4000-8000-000000000002', 'Fix login', 3);
+             INSERT INTO agents (id, name, spec, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000004', 'Ada',
+                        '{\"name\":\"Ada\",\"role\":\"\",\"runtime\":\"claude_code\",\"model\":\"m\",\"instructions\":\"\",\"permission_mode\":\"read_only\",\"allowed_tools\":[]}', 4);
+             INSERT INTO runs (id, thread_id, agent_id, session_id, status, started_at, ended_at, ord)
+                VALUES ('00000000-0000-4000-8000-000000000005',
+                        '00000000-0000-4000-8000-000000000003',
+                        '00000000-0000-4000-8000-000000000004', 's', 'done', 5, 6, 0);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.runs(RunFilter::default()).unwrap().len(), 1);
+    assert!(store.handoffs_since(0).unwrap().is_empty());
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn handoff_runs_remember_who_brought_them_in() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "first").unwrap();
+    let (ada, bob) = (
+        store.create_agent(&spec("Ada")).unwrap(),
+        store.create_agent(&spec("Bob")).unwrap(),
+    );
+    let from = store.create_run(t, ada).unwrap();
+    let to = store.create_handoff_run(t, bob, from).unwrap();
+    assert_eq!(store.run(to).unwrap().agent, bob);
+    assert_eq!(store.handoffs_since(0).unwrap(), [(ada, bob)]);
+    assert!(store.handoffs_since(i64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn a_removed_project_leaves_the_lists_but_keeps_its_history() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let other = store
+        .create_project("other", Path::new("/work/other"), "main")
+        .unwrap();
+    store.rename_project(p, "Demo app").unwrap();
+    assert_eq!(store.project(p).unwrap().name, "Demo app");
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    let kept = store
+        .create_thread(store.create_channel(other, "general").unwrap(), "kept")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "gone").unwrap();
+    let r = store.create_run(t, a).unwrap();
+    store
+        .add_message(t, Author::You, "gone for good", None)
+        .unwrap();
+
+    store.remove_project(p).unwrap();
+    assert!(matches!(
+        store.project(p),
+        Err(StoreError::NotFound("project"))
+    ));
+    let ids = |v: Vec<crew_core::store::StoredProject>| v.iter().map(|p| p.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.projects().unwrap()), [other]);
+    assert_eq!(ids(store.all_projects().unwrap()), [p, other]);
+    assert_eq!(ids(store.removed_projects().unwrap()), [p]);
+    // Its threads leave the searches and the snapshot's runs, but stay.
+    let open: Vec<_> = store
+        .open_threads(None)
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(open, [kept]);
+    assert!(store.open_threads(Some(p)).unwrap().is_empty());
+    assert!(
+        store
+            .threads_mentioning("gone", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.recent_runs(0).unwrap().is_empty());
+    assert_eq!(store.thread(t).unwrap().channel, c);
+    assert_eq!(store.run(r).unwrap().thread, t);
+    assert_eq!(store.project_of_thread(t).unwrap().id, p);
+    assert!(matches!(
+        store.remove_project(p),
+        Err(StoreError::NotFound("project"))
+    ));
+    assert!(matches!(
+        store.rename_project(p, "x"),
+        Err(StoreError::NotFound("project"))
+    ));
+
+    // Restored, it comes back with what it held.
+    store.restore_project(p, "demo").unwrap();
+    assert_eq!(store.project(p).unwrap().name, "demo");
+    assert_eq!(store.open_threads(Some(p)).unwrap()[0].id, t);
+    assert!(store.removed_projects().unwrap().is_empty());
+    assert!(store.restore_project(p, "demo").is_err());
+}
+
+#[test]
+fn a_transaction_keeps_all_or_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let failed = store.in_transaction(|s| {
+        s.rename_project(p, "renamed")?;
+        s.remove_project(ProjectId::new())
+    });
+    assert!(failed.is_err());
+    assert_eq!(store.project(p).unwrap().name, "demo");
+    store
+        .in_transaction(|s| s.rename_project(p, "renamed"))
+        .unwrap();
+    assert_eq!(store.project(p).unwrap().name, "renamed");
+}
+
+#[test]
+fn message_search_reads_only_the_newest_messages_and_folds_any_case() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let old = store.create_thread(c, "old").unwrap();
+    let new = store.create_thread(c, "new").unwrap();
+    store
+        .add_message(old, Author::You, "the needle", None)
+        .unwrap();
+    store
+        .add_message(new, Author::You, "École rules", None)
+        .unwrap();
+    store.add_message(new, Author::You, "filler", None).unwrap();
+    assert_eq!(store.threads_mentioning("needle", None, 3).unwrap(), [old]);
+    // Past the cap, the older message isn't read.
+    assert!(
+        store
+            .threads_mentioning("needle", None, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.threads_mentioning("école", None, 2).unwrap(), [new]);
+}
+
+#[test]
+fn a_reader_sees_what_the_store_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("crew.db")).unwrap();
+    let reader = store.open_reader().unwrap().expect("a file database");
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    assert_eq!(reader.project(p).unwrap().name, "demo");
+    assert!(reader.rename_project(p, "x").is_err(), "read only");
+    assert!(
+        Store::open_in_memory()
+            .unwrap()
+            .open_reader()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn open_threads_and_message_matches_leave_archived_ones_out() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let q = store
+        .create_project("other", Path::new("/work/other"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let d = store.create_channel(q, "general").unwrap();
+    let open = store.create_thread(c, "open").unwrap();
+    let archived = store.create_thread(c, "archived").unwrap();
+    let elsewhere = store.create_thread(d, "elsewhere").unwrap();
+    store.set_thread_archived(archived, true).unwrap();
+    for t in [open, archived, elsewhere] {
+        store
+            .add_message(t, Author::You, "Fix the Parser please", None)
+            .unwrap();
+    }
+    store
+        .add_message(open, Author::System, "system parser note", None)
+        .unwrap();
+
+    let ids = |v: Vec<crew_core::store::StoredThread>| v.iter().map(|t| t.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.open_threads(Some(p)).unwrap()), [open]);
+    assert_eq!(ids(store.open_threads(None).unwrap()), [open, elsewhere]);
+    assert_eq!(ids(store.project_threads(p).unwrap()), [open, archived]);
+
+    assert_eq!(
+        store.threads_mentioning("parser", Some(p), 100).unwrap(),
+        [open]
+    );
+    let mut all = store.threads_mentioning("parser", None, 100).unwrap();
+    all.sort_by_key(|t| t.to_string());
+    let mut want = vec![open, elsewhere];
+    want.sort_by_key(|t| t.to_string());
+    assert_eq!(all, want);
+    assert!(
+        store
+            .threads_mentioning("note", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn runs_of_a_project_and_of_an_agent() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let q = store
+        .create_project("other", Path::new("/work/other"), "main")
+        .unwrap();
+    let t = store
+        .create_thread(store.create_channel(p, "general").unwrap(), "a")
+        .unwrap();
+    let u = store
+        .create_thread(store.create_channel(q, "general").unwrap(), "b")
+        .unwrap();
+    let (ada, bob) = (
+        store.create_agent(&spec("Ada")).unwrap(),
+        store.create_agent(&spec("Bob")).unwrap(),
+    );
+    let r1 = store.create_run(t, ada).unwrap();
+    let r2 = store.create_run(u, ada).unwrap();
+    let r3 = store.create_run(t, bob).unwrap();
+    let ids = |v: Vec<crew_core::store::StoredRun>| v.iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.project_runs(p).unwrap()), [r1, r3]);
+    assert_eq!(ids(store.agent_runs(ada).unwrap()), [r1, r2]);
 }

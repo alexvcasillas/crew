@@ -78,6 +78,11 @@ impl Scheduler {
         self.active.insert(thread)
     }
 
+    /// Whether `thread` has an active run or is claimed.
+    pub fn is_active(&self, thread: ThreadId) -> bool {
+        self.active.contains(&thread)
+    }
+
     /// Frees the slot of `thread`. Does nothing if it has no active run.
     pub fn finished(&mut self, thread: ThreadId) {
         self.active.remove(&thread);

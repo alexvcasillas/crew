@@ -21,7 +21,7 @@ use crate::service::{Reply, Service, json, log, now_ms};
 /// Longest excerpt, in characters.
 pub const EXCERPT_LEN: usize = 240;
 /// What "this week" covers.
-const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+pub(crate) const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Threads whose counts are worked out at once, across all overviews.
 pub(crate) const GIT_AT_ONCE: usize = 8;
 /// How long an overview waits for counts it lacks.
@@ -162,6 +162,14 @@ impl Service {
     /// within [`OVERVIEW_WAIT`] come as their last value, or zeros, marked
     /// `counting`.
     pub(crate) async fn channel_overview(&self, channel: ChannelId) -> Reply {
+        json(self.channel_overview_data(channel).await?)
+    }
+
+    /// The overview [`Self::channel_overview`] answers with.
+    pub(crate) async fn channel_overview_data(
+        &self,
+        channel: ChannelId,
+    ) -> Result<ChannelOverview, String> {
         let (threads, activity, runs, copied) = {
             let db = self.db();
             let found = db.store.channel(channel).and_then(|c| {
@@ -252,7 +260,7 @@ impl Service {
             }
         }
 
-        json(summarise(
+        Ok(summarise(
             &threads,
             &activity,
             &runs,
@@ -358,13 +366,20 @@ fn count_changes(
 
 /// How long a run ran, or has run so far. A queued run, or one that ended
 /// without starting its CLI, counts 0.
-fn run_ms(run: &StoredRun, now: i64) -> i64 {
+pub(crate) fn run_ms(run: &StoredRun, now: i64) -> i64 {
     match (&run.status, run.ended_at) {
         (RunStatus::Queued, _) => 0,
         (_, Some(_)) if run.session_id.is_empty() => 0,
         (_, Some(ended)) => (ended - run.started_at).max(0),
         (_, None) => (now - run.started_at).max(0),
     }
+}
+
+/// Whether the run counts for the span from `since` (Unix ms): it is
+/// working, or it started and ended since then.
+pub(crate) fn ran_since(run: &StoredRun, since: i64) -> bool {
+    run.status == RunStatus::Working
+        || (run.ended_at.is_some_and(|e| e >= since) && !run.session_id.is_empty())
 }
 
 fn worktree_state(thread: &StoredThread, counts: Option<&ChangeCounts>) -> WorktreeState {
@@ -462,9 +477,7 @@ pub(crate) fn summarise(
                 stats.needs_you += 1;
             }
             for r in &own {
-                let this_week = r.status == RunStatus::Working
-                    || (r.ended_at.is_some_and(|e| e >= since) && !r.session_id.is_empty());
-                if this_week {
+                if ran_since(r, since) {
                     stats.runs_week += 1;
                     stats.agent_ms_week += run_ms(r, now);
                 }

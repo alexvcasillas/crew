@@ -121,6 +121,20 @@ impl TerminalState {
             .collect()
     }
 
+    /// Forgets the sessions of a removed project. Returns their ids.
+    pub(crate) fn remove_project(&mut self, project: ProjectId) -> Vec<String> {
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, e)| e.info.project == project)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &gone {
+            self.sessions.remove(id);
+        }
+        gone
+    }
+
     pub(crate) fn unsubscribe(&mut self, session: &str) {
         if let Some(entry) = self.sessions.get_mut(session) {
             entry.subscribers = entry.subscribers.saturating_sub(1);

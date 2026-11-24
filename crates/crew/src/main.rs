@@ -337,19 +337,31 @@ async fn agent_names(c: &mut Client, include_deleted: bool) -> Result<HashMap<Ag
 
 async fn init_demo(c: &mut Client) -> Result<()> {
     let root = std::env::current_dir().context("Can't read the current directory.")?;
-    let project: ProjectId = c
-        .ask(Request::CreateProject {
-            name: "demo".into(),
-            root: root.to_string_lossy().into_owned(),
-            main_branch: "main".into(),
-        })
-        .await?;
-    let channel: ChannelId = c
-        .ask(Request::CreateChannel {
-            project,
-            name: "general".into(),
-        })
-        .await?;
+    // Projects may not share a folder, so a second run reuses the first.
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let projects: Vec<StoredProject> = c.ask(Request::ListProjects).await?;
+    let project: ProjectId = match projects.iter().find(|p| real(&p.root) == real(&root)) {
+        Some(p) => p.id,
+        None => {
+            c.ask(Request::CreateProject {
+                name: "demo".into(),
+                root: root.to_string_lossy().into_owned(),
+                main_branch: "main".into(),
+            })
+            .await?
+        }
+    };
+    let channels: Vec<StoredChannel> = c.ask(Request::ListChannels { project }).await?;
+    let channel: ChannelId = match channels.iter().find(|ch| ch.name == "general") {
+        Some(ch) => ch.id,
+        None => {
+            c.ask(Request::CreateChannel {
+                project,
+                name: "general".into(),
+            })
+            .await?
+        }
+    };
     let exists = agent_names(c, false).await?.values().any(|n| n == "Scout");
     if !exists {
         let _: AgentId = c
@@ -708,6 +720,7 @@ async fn watch(
             ServerMsg::Response { .. }
             | ServerMsg::Snapshot { .. }
             | ServerMsg::ProjectChanged { .. }
+            | ServerMsg::ProjectRemoved { .. }
             | ServerMsg::ChannelChanged { .. }
             | ServerMsg::ThreadCreated { .. }
             | ServerMsg::ThreadChanged { .. }

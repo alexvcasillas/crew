@@ -14,6 +14,7 @@ mod first_launch;
 mod inspector;
 mod markdown_view;
 mod mention_menu;
+pub mod palette;
 mod run_card;
 pub mod running_view;
 mod service_control;
@@ -41,6 +42,8 @@ mod diff_tests;
 mod inspector_tests;
 #[cfg(test)]
 mod motion_tests;
+#[cfg(test)]
+mod palette_tests;
 #[cfg(test)]
 mod running_tests;
 #[cfg(test)]

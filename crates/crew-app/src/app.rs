@@ -70,6 +70,7 @@ pub fn bindings() -> Vec<Shortcut> {
         shortcut("cmd-,", OpenSettings, "Settings"),
         shortcut("cmd-1", ShowThreads, "Threads"),
         shortcut("cmd-2", ShowRunning, "Running now"),
+        shortcut("cmd-shift-r", ShowRunning, "Running now"),
         shortcut("cmd-enter", ApproveLatest, "Approve the newest request"),
         outside_text("cmd-r", RenameThread, "Rename thread"),
         outside_text("cmd-backspace", ArchiveThread, "Archive thread"),
@@ -106,6 +107,7 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(crate::ui::diff_view::bindings());
     cx.bind_keys(crate::ui::running_view::bindings());
     cx.bind_keys(crate::ui::settings::bindings());
+    cx.bind_keys(crate::ui::palette::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -170,6 +172,7 @@ mod tests {
                 "cmd-,",
                 "cmd-1",
                 "cmd-2",
+                "cmd-shift-r",
                 "cmd-enter",
                 "cmd-r",
                 "cmd-backspace",
