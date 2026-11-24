@@ -32,6 +32,8 @@ mod diff_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]
+mod motion_tests;
+#[cfg(test)]
 mod running_tests;
 #[cfg(test)]
 mod settings_tests;
