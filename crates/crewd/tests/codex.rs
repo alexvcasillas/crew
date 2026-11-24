@@ -146,12 +146,20 @@ struct Daemon {
 
 impl Daemon {
     async fn start(codex_bin: PathBuf, crew_mcp: Option<PathBuf>) -> Daemon {
+        Self::start_with(PathBuf::from("/nonexistent/claude"), codex_bin, crew_mcp).await
+    }
+
+    async fn start_with(
+        claude_bin: PathBuf,
+        codex_bin: PathBuf,
+        crew_mcp: Option<PathBuf>,
+    ) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
-                claude_bin: Some(PathBuf::from("/nonexistent/claude")),
+                claude_bin: Some(claude_bin),
                 codex_bin: Some(codex_bin),
                 crew_mcp_bin: crew_mcp,
                 runtimes_wait: Some(WAIT),
@@ -483,6 +491,10 @@ async fn a_codex_run_streams_events_and_ends_done() {
         turn["input"],
         json!([{"type": "text", "text": "@Forge look around", "text_elements": []}])
     );
+    assert_eq!(
+        turn["sandboxPolicy"],
+        json!({"type": "readOnly", "networkAccess": false})
+    );
     // No crew-mcp, so no MCP server for it.
     let args = args_log(dir);
     assert!(args.starts_with("login status\n"), "{args}");
@@ -581,6 +593,13 @@ async fn edit_agents_write_in_the_worktree_and_file_changes_ask() {
         start["config"]["sandbox_workspace_write"]["writable_roots"],
         json!([cwd])
     );
+    // Per turn too, in the documented object form.
+    let turn = &find(&msgs, "turn/start")["params"];
+    assert_eq!(
+        turn["sandboxPolicy"],
+        json!({"type": "workspaceWrite", "writableRoots": [cwd], "networkAccess": false,
+               "excludeTmpdirEnvVar": false, "excludeSlashTmp": false})
+    );
     let instructions = start["developerInstructions"].as_str().unwrap();
     assert!(
         instructions.contains("You can edit files in this thread's worktree."),
@@ -603,7 +622,9 @@ async fn edit_agents_write_in_the_worktree_and_file_changes_ask() {
         "{line}"
     );
     assert!(
-        line.contains(&format!("-c mcp_servers.crew.args=[\"--run\",\"{run}\"]")),
+        line.contains(&format!(
+            "-c mcp_servers.crew.args=[\"--run\",\"{run}\",\"--tools\",\"handoff\"]"
+        )),
         "{line}"
     );
     assert!(
@@ -632,7 +653,7 @@ async fn crew_elicitations_pass_and_other_servers_ask() {
     ]);
     steps.extend(finish("Skipped the issue."));
     scenario(dir, 1, steps);
-    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let d = Daemon::start(codex_script(dir, 0), Some(fake_app_server())).await;
     let mut c = d.client().await;
     let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
     let run = ask_forge(&mut c, thread, "@Forge file it").await;
@@ -708,6 +729,13 @@ async fn a_later_run_resumes_the_codex_thread() {
     assert!(msgs.iter().all(|m| m["method"] != "thread/start"));
     let resume = &find(&msgs, "thread/resume")["params"];
     assert_eq!(resume["threadId"], TID);
+    // The Crew block is sent again, fresh, like Claude's system prompt.
+    let instructions = resume["developerInstructions"].as_str().unwrap();
+    assert!(
+        instructions.starts_with("You are Forge, Builds things, working in Crew"),
+        "{instructions}"
+    );
+    assert!(instructions.ends_with("\n\nBe brief."), "{instructions}");
     // Only what Forge missed, then the new prompt.
     let turn = &find(&msgs, "turn/start")["params"];
     assert_eq!(turn["threadId"], TID);
@@ -879,5 +907,190 @@ async fn runtimes_list_codex_models_and_sign_in() {
     let list: Vec<RuntimeInfo> = c.ok(Request::Runtimes).await;
     let codex = list.iter().find(|r| r.runtime == Runtime::Codex).unwrap();
     assert_eq!(codex.signed_in, Some(false));
-    assert!(codex.models.is_empty(), "its app-server has no scenario");
+    assert!(codex.models.is_empty());
+    assert!(
+        !args_log(out.path()).contains("app-server"),
+        "no model list when signed out"
+    );
+}
+
+fn claude_replay(dir: &Path) -> PathBuf {
+    let path = dir.join("claude");
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let body = format!(
+        "#!/bin/sh\nexec '{}' '{}'\n",
+        base.join("tests/fake/claude_ok.sh").display(),
+        base.join("../crew-core/tests/fixtures/claude/read_file.jsonl")
+            .display(),
+    );
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A Claude session can't be resumed by Codex: the first Codex run of an
+/// agent that was on Claude Code starts a thread with the whole chat.
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_to_codex_starts_a_fresh_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut steps = start();
+    steps.extend(finish("On Codex now."));
+    scenario(dir, 1, steps);
+    let d = Daemon::start_with(claude_replay(dir), codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let root = d.tmp.path().join("repo");
+    git_repo(&root);
+    let project = c
+        .ok(Request::CreateProject {
+            name: "demo".into(),
+            root: root.to_string_lossy().into_owned(),
+            main_branch: "main".into(),
+        })
+        .await;
+    let channel = c
+        .ok(Request::CreateChannel {
+            project,
+            name: "general".into(),
+        })
+        .await;
+    let claude_spec = AgentSpec {
+        runtime: Runtime::ClaudeCode,
+        model: "haiku".into(),
+        ..forge(PermissionMode::ReadOnly)
+    };
+    let agent: crew_core::ids::AgentId = c.ok(Request::CreateAgent { spec: claude_spec }).await;
+    let thread = c
+        .ok(Request::CreateThread {
+            channel,
+            title: "work".into(),
+        })
+        .await;
+    c.call(Request::Subscribe { thread }).await.unwrap();
+
+    let run1 = ask_forge(&mut c, thread, "@Forge one").await;
+    let seen = c.until_ended(run1).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+    let reply = agent_texts(&seen).pop().unwrap();
+
+    c.call(Request::UpdateAgent {
+        agent,
+        spec: forge(PermissionMode::ReadOnly),
+    })
+    .await
+    .unwrap();
+    let run2 = ask_forge(&mut c, thread, "@Forge two").await;
+    let seen = c.until_ended(run2).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+
+    let msgs = messages(dir, 1);
+    assert!(msgs.iter().all(|m| m["method"] != "thread/resume"));
+    find(&msgs, "thread/start");
+    let turn = &find(&msgs, "turn/start")["params"];
+    assert_eq!(
+        turn["input"][0]["text"],
+        format!("You: @Forge one\nForge: {reply}\n\n@Forge two")
+    );
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    let runtimes: Vec<(&Runtime, &str)> = runs
+        .iter()
+        .map(|r| (&r.runtime, r.session_id.as_str()))
+        .collect();
+    assert_eq!(runtimes[1], (&Runtime::Codex, TID));
+    assert_eq!(runtimes[0].0, &Runtime::ClaudeCode);
+}
+
+/// A stored thread Codex no longer has is started again, once, with the
+/// whole chat.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_codex_thread_is_started_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut first = start();
+    first.extend(finish("First."));
+    scenario(dir, 1, first);
+    let fresh = "00000000-0000-7000-8000-000000000002";
+    let mut second = vec![
+        json!({"expect": "initialize", "as": "init"}),
+        json!({"respond": "init", "result": {}}),
+        json!({"expect": "initialized"}),
+        json!({"expect": "thread/resume", "as": "resume", "match": {"threadId": TID}}),
+        json!({"respond": "resume", "error": {"code": -32600, "message": format!("thread not found: {TID}")}}),
+        json!({"expect": "thread/start", "as": "start"}),
+        json!({"respond": "start", "result": {"thread": {"id": fresh, "cwd": "/work/demo"}, "model": "gpt-test"}}),
+        json!({"expect": "turn/start", "as": "turn", "match": {"threadId": fresh}}),
+        json!({"respond": "turn", "result": {"turn": {"id": "turn-1", "status": "inProgress"}}}),
+    ];
+    second.extend(finish("Second."));
+    scenario(dir, 2, second);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
+    let run1 = ask_forge(&mut c, thread, "@Forge one").await;
+    assert_eq!(status_of(&c.until_ended(run1).await), RunStatus::Done);
+    let run2 = ask_forge(&mut c, thread, "@Forge two").await;
+    let seen = c.until_ended(run2).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+
+    let msgs = messages(dir, 2);
+    let start = &find(&msgs, "thread/start")["params"];
+    assert!(start["developerInstructions"].as_str().is_some());
+    let turn = &find(&msgs, "turn/start")["params"];
+    assert_eq!(
+        turn["input"][0]["text"],
+        "You: @Forge one\nForge: First.\n\n@Forge two"
+    );
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs[1].session_id, fresh);
+}
+
+/// Stopping while Codex waits for an approval cancels it, then interrupts
+/// the turn, which Codex ends as interrupted.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_cancels_a_pending_approval_then_interrupts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut steps = start();
+    steps.extend([
+        item("item/started", command("exec-1", "make", "inProgress")),
+        json!({"request": "item/commandExecution/requestApproval", "id": 0, "params": approval_params("exec-1", "make"), "reply": {"decision": "cancel"}}),
+        json!({"expect": "turn/interrupt", "as": "interrupt", "match": {"threadId": TID, "turnId": "turn-1"}}),
+        json!({"respond": "interrupt", "result": {}}),
+        notify(
+            "turn/completed",
+            json!({"threadId": TID, "turn": {"id": "turn-1", "status": "interrupted", "items": []}}),
+        ),
+    ]);
+    scenario(dir, 1, steps);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
+    let run = ask_forge(&mut c, thread, "@Forge build").await;
+    let asked = c.until_asked().await;
+
+    let stopped_at = Instant::now();
+    c.call(Request::StopRun { run }).await.unwrap();
+    let seen = c.until_ended(run).await;
+    assert_eq!(status_of(&seen), RunStatus::Stopped, "{seen:#?}");
+    // Codex honoured the interrupt, so no signals were needed.
+    assert!(
+        stopped_at.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        stopped_at.elapsed()
+    );
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, ServerMsg::Approval { approval, .. }
+        if approval.id == asked.id && approval.status == ApprovalStatus::Cancelled))
+    );
+    assert!(events_of(&seen, run).iter().any(|e| matches!(e,
+        Event::ToolResult { id, is_error: true, output } if id == "exec-1" && output == "Stopped.")));
+    let msgs = messages(dir, 1);
+    let order: Vec<&str> = msgs
+        .iter()
+        .filter_map(|m| m["method"].as_str().or(m["result"]["decision"].as_str()))
+        .collect();
+    let cancel = order.iter().position(|m| *m == "cancel").unwrap();
+    let interrupt = order.iter().position(|m| *m == "turn/interrupt").unwrap();
+    assert!(cancel < interrupt, "{order:?}");
 }

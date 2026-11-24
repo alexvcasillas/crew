@@ -64,9 +64,14 @@ struct Mcp {
 
 impl Mcp {
     fn start(home: &Path) -> Mcp {
+        Self::start_with(home, &[])
+    }
+
+    fn start_with(home: &Path, extra: &[&str]) -> Mcp {
         let run = RunId::new();
         let mut child = Command::new(env!("CARGO_BIN_EXE_crew-mcp"))
             .args(["--run", &run.to_string()])
+            .args(extra)
             .env("CREW_HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -467,4 +472,41 @@ async fn cancelled_approve_drops_its_crewd_connection() {
     // The cancelled call gets no reply; the next request is answered.
     let reply = mcp.request(8, "ping", json!({})).await;
     assert_eq!(reply["result"], json!({}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_flag_limits_the_tools() {
+    let (_tmp, home) = home();
+    let mut mcp = Mcp::start_with(&home, &["--tools", "handoff"]);
+    let reply = mcp.request(1, "tools/list", json!({})).await;
+    let names: Vec<&str> = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["handoff"]);
+    let reply = mcp
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "approve", "arguments": {"tool_name": "Bash", "input": {}}}),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+}
+
+#[test]
+fn unknown_tools_are_refused() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_crew-mcp"))
+        .args([
+            "--run",
+            &RunId::new().to_string(),
+            "--tools",
+            "handoff,nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nope"));
 }

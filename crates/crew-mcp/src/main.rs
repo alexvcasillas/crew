@@ -1,7 +1,8 @@
-//! `crew-mcp`: the MCP server crewd passes to each Claude run.
+//! `crew-mcp`: the MCP server crewd passes to each agent run.
 //!
 //! Speaks newline-delimited JSON-RPC on stdio and serves two tools,
-//! `handoff` and `approve`. Each call opens its own connection to crewd.
+//! `handoff` and `approve`, or those named with `--tools`. Each call opens
+//! its own connection to crewd.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -40,12 +41,23 @@ struct Args {
     /// The run this server belongs to.
     #[arg(long)]
     run: Uuid,
+    /// Serve only these tools, comma separated. All of them by default.
+    #[arg(long, value_delimiter = ',', value_parser = ["handoff", "approve"])]
+    tools: Vec<String>,
 }
 
 #[derive(Clone)]
 struct Ctx {
     home: PathBuf,
     run: RunId,
+    /// The tools served. Empty means all.
+    tools: Vec<String>,
+}
+
+impl Ctx {
+    fn serves(&self, tool: &str) -> bool {
+        self.tools.is_empty() || self.tools.iter().any(|t| t == tool)
+    }
 }
 
 fn non_empty(v: Option<OsString>) -> Option<OsString> {
@@ -77,6 +89,7 @@ fn main() -> ExitCode {
     match rt.block_on(serve(Ctx {
         home,
         run: RunId(args.run),
+        tools: args.tools,
     })) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -152,7 +165,7 @@ async fn serve(ctx: Ctx) -> std::io::Result<()> {
                 let _ = out_tx.send(result(id, json!({})));
             }
             "tools/list" => {
-                let _ = out_tx.send(result(id, json!({ "tools": tools() })));
+                let _ = out_tx.send(result(id, json!({ "tools": tools(&ctx) })));
             }
             "tools/call" => {
                 let ctx = ctx.clone();
@@ -201,8 +214,8 @@ fn text(id: Value, text: &str, is_error: bool) -> Value {
     )
 }
 
-fn tools() -> Value {
-    json!([
+fn tools(ctx: &Ctx) -> Value {
+    let all = json!([
         {
             "name": "handoff",
             "description": "Hand work to another agent in this thread. Name the agent and give it a short brief of what to do.",
@@ -228,13 +241,22 @@ fn tools() -> Value {
                 "required": ["tool_name", "input"],
             },
         },
-    ])
+    ]);
+    let served = all
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter(|t| t["name"].as_str().is_some_and(|name| ctx.serves(name)))
+        .cloned()
+        .collect();
+    Value::Array(served)
 }
 
 async fn call_tool(ctx: &Ctx, id: Value, params: &Value) -> Value {
     let args = &params["arguments"];
     let str_arg = |name: &str| args.get(name).and_then(Value::as_str).map(String::from);
     match params.get("name").and_then(Value::as_str) {
+        Some(name) if !ctx.serves(name) => error(id, INVALID_PARAMS, &format!("No tool {name}.")),
         Some("handoff") => {
             let (Some(agent), Some(brief)) = (str_arg("agent"), str_arg("brief")) else {
                 return text(id, "handoff needs an agent and a brief.", true);

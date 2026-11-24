@@ -686,6 +686,7 @@ mod tests {
             status,
             started_at,
             ended_at: None,
+            runtime: crew_core::agent::Runtime::ClaudeCode,
         }
     }
 
