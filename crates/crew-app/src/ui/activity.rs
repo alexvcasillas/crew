@@ -63,8 +63,10 @@ pub enum ActivityRow {
     },
     Error(String),
     Raw(String),
+    /// The run's end, with its event's number and the agent's summary.
     Finished {
         ok: bool,
+        seq: u64,
         summary: String,
     },
 }
@@ -130,6 +132,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
             Event::Raw { line } => rows.push(ActivityRow::Raw(line.clone())),
             Event::TurnEnd { ok, summary, .. } => rows.push(ActivityRow::Finished {
                 ok: *ok,
+                seq: logged.seq,
                 summary: summary.clone(),
             }),
         }
@@ -216,22 +219,11 @@ impl Workspace {
                     )
                     .into_any_element(),
             ),
-            ActivityRow::Said { seq, text } => {
-                let content = match self.inspector.rows_from {
-                    Some((run, _)) => {
-                        let doc = self.docs.get(DocKey::Event(run, *seq), text);
-                        let names: Vec<String> = self
-                            .state()
-                            .agents()
-                            .iter()
-                            .map(|a| a.spec.name.clone())
-                            .collect();
-                        render_doc(&doc, &names, &format!("md-activity-{ix}")).into_any_element()
-                    }
-                    None => div().child(text.clone()).into_any_element(),
-                };
-                (IconName::Bot, "text-secondary", content)
-            }
+            ActivityRow::Said { seq, text } => (
+                IconName::Bot,
+                "text-secondary",
+                self.render_said(ix, *seq, text),
+            ),
             ActivityRow::Tool(tool) => {
                 let (icon, token) = tool_icon(tool);
                 (
@@ -273,21 +265,21 @@ impl Workspace {
                     .child(line.clone())
                     .into_any_element(),
             ),
-            ActivityRow::Finished { ok, summary } => (
+            ActivityRow::Finished { ok, seq, summary } => (
                 if *ok {
                     IconName::CircleCheck
                 } else {
                     IconName::CircleX
                 },
                 if *ok { "success" } else { "danger" },
-                div()
-                    .text_color(color("text-secondary"))
-                    .child(if summary.is_empty() {
-                        (if *ok { "Finished" } else { "Failed" }).to_string()
-                    } else {
-                        summary.clone()
-                    })
-                    .into_any_element(),
+                if summary.is_empty() {
+                    div()
+                        .text_color(color("text-secondary"))
+                        .child(if *ok { "Finished" } else { "Failed" })
+                        .into_any_element()
+                } else {
+                    self.render_said(ix, *seq, summary)
+                },
             ),
         };
         div()
@@ -313,6 +305,21 @@ impl Workspace {
             .child(div().flex_1().min_w_0().child(content))
             .test_support()
             .into_any_element()
+    }
+
+    /// Text an agent wrote, as Markdown parsed once per event.
+    fn render_said(&self, ix: usize, seq: u64, text: &str) -> AnyElement {
+        let Some((run, _)) = self.inspector.rows_from else {
+            return div().child(text.to_string()).into_any_element();
+        };
+        let doc = self.docs.get(DocKey::Event(run, seq), text);
+        let names: Vec<String> = self
+            .state()
+            .agents()
+            .iter()
+            .map(|a| a.spec.name.clone())
+            .collect();
+        render_doc(&doc, &names, &format!("md-activity-{ix}")).into_any_element()
     }
 
     fn render_tool(&self, ix: usize, tool: &ToolRow, cx: &mut Context<Self>) -> impl IntoElement {
@@ -486,8 +493,12 @@ pub fn row_label(row: &ActivityRow) -> String {
         ActivityRow::Denied { tool, input } => format!("Not allowed: {tool} {input}"),
         ActivityRow::Error(message) => message.clone(),
         ActivityRow::Raw(line) => line.clone(),
-        ActivityRow::Finished { ok: true, summary } => format!("Finished {summary}"),
-        ActivityRow::Finished { ok: false, summary } => format!("Failed {summary}"),
+        ActivityRow::Finished {
+            ok: true, summary, ..
+        } => format!("Finished {summary}"),
+        ActivityRow::Finished {
+            ok: false, summary, ..
+        } => format!("Failed {summary}"),
     }
 }
 

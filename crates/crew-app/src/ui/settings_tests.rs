@@ -441,7 +441,8 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
                 && p.copy_files == [".env", "config/local.toml"]
         })
     });
-    assert!(shows(cx, window, "Saved"));
+    // crewd's answer and its project update arrive apart.
+    wait_to_show(cx, window, "Saved");
 
     // Channels: add one, and set #general's handoffs.
     click(cx, window, "project-new-channel");
@@ -456,6 +457,13 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
         })
     });
     click(cx, window, format!("channel-policy-{}-budget", w.channel));
+    // Each button sends the channel's whole setting as last drawn, so the
+    // policy has to be back from crewd before the budget goes up.
+    wait_until(cx, "#general's policy", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().channel(w.channel).unwrap().handoff_policy == Some(HandoffPolicy::Budget)
+        })
+    });
     click(cx, window, format!("channel-budget-up-{}", w.channel));
     wait_until(cx, "#general's handoffs", |cx| {
         ws.read_with(cx, |ws, _| {
