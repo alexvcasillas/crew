@@ -1742,6 +1742,10 @@ fn pins_and_unpins_a_project() {
     assert_eq!(store.project(p).unwrap().pinned_at, Some(pinned));
     store.pin_project(p, false).unwrap();
     assert_eq!(store.project(p).unwrap().pinned_at, None);
+    store.pin_project(p, true).unwrap();
     store.remove_project(p).unwrap();
     assert!(store.pin_project(p, true).is_err());
+    // Adding the folder again brings it back unpinned.
+    store.restore_project(p, "demo").unwrap();
+    assert_eq!(store.project(p).unwrap().pinned_at, None);
 }

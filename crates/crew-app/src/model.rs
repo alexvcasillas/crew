@@ -45,9 +45,10 @@ pub enum ThreadStatus {
 pub struct ProjectFacts {
     /// The most urgent status among its threads.
     pub status: ThreadStatus,
-    /// When anything last happened in it, in Unix ms: the project, a
-    /// channel or thread made, a run started or ended, a message known.
-    pub activity: i64,
+    /// When something last happened in one of its threads, in Unix ms: a
+    /// thread made, a run started or ended, an ask, a message known.
+    /// `None` for a project without threads.
+    pub activity: Option<i64>,
 }
 
 /// A pending approval: something waiting for you to decide.
@@ -177,6 +178,8 @@ pub struct State {
     terminal_logs: HashMap<String, TerminalLog>,
     /// crewd's global limits, as last reported.
     limits: Limits,
+    /// Counts what crewd sent, so views can tell when to rebuild.
+    revision: u64,
     /// Limits sent to crewd and not yet reported back.
     sent_limits: Option<Limits>,
 }
@@ -185,6 +188,11 @@ pub struct State {
 pub type Handoff = (Option<HandoffPolicy>, Option<u32>);
 
 impl State {
+    /// Goes up with every message from crewd taken in.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn connection(&self) -> Option<&ConnectionState> {
         self.connection.as_ref()
     }
@@ -196,6 +204,7 @@ impl State {
     /// Takes in one message from crewd. Copies of what is already known,
     /// as crewd may resend after a subscribe, change nothing.
     pub fn apply(&mut self, msg: ServerMsg) {
+        self.revision += 1;
         match msg {
             ServerMsg::Snapshot {
                 projects,
@@ -807,20 +816,17 @@ impl State {
             .map(|p| {
                 let facts = ProjectFacts {
                     status: ThreadStatus::Idle,
-                    activity: p.created_at,
+                    activity: None,
                 };
                 (p.id, facts)
             })
             .collect();
         let mut bump = |project: Option<ProjectId>, at: i64, status: ThreadStatus| {
             if let Some(f) = project.and_then(|p| facts.get_mut(&p)) {
-                f.activity = f.activity.max(at);
+                f.activity = Some(f.activity.map_or(at, |a| a.max(at)));
                 f.status = f.status.max(status);
             }
         };
-        for c in self.channels.values() {
-            bump(Some(c.project), c.created_at, ThreadStatus::Idle);
-        }
         for t in self.threads.values() {
             bump(self.thread_project(t.id), t.created_at, ThreadStatus::Idle);
         }
@@ -1081,12 +1087,12 @@ mod tests {
 
     #[test]
     fn project_facts_take_the_latest_activity_and_most_urgent_status() {
-        let (mut state, p, _, t) = one_thread();
+        let (mut state, p, c, t) = one_thread();
         assert_eq!(
             state.project_facts()[&p.id],
             ProjectFacts {
                 status: ThreadStatus::Idle,
-                activity: 1,
+                activity: Some(1),
             }
         );
         let working = run(t.id, RunStatus::Working, 50);
@@ -1100,7 +1106,7 @@ mod tests {
             state.project_facts()[&p.id],
             ProjectFacts {
                 status: ThreadStatus::Working,
-                activity: 70,
+                activity: Some(70),
             }
         );
         state.apply(ServerMsg::Approval {
@@ -1109,7 +1115,28 @@ mod tests {
         });
         let facts = state.project_facts()[&p.id];
         assert_eq!(facts.status, ThreadStatus::NeedsYou);
-        assert_eq!(facts.activity, 90);
+        assert_eq!(facts.activity, Some(90));
+
+        // A project with channels and no threads has no activity.
+        let empty = project(500);
+        state.apply(ServerMsg::ProjectChanged {
+            project: empty.clone(),
+        });
+        state.apply(ServerMsg::ChannelChanged {
+            channel: StoredChannel {
+                id: ChannelId::new(),
+                project: empty.id,
+                created_at: 600,
+                ..c
+            },
+        });
+        assert_eq!(
+            state.project_facts()[&empty.id],
+            ProjectFacts {
+                status: ThreadStatus::Idle,
+                activity: None,
+            }
+        );
     }
 
     fn texts(state: &State, thread: ThreadId) -> Vec<String> {

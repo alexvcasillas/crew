@@ -69,6 +69,14 @@ impl Setup {
                 name: "general".into(),
             },
         );
+        // A thread keeps the project active, so the sidebar lists it.
+        let _: crew_core::ids::ThreadId = ask(
+            &client,
+            Request::CreateThread {
+                channel,
+                title: "a thread".into(),
+            },
+        );
         Setup {
             daemon: Some(daemon),
             home: home.to_path_buf(),

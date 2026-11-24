@@ -33,8 +33,17 @@ pub(crate) struct ProjectInfo {
     pub(crate) pinned: bool,
     /// A run works or waits for a slot, or something needs you.
     pub(crate) live: bool,
-    /// When anything last happened in it, in Unix ms.
-    pub(crate) activity: i64,
+    /// When something last happened in one of its threads, in Unix ms.
+    pub(crate) activity: Option<i64>,
+    /// When it was added, for ordering projects without activity.
+    pub(crate) created_at: i64,
+}
+
+impl ProjectInfo {
+    /// Live, or a thread did something in the last 7 days.
+    pub(crate) fn is_active(&self, now: i64) -> bool {
+        self.live || self.activity.is_some_and(|at| now - at <= ACTIVE_WITHIN_MS)
+    }
 }
 
 /// The sidebar's project groups, each in the chosen order.
@@ -45,32 +54,36 @@ pub(crate) struct Groups {
     pub(crate) other: Vec<ProjectId>,
 }
 
-/// Puts each project in Pinned, Active (live, or activity in the last 7
-/// days) or Other, ordered by `sort`, and keeps only what `show` asks
-/// for.
+/// Puts each project in Pinned, Active (live, or thread activity in
+/// the last 7 days) or Other, ordered by `sort`, and keeps only what
+/// `show` asks for, except `keep` (the open channel's project), which
+/// always stays so the selection shows.
 pub(crate) fn group_projects(
     mut projects: Vec<ProjectInfo>,
     show: ShowProjects,
     sort: SortProjects,
     now: i64,
+    keep: Option<ProjectId>,
 ) -> Groups {
     sort_projects(&mut projects, sort);
     let mut groups = Groups::default();
     for p in projects {
+        let active = p.is_active(now);
+        let shown = keep == Some(p.id)
+            || match show {
+                ShowProjects::All => true,
+                ShowProjects::Active => p.pinned || active,
+                ShowProjects::Pinned => p.pinned,
+            };
+        if !shown {
+            continue;
+        }
         if p.pinned {
             groups.pinned.push(p.id);
-        } else if p.live || now - p.activity <= ACTIVE_WITHIN_MS {
+        } else if active {
             groups.active.push(p.id);
         } else {
             groups.other.push(p.id);
-        }
-    }
-    match show {
-        ShowProjects::All => {}
-        ShowProjects::Active => groups.other.clear(),
-        ShowProjects::Pinned => {
-            groups.active.clear();
-            groups.other.clear();
         }
     }
     groups
@@ -81,16 +94,21 @@ pub(crate) fn sort_projects(projects: &mut [ProjectInfo], sort: SortProjects) {
     let name = |p: &ProjectInfo| (p.name.to_lowercase(), p.id.0);
     match sort {
         SortProjects::Recent => {
-            projects.sort_by(|a, b| b.activity.cmp(&a.activity).then(name(a).cmp(&name(b))));
+            let at = |p: &ProjectInfo| p.activity.unwrap_or(p.created_at);
+            projects.sort_by(|a, b| at(b).cmp(&at(a)).then(name(a).cmp(&name(b))));
         }
         SortProjects::Name => projects.sort_by_key(name),
     }
 }
 
-/// For projects whose names clash (ignoring case), the shortest end of
-/// their folder paths that tells them apart, with `~` for `home`. Folder
-/// names they all end with are left out, since the name says them
-/// already. Projects whose names don't clash get no hint.
+/// Folder names a hint keeps at least, as "~/code/a" has.
+const HINT_KEEPS: usize = 3;
+
+/// For projects whose names clash (ignoring case), the folder each one
+/// sits in, with `~` for `home`: "~/code/a". A path longer than three
+/// folders loses folders from the left ("…/acme/src/a") only while the
+/// hints still tell the projects apart. Projects in the same folder show their own path
+/// instead. Projects whose names don't clash get no hint.
 pub(crate) fn duplicate_hints(
     projects: &[(ProjectId, &str, &Path)],
     home: Option<&Path>,
@@ -104,62 +122,59 @@ pub(crate) fn duplicate_hints(
     }
     let mut hints = HashMap::new();
     for clash in by_name.into_values().filter(|c| c.len() > 1) {
-        let mut parts: Vec<(ProjectId, Vec<OsString>, bool)> = clash
+        let parents: Vec<&Path> = clash
             .iter()
-            .map(|(id, root)| {
-                let (parts, absolute) = path_parts(root, home);
-                (*id, parts, absolute)
-            })
+            .map(|(_, root)| root.parent().unwrap_or(root))
             .collect();
-        // Drop the folder names they all end with, keeping at least one.
+        let shared = parents.windows(2).all(|w| w[0] == w[1]);
+        let parts: Vec<(Vec<OsString>, bool)> = clash
+            .iter()
+            .zip(&parents)
+            .map(|((_, root), parent)| path_parts(if shared { root } else { parent }, home))
+            .collect();
+        // Drop folders from the left while the hints stay apart.
+        let mut dropped = 0;
         loop {
-            let last = parts[0].1.last().cloned();
-            let shared = last.is_some()
-                && parts
-                    .iter()
-                    .all(|(_, p, _)| p.len() > 1 && p.last() == last.as_ref());
-            if !shared {
+            let next = dropped + 1;
+            let fits = parts.iter().all(|(p, _)| p.len() >= next + HINT_KEEPS);
+            if !fits || !distinct(&hint_texts(&parts, next)) {
                 break;
             }
-            for (_, p, _) in &mut parts {
-                p.pop();
-            }
+            dropped = next;
         }
-        let longest = parts.iter().map(|(_, p, _)| p.len()).max().unwrap_or(0);
-        let ends = |k: usize| -> Vec<String> {
-            parts
-                .iter()
-                .map(|(_, p, absolute)| {
-                    let from = p.len().saturating_sub(k);
-                    let joined = p[from..]
-                        .iter()
-                        .map(|s| s.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    if from == 0 && *absolute {
-                        format!("/{joined}")
-                    } else {
-                        joined
-                    }
-                })
-                .collect()
-        };
-        let mut shown = ends(longest);
-        for k in 1..=longest {
-            let tried = ends(k);
-            let mut seen = tried.clone();
-            seen.sort();
-            seen.dedup();
-            if seen.len() == tried.len() {
-                shown = tried;
-                break;
-            }
-        }
-        for ((id, _, _), hint) in parts.iter().zip(shown) {
+        for ((id, _), hint) in clash.iter().zip(hint_texts(&parts, dropped)) {
             hints.insert(*id, hint);
         }
     }
     hints
+}
+
+/// Each path less its first `dropped` folders, "…/" marking the cut.
+fn hint_texts(parts: &[(Vec<OsString>, bool)], dropped: usize) -> Vec<String> {
+    parts
+        .iter()
+        .map(|(p, absolute)| {
+            let joined = p[dropped..]
+                .iter()
+                .map(|s| s.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if dropped > 0 {
+                format!("…/{joined}")
+            } else if *absolute {
+                format!("/{joined}")
+            } else {
+                joined
+            }
+        })
+        .collect()
+}
+
+fn distinct(texts: &[String]) -> bool {
+    let mut seen: Vec<&String> = texts.iter().collect();
+    seen.sort();
+    seen.dedup();
+    seen.len() == texts.len()
 }
 
 /// `root`'s folder names, with the home folder as one `~`, and whether
@@ -213,11 +228,13 @@ impl Workspace {
             super::row_probe::single(channel, id);
         }
         let selected = match look.single {
-            Some(channel) => self.nav.channel == Some(channel) && self.nav.thread.is_none(),
+            Some(channel) => self.nav.channel == Some(channel),
             None => false,
         } || look.hit.is_some_and(|hit| hit == self.sidebar.selected);
         let badge = match look.single {
             Some(channel) => self.channel_badge(channel),
+            // Open, its channels carry their own dots.
+            None if look.open => ChannelBadge::None,
             None => match status_dot(state.project_status(id)) {
                 Some(_) => ChannelBadge::Status(state.project_status(id)),
                 None => ChannelBadge::None,
@@ -480,24 +497,26 @@ mod tests {
     use crate::prefs::{ShowProjects, SortProjects};
 
     const NOW: i64 = 100 * ACTIVE_WITHIN_MS;
+    const DAY: i64 = 24 * 60 * 60 * 1000;
 
-    fn info(name: &str, pinned: bool, live: bool, days_ago: i64) -> ProjectInfo {
+    fn info(name: &str, pinned: bool, live: bool, days_ago: Option<i64>) -> ProjectInfo {
         ProjectInfo {
             id: ProjectId::new(),
             name: name.into(),
             pinned,
             live,
-            activity: NOW - days_ago * 24 * 60 * 60 * 1000,
+            activity: days_ago.map(|d| NOW - d * DAY),
+            created_at: NOW - 60 * DAY,
         }
     }
 
     #[test]
     fn groups_pinned_then_active_then_the_rest() {
-        let pinned = info("curl-runner", true, false, 30);
-        let live = info("api", false, true, 30);
-        let recent = info("web", false, false, 2);
-        let week = info("docs", false, false, 7);
-        let old = info("legacy", false, false, 8);
+        let pinned = info("curl-runner", true, false, Some(30));
+        let live = info("api", false, true, Some(30));
+        let recent = info("web", false, false, Some(2));
+        let week = info("docs", false, false, Some(7));
+        let old = info("legacy", false, false, Some(8));
         let all = vec![
             old.clone(),
             recent.clone(),
@@ -505,37 +524,71 @@ mod tests {
             pinned.clone(),
             week.clone(),
         ];
-        let groups = group_projects(all.clone(), ShowProjects::All, SortProjects::Recent, NOW);
+        let group = |show, sort, keep| group_projects(all.clone(), show, sort, NOW, keep);
         assert_eq!(
-            groups,
+            group(ShowProjects::All, SortProjects::Recent, None),
             Groups {
                 pinned: vec![pinned.id],
                 active: vec![recent.id, week.id, live.id],
                 other: vec![old.id],
             }
         );
-        let by_name = group_projects(all.clone(), ShowProjects::All, SortProjects::Name, NOW);
+        let by_name = group(ShowProjects::All, SortProjects::Name, None);
         assert_eq!(by_name.active, vec![live.id, week.id, recent.id]);
 
-        let active = group_projects(all.clone(), ShowProjects::Active, SortProjects::Name, NOW);
+        let active = group(ShowProjects::Active, SortProjects::Name, None);
         assert_eq!(active.pinned, vec![pinned.id]);
         assert_eq!(active.active.len(), 3);
         assert!(active.other.is_empty());
 
-        let only_pinned = group_projects(all, ShowProjects::Pinned, SortProjects::Name, NOW);
+        let only_pinned = group(ShowProjects::Pinned, SortProjects::Name, None);
         assert_eq!(only_pinned.pinned, vec![pinned.id]);
         assert!(only_pinned.active.is_empty() && only_pinned.other.is_empty());
+
+        // The open channel's project stays, in its own group.
+        let kept = group(ShowProjects::Pinned, SortProjects::Name, Some(old.id));
+        assert_eq!(kept.other, vec![old.id]);
+        assert!(kept.active.is_empty());
+    }
+
+    #[test]
+    fn a_project_without_threads_is_never_active() {
+        let quiet = ProjectInfo {
+            created_at: NOW,
+            ..info("new", false, false, None)
+        };
+        let busy = info("busy", false, false, Some(1));
+        let groups = group_projects(
+            vec![quiet.clone(), busy.clone()],
+            ShowProjects::All,
+            SortProjects::Recent,
+            NOW,
+            None,
+        );
+        assert_eq!(groups.active, vec![busy.id]);
+        assert_eq!(groups.other, vec![quiet.id]);
+        // Live always counts.
+        let live = info("live", false, true, None);
+        let groups = group_projects(
+            vec![live.clone()],
+            ShowProjects::All,
+            SortProjects::Recent,
+            NOW,
+            None,
+        );
+        assert_eq!(groups.active, vec![live.id]);
     }
 
     #[test]
     fn names_sort_ignoring_case() {
-        let a = info("Zeta", false, false, 1);
-        let b = info("alpha", false, false, 1);
+        let a = info("Zeta", false, false, Some(1));
+        let b = info("alpha", false, false, Some(1));
         let groups = group_projects(
             vec![a.clone(), b.clone()],
             ShowProjects::All,
             SortProjects::Name,
             NOW,
+            None,
         );
         assert_eq!(groups.active, vec![b.id, a.id]);
     }
@@ -552,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn only_clashing_names_get_the_shortest_telling_path_end() {
+    fn only_clashing_names_get_their_folder_with_a_tilde_for_home() {
         assert_eq!(
             hints(
                 &[
@@ -562,54 +615,58 @@ mod tests {
                 ],
                 Some("/Users/me"),
             ),
-            [Some("a".into()), Some("b".into()), None]
+            [Some("~/code/a".into()), Some("~/code/b".into()), None]
         );
-        // Names clash ignoring case.
+        // Names clash ignoring case; outside home the path is whole.
         assert_eq!(
             hints(
                 &[("Demo", "/work/one/demo"), ("demo", "/work/two/demo")],
                 None
             ),
-            [Some("one".into()), Some("two".into())]
+            [Some("/work/one".into()), Some("/work/two".into())]
+        );
+        assert_eq!(
+            hints(
+                &[("demo", "/Users/me/demo"), ("demo", "/opt/code/demo")],
+                Some("/Users/me"),
+            ),
+            [Some("~".into()), Some("/opt/code".into())]
+        );
+        // Two projects in one folder show their own paths.
+        assert_eq!(
+            hints(
+                &[("demo", "/Users/me/code/a"), ("demo", "/Users/me/code/b")],
+                Some("/Users/me"),
+            ),
+            [Some("~/code/a".into()), Some("~/code/b".into())]
         );
     }
 
     #[test]
-    fn hints_grow_until_they_differ_and_use_a_tilde_for_home() {
+    fn long_paths_lose_folders_from_the_left_only_while_still_apart() {
         assert_eq!(
             hints(
                 &[
-                    ("demo", "/Users/me/x/src/demo"),
-                    ("demo", "/Users/me/y/src/demo"),
+                    ("demo", "/Users/me/work/clients/acme/src/a/demo"),
+                    ("demo", "/Users/me/work/clients/acme/src/b/demo"),
                 ],
                 Some("/Users/me"),
             ),
-            [Some("x".into()), Some("y".into())]
+            [Some("…/acme/src/a".into()), Some("…/acme/src/b".into())]
         );
+        // They differ further left: only what tells them apart stays.
         assert_eq!(
             hints(
                 &[
-                    ("demo", "/Users/me/a/x/demo"),
-                    ("demo", "/Users/me/b/x/demo"),
-                    ("demo", "/Users/me/a/y/demo"),
+                    ("demo", "/Users/me/x/one/two/three/demo"),
+                    ("demo", "/Users/me/y/one/two/three/demo"),
                 ],
                 Some("/Users/me"),
             ),
-            [Some("a/x".into()), Some("b/x".into()), Some("a/y".into())]
-        );
-        assert_eq!(
-            hints(
-                &[("demo", "/Users/me/demo"), ("demo", "/Users/me/code/demo")],
-                Some("/Users/me"),
-            ),
-            [Some("~".into()), Some("code".into())]
-        );
-        assert_eq!(
-            hints(
-                &[("demo", "/Users/me/code/a"), ("demo", "/opt/code/a")],
-                Some("/Users/me"),
-            ),
-            [Some("~".into()), Some("/opt".into())]
+            [
+                Some("…/x/one/two/three".into()),
+                Some("…/y/one/two/three".into())
+            ]
         );
     }
 }

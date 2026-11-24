@@ -587,12 +587,13 @@ impl Store {
         Ok(())
     }
 
-    /// Marks the project removed. It drops out of [`Self::projects`] and
+    /// Marks the project removed, and unpins it. It drops out of [`Self::projects`] and
     /// [`Self::project`], and its threads out of the thread searches, but
     /// its channels, threads and runs stay for history.
     pub fn remove_project(&self, p: ProjectId) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE projects SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+            "UPDATE projects SET removed_at = ?2, pinned_at = NULL
+             WHERE id = ?1 AND removed_at IS NULL",
             params![p.to_string(), now_ms()],
         )?;
         if changed == 0 {

@@ -12,7 +12,7 @@ use std::path::Path;
 use crew_core::ids::{AgentId, ChannelId, ProjectId};
 use crew_core::store::StoredAgent;
 use crew_proto::TerminalSession;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,7 +20,7 @@ use gpui_kit::*;
 
 use super::common::{ago, dot, monogram, now_ms, status_word, with_font_probe};
 use super::palette::{highlighted, match_range};
-use super::settings::Page;
+
 use super::workspace::Workspace;
 use crate::model::ThreadStatus;
 use crate::prefs::SidebarPrefs;
@@ -107,6 +107,42 @@ pub(super) enum Row {
     Agent(AgentId),
 }
 
+/// What the rows depend on: they are built again only when it changes.
+#[derive(Debug, Clone, PartialEq)]
+struct SidebarKey {
+    revision: u64,
+    collapsed: Vec<ProjectId>,
+    terminal_groups: Vec<ProjectId>,
+    channel: Option<ChannelId>,
+    query: String,
+    prefs: SidebarPrefs,
+    other_open: bool,
+    agents_open: bool,
+    /// Projects go quiet as time passes.
+    minute: i64,
+}
+
+fn sorted_ids(ids: &std::collections::HashSet<ProjectId>) -> Vec<ProjectId> {
+    let mut ids: Vec<ProjectId> = ids.iter().copied().collect();
+    ids.sort_by_key(|p| p.0);
+    ids
+}
+
+/// What grouping needs to know about `project`.
+fn project_info(
+    project: &crew_core::store::StoredProject,
+    facts: Option<&crate::model::ProjectFacts>,
+) -> ProjectInfo {
+    ProjectInfo {
+        id: project.id,
+        name: project.name.clone(),
+        pinned: project.pinned_at.is_some(),
+        live: facts.is_some_and(|f| f.status != ThreadStatus::Idle),
+        activity: facts.and_then(|f| f.activity),
+        created_at: project.created_at,
+    }
+}
+
 /// The sidebar's own state, kept in memory except the filter menu's
 /// choices, which live in the app prefs.
 pub(super) struct Sidebar {
@@ -133,6 +169,10 @@ pub(super) struct Sidebar {
     pub(super) hits: Vec<Hit>,
     /// Hints for projects whose names clash.
     pub(super) hints: HashMap<ProjectId, String>,
+    /// What the rows were last built from.
+    built: Option<SidebarKey>,
+    /// The open channel the list last made visible.
+    revealed: Option<ChannelId>,
     /// The time grouping uses in place of now, as tests set it.
     #[cfg(test)]
     pub(super) now: Option<i64>,
@@ -158,6 +198,8 @@ impl Sidebar {
             rows: Vec::new(),
             hits: Vec::new(),
             hints: HashMap::new(),
+            built: None,
+            revealed: None,
             #[cfg(test)]
             now: None,
             _filter_events: events,
@@ -169,7 +211,23 @@ impl Workspace {
     /// Builds the list's rows from what is known, keeping the scroll
     /// position when they change.
     pub(super) fn refresh_sidebar(&mut self) {
-        let (rows, hits) = self.sidebar_rows();
+        let now = self.sidebar_now();
+        self.reveal_open_channel(now);
+        let key = SidebarKey {
+            revision: self.state().revision(),
+            collapsed: sorted_ids(&self.nav.collapsed),
+            terminal_groups: sorted_ids(&self.nav.terminal_groups),
+            channel: self.nav.channel,
+            query: self.sidebar.query.clone(),
+            prefs: self.sidebar.prefs,
+            other_open: self.sidebar.other_open,
+            agents_open: self.sidebar.agents_open,
+            minute: now / 60_000,
+        };
+        if self.sidebar.built.as_ref() == Some(&key) {
+            return;
+        }
+        let (rows, hits) = self.sidebar_rows(now);
         let state = self.state();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let named: Vec<(ProjectId, &str, &Path)> = state
@@ -179,6 +237,7 @@ impl Workspace {
             .collect();
         let hints = duplicate_hints(&named, home.as_deref());
         let sidebar = &mut self.sidebar;
+        sidebar.built = Some(key);
         sidebar.hints = hints;
         sidebar.hits = hits;
         if sidebar.selected >= sidebar.hits.len() {
@@ -195,23 +254,50 @@ impl Workspace {
         }
     }
 
+    /// Now, or the time a test set.
+    fn sidebar_now(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(now) = self.sidebar.now {
+            return now;
+        }
+        now_ms()
+    }
+
+    /// A channel just opened shows in the list: its project opens, and
+    /// so does Other projects if it is there. Shown by Show or not, its
+    /// project stays listed (see [`group_projects`]).
+    fn reveal_open_channel(&mut self, now: i64) {
+        if self.nav.channel == self.sidebar.revealed {
+            return;
+        }
+        self.sidebar.revealed = self.nav.channel;
+        let state = self.state();
+        let Some(project) = self
+            .nav
+            .channel
+            .and_then(|c| state.channel(c))
+            .and_then(|c| state.project(c.project))
+        else {
+            return;
+        };
+        let id = project.id;
+        let facts = state.project_facts().get(&id).copied();
+        let info = project_info(project, facts.as_ref());
+        let in_other = !info.pinned && !info.is_active(now);
+        self.nav.collapsed.remove(&id);
+        if in_other {
+            self.sidebar.other_open = true;
+        }
+    }
+
     /// The rows to show, and the filter results among them.
-    fn sidebar_rows(&self) -> (Vec<Row>, Vec<Hit>) {
+    fn sidebar_rows(&self, now: i64) -> (Vec<Row>, Vec<Hit>) {
         let state = self.state();
         let facts = state.project_facts();
         let infos: Vec<ProjectInfo> = state
             .projects()
             .into_iter()
-            .map(|p| {
-                let f = facts.get(&p.id);
-                ProjectInfo {
-                    id: p.id,
-                    name: p.name.clone(),
-                    pinned: p.pinned_at.is_some(),
-                    live: f.is_some_and(|f| f.status != ThreadStatus::Idle),
-                    activity: f.map_or(p.created_at, |f| f.activity),
-                }
-            })
+            .map(|p| project_info(p, facts.get(&p.id)))
             .collect();
         let prefs = self.sidebar.prefs;
         let mut rows = Vec::new();
@@ -249,11 +335,12 @@ impl Workspace {
             }
             return (rows, hits);
         }
-        #[cfg(test)]
-        let now = self.sidebar.now.unwrap_or_else(now_ms);
-        #[cfg(not(test))]
-        let now = now_ms();
-        let groups = group_projects(infos, prefs.show, prefs.sort, now);
+        let keep = self
+            .nav
+            .channel
+            .and_then(|c| state.channel(c))
+            .map(|c| c.project);
+        let groups = group_projects(infos, prefs.show, prefs.sort, now, keep);
         if !groups.pinned.is_empty() {
             rows.push(Row::Heading(Heading::Pinned));
             for project in groups.pinned {
@@ -340,6 +427,7 @@ impl Workspace {
                     .id("sidebar-list")
                     .flex_1()
                     .min_h_0()
+                    .when(self.sidebar.menu_open, |list| list.opacity(0.4))
                     .child(
                         list(
                             self.sidebar.list.clone(),
@@ -350,7 +438,7 @@ impl Workspace {
                     .test_support(),
             )
             .when(filtering, |sidebar| sidebar.child(filter::render_hints()))
-            .when(running > 0, |sidebar| {
+            .when(running > 0 && !filtering, |sidebar| {
                 sidebar.child(render_footer(running, self.stopping_all, cx))
             })
             .when(self.sidebar.menu_open, |sidebar| {
@@ -548,58 +636,36 @@ impl Workspace {
         }
     }
 
-    /// "Agents", which opens and closes the list, and the New agent
-    /// button.
+    /// "Agents", which opens and closes the list.
     fn render_agents_heading(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.sidebar.agents_open;
-        div()
-            .flex()
-            .items_center()
-            .h(scale::row(28.))
-            .pl(ui_px(8.))
+        sidebar_row("sidebar-agents".into())
+            .gap(ui_px(8.))
             .pr(ui_px(4.))
+            .aria_label("Agents")
+            .aria_expanded(open)
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(ui_px(12.))
+                .text_color(color("text-secondary")),
+            )
             .child(
                 div()
-                    .id("sidebar-agents")
-                    .flex()
                     .flex_1()
-                    .items_center()
-                    .gap(ui_px(6.))
-                    .h_full()
-                    .cursor_pointer()
                     .text_size(scale::text(12.))
                     .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color("text-secondary"))
-                    .aria_label("Agents")
-                    .aria_expanded(open)
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(ui_px(12.))
-                        .text_color(color("text-secondary")),
-                    )
-                    .child("Agents")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar.agents_open = !this.sidebar.agents_open;
-                        cx.notify();
-                    }))
-                    .test_support(),
+                    .child("Agents"),
             )
-            .child(
-                Button::new("sidebar-agents-add")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .accessibility_label("New agent")
-                    .tooltip("New agent")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(Page::Agents, window, cx);
-                        this.new_agent(window, cx);
-                    })),
-            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar.agents_open = !this.sidebar.agents_open;
+                cx.notify();
+            }))
+            .test_support()
     }
 
     fn render_agent(&self, agent: &StoredAgent) -> impl IntoElement {

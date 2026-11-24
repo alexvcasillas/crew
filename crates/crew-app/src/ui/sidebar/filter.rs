@@ -380,9 +380,12 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &SidebarMenuClose, window, cx| {
                 this.close_filter_menu(window, cx);
             }))
-            .on_mouse_down_out(cx.listener(|this, e: &MouseDownEvent, _, cx| {
+            .on_mouse_down_out(cx.listener(|this, e: &MouseDownEvent, window, cx| {
                 this.sidebar.menu_open = false;
                 this.sidebar.menu_closed_at = Some(e.position);
+                // The menu's focus goes with it; what was pressed may
+                // take it next.
+                this.focus_workspace(window, cx);
                 cx.notify();
             }))
             .child(menu_heading("Show"))
@@ -455,7 +458,8 @@ fn icon_button(
         .child(Icon::default().data(svg).size(ui_px(14.)))
 }
 
-/// The switch to the threads sidebar. Off until that sidebar is built.
+/// The switch to the threads sidebar, with the board's tooltip. It does
+/// nothing until that sidebar is built, and says so to assistive tech.
 fn switch_button() -> impl IntoElement {
     div()
         .id("sidebar-switch")
@@ -465,7 +469,7 @@ fn switch_button() -> impl IntoElement {
         .justify_center()
         .size(ui_px(24.))
         .rounded(ui_px(6.))
-        .text_color(color("text-tertiary"))
+        .text_color(color("text-secondary"))
         .hover(|b| b.bg(color("surface-300")))
         .aria_label("Show threads")
         .aria_description(SWITCH_LATER)
@@ -483,7 +487,7 @@ fn switch_button() -> impl IntoElement {
                     .child(
                         div()
                             .text_color(color("text-tertiary"))
-                            .child(format!("· {SWITCH_LATER}")),
+                            .child("· switch sidebar"),
                     )
             })
             .build(window, cx)

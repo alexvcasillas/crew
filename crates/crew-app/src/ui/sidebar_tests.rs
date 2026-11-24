@@ -41,6 +41,14 @@ fn add_channel(w: &World, project: ProjectId, name: &str) -> ChannelId {
     })
 }
 
+/// A thread in `channel`, which makes its project active.
+fn add_thread(w: &World, channel: ChannelId) {
+    let _: crew_core::ids::ThreadId = w.ask(Request::CreateThread {
+        channel,
+        title: "a thread".into(),
+    });
+}
+
 fn project_row(project: ProjectId) -> String {
     format!("project-{project}")
 }
@@ -113,16 +121,21 @@ fn projects_group_into_pinned_active_and_other(cx: &mut TestAppContext) {
     let _daemon = Daemon::start(home.path().to_path_buf());
     let w = world(home.path(), &tmp.path().join("repo"), &[]);
     let api = add_project(&w, "api", &tmp.path().join("api"));
-    add_channel(&w, api, "general");
+    let api_general = add_channel(&w, api, "general");
     let (window, ws) = open(cx, home.path());
-    wait_has(cx, window, project_row(api));
+    // api has no threads: it isn't active, so it waits in Other.
+    wait_until(cx, "Other projects", |cx| {
+        label_of(cx, window, "sidebar-other").as_deref() == Some("Other projects · 1")
+    });
     assert_eq!(
         label_of(cx, window, "sidebar-group-active").as_deref(),
         Some("Active")
     );
+    assert!(has(cx, window, project_row(w.project)));
+    assert!(!has(cx, window, project_row(api)), "Other starts closed");
     assert!(!has(cx, window, "sidebar-group-pinned"));
-    assert!(!has(cx, window, "sidebar-other"));
-
+    click(cx, window, "sidebar-other");
+    wait_has(cx, window, project_row(api));
     // Pin to top: the project moves into Pinned, above Active.
     right_click(cx, window, project_row(api));
     assert!(shows_within(cx, window, "popup-menu", "Pin to top"));
@@ -137,8 +150,10 @@ fn projects_group_into_pinned_active_and_other(cx: &mut TestAppContext) {
     let active = top(cx, window, "sidebar-group-active".into());
     let demo_y = top(cx, window, project_row(w.project));
     assert!(pinned < api_y && api_y < active && active < demo_y);
+    assert!(!has(cx, window, "sidebar-other"));
 
-    // A week later the unpinned project is quiet: Other projects, closed.
+    // A week later the unpinned project is quiet: Other projects, which
+    // stays open as you left it.
     let now = crate::ui::common::now_ms() + 8 * DAY_MS;
     set_now(cx, &ws, now);
     assert_eq!(
@@ -146,12 +161,13 @@ fn projects_group_into_pinned_active_and_other(cx: &mut TestAppContext) {
         Some("Other projects · 1")
     );
     assert!(!has(cx, window, "sidebar-group-active"));
-    assert!(!has(cx, window, project_row(w.project)));
+    assert!(has(cx, window, project_row(w.project)));
     assert!(has(cx, window, project_row(api)), "pinned stays");
+    click(cx, window, "sidebar-other");
+    assert!(!has(cx, window, project_row(w.project)));
     click(cx, window, "sidebar-other");
     assert!(has(cx, window, project_row(w.project)));
     click(cx, window, "sidebar-other");
-    assert!(!has(cx, window, project_row(w.project)));
 
     // Unpin: it joins the others.
     right_click(cx, window, project_row(api));
@@ -161,6 +177,25 @@ fn projects_group_into_pinned_active_and_other(cx: &mut TestAppContext) {
         label_of(cx, window, "sidebar-other").as_deref() == Some("Other projects · 2")
     });
     assert!(!has(cx, window, "sidebar-group-pinned"));
+
+    // Opening a channel in closed Other opens Other so it shows selected.
+    assert!(!has(cx, window, project_row(api)));
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_place(super::workspace::Place::Channel(api_general), window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    wait_has(cx, window, project_row(api));
+    assert!(is_selected(cx, window, project_row(api)));
+
+    // Pinned only still lists the open channel's project.
+    click(cx, window, "sidebar-filter-options");
+    click(cx, window, "sidebar-show-pinned");
+    press(cx, window, "escape");
+    assert!(has(cx, window, project_row(api)));
+    assert!(!has(cx, window, project_row(w.project)));
 }
 
 #[gpui_kit::test]
@@ -183,12 +218,28 @@ fn a_single_channel_project_is_one_row_that_opens_it(cx: &mut TestAppContext) {
         shown_channel(cx, &ws) == Some(w.channel) && has(cx, window, "channel-view")
     });
     assert!(is_selected(cx, window, project_row(w.project)));
+    // It stays selected while a thread in it is open.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_place(super::workspace::Place::Thread(w.thread), window, cx)
+        });
+    })
+    .unwrap();
+    wait_until(cx, "the thread", |cx| {
+        ws.read_with(cx, |ws, _| ws.open_thread_id() == Some(w.thread))
+    });
+    assert!(is_selected(cx, window, project_row(w.project)));
 
     // A second channel: the project opens out into its channels.
     let bugs = add_channel(&w, w.project, "bugs");
     wait_has(cx, window, format!("channel-{bugs}"));
     assert!(has(cx, window, format!("channel-{}", w.channel)));
     assert!(is_selected(cx, window, format!("channel-{}", w.channel)));
+    // Open, the project row carries no status of its own.
+    assert_eq!(
+        label_of(cx, window, format!("project-status-{}", w.project)).as_deref(),
+        Some("")
+    );
     click(cx, window, project_row(w.project));
     assert!(!has(cx, window, format!("channel-{bugs}")), "it closes");
 }
@@ -201,8 +252,10 @@ fn the_filter_finds_projects_and_channels_and_keys_move_through_them(cx: &mut Te
     let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
     let supa = add_project(&w, "supa-app", &tmp.path().join("supa"));
     let supa_general = add_channel(&w, supa, "general");
+    add_thread(&w, supa_general);
     let api = add_project(&w, "api", &tmp.path().join("api"));
-    add_channel(&w, api, "general");
+    let api_general = add_channel(&w, api, "general");
+    add_thread(&w, api_general);
     let support = add_channel(&w, api, "support");
     let (window, ws) = open(cx, home.path());
     wait_has(cx, window, project_row(api));
@@ -274,7 +327,8 @@ fn the_filter_menu_choices_apply_and_are_kept(cx: &mut TestAppContext) {
     let _daemon = Daemon::start(home.path().to_path_buf());
     let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
     let alpha = add_project(&w, "alpha", &tmp.path().join("alpha"));
-    add_channel(&w, alpha, "general");
+    let alpha_general = add_channel(&w, alpha, "general");
+    add_thread(&w, alpha_general);
     let (window, _ws) = open(cx, home.path());
     wait_has(cx, window, project_row(alpha));
     // Recent activity first: alpha is newer.
@@ -346,6 +400,9 @@ fn the_filter_menu_choices_apply_and_are_kept(cx: &mut TestAppContext) {
     click(cx, window, "sidebar-filter-options");
     click(cx, window, "status-bar");
     assert!(!has(cx, window, "sidebar-filter-menu"));
+    // Window shortcuts still answer: ⌘K opens the palette.
+    press(cx, window, "cmd-k");
+    wait_until(cx, "the palette", |cx| has(cx, window, "palette"));
 }
 
 #[gpui_kit::test]
@@ -356,16 +413,26 @@ fn clashing_project_names_get_a_path_hint(cx: &mut TestAppContext) {
     let w = world(home.path(), &tmp.path().join("a").join("demo"), &[]);
     let twin = add_project(&w, "demo", &tmp.path().join("b").join("demo"));
     let other = add_project(&w, "web", &tmp.path().join("web"));
+    for project in [twin, other] {
+        add_thread(&w, add_channel(&w, project, "general"));
+    }
     let (window, _ws) = open(cx, home.path());
     wait_has(cx, window, project_row(twin));
     wait_has(cx, window, project_row(other));
+    // The folder each sits in, cut from the left to three folders.
+    let names: Vec<String> = tmp
+        .path()
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let end = names[names.len() - 2..].join("/");
     assert_eq!(
-        label_of(cx, window, format!("project-hint-{}", w.project)).as_deref(),
-        Some("· a")
+        label_of(cx, window, format!("project-hint-{}", w.project)),
+        Some(format!("· …/{end}/a"))
     );
     assert_eq!(
-        label_of(cx, window, format!("project-hint-{twin}")).as_deref(),
-        Some("· b")
+        label_of(cx, window, format!("project-hint-{twin}")),
+        Some(format!("· …/{end}/b"))
     );
     assert!(!has(cx, window, format!("project-hint-{other}")));
 }
