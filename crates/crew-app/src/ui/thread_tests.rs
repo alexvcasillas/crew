@@ -229,13 +229,16 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
 fn agent_replies_render_markdown_here_and_in_the_activity(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let reply = "**The change:** made it fast\\n\\n- first item\\n- second for @Forge";
+    // The run's summary becomes the reply; its text before that shows only
+    // in the Activity tab.
+    let said = "**Verdict:** ok\\n\\n1. **one step**\\n2. two";
     let session = "\"session_id\":\"00000000-0000-4000-8000-000000000001\"";
     let script = tmp.path().join("reply.jsonl");
     std::fs::write(
         &script,
         format!(
             "{{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"model\":\"claude-haiku-4-5\",\"tools\":[],{session}}}\n\
-             {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{reply}\"}}]}},{session}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{said}\"}}]}},{session}}}\n\
              {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{reply}\",\"duration_ms\":10,\"num_turns\":1,\"permission_denials\":[],{session}}}\n"
         ),
     )
@@ -284,13 +287,28 @@ fn agent_replies_render_markdown_here_and_in_the_activity(cx: &mut TestAppContex
         "your own message stays plain"
     );
 
-    // The same text in the Activity tab, parsed once per message.
+    // In the Activity tab: what the agent said, then the run's summary
+    // row, both parsed once per event.
     click(cx, window, "inspector-tab-activity");
+    let said_row = ("activity-row", 0usize);
+    let summary_row = ("activity-row", 1usize);
     wait_until(cx, "the activity", |cx| {
-        shows_within(cx, window, "inspector", "bold The change:")
+        shows_within(cx, window, said_row, "bold Verdict:")
+            && shows_within(cx, window, summary_row, "bold The change:")
     });
+    assert!(shows_within(cx, window, said_row, "bold one step"));
+    assert!(shows_within(cx, window, summary_row, "second for @Forge"));
+    let items = |cx: &mut TestAppContext, row: (&'static str, usize)| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.within(row).find_all_by_role(Role::ListItem).len()
+        })
+        .unwrap()
+    };
+    assert_eq!(items(cx, said_row), 2, "the numbered list");
+    assert_eq!(items(cx, summary_row), 2, "the summary's bullets");
     let parsed = ws.read_with(cx, |ws, _| ws.docs.len());
-    assert!(shows_within(cx, window, "inspector", "first item"));
+    assert!(shows_within(cx, window, summary_row, "first item"));
     assert_eq!(
         ws.read_with(cx, |ws, _| ws.docs.len()),
         parsed,
