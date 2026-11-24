@@ -211,6 +211,9 @@ impl Client {
             name: name.into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await
     }
@@ -399,6 +402,7 @@ async fn search_ranks_threads_channels_agents_and_files() {
     // Committed, it is no longer changed.
     c.call(Request::Commit {
         thread: crash,
+        repo: None,
         message: "Add file".into(),
     })
     .await
@@ -641,6 +645,9 @@ async fn projects_may_not_share_a_folder() {
             name: "again".into(),
             root: format!("{}/", root.display()),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await
         .unwrap_err();
@@ -775,6 +782,7 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         },
         Request::Commit {
             thread: busy,
+            repo: None,
             message: "x".into(),
         },
         Request::RemoveProject { project: p },
@@ -874,6 +882,9 @@ async fn two_clients_adding_one_folder_make_one_project() {
                 name: "demo".into(),
                 root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             })
             .await
         })

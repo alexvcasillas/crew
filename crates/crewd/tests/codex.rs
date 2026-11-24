@@ -332,6 +332,9 @@ async fn setup(c: &mut Client, root: &Path, mode: PermissionMode) -> ThreadId {
             name: "demo".into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel = c
@@ -984,6 +987,9 @@ async fn switching_to_codex_starts_a_fresh_thread() {
             name: "demo".into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel = c
@@ -1277,4 +1283,68 @@ async fn access_through_links_is_refused_and_network_shows_first() {
         "the long path is cut in the middle: {shown}"
     );
     assert!(!shown.ends_with("..."), "the line is never cut: {shown}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_a_folder_of_repos_codex_writes_only_its_thread_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut steps = start();
+    steps.extend(finish("Done."));
+    scenario(dir, 1, steps);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let root = d.tmp.path().join("platform");
+    git_repo(&root.join("api"));
+    git_repo(&root.join("web"));
+    let project = c
+        .ok(Request::CreateProject {
+            name: "platform".into(),
+            root: root.to_string_lossy().into_owned(),
+            main_branch: String::new(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
+        })
+        .await;
+    let channel = c
+        .ok(Request::CreateChannel {
+            project,
+            name: "general".into(),
+        })
+        .await;
+    let _: crew_core::ids::AgentId = c
+        .ok(Request::CreateAgent {
+            spec: forge(PermissionMode::EditFiles),
+        })
+        .await;
+    let thread = c
+        .ok(Request::CreateThread {
+            channel,
+            title: "work".into(),
+        })
+        .await;
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    let run = ask_forge(&mut c, thread, "@Forge go").await;
+    let seen = c.until_ended(run).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+
+    let msgs = messages(dir, 1);
+    let start = &find(&msgs, "thread/start")["params"];
+    let folder = std::fs::canonicalize(&d.home)
+        .unwrap()
+        .join("worktrees/platform/work");
+    assert_eq!(start["cwd"], json!(folder.to_string_lossy()));
+    assert_eq!(
+        start["config"]["sandbox_workspace_write"]["writable_roots"],
+        json!([folder.to_string_lossy()])
+    );
+    let instructions = start["developerInstructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!(
+            "The original folder {} is there to read; don't change files in it.",
+            root.display()
+        )),
+        "{instructions}"
+    );
 }

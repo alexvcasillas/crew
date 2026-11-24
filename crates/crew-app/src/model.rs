@@ -872,6 +872,8 @@ mod tests {
             created_at,
             setup_command: None,
             copy_files: vec![],
+            kind: Default::default(),
+            work_mode: Default::default(),
         }
     }
 
@@ -931,6 +933,7 @@ mod tests {
             started_at,
             ended_at: None,
             runtime: crew_core::agent::Runtime::ClaudeCode,
+            waiting_for: None,
         }
     }
 

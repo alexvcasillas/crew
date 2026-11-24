@@ -8,6 +8,7 @@ pub mod event;
 pub mod ids;
 pub mod mention;
 pub mod policy;
+pub mod project_kind;
 pub mod review;
 pub mod scheduler;
 pub mod slug;

@@ -195,6 +195,8 @@ pub async fn serve_until(
         opts.notice_buffer,
     );
     service.set_count_delay(opts.count_delay);
+    // Folders may have gained or lost repos while crewd was off.
+    service.refresh_kinds();
     let sweeper = service.sweep_blocked();
     let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
     let terminal = opts

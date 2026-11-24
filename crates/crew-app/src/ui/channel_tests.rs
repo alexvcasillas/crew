@@ -226,6 +226,7 @@ fn cards_show_title_status_counts_and_branch(cx: &mut TestAppContext) {
     // Once everything is committed there is nothing to review.
     let _: serde_json::Value = w.ask(Request::Commit {
         thread: t,
+        repo: None,
         message: "Fix it".into(),
     });
     // crewd doesn't announce a commit; the thread's next change brings it.

@@ -132,6 +132,9 @@ pub(crate) async fn create_project(
             name,
             root: repo.root.to_string_lossy().into_owned(),
             main_branch: repo.branch,
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await?;
     let project: ProjectId = serde_json::from_value(project).map_err(|e| e.to_string())?;

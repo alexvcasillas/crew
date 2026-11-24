@@ -828,7 +828,11 @@ impl Workspace {
             .and_then(|t| t.worktree.as_ref())
             .map(|wt| wt.branch.clone())
             .unwrap_or_default();
-        let answer = self.client.request(Request::Commit { thread, message });
+        let answer = self.client.request(Request::Commit {
+            thread,
+            repo: None,
+            message,
+        });
         self.spawn_request(window, cx, async move |this, cx| {
             let result = answer.await;
             this.update_in(cx, |this, window, cx| {
@@ -904,6 +908,7 @@ impl Workspace {
         let thread = review.thread;
         let answer = self.client.request(Request::Discard {
             thread,
+            repos: None,
             delete_branch: false,
         });
         self.spawn_request(window, cx, async move |this, cx| {

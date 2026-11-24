@@ -6,7 +6,9 @@ CREATE TABLE projects (
     created_at INTEGER NOT NULL,
     setup_command TEXT,
     copy_files TEXT NOT NULL DEFAULT '[]',
-    removed_at INTEGER
+    removed_at INTEGER,
+    kind TEXT NOT NULL DEFAULT '{"kind":"repo"}',
+    work_mode TEXT NOT NULL DEFAULT 'own_copy'
 );
 
 CREATE TABLE channels (
@@ -40,7 +42,8 @@ CREATE TABLE threads (
     handoff_policy TEXT,
     handoff_budget INTEGER,
     handoffs_used INTEGER NOT NULL DEFAULT 0,
-    archived_at INTEGER
+    archived_at INTEGER,
+    worktree_repos TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE messages (
@@ -66,7 +69,8 @@ CREATE TABLE runs (
     ended_at INTEGER,
     ord INTEGER NOT NULL,
     runtime TEXT NOT NULL DEFAULT 'claude_code',
-    handed_from TEXT REFERENCES runs(id)
+    handed_from TEXT REFERENCES runs(id),
+    waiting_for TEXT REFERENCES runs(id)
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);

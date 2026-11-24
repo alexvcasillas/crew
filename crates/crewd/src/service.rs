@@ -17,13 +17,14 @@ use crew_core::claude::{
 use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crew_core::mention::parse_mentions;
+use crew_core::project_kind::{NEEDS_REPO, ProjectKind, WorkMode, detect_kind};
 use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{
     ApprovalStatus, Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun,
     ThreadWorktree,
 };
-use crew_core::worktree::{self, Diff};
+use crew_core::worktree;
 use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -110,6 +111,8 @@ pub(crate) struct State {
     /// Allow rules a queued run gets for itself only: the call you let a
     /// retry make.
     pub(crate) retry_rules: HashMap<RunId, Vec<String>>,
+    /// The run writing in each project folder agents work in in place.
+    pub(crate) writers: HashMap<ProjectId, RunId>,
 }
 
 struct Inner {
@@ -228,6 +231,7 @@ impl Service {
                 timers: HashMap::new(),
                 timed_out: HashMap::new(),
                 retry_rules: HashMap::new(),
+                writers: HashMap::new(),
             }),
             tx,
             bins,
@@ -312,7 +316,7 @@ impl Service {
     }
 
     /// Forgets the thread's cached change counts and file list.
-    fn changes_may_differ(&self, thread: ThreadId) {
+    pub(crate) fn changes_may_differ(&self, thread: ThreadId) {
         {
             let mut cache = self.changes();
             cache.invalidate(thread);
@@ -391,7 +395,7 @@ impl Service {
 
     /// Tells `SubscribeAll` clients that the overview of `thread`'s
     /// channel changed.
-    fn thread_overview_stale(&self, thread: ThreadId) {
+    pub(crate) fn thread_overview_stale(&self, thread: ThreadId) {
         let channel = match self.db().store.thread(thread) {
             Ok(t) => t.channel,
             Err(e) => {
@@ -454,12 +458,40 @@ impl Service {
     pub async fn handle(&self, req: Request) -> Reply {
         self.refuse_removed(&req)?;
         match req {
-            Request::ThreadDiff { thread } => self.thread_diff(thread).await,
-            Request::Commit { thread, message } => self.commit(thread, &message).await,
+            Request::ThreadDiff { thread } => self.thread_changes(thread).await,
+            Request::Commit {
+                thread,
+                repo,
+                message,
+            } => self.commit_in(thread, repo, &message).await,
             Request::Discard {
                 thread,
+                repos,
                 delete_branch,
-            } => self.discard(thread, delete_branch).await,
+            } => self.discard_in(thread, repos, delete_branch).await,
+            Request::InspectFolder { path } => self.inspect_folder(path).await,
+            Request::CreateProject {
+                name,
+                root,
+                main_branch,
+                work_mode,
+                copy_files,
+                setup_command,
+            } => {
+                let svc = self.clone();
+                let made = blocking(move || {
+                    svc.create_project(NewProject {
+                        name: &name,
+                        root: Path::new(&root),
+                        main: &main_branch,
+                        work_mode,
+                        copy_files: &copy_files,
+                        setup_command: setup_command.as_deref(),
+                    })
+                })
+                .await?;
+                json(made)
+            }
             Request::ChannelOverview { channel } => self.channel_overview(channel).await,
             Request::Runtimes => self.runtimes().await,
             Request::Search {
@@ -508,11 +540,6 @@ impl Service {
             | Request::PermissionAsk { .. } => {
                 Err("This request is handled by the connection.".into())
             }
-            Request::CreateProject {
-                name,
-                root,
-                main_branch,
-            } => json(self.create_project(&name, Path::new(&root), &main_branch)?),
             Request::CreateChannel { project, name } => {
                 let mut db = self.db();
                 db.store
@@ -649,6 +676,8 @@ impl Service {
                 Ok(serde_json::Value::Null)
             }
             Request::ThreadDiff { .. }
+            | Request::CreateProject { .. }
+            | Request::InspectFolder { .. }
             | Request::Commit { .. }
             | Request::Discard { .. }
             | Request::ChannelOverview { .. }
@@ -720,7 +749,7 @@ impl Service {
     }
 
     /// Tells `SubscribeAll` clients the project as it is now.
-    fn project_changed(&self, db: &mut Db, project: ProjectId) -> Result<(), String> {
+    pub(crate) fn project_changed(&self, db: &mut Db, project: ProjectId) -> Result<(), String> {
         let project = db.store.project(project).map_err(|e| e.to_string())?;
         self.publish_global(db, ServerMsg::ProjectChanged { project });
         // Sessions may belong to it now.
@@ -847,7 +876,25 @@ impl Service {
     /// project with the folder comes back instead, the most recently
     /// removed one, with its channels and threads. Folders are compared
     /// with links resolved, which reads the disk, so not under a lock.
-    fn create_project(&self, name: &str, root: &Path, main: &str) -> Result<ProjectId, String> {
+    /// Any folder works; what it holds decides the default work mode.
+    fn create_project(&self, new: NewProject) -> Result<ProjectId, String> {
+        let NewProject {
+            name,
+            root,
+            main,
+            work_mode,
+            copy_files,
+            setup_command,
+        } = new;
+        let kind = detect_kind(root);
+        let mode = work_mode.unwrap_or_else(|| kind.default_mode());
+        kind.allows(mode)?;
+        let main = if !main.is_empty() || kind != ProjectKind::Repo {
+            main.to_string()
+        } else {
+            worktree::current_branch(root).unwrap_or_else(|| "HEAD".into())
+        };
+        let setup_command = setup_command.map(str::trim).filter(|c| !c.is_empty());
         let err = |e: StoreError| e.to_string();
         let _adding = self
             .0
@@ -868,11 +915,29 @@ impl Service {
         let revived = removed.iter().find(|p| same_folder(&p.root) == wanted);
         let mut db = self.db();
         let Some(old) = revived else {
-            let project = db.store.create_project(name, root, main).map_err(err)?;
+            let project = db
+                .store
+                .in_transaction(|s| {
+                    let project = s.create_project(name, root, &main)?;
+                    s.set_project_kind(project, &kind)?;
+                    s.set_project_mode(project, mode)?;
+                    s.set_project_setup(project, setup_command, copy_files)?;
+                    Ok(project)
+                })
+                .map_err(err)?;
             self.project_changed(&mut db, project)?;
             return Ok(project);
         };
-        db.store.restore_project(old.id, name).map_err(err)?;
+        db.store
+            .in_transaction(|s| {
+                s.restore_project(old.id, name)?;
+                s.set_project_kind(old.id, &kind)?;
+                if work_mode.is_some() {
+                    s.set_project_mode(old.id, mode)?;
+                }
+                Ok(())
+            })
+            .map_err(err)?;
         self.project_changed(&mut db, old.id)?;
         for channel in db.store.channels(old.id).map_err(err)? {
             self.channel_changed(&mut db, channel.id)?;
@@ -979,12 +1044,17 @@ impl Service {
             }
             drop(terminal);
             self.publish_global(&mut db, ServerMsg::ProjectRemoved { project });
-            let mut dirs = vec![stored.root];
-            dirs.extend(
-                threads
-                    .iter()
-                    .filter_map(|t| t.worktree.as_ref().map(|w| w.path.clone())),
-            );
+            let mut dirs: Vec<PathBuf> = crate::folders::project_checkouts(&stored)
+                .into_iter()
+                .map(|(dir, _)| dir)
+                .collect();
+            for wt in threads.iter().filter_map(|t| t.worktree.as_ref()) {
+                dirs.extend(
+                    crate::folders::worktree_checkouts(wt)
+                        .into_iter()
+                        .map(|(dir, _)| dir),
+                );
+            }
             (dirs, ids)
         };
         {
@@ -1004,72 +1074,26 @@ impl Service {
         Ok(())
     }
 
-    /// Uncommitted changes in the thread's worktree, or nothing if it has
-    /// none. Files copied in from the project root are left out.
-    async fn thread_diff(&self, thread: ThreadId) -> Reply {
-        let wt = self
-            .db()
-            .store
-            .thread(thread)
-            .map_err(|e| e.to_string())?
-            .worktree;
-        let Some(wt) = wt else {
-            return json(Diff::default());
-        };
-        let copied = self.copied_files(thread)?;
-        json(blocking(move || worktree::diff(&wt.path, "HEAD", &copied)).await?)
-    }
-
-    /// The project's `copy_files`, which stay out of diffs and commits.
-    fn copied_files(&self, thread: ThreadId) -> Result<Vec<String>, String> {
-        let project = self
-            .db()
-            .store
-            .project_of_thread(thread)
-            .map_err(|e| e.to_string())?;
-        Ok(project.copy_files)
-    }
-
-    /// Commits everything in the thread's worktree except files copied in
-    /// from the project root. The worktree stays.
-    async fn commit(&self, thread: ThreadId, message: &str) -> Reply {
-        let message = message.trim().to_string();
-        if message.is_empty() {
-            return Err("Write a commit message.".into());
-        }
-        let copied = self.copied_files(thread)?;
-        let wt = self.claim_for_change(thread, |name| {
-            format!("Wait for {name} to finish, or stop it.")
-        })?;
-        let result = blocking(move || {
-            if worktree::diff(&wt.path, "HEAD", &copied)?.files.is_empty() {
-                return Ok(None);
-            }
-            worktree::commit(&wt.path, &message, &copied).map(Some)
-        })
-        .await;
-        self.changes_may_differ(thread);
-        self.release_change(thread);
-        if matches!(result, Ok(Some(_))) {
-            self.thread_overview_stale(thread);
-        }
-        match result? {
-            Some(sha) => json(sha),
-            None => Err("Nothing to commit.".into()),
-        }
-    }
-
     /// Removes the thread's worktree, uncommitted changes included. Its
     /// branch goes too, unless it has commits beyond the worktree's base
     /// and `delete_branch` is off: then it is kept and the thread is told.
-    async fn discard(&self, thread: ThreadId, delete_branch: bool) -> Reply {
+    pub(crate) async fn discard(&self, thread: ThreadId, delete_branch: bool) -> Reply {
         let root = self
             .db()
             .store
             .project_of_thread(thread)
             .map_err(|e| e.to_string())?
             .root;
-        let wt = self.claim_for_change(thread, |name| format!("Stop {name} first."))?;
+        let wt = self
+            .claim_for_change(thread, |name| format!("Stop {name} first."))?
+            .ok_or("This thread has no worktree.");
+        let wt = match wt {
+            Ok(wt) => wt,
+            Err(e) => {
+                self.release_change(thread);
+                return Err(e.into());
+            }
+        };
         let (path, branch) = (wt.path.clone(), wt.branch.clone());
         let result = blocking(move || {
             let keep = !delete_branch && worktree::has_commits_beyond(&root, &wt.branch, &wt.base)?;
@@ -1103,14 +1127,15 @@ impl Service {
         Ok(serde_json::Value::Null)
     }
 
-    /// Holds the thread so no run starts there while its worktree changes.
+    /// Holds the thread so no run starts there while its changes are
+    /// committed or dropped, and returns its worktree if it has one.
     /// Refuses while a run in the thread is live, saying `busy` of its
     /// agent's name.
-    fn claim_for_change(
+    pub(crate) fn claim_for_change(
         &self,
         thread: ThreadId,
         busy: impl FnOnce(&str) -> String,
-    ) -> Result<ThreadWorktree, String> {
+    ) -> Result<Option<ThreadWorktree>, String> {
         let mut state = self.state();
         let db = self.db();
         let live = state
@@ -1127,12 +1152,7 @@ impl Service {
                 .map_or("the agent", |(_, spec)| spec.name.as_str());
             return Err(busy(name));
         }
-        let wt = db
-            .store
-            .thread(thread)
-            .map_err(|e| e.to_string())?
-            .worktree
-            .ok_or("This thread has no worktree.")?;
+        let wt = db.store.thread(thread).map_err(|e| e.to_string())?.worktree;
         if !state.scheduler.claim(thread) {
             return Err("Another change to this thread's worktree is in progress.".into());
         }
@@ -1140,7 +1160,7 @@ impl Service {
     }
 
     /// Lets runs start in the thread again.
-    fn release_change(&self, thread: ThreadId) {
+    pub(crate) fn release_change(&self, thread: ThreadId) {
         self.state().scheduler.finished(thread);
         self.start_ready();
     }
@@ -1440,9 +1460,11 @@ impl Service {
         state.timers.insert(job.run, timer.abort_handle());
     }
 
-    /// Forgets a run that is no longer live, and its time limit.
+    /// Forgets a run that is no longer live, its time limit, and the
+    /// folder it was writing in.
     fn end_live(state: &mut State, run: RunId) {
         state.live.remove(&run);
+        state.writers.retain(|_, writer| *writer != run);
         if let Some(timer) = state.timers.remove(&run) {
             timer.abort();
         }
@@ -1497,7 +1519,20 @@ impl Service {
         if state.shutting_down {
             return;
         }
-        while let Some(job) = state.scheduler.next_ready() {
+        loop {
+            // In place, one agent writes in a folder at a time.
+            let job = {
+                let State {
+                    scheduler, writers, ..
+                } = &mut *state;
+                let db = self.db();
+                scheduler.next_ready_where(|job| self.lock_holder(&db, writers, job).is_none())
+            };
+            let Some(job) = job else { break };
+            let writes_in = self.in_place_writer(&self.db(), &job);
+            if let Some(project) = writes_in {
+                state.writers.insert(project, job.run);
+            }
             let pending = state.pending.remove(&job.run);
             // Forget watchers that are done, so the set stays small.
             while state.watchers.try_join_next().is_some() {}
@@ -1507,11 +1542,12 @@ impl Service {
                 state.watchers.spawn(watch);
             }
         }
+        self.update_waiting(&state);
     }
 
-    /// Whether the job's agent may write and the thread has no worktree,
-    /// or one whose setup didn't finish.
-    /// Store errors say no, so `prepare` reports them.
+    /// Whether the job's agent may write, its project gives each thread
+    /// its own copy, and the thread has no worktree, or one whose setup
+    /// didn't finish. Store errors say no, so `prepare` reports them.
     fn needs_worktree(&self, job: &Job) -> bool {
         let db = self.db();
         let writes = db.store.agents().is_ok_and(|agents| {
@@ -1519,7 +1555,12 @@ impl Service {
                 *id == job.agent && spec.permission_mode != PermissionMode::ReadOnly
             })
         });
+        let own_copy = db
+            .store
+            .project_of_thread(job.thread)
+            .is_ok_and(|p| p.work_mode == WorkMode::OwnCopy);
         writes
+            && own_copy
             && db
                 .store
                 .thread(job.thread)
@@ -1699,27 +1740,42 @@ impl Service {
             None => {
                 let dir = self.0.worktrees.join(project_slug);
                 let svc = self.clone();
-                let (root, main, title) = (
+                let (id, root, main, title) = (
+                    project.id,
                     project.root.clone(),
                     project.main_branch.clone(),
                     thread.title,
                 );
                 let wt = blocking(move || {
+                    // A fresh look, so a repo added since is in.
+                    let kind = svc.refresh_kind(id).unwrap_or_default();
+                    let repos = match &kind {
+                        ProjectKind::Plain => return Err(NEEDS_REPO.to_string()),
+                        ProjectKind::Repo => vec![String::new()],
+                        ProjectKind::MultiRepo { repos } => repos.clone(),
+                    };
                     let _held = svc.0.slugs.lock().unwrap_or_else(PoisonError::into_inner);
                     let taken = |slug: &str| {
                         dir.join(slug).exists()
-                            || worktree::branch_exists(&root, &format!("crew/{slug}"))
-                                .unwrap_or(false)
+                            || repos.iter().any(|repo| {
+                                worktree::branch_exists(&root.join(repo), &format!("crew/{slug}"))
+                                    .unwrap_or(false)
+                            })
                     };
                     let slug = slugify(&title, &taken);
                     let path = dir.join(&slug);
                     let branch = format!("crew/{slug}");
-                    let base = worktree::create(&root, &main, &path, &branch)?;
-                    Ok::<_, worktree::WorktreeError>(ThreadWorktree {
+                    if kind != ProjectKind::Repo {
+                        return crate::folders::make_repo_worktrees(&root, &repos, &path, &branch);
+                    }
+                    let base = worktree::create(&root, &main, &path, &branch)
+                        .map_err(|e| e.to_string())?;
+                    Ok(ThreadWorktree {
                         path,
                         branch,
                         base,
                         ready: false,
+                        repos: Vec::new(),
                     })
                 })
                 .await
@@ -1846,6 +1902,15 @@ impl Service {
         }
         let spec = spec.spec;
         let cwd = db.store.thread_cwd(job.thread)?;
+        let project = db.store.project_of_thread(job.thread)?;
+        // A thread folder of repo worktrees leaves plain files out; the
+        // agent may read them in the original folder.
+        let read_only_root = db
+            .store
+            .thread(job.thread)?
+            .worktree
+            .is_some_and(|wt| !wt.repos.is_empty())
+            .then(|| project.root.clone());
         let filter = RunFilter {
             status: None,
             thread: Some(job.thread),
@@ -1913,7 +1978,7 @@ impl Service {
             crew_home: home.clone(),
         });
         let context = CrewContext {
-            project: db.store.project_of_thread(job.thread)?.name,
+            project: project.name.clone(),
             team: db
                 .store
                 .agents()?
@@ -1944,11 +2009,23 @@ impl Service {
                 if let Some(bin) = &self.0.bins.claude {
                     inv.bin = bin.clone();
                 }
+                if let Some(root) = &read_only_root {
+                    inv.add_read_only_dir(root);
+                }
                 Invocation::Claude(inv)
             }
             Runtime::Codex => {
+                // Codex reads anywhere but writes only in its folder, so
+                // the original folder needs no grant to be read.
+                let original = read_only_root.as_ref().map(|root| {
+                    format!(
+                        "Your folder holds a worktree of each repo. The original folder {} is there to read; don't change files in it.",
+                        root.display()
+                    )
+                });
                 let developer_instructions = [
                     context.render_codex(&spec, wiring.is_some()),
+                    original.unwrap_or_default(),
                     spec.instructions.clone(),
                 ]
                 .into_iter()
@@ -2262,8 +2339,18 @@ enum Invocation {
 
 /// A folder as compared between projects: links resolved when it exists,
 /// trailing slashes dropped.
-fn same_folder(path: &Path) -> PathBuf {
+pub(crate) fn same_folder(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
+}
+
+/// What a new project is made with.
+struct NewProject<'a> {
+    name: &'a str,
+    root: &'a Path,
+    main: &'a str,
+    work_mode: Option<WorkMode>,
+    copy_files: &'a [String],
+    setup_command: Option<&'a str>,
 }
 
 /// Runs blocking work, such as git, off the async threads.
@@ -2397,6 +2484,7 @@ mod tests {
             started_at: 1,
             ended_at: None,
             runtime: crew_core::agent::Runtime::ClaudeCode,
+            waiting_for: None,
         }
     }
 

@@ -347,6 +347,9 @@ async fn init_demo(c: &mut Client) -> Result<()> {
                 name: "demo".into(),
                 root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             })
             .await?
         }
@@ -843,7 +846,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Commit { thread, message } => {
             let thread = resolve_thread(&mut c, &thread).await?;
-            let sha: String = c.ask(Request::Commit { thread, message }).await?;
+            let sha: String = c
+                .ask(Request::Commit {
+                    thread,
+                    repo: None,
+                    message,
+                })
+                .await?;
             println!("{}", sha.chars().take(8).collect::<String>());
             Ok(())
         }
@@ -854,6 +863,7 @@ async fn run(cli: Cli) -> Result<()> {
             let thread = resolve_thread(&mut c, &thread).await?;
             c.call(Request::Discard {
                 thread,
+                repos: None,
                 delete_branch: false,
             })
             .await?;

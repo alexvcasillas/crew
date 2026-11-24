@@ -192,6 +192,7 @@ impl Workspace {
                 ..
             } => Ok(Request::Discard {
                 thread: *thread,
+                repos: None,
                 delete_branch: *delete_branch,
             }),
             DialogKind::ChannelSettings {

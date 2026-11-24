@@ -396,3 +396,90 @@ fn a_root_inside_a_repo_lists_and_counts_only_its_own_files() {
     assert!(info.is_repo);
     assert_eq!(info.uncommitted, 2, "the edit outside app doesn't count");
 }
+
+#[test]
+fn a_scoped_diff_lists_only_the_given_paths_under_a_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api");
+    repo(&root);
+    fs::write(root.join("a.txt"), "one\nTWO\n").unwrap();
+    fs::write(root.join("b.txt"), "user edit\n").unwrap();
+    fs::write(root.join("new.txt"), "fresh\n").unwrap();
+    let only = vec!["a.txt".to_string(), "new.txt".to_string()];
+    let d = worktree::diff_scoped(&root, "HEAD", &[], Some(&only), "api/").unwrap();
+    let paths: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["a.txt", "new.txt"]);
+    assert!(d.patch.contains("diff --git a/api/a.txt b/api/a.txt"));
+    assert!(!d.patch.contains("b.txt"));
+    // Nothing asked for, nothing listed.
+    let none = worktree::diff_scoped(&root, "HEAD", &[], Some(&[]), "").unwrap();
+    assert!(none.files.is_empty());
+}
+
+#[test]
+fn commit_only_leaves_everything_else_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api");
+    repo(&root);
+    fs::write(root.join("a.txt"), "agent\n").unwrap();
+    fs::write(root.join("new.txt"), "agent made this\n").unwrap();
+    // Your own work: one staged edit and one new file.
+    fs::write(root.join("b.txt"), "you\n").unwrap();
+    git(&root, &["add", "b.txt"]);
+    fs::write(root.join("mine.txt"), "yours\n").unwrap();
+
+    let only = vec!["a.txt".to_string(), "new.txt".to_string()];
+    let sha = worktree::commit_only(&root, "agent work", &only).unwrap();
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), sha);
+    assert_eq!(git(&root, &["branch", "--show-current"]), "main");
+    let committed = git(&root, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(committed, "a.txt\nnew.txt");
+    // b.txt is still staged, mine.txt still new.
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(status.contains("M  b.txt"), "{status}");
+    assert!(status.contains("?? mine.txt"), "{status}");
+}
+
+#[test]
+fn restore_tracked_never_touches_new_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api");
+    repo(&root);
+    fs::write(root.join("a.txt"), "agent\n").unwrap();
+    fs::write(root.join("b.txt"), "you\n").unwrap();
+    fs::write(root.join("new.txt"), "agent made this\n").unwrap();
+    let paths = vec!["a.txt".to_string(), "new.txt".to_string()];
+    let done = worktree::restore_tracked(&root, &paths).unwrap();
+    assert_eq!(done.restored, ["a.txt"]);
+    assert_eq!(done.kept, ["new.txt"]);
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "you\n");
+    assert!(root.join("new.txt").exists());
+    assert!(worktree::restore_tracked(&root, &["../x".to_string()]).is_err());
+}
+
+#[test]
+fn ignored_files_at_the_top_are_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api");
+    repo(&root);
+    fs::write(root.join(".gitignore"), ".env*\ncerts/\nlogs/\n").unwrap();
+    git(&root, &["add", ".gitignore"]);
+    git(&root, &["commit", "-q", "-m", "ignore"]);
+    fs::write(root.join(".env"), "A=1\n").unwrap();
+    fs::write(root.join(".env.production"), "A=2\n").unwrap();
+    fs::create_dir_all(root.join("certs")).unwrap();
+    fs::write(root.join("certs/a.pem"), "x").unwrap();
+    fs::create_dir_all(root.join("src/deep")).unwrap();
+    fs::write(root.join("src/deep/.env"), "x").unwrap();
+    let mut got = worktree::ignored_top_level(&root).unwrap();
+    got.sort();
+    assert_eq!(got, [".env", ".env.production", "certs/"]);
+    assert_eq!(worktree::current_branch(&root).as_deref(), Some("main"));
+    let mut changed = worktree::changed_files(&root).unwrap();
+    changed.sort();
+    assert!(changed.is_empty(), "{changed:?}");
+}

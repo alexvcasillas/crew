@@ -17,6 +17,7 @@ use crew_core::store::{RunFilter, StoredProject};
 use crew_core::worktree;
 use crew_proto::{FileHit, SearchResults, SearchTotals, ThreadHit};
 
+use crate::folders::{project_checkouts, worktree_checkouts};
 use crate::profile::thread_state;
 use crate::service::{Reply, Service, blocking, json, log};
 
@@ -155,11 +156,14 @@ fn list(dir: &Path) -> Listing {
     }
 }
 
-/// One checkout to search: a project root or a thread's worktree.
+/// One checkout to search: a repo of a project folder or of a thread's
+/// worktree.
 struct Checkout {
     project: ProjectId,
     thread: Option<ThreadId>,
     dir: PathBuf,
+    /// Put before its paths: the repo's place in the folder, as `api/`.
+    prefix: String,
     /// Files copied in from the root, which aren't the thread's work.
     skip: Vec<String>,
 }
@@ -285,23 +289,29 @@ impl Service {
         // file is left out.
         let mut checkouts = Vec::new();
         for p in &projects {
-            checkouts.push(Checkout {
-                project: p.id,
-                thread: None,
-                dir: p.root.clone(),
-                skip: Vec::new(),
-            });
+            for (dir, prefix) in project_checkouts(p) {
+                checkouts.push(Checkout {
+                    project: p.id,
+                    thread: None,
+                    dir,
+                    prefix,
+                    skip: Vec::new(),
+                });
+            }
             for t in threads
                 .iter()
                 .filter(|t| project_of.get(&t.channel) == Some(&p.id))
             {
                 if let Some(wt) = &t.worktree {
-                    checkouts.push(Checkout {
-                        project: p.id,
-                        thread: Some(t.id),
-                        dir: wt.path.clone(),
-                        skip: p.copy_files.clone(),
-                    });
+                    for (dir, prefix) in worktree_checkouts(wt) {
+                        checkouts.push(Checkout {
+                            project: p.id,
+                            thread: Some(t.id),
+                            dir,
+                            prefix,
+                            skip: p.copy_files.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -310,37 +320,38 @@ impl Service {
         let mut dirs = HashSet::new();
         checkouts.retain(|c| c.dir.is_dir() && dirs.insert(c.dir.clone()));
         let lists = self.file_lists(&checkouts);
-        let mut files: Vec<(u8, bool, usize, &str, FileHit)> = Vec::new();
-        let mut seen: HashSet<(ProjectId, &str)> = HashSet::new();
+        let mut files: Vec<(u8, bool, usize, String, FileHit)> = Vec::new();
+        let mut seen: HashSet<(ProjectId, String)> = HashSet::new();
         for (checkout, listing) in checkouts.iter().zip(&lists) {
             for f in &listing.files {
                 let Some(r) = file_rank(f, &needle) else {
                     continue;
                 };
-                if checkout.thread.is_some() && checkout.skip.contains(&f.path) {
+                let path = format!("{}{}", checkout.prefix, f.path);
+                if checkout.thread.is_some() && checkout.skip.contains(&path) {
                     continue;
                 }
                 // A changed copy always shows; an unchanged one only if
                 // no earlier checkout of the project had the file.
-                let first = seen.insert((checkout.project, f.path.as_str()));
+                let first = seen.insert((checkout.project, path.clone()));
                 if !f.changed && !first {
                     continue;
                 }
                 files.push((
                     r,
                     !f.changed,
-                    f.path.len(),
-                    f.path.as_str(),
+                    path.len(),
+                    path.clone(),
                     FileHit {
                         project: checkout.project,
                         thread: checkout.thread,
-                        path: f.path.clone(),
+                        path,
                         changed: f.changed,
                     },
                 ));
             }
         }
-        files.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+        files.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
         totals.files = count(files.len());
         out.files = files.into_iter().take(limit).map(|(.., hit)| hit).collect();
         out.totals = totals;
@@ -417,14 +428,30 @@ impl Service {
         });
     }
 
-    /// Drops the cached file list of the thread's worktree and lists it
-    /// again in the background.
+    /// Drops the cached file lists of the thread's worktree and lists
+    /// them again in the background.
     pub(crate) fn files_may_differ(&self, thread: ThreadId) {
-        let dir = match self.db().store.thread(thread) {
-            Ok(t) => t.worktree.map(|w| w.path),
+        let wt = match self.db().store.thread(thread) {
+            Ok(t) => t.worktree,
             Err(_) => None,
         };
-        let Some(dir) = dir else { return };
+        let Some(wt) = wt else { return };
+        for (dir, _) in worktree_checkouts(&wt) {
+            self.relist(dir);
+        }
+    }
+
+    /// Drops the cached file lists of the project folder's repos, which
+    /// agents working in place change.
+    pub(crate) fn project_files_may_differ(&self, project: &StoredProject) {
+        for (dir, _) in project_checkouts(project) {
+            self.relist(dir);
+        }
+    }
+
+    /// Drops the folder's cached list and lists it again in the
+    /// background, if it was listed before.
+    fn relist(&self, dir: PathBuf) {
         let generation = {
             let mut index = self.files();
             index.invalidate(&dir);

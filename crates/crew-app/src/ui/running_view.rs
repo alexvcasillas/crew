@@ -1616,6 +1616,7 @@ mod tests {
             started_at: 0,
             ended_at: Some(ended_at),
             runtime: Runtime::ClaudeCode,
+            waiting_for: None,
         };
         let (a, b, c) = (run(30), run(20), run(20));
         let mut known = vec![a.clone(), b.clone()];

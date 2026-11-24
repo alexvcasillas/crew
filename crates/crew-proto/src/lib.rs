@@ -9,18 +9,19 @@ use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
+pub use crew_core::project_kind::{ProjectKind, WorkMode};
 pub use crew_core::store::{Limits, RuntimeUsage};
 use crew_core::store::{
     StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
     StoredThread,
 };
-pub use crew_core::worktree::RootInfo;
+pub use crew_core::worktree::{Diff, FileChange, RootInfo};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 11;
+pub const PROTO_VERSION: u32 = 12;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -39,11 +40,25 @@ pub enum Request {
         version: u32,
     },
     /// Answered with the project's id. Refused if another project uses
-    /// the folder; a removed one with the folder comes back instead.
+    /// the folder; a removed one with the folder comes back instead. Any
+    /// folder works. `main_branch` empty means the repo's current branch;
+    /// `work_mode` unset means the default for what the folder holds.
     CreateProject {
         name: String,
         root: String,
+        #[serde(default)]
         main_branch: String,
+        #[serde(default)]
+        work_mode: Option<WorkMode>,
+        #[serde(default)]
+        copy_files: Vec<String>,
+        #[serde(default)]
+        setup_command: Option<String>,
+    },
+    /// Answered with a [`FolderInfo`]: what the folder holds, for the Add
+    /// project dialog. Reads the folder, never changes it.
+    InspectFolder {
+        path: String,
     },
     CreateChannel {
         project: ProjectId,
@@ -152,22 +167,36 @@ pub enum Request {
         setup_command: Option<String>,
         copy_files: Vec<String>,
     },
-    /// Answered with a `Diff` of the uncommitted changes in the thread's
-    /// worktree. Empty if the thread has no worktree.
+    /// Answered with [`ThreadChanges`]: the uncommitted changes of the
+    /// thread, per repo. Empty if it has none.
     ThreadDiff {
         thread: ThreadId,
     },
-    /// Commits everything in the thread's worktree. Answered with the sha.
+    /// Commits the thread's changes in one repo, `None` being the only
+    /// one. In a copy per thread that is everything in the repo's
+    /// worktree; in place, only the files the thread's runs changed, on
+    /// the repo's current branch. Answered with the sha. Nothing is pushed.
     Commit {
         thread: ThreadId,
+        #[serde(default)]
+        repo: Option<String>,
         message: String,
     },
-    /// Removes the thread's worktree, changes included, and its branch
-    /// unless the branch has commits beyond the worktree's base. With
-    /// `delete_branch`, the branch goes even then. Refused while a run in
-    /// the thread is live.
+    /// Drops the thread's changes in `repos`, all of them if `None`.
+    ///
+    /// In a copy per thread: removes each repo's worktree, changes
+    /// included, and its branch unless the branch has commits beyond the
+    /// worktree's base (with `delete_branch`, the branch goes even then).
+    /// The thread folder goes once no repo is left.
+    ///
+    /// In place: puts back only the tracked files the thread's runs
+    /// changed. Files git doesn't have are never touched.
+    ///
+    /// Refused while a run in the thread is live.
     Discard {
         thread: ThreadId,
+        #[serde(default)]
+        repos: Option<Vec<String>>,
         #[serde(default)]
         delete_branch: bool,
     },
@@ -399,10 +428,73 @@ pub struct AgentUse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupFile {
-    /// As set in `copy_files`.
+    /// As set in `copy_files`, relative to the project folder.
     pub path: String,
     #[serde(default)]
     pub size: SetupFileSize,
+    /// Git ignores it.
+    #[serde(default)]
+    pub ignored: bool,
+    /// It looks like it holds secrets, such as keys or production env
+    /// files, so it starts left out.
+    #[serde(default)]
+    pub looks_secret: bool,
+}
+
+/// The answer to [`Request::InspectFolder`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FolderInfo {
+    /// Whether the path is a folder. When not, the rest stays empty.
+    pub exists: bool,
+    pub kind: ProjectKind,
+    /// The folder's name.
+    pub name_suggestion: String,
+    /// For a repo: its checked out branch and where `origin` points.
+    pub branch: Option<String>,
+    pub remote: Option<String>,
+    /// Files and folders git ignores at the top of each repo, which a
+    /// copy per thread would miss.
+    pub setup_files: Vec<SetupFile>,
+    /// The project that already uses this folder.
+    pub already_added: Option<ProjectId>,
+}
+
+/// The answer to [`Request::ThreadDiff`].
+///
+/// `files` and `patch` cover every repo, paths relative to the project
+/// (or thread) folder, so a client that knows one repo reads them as
+/// before. `repos` splits them per repo.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadChanges {
+    pub files: Vec<FileChange>,
+    pub patch: String,
+    pub repos: Vec<RepoChanges>,
+    /// Files the thread's runs changed outside any repo. Git can't show
+    /// or undo them.
+    pub outside_git: Vec<OutsideFile>,
+}
+
+/// One repo's part of [`ThreadChanges`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoChanges {
+    /// Relative to the project folder; empty when the project is the repo.
+    pub repo: String,
+    /// Where a commit lands.
+    pub branch: Option<String>,
+    /// Paths relative to the repo. The patch names them under the repo.
+    pub diff: Diff,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutsideFile {
+    /// Relative to the project folder.
+    pub path: String,
+    /// Whether the file is still there.
+    pub exists: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,6 +964,7 @@ mod tests {
                 id: 4,
                 req: Request::Discard {
                     thread: ThreadId::new(),
+                    repos: Some(vec!["api".into()]),
                     delete_branch: true,
                 },
             },
@@ -887,6 +980,7 @@ mod tests {
             serde_json::from_str::<Request>(&json).unwrap(),
             Request::Discard {
                 thread,
+                repos: None,
                 delete_branch: false
             }
         );
@@ -992,6 +1086,8 @@ mod tests {
             setup_files: vec![SetupFile {
                 path: ".env".into(),
                 size: SetupFileSize::File { bytes: 3 },
+                ignored: true,
+                looks_secret: false,
             }],
             ..ProjectOverview::default()
         };
@@ -1006,6 +1102,90 @@ mod tests {
         );
         let profile: AgentProfile = serde_json::from_str("{}").unwrap();
         assert_eq!(profile, AgentProfile::default());
+    }
+
+    #[test]
+    fn folder_project_messages_round_trip() {
+        let reqs = vec![
+            Request::CreateProject {
+                name: "platform".into(),
+                root: "/work/platform".into(),
+                main_branch: String::new(),
+                work_mode: Some(WorkMode::InPlace),
+                copy_files: vec!["api/.env".into()],
+                setup_command: Some("make".into()),
+            },
+            Request::InspectFolder {
+                path: "/work/platform".into(),
+            },
+            Request::Commit {
+                thread: ThreadId::new(),
+                repo: Some("api".into()),
+                message: "fix".into(),
+            },
+        ];
+        for req in reqs {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+        // An older client's project and commit still read.
+        let req: Request = serde_json::from_str(
+            r#"{"type":"create_project","name":"demo","root":"/work/demo","main_branch":"main"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::CreateProject {
+                work_mode: None,
+                setup_command: None,
+                ..
+            }
+        ));
+        let thread = ThreadId::new();
+        let json = format!(r#"{{"type":"commit","thread":"{thread}","message":"m"}}"#);
+        assert!(matches!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::Commit { repo: None, .. }
+        ));
+
+        let info = FolderInfo {
+            exists: true,
+            kind: ProjectKind::MultiRepo {
+                repos: vec!["api".into(), "web".into()],
+            },
+            name_suggestion: "platform".into(),
+            ..FolderInfo::default()
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["kind"]["kind"], "multi_repo");
+        assert_eq!(serde_json::from_value::<FolderInfo>(json).unwrap(), info);
+
+        // A client that reads a plain diff still reads the changes.
+        let changes = ThreadChanges {
+            files: vec![FileChange {
+                path: "api/a.rs".into(),
+                status: 'M',
+                added: 1,
+                removed: 0,
+            }],
+            patch: "diff --git a/api/a.rs b/api/a.rs\n".into(),
+            repos: vec![RepoChanges {
+                repo: "api".into(),
+                branch: Some("main".into()),
+                diff: Diff::default(),
+            }],
+            outside_git: vec![OutsideFile {
+                path: "notes.md".into(),
+                exists: true,
+            }],
+        };
+        let json = serde_json::to_value(&changes).unwrap();
+        let plain: Diff = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(plain.files, changes.files);
+        assert_eq!(
+            serde_json::from_value::<ThreadChanges>(json).unwrap(),
+            changes
+        );
     }
 
     #[test]

@@ -186,6 +186,9 @@ async fn setup(c: &mut Client, root: &Path) -> (ProjectId, ChannelId, AgentId) {
             name: "demo".into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel: ChannelId = c
@@ -383,6 +386,9 @@ async fn project_channel_and_thread_changes_are_broadcast() {
             name: "demo".into(),
             root: dir.path().to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let ServerMsg::ProjectChanged { project: got } = app.recv().await else {

@@ -1617,6 +1617,9 @@ mod gpui_tests {
             name: "demo".into(),
             root: "/work/demo".into(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         }))
         .unwrap();
     }
@@ -1681,6 +1684,9 @@ mod gpui_tests {
                 name: name.into(),
                 root: root.into(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             }))
             .unwrap();
             let channel = serde_json::from_value(ask(Request::CreateChannel {
@@ -1750,6 +1756,9 @@ mod gpui_tests {
             name: "demo".into(),
             root: "/work/demo".into(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         }))
         .unwrap();
         let channel: ChannelId = serde_json::from_value(ask(Request::CreateChannel {

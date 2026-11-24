@@ -265,6 +265,31 @@ pub struct ClaudeInvocation {
     pub env: Vec<(String, String)>,
 }
 
+impl ClaudeInvocation {
+    /// Lets the agent read `dir` besides its working folder, with
+    /// `--add-dir`, and denies edits and writes there. The deny rules are
+    /// left out when the path holds characters a rule can't carry.
+    pub fn add_read_only_dir(&mut self, dir: &Path) {
+        let at = self
+            .args
+            .iter()
+            .rposition(|a| a == "--")
+            .unwrap_or(self.args.len());
+        let text = dir.to_string_lossy().into_owned();
+        let mut extra = vec!["--add-dir".to_string(), text.clone()];
+        if !text.contains(NOT_EXACT) && !text.contains(' ') {
+            let abs = format!("/{}", text.trim_end_matches('/'));
+            let rules: Vec<String> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+                .iter()
+                .map(|tool| format!("{tool}({abs}/**)"))
+                .collect();
+            extra.push("--disallowedTools".into());
+            extra.push(rules.join(","));
+        }
+        self.args.splice(at..at, extra);
+    }
+}
+
 /// Picks the binary: the given override if set, else `claude` on `PATH`.
 pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
     match env {
@@ -415,6 +440,35 @@ mod tests {
             handoff_budget: None,
             max_run_minutes: 20,
         }
+    }
+
+    #[test]
+    fn a_read_only_dir_goes_before_the_prompt() {
+        let mut inv = build_claude(
+            &agent(PermissionMode::EditFiles),
+            "-p fix it",
+            Path::new("/work/crew/platform/fix"),
+            SessionArg::New(Uuid::nil()),
+            None,
+            None,
+            &[],
+        );
+        inv.add_read_only_dir(Path::new("/work/platform"));
+        let n = inv.args.len();
+        assert_eq!(&inv.args[n - 2..], ["--", "-p fix it"]);
+        assert_eq!(
+            &inv.args[n - 6..n - 2],
+            [
+                "--add-dir",
+                "/work/platform",
+                "--disallowedTools",
+                "Edit(//work/platform/**),Write(//work/platform/**),MultiEdit(//work/platform/**),NotebookEdit(//work/platform/**)"
+            ]
+        );
+        let mut odd = inv.clone();
+        odd.add_read_only_dir(Path::new("/work/my notes"));
+        let n = odd.args.len();
+        assert_eq!(&odd.args[n - 4..n - 2], ["--add-dir", "/work/my notes"]);
     }
 
     fn args(list: &[&str]) -> Vec<String> {

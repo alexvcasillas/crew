@@ -236,6 +236,9 @@ fn tab_toggles_all_projects(cx: &mut TestAppContext) {
         name: "other".into(),
         root: other_root.to_string_lossy().into_owned(),
         main_branch: "main".into(),
+        work_mode: None,
+        copy_files: vec![],
+        setup_command: None,
     });
     let general: ChannelId = w.ask(Request::CreateChannel {
         project: other,
@@ -569,6 +572,9 @@ fn more_projects(
                 name: (*name).into(),
                 root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             });
             let channel: ChannelId = w.ask(Request::CreateChannel {
                 project,

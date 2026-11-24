@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ChannelId, ThreadId};
-use crew_core::store::{StoredRun, StoredThread, ThreadActivity};
+use crew_core::store::{StoredRun, StoredThread, ThreadActivity, ThreadWorktree};
 use crew_core::text::clean_line;
-use crew_core::worktree::{self, ChangeCounts};
+use crew_core::worktree::ChangeCounts;
 use crew_proto::{ChannelOverview, ChannelStats, RunBar, ThreadSummary, WorktreeState};
 
 use crate::service::{Reply, Service, json, log, now_ms};
@@ -196,13 +196,7 @@ impl Service {
                 }
                 wanted.push(thread.id);
                 if let Some(generation) = cache.claim(thread.id) {
-                    self.count_in_background(
-                        thread.id,
-                        generation,
-                        wt.path.clone(),
-                        wt.base.clone(),
-                        copied.clone(),
-                    );
+                    self.count_in_background(thread.id, generation, wt.clone(), copied.clone());
                 }
             }
         }
@@ -307,8 +301,7 @@ impl Service {
         &self,
         thread: ThreadId,
         mut generation: u64,
-        path: std::path::PathBuf,
-        base: String,
+        wt: ThreadWorktree,
         copied: Vec<String>,
     ) {
         let svc = self.clone();
@@ -317,11 +310,11 @@ impl Service {
                 let counts = match svc.count_slots().acquire_owned().await {
                     Ok(slot) => {
                         let delay = svc.count_delay();
-                        let (path, base, copied) = (path.clone(), base.clone(), copied.clone());
+                        let (wt, copied) = (wt.clone(), copied.clone());
                         let job = tokio::task::spawn_blocking(move || {
                             let _slot = slot;
                             std::thread::sleep(delay);
-                            count_changes(thread, &path, &base, &copied)
+                            count_changes(thread, &wt, &copied)
                         });
                         job.await.unwrap_or_else(|e| {
                             log(format!(
@@ -345,18 +338,13 @@ impl Service {
     }
 }
 
-/// The thread's change counts. A missing folder or a git failure gives
-/// zeros; a failure is logged.
-fn count_changes(
-    thread: ThreadId,
-    path: &std::path::Path,
-    base: &str,
-    copied: &[String],
-) -> ChangeCounts {
-    if !path.is_dir() {
+/// The thread's change counts, every repo's added up. A missing folder or
+/// a git failure gives zeros; a failure is logged.
+fn count_changes(thread: ThreadId, wt: &ThreadWorktree, copied: &[String]) -> ChangeCounts {
+    if !wt.path.is_dir() {
         return ChangeCounts::default();
     }
-    worktree::change_counts(path, base, copied).unwrap_or_else(|e| {
+    crate::folders::thread_counts(wt, copied).unwrap_or_else(|e| {
         log(format!(
             "couldn't count the changes of thread {thread}: {e}"
         ));

@@ -133,9 +133,50 @@ pub fn run_edits<'a>(events: impl IntoIterator<Item = &'a Event>) -> EditCounts 
     counts
 }
 
+/// The files the edit and write calls among `events` touched, as the
+/// calls named them, each once in the order first touched. Calls that
+/// failed don't count.
+pub fn edited_paths<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<String> {
+    let mut calls: Vec<(&str, String)> = Vec::new();
+    let mut failed: HashSet<&str> = HashSet::new();
+    for event in events {
+        match event {
+            Event::ToolCall {
+                id,
+                kind: kind @ (ToolKind::Edit | ToolKind::Create),
+                target,
+                input,
+                ..
+            } => {
+                if changed_lines(kind, input).is_none() {
+                    continue;
+                }
+                let path = target
+                    .clone()
+                    .or_else(|| input["file_path"].as_str().map(str::to_string))
+                    .or_else(|| input["path"].as_str().map(str::to_string));
+                if let Some(path) = path {
+                    calls.push((id, path));
+                }
+            }
+            Event::ToolResult { id, is_error, .. } if *is_error => {
+                failed.insert(id);
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (id, path) in calls {
+        if !failed.contains(id) && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::edits::{EditCounts, run_edits};
+    use crate::edits::{EditCounts, edited_paths, run_edits};
     use crate::event::{Event, ToolKind};
 
     fn call(id: &str, kind: ToolKind, target: &str, input: serde_json::Value) -> Event {
@@ -191,5 +232,6 @@ mod tests {
             }
         );
         assert_eq!(run_edits(&[]), EditCounts::default());
+        assert_eq!(edited_paths(&events), ["src/a.rs", "src/new.rs"]);
     }
 }
