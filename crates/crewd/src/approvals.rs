@@ -4,7 +4,7 @@
 //! Same lock order as the rest of the service: `state` before `db`.
 
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
-use crew_core::claude::{retry_prompt, retry_rule};
+use crew_core::claude::{NO_EXACT_RULE, retry_prompt, retry_rule};
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, RunId, ThreadId};
 use crew_core::policy::{self, Decision, PolicyInputs};
@@ -212,6 +212,7 @@ impl Service {
         approval: &StoredApproval,
         tool: &str,
         input: &serde_json::Value,
+        rule: String,
     ) -> Result<RunId, StoreError> {
         let agent = db.store.run(approval.run)?.agent;
         let thread = approval.thread;
@@ -223,7 +224,7 @@ impl Service {
             agent,
             prompt: retry_prompt(tool, input),
         });
-        state.retry_rules.insert(run, vec![retry_rule(tool, input)]);
+        state.retry_rules.insert(run, vec![rule]);
         Ok(run)
     }
 
@@ -387,6 +388,13 @@ impl Service {
             if current.status != ApprovalStatus::Pending {
                 return Err("That request was already answered.".into());
             }
+            // A retry may only make the one call it was allowed.
+            let rule = match &current.kind {
+                ApprovalKind::Blocked { tool, input, .. } if approve => {
+                    Some(retry_rule(tool, input).ok_or_else(|| NO_EXACT_RULE.to_string())?)
+                }
+                _ => None,
+            };
             let gone = match &current.kind {
                 ApprovalKind::Handoff { to, .. } if approve => Some(*to),
                 ApprovalKind::Blocked { .. } if approve => {
@@ -418,8 +426,15 @@ impl Service {
                         .map_err(store_err)?,
                 ),
                 ApprovalKind::Blocked { tool, input, .. } if approve => Some(
-                    self.queue_retry(&mut state, &mut db, &current, tool, input)
-                        .map_err(store_err)?,
+                    self.queue_retry(
+                        &mut state,
+                        &mut db,
+                        &current,
+                        tool,
+                        input,
+                        rule.unwrap_or_default(),
+                    )
+                    .map_err(store_err)?,
                 ),
                 _ => None,
             };

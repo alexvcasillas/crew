@@ -46,23 +46,56 @@ fn call_path(input: &serde_json::Value) -> Option<&str> {
         .filter(|p| !p.is_empty())
 }
 
-/// An allow rule for exactly one call: `Bash(<command>)` for a command,
-/// else the tool with the path it works on, else the bare tool. An
-/// absolute path is written `//path`, as Claude Code reads a single `/`
-/// as relative to the project.
-pub fn retry_rule(tool: &str, input: &serde_json::Value) -> String {
-    if tool == "Bash"
-        && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
-    {
-        return format!("Bash({command})");
+/// Said when a stopped call can't be allowed by a rule that matches it
+/// and nothing else.
+pub const NO_EXACT_RULE: &str = "This call can't be allowed exactly, so Crew won't retry it. Reply in the thread to ask for another way.";
+
+/// Characters that would let a rule match more than one call, or that
+/// Claude Code reads as part of the rule's own syntax.
+const NOT_EXACT: [char; 12] = [
+    '*', ',', '(', ')', '\\', '{', '}', '?', '[', ']', '\n', '\r',
+];
+
+/// Tools whose rule names a single file.
+const PATH_TOOLS: [&str; 5] = ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// An allow rule for exactly one call, or `None` if there is no such
+/// rule: `Bash(<command>)` for a command, else a file tool with the file
+/// it works on. An absolute path is written `//path`, as Claude Code reads
+/// a single `/` as relative to the settings; a relative one `./path`, so
+/// it never matches the same name in another folder. MCP tools, web tools
+/// and anything else get no rule, as does any text with a wildcard, a
+/// separator or a line break in it.
+pub fn retry_rule(tool: &str, input: &serde_json::Value) -> Option<String> {
+    let exact = |text: &str| !text.trim().is_empty() && !text.contains(NOT_EXACT);
+    if tool == "Bash" {
+        let command = input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .filter(|c| exact(c))?;
+        return Some(format!("Bash({command})"));
     }
-    match call_path(input) {
-        Some(path) if path.starts_with('/') && !path.starts_with("//") => {
-            format!("{tool}(/{path})")
-        }
-        Some(path) => format!("{tool}({path})"),
-        None => tool.to_string(),
+    if !PATH_TOOLS.contains(&tool) {
+        return None;
     }
+    let path = call_path(input).filter(|p| exact(p))?;
+    if path.starts_with(['~', '!', '#']) || path.split('/').any(|part| part == "..") {
+        return None;
+    }
+    Some(if path.starts_with("//") {
+        format!("{tool}({path})")
+    } else if path.starts_with('/') {
+        format!("{tool}(/{path})")
+    } else if path.starts_with("./") {
+        format!("{tool}({path})")
+    } else {
+        format!("{tool}(./{path})")
+    })
+}
+
+/// The `--settings` value that allows `rules` for one run.
+fn allow_settings(rules: &[String]) -> String {
+    serde_json::json!({ "permissions": { "allow": rules } }).to_string()
 }
 
 /// The prompt of the run that retries a call the safety check stopped.
@@ -246,7 +279,8 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 /// in one `--append-system-prompt`.
 ///
 /// `extra_allowed` are allow rules for this run only, such as the one
-/// call you let a retry make.
+/// call you let a retry make. They go in `--settings` as JSON, so a rule
+/// is never split on a comma the way `--allowedTools` splits its list.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
@@ -322,14 +356,19 @@ pub fn build_claude(
         }
         allowed = merged;
     }
-    for rule in extra_allowed {
-        if !allowed.contains(rule) {
-            allowed.push(rule.clone());
-        }
-    }
     if !allowed.is_empty() {
         args.push("--allowedTools".into());
         args.push(allowed.join(","));
+    }
+    let mut extra: Vec<String> = Vec::new();
+    for rule in extra_allowed {
+        if !allowed.contains(rule) && !extra.contains(rule) {
+            extra.push(rule.clone());
+        }
+    }
+    if !extra.is_empty() {
+        args.push("--settings".into());
+        args.push(allow_settings(&extra));
     }
     if let Some(mcp) = &mcp {
         args.push("--mcp-config".into());
@@ -729,7 +768,9 @@ mod tests {
                 "--resume",
                 "abc",
                 "--allowedTools",
-                "Read,Bash(npm test),Edit(./**),Write(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew_run__handoff,Bash(rm -rf build)",
+                "Read,Bash(npm test),Edit(./**),Write(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew_run__handoff",
+                "--settings",
+                r#"{"permissions":{"allow":["Bash(rm -rf build)"]}}"#,
                 "--mcp-config",
                 &config,
                 "--permission-prompt-tool",
@@ -770,8 +811,8 @@ mod tests {
                 "none",
                 "--resume",
                 "abc",
-                "--allowedTools",
-                "Bash(ls)",
+                "--settings",
+                r#"{"permissions":{"allow":["Bash(ls)"]}}"#,
                 "--",
                 "go",
             ])
@@ -794,22 +835,52 @@ mod tests {
     #[test]
     fn a_retry_allows_exactly_the_stopped_call() {
         use serde_json::json;
+        let bash = |command: &str| retry_rule("Bash", &json!({ "command": command }));
+        assert_eq!(bash("rm -rf build").as_deref(), Some("Bash(rm -rf build)"));
         assert_eq!(
-            retry_rule("Bash", &json!({"command": "rm -rf build"})),
-            "Bash(rm -rf build)"
+            retry_rule("Write", &json!({"file_path": "/work/demo/a.txt"})).as_deref(),
+            Some("Write(//work/demo/a.txt)")
         );
         assert_eq!(
-            retry_rule("Write", &json!({"file_path": "/work/demo/a.txt"})),
-            "Write(//work/demo/a.txt)"
+            retry_rule("Edit", &json!({"file_path": "src/a.rs"})).as_deref(),
+            Some("Edit(./src/a.rs)")
         );
         assert_eq!(
-            retry_rule("Edit", &json!({"file_path": "src/a.rs"})),
-            "Edit(src/a.rs)"
+            retry_rule("Read", &json!({"file_path": "a.rs"})).as_deref(),
+            Some("Read(./a.rs)"),
+            "never any a.rs in another folder"
         );
+        // Anything that could match more, or split, is refused.
+        for command in [
+            "rm -rf *",
+            "git log --format=%h,%s",
+            "echo (x)",
+            "echo a)",
+            "rm a\nrm b",
+            "ls ?",
+            "ls [ab]",
+            "echo {a,b}",
+            "echo a\\b",
+            "   ",
+        ] {
+            assert_eq!(bash(command), None, "{command:?}");
+        }
+        assert_eq!(retry_rule("Bash", &json!({})), None, "no command");
         assert_eq!(
-            retry_rule("WebFetch", &json!({"url": "https://x"})),
-            "WebFetch"
+            retry_rule("mcp__github__create_issue", &json!({"title": "x"})),
+            None
         );
+        assert_eq!(retry_rule("WebFetch", &json!({"url": "https://x"})), None);
+        assert_eq!(retry_rule("WebSearch", &json!({"query": "x"})), None);
+        assert_eq!(retry_rule("Glob", &json!({"path": "src"})), None);
+        assert_eq!(retry_rule("Write", &json!({})), None, "no path");
+        for path in ["src/**/a.rs", "../a.rs", "~/a.rs", "a\nb"] {
+            assert_eq!(
+                retry_rule("Write", &json!({ "file_path": path })),
+                None,
+                "{path:?}"
+            );
+        }
         assert_eq!(
             retry_prompt("Bash", &json!({"command": "rm -rf build"})),
             "The safety check stopped `rm -rf build`. The user allowed it once. Run it now if you still need it, then carry on."

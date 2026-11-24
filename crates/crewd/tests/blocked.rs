@@ -17,11 +17,15 @@ use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// The settings of a run that may make the stopped call once.
+const ALLOW_RM: &str = r#"{"permissions":{"allow":["Bash(rm -rf build)"]}}"#;
+
 const RETRY: &str = "The safety check stopped `rm -rf build`. The user allowed it once. Run it now if you still need it, then carry on.";
 
 /// A fake claude. It logs its arguments to `args.log` (each argument ends
 /// with byte 0x1e, each call with 0x1f). A prompt with `BLOCK` in it first
-/// tries `rm -rf build`, which the safety check refuses. One that ends
+/// tries `rm -rf build`, which the safety check refuses; with `COMMA` in
+/// it too, `git log --format=%h,%s` instead. One that ends
 /// with `WAIT` then waits until the file `go` exists.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude-fake.sh");
@@ -32,10 +36,14 @@ for a in "$@"; do printf '%s\036' "$a" >> '{dir}/args.log'; done
 printf '\037' >> '{dir}/args.log'
 printf '{{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"m","tools":[]}}\n'
 denials=''
+cmd='rm -rf build'
+case "$last" in
+  *COMMA*) cmd='git log --format=%h,%s' ;;
+esac
 case "$last" in
   *BLOCK*)
-    denials='{{"tool_name":"Bash","tool_input":{{"command":"rm -rf build"}},"tool_use_id":"toolu_01"}}'
-    printf '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_01","name":"Bash","input":{{"command":"rm -rf build"}}}}]}}}}\n'
+    denials='{{"tool_name":"Bash","tool_input":{{"command":"'"$cmd"'"}},"tool_use_id":"toolu_01"}}'
+    printf '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_01","name":"Bash","input":{{"command":"%s"}}}}]}}}}\n' "$cmd"
     printf '{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_01","is_error":true,"content":"Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions] Find another way."}}]}}}}\n'
     ;;
 esac
@@ -340,7 +348,7 @@ async fn a_blocked_call_asks_you_and_allow_retries_it_once() {
     let calls = until_logged(d.dir(), 2).await;
     let retry = &calls[1];
     assert_eq!(flag(retry, "--resume"), Some(session.as_str()));
-    assert_eq!(flag(retry, "--allowedTools"), Some("Bash(rm -rf build)"));
+    assert_eq!(flag(retry, "--settings"), Some(ALLOW_RM));
     assert!(retry.last().unwrap().ends_with(RETRY), "{retry:?}");
     let runs = c.runs(thread).await;
     assert_eq!(runs.len(), 2);
@@ -362,7 +370,7 @@ async fn a_blocked_call_asks_you_and_allow_retries_it_once() {
     .await
     .unwrap();
     let calls = until_logged(d.dir(), 3).await;
-    assert_eq!(flag(&calls[2], "--allowedTools"), None);
+    assert_eq!(flag(&calls[2], "--settings"), None);
 }
 
 #[tokio::test]
@@ -417,10 +425,7 @@ async fn allow_during_the_run_retries_once_it_ends() {
 
     std::fs::write(d.dir().join("go"), "").unwrap();
     let calls = until_logged(d.dir(), 2).await;
-    assert_eq!(
-        flag(&calls[1], "--allowedTools"),
-        Some("Bash(rm -rf build)")
-    );
+    assert_eq!(flag(&calls[1], "--settings"), Some(ALLOW_RM));
     c.until_done(retry.id).await;
 }
 
@@ -448,4 +453,40 @@ async fn only_auto_agents_get_blocked_cards() {
         })
         .await;
     assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn a_call_no_rule_matches_exactly_is_never_retried() {
+    let d = Daemon::start().await;
+    let mut c = d.client().await;
+    let thread = setup(&d, &mut c).await;
+
+    let (approval, run) = blocked(&mut c, thread, "@Forge log COMMA BLOCK").await;
+    assert_eq!(
+        approval.kind,
+        ApprovalKind::Blocked {
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "git log --format=%h,%s"}),
+            reason: "Destructive or unwanted actions".into(),
+        }
+    );
+    c.until_done(run).await;
+    assert_eq!(
+        c.call(Request::Decide {
+            approval: approval.id,
+            approve: true,
+            brief: None
+        })
+        .await,
+        Err(crew_core::claude::NO_EXACT_RULE.into())
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(c.runs(thread).await.len(), 1, "nothing was queued");
+    let pending: Vec<StoredApproval> = c
+        .ok(Request::ListApprovals {
+            thread: Some(thread),
+        })
+        .await;
+    assert_eq!(pending.len(), 1, "still yours to dismiss");
+    decide(&mut c, approval.id, false).await;
 }

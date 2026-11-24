@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use crew_core::agent::Runtime;
+use crew_core::claude::retry_rule;
 use crew_core::event::{RunStatus, tool_label};
 use crew_core::ids::{ApprovalId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalKind, StoredApproval, StoredRun};
@@ -108,6 +109,9 @@ enum RowKind {
         paused: bool,
         /// A call the safety check stopped, to retry or dismiss.
         blocked: bool,
+        /// Whether a stopped call can be retried exactly. Else it can only
+        /// be dismissed.
+        retryable: bool,
     },
     Working(RunId),
     Queued(RunId),
@@ -505,6 +509,10 @@ impl Workspace {
     fn ask_row(&self, approval: &StoredApproval) -> Row {
         let run = self.state().run(approval.run);
         let blocked = matches!(approval.kind, ApprovalKind::Blocked { .. });
+        let retryable = match &approval.kind {
+            ApprovalKind::Blocked { tool, input, .. } => retry_rule(tool, input).is_some(),
+            _ => true,
+        };
         let (handoff, paused, now, mono) = match &approval.kind {
             ApprovalKind::Handoff { to, paused, .. } => {
                 let to = self
@@ -528,6 +536,7 @@ impl Workspace {
                 handoff,
                 paused,
                 blocked,
+                retryable,
             },
         );
         row.now = now;
@@ -943,6 +952,7 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
             handoff,
             paused,
             blocked,
+            retryable,
         } => {
             let mut buttons = Vec::new();
             if !paused {
@@ -953,17 +963,19 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
                 } else {
                     ("Allow once", "Deny")
                 };
-                buttons.push(
-                    Button::new(SharedString::from(format!("running-allow-{id}")))
-                        .outline()
-                        .small()
-                        .label(yes)
-                        .disabled(row.deciding)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.decide(id, true, None, window, cx);
-                        }))
-                        .into_any_element(),
-                );
+                if retryable {
+                    buttons.push(
+                        Button::new(SharedString::from(format!("running-allow-{id}")))
+                            .outline()
+                            .small()
+                            .label(yes)
+                            .disabled(row.deciding)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.decide(id, true, None, window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 buttons.push(
                     Button::new(SharedString::from(format!("running-deny-{id}")))
                         .ghost()
