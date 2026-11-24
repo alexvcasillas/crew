@@ -1100,7 +1100,7 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .max_w(px(720.))
+                            .when(!review.split, |card| card.max_w(px(720.)))
                             .px(px(12.))
                             .py(px(10.))
                             .bg(color("surface-raised"))
