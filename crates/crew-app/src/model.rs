@@ -1,9 +1,10 @@
 //! What the app knows about crewd, built only from what crewd sends. Pure:
 //! no IO and no UI types, so it is tested on its own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crew_core::agent::PermissionMode;
+use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
@@ -11,7 +12,7 @@ use crew_core::store::{
     ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
     StoredProject, StoredRun, StoredThread,
 };
-use crew_proto::ServerMsg;
+use crew_proto::{ServerMsg, TerminalSession};
 
 /// Whether the app can talk to crewd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +168,46 @@ struct EventLog {
     seen: HashSet<(RunId, u64)>,
 }
 
+/// Most items a watched terminal session keeps. Older ones are dropped.
+pub const TERMINAL_ITEMS_MAX: usize = 2000;
+
+/// The items of the watched terminal session, each seq once, in seq
+/// order.
+#[derive(Debug, Default)]
+struct TerminalLog {
+    items: BTreeMap<u64, TranscriptItem>,
+    /// Counts changes, so views redo their rows only when it moves.
+    version: u64,
+}
+
+impl TerminalLog {
+    fn add(&mut self, seq: u64, item: TranscriptItem) {
+        let full = self.items.len() >= TERMINAL_ITEMS_MAX;
+        // Older than all kept: it would be dropped at once.
+        if full
+            && self
+                .items
+                .first_key_value()
+                .is_some_and(|(&first, _)| seq < first)
+        {
+            return;
+        }
+        if self.items.contains_key(&seq) {
+            return;
+        }
+        self.items.insert(seq, item);
+        while self.items.len() > TERMINAL_ITEMS_MAX {
+            self.items.pop_first();
+        }
+        self.version += 1;
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.version += 1;
+    }
+}
+
 /// Everything the UI renders from.
 #[derive(Debug, Default)]
 pub struct State {
@@ -187,6 +228,10 @@ pub struct State {
     /// Handoff settings sent to crewd and not yet reported back.
     sent_channel_handoffs: HashMap<ChannelId, Handoff>,
     sent_thread_handoffs: HashMap<ThreadId, Handoff>,
+    /// Claude Code sessions run in a terminal, by id.
+    terminal: HashMap<String, TerminalSession>,
+    /// One log per watched terminal session.
+    terminal_logs: HashMap<String, TerminalLog>,
 }
 
 /// A handoff policy and budget, `None` for "fall back".
@@ -212,8 +257,34 @@ impl State {
                 agents,
                 runs,
                 approvals,
-                ..
-            } => self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals),
+                terminal_sessions,
+            } => {
+                self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
+                self.terminal = terminal_sessions
+                    .into_iter()
+                    .map(|s| (s.id.clone(), s))
+                    .collect();
+                // Watched sessions fill again from their backlog.
+                for log in self.terminal_logs.values_mut() {
+                    log.clear();
+                }
+            }
+            ServerMsg::TerminalSessionChanged { session } => {
+                self.terminal.insert(session.id.clone(), session);
+            }
+            ServerMsg::TerminalSessionRemoved { id } => {
+                self.terminal.remove(&id);
+            }
+            ServerMsg::TerminalSessionReset { session } => {
+                if let Some(log) = self.terminal_logs.get_mut(&session) {
+                    log.clear();
+                }
+            }
+            ServerMsg::TerminalEvent { session, seq, item } => {
+                if let Some(log) = self.terminal_logs.get_mut(&session) {
+                    log.add(seq, item);
+                }
+            }
             ServerMsg::ProjectChanged { project } => {
                 self.projects.insert(project.id, project);
             }
@@ -250,13 +321,7 @@ impl State {
                 }
             }
             // The workspace keeps the runtimes.
-            ServerMsg::Response { .. }
-            | ServerMsg::Resync
-            | ServerMsg::RuntimesChanged { .. }
-            | ServerMsg::TerminalSessionChanged { .. }
-            | ServerMsg::TerminalEvent { .. }
-            | ServerMsg::TerminalSessionRemoved { .. }
-            | ServerMsg::TerminalSessionReset { .. } => {}
+            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
         }
     }
 
@@ -339,6 +404,51 @@ impl State {
 
     pub fn is_watched(&self, thread: ThreadId) -> bool {
         self.logs.contains_key(&thread)
+    }
+
+    /// Keeps `session`'s items from now on. crewd's backlog for it fills
+    /// the log.
+    pub fn watch_terminal(&mut self, session: &str) {
+        self.terminal_logs.entry(session.to_string()).or_default();
+    }
+
+    /// Drops `session`'s items and stops keeping them.
+    pub fn unwatch_terminal(&mut self, session: &str) {
+        self.terminal_logs.remove(session);
+    }
+
+    pub fn is_terminal_watched(&self, session: &str) -> bool {
+        self.terminal_logs.contains_key(session)
+    }
+
+    pub fn terminal_session(&self, session: &str) -> Option<&TerminalSession> {
+        self.terminal.get(session)
+    }
+
+    /// The project's terminal sessions: live ones first, then the most
+    /// recently active.
+    pub fn terminal_sessions(&self, project: ProjectId) -> Vec<&TerminalSession> {
+        terminal_order(self.terminal.values().filter(|s| s.project == project))
+    }
+
+    /// Live terminal sessions in every project, most recently active
+    /// first.
+    pub fn live_terminal_sessions(&self) -> Vec<&TerminalSession> {
+        terminal_order(self.terminal.values().filter(|s| s.live))
+    }
+
+    /// The watched session's items with their seqs, oldest first. Empty
+    /// if it isn't watched.
+    pub fn terminal_items(&self, session: &str) -> impl Iterator<Item = (u64, &TranscriptItem)> {
+        self.terminal_logs
+            .get(session)
+            .into_iter()
+            .flat_map(|log| log.items.iter().map(|(seq, item)| (*seq, item)))
+    }
+
+    /// Moves whenever the watched session's items change.
+    pub fn terminal_version(&self, session: &str) -> u64 {
+        self.terminal_logs.get(session).map_or(0, |log| log.version)
     }
 
     /// Projects, oldest first.
@@ -703,6 +813,20 @@ fn stage(status: &RunStatus) -> u8 {
 
 fn is_live(status: &RunStatus) -> bool {
     matches!(status, RunStatus::Queued | RunStatus::Working)
+}
+
+/// Live sessions first, then the most recently active, then by id.
+fn terminal_order<'a>(
+    sessions: impl Iterator<Item = &'a TerminalSession>,
+) -> Vec<&'a TerminalSession> {
+    let mut sessions: Vec<&TerminalSession> = sessions.collect();
+    sessions.sort_by(|a, b| {
+        b.live
+            .cmp(&a.live)
+            .then(b.last_active_at.cmp(&a.last_active_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    sessions
 }
 
 /// `items` sorted by `key`, which must be unique so the order is stable.
@@ -1432,5 +1556,152 @@ mod tests {
         );
         assert_eq!(codex.lines, Some((1, 2)));
         assert_eq!(patch_lines("-a\n+b\n"), (1, 1), "no headers at all");
+    }
+
+    fn session(project: ProjectId, id: &str, last_active_at: i64, live: bool) -> TerminalSession {
+        TerminalSession {
+            id: id.into(),
+            project,
+            cwd: "/work/demo".into(),
+            title: format!("session {id}"),
+            started_at: 1,
+            last_active_at,
+            live,
+        }
+    }
+
+    fn said(session: &str, seq: u64, text: &str) -> ServerMsg {
+        ServerMsg::TerminalEvent {
+            session: session.into(),
+            seq,
+            item: TranscriptItem::Event(Event::Message { text: text.into() }),
+        }
+    }
+
+    fn terminal_texts(state: &State, session: &str) -> Vec<(u64, String)> {
+        state
+            .terminal_items(session)
+            .map(|(seq, item)| {
+                let text = match item {
+                    TranscriptItem::UserPrompt(text) => text.clone(),
+                    TranscriptItem::Event(Event::Message { text }) => text.clone(),
+                    other => format!("{other:?}"),
+                };
+                (seq, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn terminal_sessions_come_per_project_live_first_then_latest() {
+        let (mut state, p, _, _) = one_thread();
+        let other = ProjectId::new();
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![p.clone()],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![
+                session(p.id, "old", 10, false),
+                session(p.id, "new", 30, false),
+                session(other, "elsewhere", 50, true),
+            ],
+        });
+        state.apply(ServerMsg::TerminalSessionChanged {
+            session: session(p.id, "busy", 20, true),
+        });
+        let ids = |list: Vec<&TerminalSession>| -> Vec<String> {
+            list.into_iter().map(|s| s.id.clone()).collect()
+        };
+        assert_eq!(ids(state.terminal_sessions(p.id)), ["busy", "new", "old"]);
+        assert_eq!(ids(state.live_terminal_sessions()), ["elsewhere", "busy"]);
+
+        state.apply(ServerMsg::TerminalSessionChanged {
+            session: session(p.id, "busy", 40, false),
+        });
+        assert_eq!(ids(state.terminal_sessions(p.id)), ["busy", "new", "old"]);
+        assert_eq!(ids(state.live_terminal_sessions()), ["elsewhere"]);
+        assert!(!state.terminal_session("busy").unwrap().live);
+
+        state.apply(ServerMsg::TerminalSessionRemoved { id: "new".into() });
+        assert_eq!(ids(state.terminal_sessions(p.id)), ["busy", "old"]);
+        assert!(state.terminal_session("new").is_none());
+    }
+
+    #[test]
+    fn terminal_items_are_kept_once_in_order_for_the_watched_session_only() {
+        let (mut state, _, _, _) = one_thread();
+        state.apply(said("s1", 0, "dropped, not watched yet"));
+        state.watch_terminal("s1");
+        state.apply(said("s1", 2, "two"));
+        state.apply(said("s1", 1, "one"));
+        state.apply(said("s1", 2, "two again"));
+        state.apply(said("s2", 3, "another session"));
+        assert_eq!(
+            terminal_texts(&state, "s1"),
+            [(1, "one".to_string()), (2, "two".to_string())]
+        );
+        assert_eq!(terminal_texts(&state, "s2"), []);
+        let before = state.terminal_version("s1");
+        state.apply(said("s1", 2, "a copy"));
+        assert_eq!(
+            state.terminal_version("s1"),
+            before,
+            "a copy changes nothing"
+        );
+
+        state.unwatch_terminal("s1");
+        assert_eq!(terminal_texts(&state, "s1"), []);
+        state.apply(said("s1", 4, "four"));
+        assert_eq!(terminal_texts(&state, "s1"), []);
+    }
+
+    #[test]
+    fn terminal_items_are_capped_dropping_the_oldest() {
+        let (mut state, _, _, _) = one_thread();
+        state.watch_terminal("s1");
+        for seq in 0..(TERMINAL_ITEMS_MAX as u64 + 5) {
+            state.apply(said("s1", seq, "x"));
+        }
+        let items = terminal_texts(&state, "s1");
+        assert_eq!(items.len(), TERMINAL_ITEMS_MAX);
+        assert_eq!(items[0].0, 5);
+        // An old item crewd sends again doesn't come back.
+        state.apply(said("s1", 0, "x"));
+        assert_eq!(terminal_texts(&state, "s1")[0].0, 5);
+    }
+
+    #[test]
+    fn a_terminal_reset_or_snapshot_empties_the_log_for_its_backlog() {
+        let (mut state, p, _, _) = one_thread();
+        state.watch_terminal("s1");
+        state.apply(said("s1", 1, "one"));
+        state.apply(ServerMsg::TerminalSessionReset {
+            session: "s2".into(),
+        });
+        assert_eq!(terminal_texts(&state, "s1").len(), 1, "another session");
+        state.apply(ServerMsg::TerminalSessionReset {
+            session: "s1".into(),
+        });
+        assert_eq!(terminal_texts(&state, "s1"), []);
+        assert!(state.is_terminal_watched("s1"));
+        state.apply(said("s1", 7, "after"));
+        assert_eq!(terminal_texts(&state, "s1"), [(7, "after".to_string())]);
+
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![p],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+        });
+        assert_eq!(terminal_texts(&state, "s1"), []);
+        assert!(state.is_terminal_watched("s1"), "still watched");
+        state.apply(said("s1", 7, "after"));
+        assert_eq!(terminal_texts(&state, "s1").len(), 1);
     }
 }

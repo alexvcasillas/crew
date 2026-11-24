@@ -18,6 +18,7 @@ mod service_control;
 pub mod settings;
 mod sidebar;
 mod status_bar;
+mod terminal_view;
 mod thread_list;
 mod thread_settings;
 mod thread_view;
@@ -34,6 +35,8 @@ mod inspector_tests;
 mod running_tests;
 #[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod terminal_tests;
 #[cfg(test)]
 mod test_ui;
 #[cfg(test)]

@@ -166,7 +166,7 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
 }
 
 /// The verb for a tool call, ongoing or finished.
-fn verb(kind: &ToolKind, name: &str, ongoing: bool) -> String {
+pub(super) fn verb(kind: &ToolKind, name: &str, ongoing: bool) -> String {
     let (now, then) = match kind {
         ToolKind::Read => ("Reading", "Read"),
         ToolKind::Search => ("Searching", "Searched"),
@@ -189,7 +189,7 @@ pub(super) fn relative(path: &str, cwd: &str) -> String {
         .to_string()
 }
 
-fn shorten(text: &str) -> String {
+pub(super) fn shorten(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default();
     if line.chars().count() > TARGET_MAX || line.len() < text.len() {
         let cut: String = line.chars().take(TARGET_MAX).collect();
@@ -403,7 +403,7 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
         )
 }
 
-fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
+pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
     let (icon, token) = match step.state {
         StepState::Done => (IconName::Check, "success"),
         StepState::Running => (IconName::LoaderCircle, "accent-blue"),

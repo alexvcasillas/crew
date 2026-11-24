@@ -91,6 +91,29 @@ pub fn elapsed(ms: i64) -> String {
     }
 }
 
+/// How long ago `then` was at `now` (both Unix ms): `now`, `5m ago`,
+/// `3h ago` or `2d ago`.
+pub fn ago(then: i64, now: i64) -> String {
+    let mins = (now - then).max(0) / 60_000;
+    match mins {
+        0 => "now".into(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 24 * 60 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / (24 * 60)),
+    }
+}
+
+/// `text` cut to `max` characters by dropping its start, for paths whose
+/// end says the most: `…/crates/app`.
+pub fn cut_start(text: &str, max: usize) -> String {
+    let n = text.chars().count();
+    if n <= max {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(n + 1 - max).collect();
+    format!("…{tail}")
+}
+
 /// The local wall-clock time of `ms`, such as `10:05`.
 pub fn clock(ms: i64) -> String {
     use chrono::{Local, TimeZone as _};
@@ -160,7 +183,7 @@ pub fn dot(token: &str) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_short, elapsed, runtime_chip, short_model};
+    use super::{ago, codex_short, cut_start, elapsed, runtime_chip, short_model};
     use crate::ui::settings::agents::blank_spec;
     use crew_core::agent::{AgentSpec, Runtime};
 
@@ -190,6 +213,23 @@ mod tests {
             ..blank_spec()
         };
         assert_eq!(runtime_chip(&claude), "claude · opus");
+    }
+
+    #[test]
+    fn ago_reads_in_the_largest_unit() {
+        let min = 60_000;
+        assert_eq!(ago(1000, 30_000), "now");
+        assert_eq!(ago(0, 5 * min), "5m ago");
+        assert_eq!(ago(0, 3 * 60 * min + 5), "3h ago");
+        assert_eq!(ago(0, 49 * 60 * min), "2d ago");
+        assert_eq!(ago(10, 0), "now", "a clock ahead");
+    }
+
+    #[test]
+    fn cut_start_keeps_the_end() {
+        assert_eq!(cut_start("/work/demo", 20), "/work/demo");
+        assert_eq!(cut_start("/work/demo/crates/app", 10), "…rates/app");
+        assert_eq!(cut_start("/work/demo/crates/app", 10).chars().count(), 10);
     }
 
     #[test]

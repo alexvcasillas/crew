@@ -18,6 +18,8 @@ pub enum DocKey {
     Message(MessageId),
     /// A run's event, by its number in the run.
     Event(RunId, u64),
+    /// An item of the open terminal session, by its seq.
+    Terminal(u64),
 }
 
 /// Parsed messages, kept since messages never change.
