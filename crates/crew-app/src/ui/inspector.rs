@@ -17,7 +17,7 @@ use gpui_kit::*;
 use super::activity::{ActivityRow, activity_rows_asked};
 use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
 use super::run_card::{FileChange, decided_asks, summarize};
-use super::terminal_tab::Command;
+use super::terminal_tab::CommandLog;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
@@ -65,12 +65,14 @@ pub(super) struct Inspector {
     diff_for: Option<(ThreadId, Option<PathBuf>, usize)>,
     pub(super) diff_task: Option<Task<()>>,
     /// The shown run's commands, for the Terminal tab.
-    pub(super) term: Vec<Command>,
+    pub(super) term: CommandLog,
     pub(super) term_list: ListState,
-    /// The run and event count `term` was made from.
-    pub(super) term_from: Option<(RunId, usize)>,
-    /// The directory the shown run started in.
-    pub(super) term_cwd: Option<String>,
+    /// The run `term` was made from.
+    pub(super) term_run: Option<RunId>,
+    /// How many of the thread's events `term` has taken in.
+    pub(super) term_done: usize,
+    /// Whether that run is still live.
+    pub(super) term_live: bool,
     /// Commands, by run and call id, whose whole output is shown.
     pub(super) term_expanded: HashSet<(RunId, String)>,
     /// A command to scroll to once the rows have it.
@@ -93,10 +95,11 @@ impl Default for Inspector {
             diff: None,
             diff_for: None,
             diff_task: None,
-            term: Vec::new(),
+            term: CommandLog::default(),
             term_list: activity_list(),
-            term_from: None,
-            term_cwd: None,
+            term_run: None,
+            term_done: 0,
+            term_live: false,
             term_expanded: HashSet::new(),
             term_reveal: None,
         }
@@ -290,7 +293,7 @@ impl Workspace {
             }
         }
 
-        self.sync_commands(thread, shown, shown.map_or(0, count_of));
+        self.sync_commands(thread, shown);
 
         let mut changed = false;
         for (run, n) in &counts {

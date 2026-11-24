@@ -10,6 +10,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::spinner;
+use super::inspector::InspectorTab;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
@@ -37,52 +38,77 @@ pub struct Command {
     pub output: String,
 }
 
-/// The commands `run` ran, in order, each with its result once it came.
-pub fn commands(events: &[LoggedEvent], run: RunId) -> Vec<Command> {
-    let mut found: Vec<Command> = Vec::new();
-    let mut at: HashMap<&str, usize> = HashMap::new();
-    for logged in events.iter().filter(|e| e.run == run) {
-        match &logged.event {
+/// The commands of one run and where they are, built event by event.
+#[derive(Debug, Default)]
+pub struct CommandLog {
+    pub rows: Vec<Command>,
+    /// Call id to its row.
+    index: HashMap<String, usize>,
+    /// The directory the run started in.
+    pub cwd: Option<String>,
+}
+
+/// What an event did to a [`CommandLog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Touched {
+    Nothing,
+    Added,
+    /// The row at this index got its result.
+    Patched(usize),
+}
+
+impl CommandLog {
+    /// Takes in one event of the run.
+    pub fn push(&mut self, event: &Event) -> Touched {
+        match event {
+            Event::SessionStarted { cwd, .. } => {
+                self.cwd.get_or_insert_with(|| cwd.clone());
+                Touched::Nothing
+            }
             Event::ToolCall {
                 id,
                 kind: ToolKind::Run,
                 target: Some(command),
                 ..
             } => {
-                at.insert(id, found.len());
-                found.push(Command {
+                self.index.insert(id.clone(), self.rows.len());
+                self.rows.push(Command {
                     id: id.clone(),
                     command: command.clone(),
                     state: CommandState::Running,
                     output: String::new(),
                 });
+                Touched::Added
             }
             Event::ToolResult {
                 id,
                 is_error,
                 output,
-            } => {
-                if let Some(&ix) = at.get(id.as_str()) {
-                    found[ix].state = if *is_error {
+            } => match self.index.get(id) {
+                Some(&ix) => {
+                    let row = &mut self.rows[ix];
+                    row.state = if *is_error {
                         CommandState::Failed
                     } else {
                         CommandState::Passed
                     };
-                    found[ix].output = output.clone();
+                    row.output = output.clone();
+                    Touched::Patched(ix)
                 }
-            }
-            _ => {}
+                None => Touched::Nothing,
+            },
+            _ => Touched::Nothing,
         }
     }
-    found
 }
 
-/// The directory `run` started in.
-pub fn cwd(events: &[LoggedEvent], run: RunId) -> Option<String> {
-    events.iter().find_map(|e| match &e.event {
-        Event::SessionStarted { cwd, .. } if e.run == run => Some(cwd.clone()),
-        _ => None,
-    })
+/// The commands `run` ran, in order, each with its result once it came.
+pub fn commands(events: &[LoggedEvent], run: RunId) -> CommandLog {
+    let mut log = CommandLog::default();
+    for logged in events.iter().filter(|e| e.run == run) {
+        log.push(&logged.event);
+    }
+    log
 }
 
 /// The last `n` lines of `text` and how many came before them.
@@ -93,67 +119,79 @@ pub fn last_lines(text: &str, n: usize) -> (String, usize) {
 }
 
 impl Workspace {
-    /// Redoes the Terminal rows from `run`'s events, keeping the scroll.
-    pub(super) fn sync_commands(&mut self, thread: ThreadId, run: Option<RunId>, count: usize) {
+    /// Brings the Terminal rows in line with `run`'s events, taking in
+    /// only the events that came since. Does nothing while another tab
+    /// is shown: the rows catch up when you switch to this one.
+    pub(super) fn sync_commands(&mut self, thread: ThreadId, run: Option<RunId>) {
+        if self.inspector.tab != InspectorTab::Terminal {
+            return;
+        }
         let Some(run) = run else {
-            if self.inspector.term_from.is_some() {
-                self.inspector.term.clear();
-                self.inspector.term_cwd = None;
+            if self.inspector.term_run.take().is_some() {
+                self.inspector.term = CommandLog::default();
+                self.inspector.term_done = 0;
                 self.inspector.term_list.reset(0);
-                self.inspector.term_from = None;
             }
+            self.inspector.term_reveal = None;
             return;
         };
-        if self.inspector.term_from != Some((run, count)) {
-            let events = self.state().events(thread);
-            let rows = commands(events, run);
-            let cwd = cwd(events, run);
-            let same_run = self.inspector.term_from.map(|(r, _)| r) == Some(run);
-            let old = std::mem::replace(&mut self.inspector.term, rows);
-            let list = &self.inspector.term_list;
-            if same_run {
-                let from = old
-                    .iter()
-                    .zip(&self.inspector.term)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                list.splice(from..old.len(), self.inspector.term.len() - from);
-            } else {
-                list.reset(self.inspector.term.len());
-                // A run opens at its end, and follows it while it is live.
-                list.set_follow_mode(FollowMode::Tail);
+        let live = self.state().live_runs(thread).iter().any(|r| r.id == run);
+        let mut term = std::mem::take(&mut self.inspector.term);
+        let (mut done, was) = (self.inspector.term_done, self.inspector.term_run);
+        let list = self.inspector.term_list.clone();
+        let events = self.state().events(thread);
+        if was != Some(run) || events.len() < done {
+            term = commands(events, run);
+            list.reset(term.rows.len());
+            // A run opens at its end, and follows it while it is live.
+            list.set_follow_mode(FollowMode::Tail);
+        } else if events.len() > done {
+            let before = term.rows.len();
+            for logged in events[done..].iter().filter(|e| e.run == run) {
+                if let Touched::Patched(ix) = term.push(&logged.event)
+                    && ix < before
+                {
+                    list.remeasure_items(ix..ix + 1);
+                }
             }
-            self.inspector.term_cwd = cwd;
-            self.inspector.term_from = Some((run, count));
+            if term.rows.len() > before {
+                list.splice(before..before, term.rows.len() - before);
+            }
         }
+        done = events.len();
+        self.inspector.term = term;
+        self.inspector.term_done = done;
+        self.inspector.term_live = live;
+        self.inspector.term_run = Some(run);
+        self.inspector.term_expanded.retain(|(r, _)| *r == run);
         self.reveal_pending_command();
     }
 
-    /// Scrolls to the command asked for, once the rows have it.
+    /// Scrolls to the command asked for. A command the shown run does
+    /// not have is forgotten.
     fn reveal_pending_command(&mut self) {
-        let Some((run, id)) = self.inspector.term_reveal.as_ref() else {
+        let Some((run, id)) = self.inspector.term_reveal.take() else {
             return;
         };
-        if self.inspector.term_from.map(|(r, _)| r) != Some(*run) {
+        if self.inspector.term_run != Some(run) {
             return;
         }
-        if let Some(ix) = self.inspector.term.iter().position(|c| &c.id == id) {
+        if let Some(ix) = self.inspector.term.rows.iter().position(|c| c.id == id) {
             self.inspector.term_list.scroll_to(ListOffset {
                 item_ix: ix,
                 offset_in_item: px(0.),
             });
-            self.inspector.term_reveal = None;
         }
     }
 
     pub(super) fn render_commands(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let cwd = self.inspector.term_cwd.clone();
+        let cwd = self.inspector.term.cwd.clone();
         div()
             .flex()
             .flex_col()
             .size_full()
             .children(self.render_picker())
-            .child(if self.inspector.term.is_empty() {
+            .child(if self.inspector.term.rows.is_empty() {
                 div()
                     .id("terminal-empty")
                     .flex_1()
@@ -199,16 +237,13 @@ impl Workspace {
                     })
                     .child("Read only.")
                     .when_some(cwd, |footer, cwd| {
-                        footer
-                            .child("Commands ran in")
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(mono_font())
-                                    .child(cwd),
-                            )
-                            .child(".")
+                        footer.child("Commands ran in").child(
+                            div()
+                                .flex()
+                                .min_w_0()
+                                .child(div().truncate().font_family(mono_font()).child(cwd))
+                                .child("."),
+                        )
                     })
                     .test_support(),
             )
@@ -216,13 +251,10 @@ impl Workspace {
 
     /// Row `ix` of the Terminal list.
     fn render_command(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(cmd) = self.inspector.term.get(ix) else {
+        let Some(cmd) = self.inspector.term.rows.get(ix) else {
             return div().into_any_element();
         };
-        let key = self
-            .inspector
-            .term_from
-            .map(|(run, _)| (run, cmd.id.clone()));
+        let key = self.inspector.term_run.map(|run| (run, cmd.id.clone()));
         let expanded = key
             .as_ref()
             .is_some_and(|k| self.inspector.term_expanded.contains(k));
@@ -232,12 +264,19 @@ impl Workspace {
             last_lines(&cmd.output, TAIL_LINES)
         };
         let long = earlier > 0 || (expanded && cmd.output.lines().count() > TAIL_LINES);
+        // A command with no result in a run that is over never finished.
+        let unfinished = cmd.state == CommandState::Running && !self.inspector.term_live;
         let (word, token) = match cmd.state {
+            CommandState::Running if unfinished => ("Didn't finish", "text-tertiary"),
             CommandState::Running => ("Running", "accent-blue"),
             CommandState::Passed => ("Passed", "success"),
             CommandState::Failed => ("Failed", "danger"),
         };
         let icon = match cmd.state {
+            CommandState::Running if unfinished => Icon::new(IconName::Minus)
+                .size(px(12.))
+                .text_color(color("text-tertiary"))
+                .into_any_element(),
             CommandState::Running => {
                 spinner(("terminal-spinner", ix), 12., "accent-blue").into_any_element()
             }
@@ -340,7 +379,7 @@ mod tests {
     use crew_core::event::{Event, ToolKind};
     use crew_core::ids::RunId;
 
-    use super::{CommandState, commands, cwd, last_lines};
+    use super::{CommandLog, CommandState, Touched, commands, last_lines};
     use crate::model::LoggedEvent;
 
     fn at(run: RunId, seq: u64, event: Event) -> LoggedEvent {
@@ -386,7 +425,9 @@ mod tests {
             at(a, 6, result("t3", true, "")),
             at(a, 7, call("t4", "Bash", ToolKind::Run, "sleep 9")),
         ];
-        let got: Vec<_> = commands(&events, a)
+        let log = commands(&events, a);
+        let got: Vec<_> = log
+            .rows
             .into_iter()
             .map(|c| (c.command, c.state, c.output))
             .collect();
@@ -398,8 +439,24 @@ mod tests {
                 ("sleep 9".into(), CommandState::Running, String::new()),
             ]
         );
-        assert_eq!(cwd(&events, a).as_deref(), Some("/work/demo"));
-        assert_eq!(cwd(&events, b), None);
+        assert_eq!(commands(&events, a).cwd.as_deref(), Some("/work/demo"));
+        assert_eq!(commands(&events, b).cwd, None);
+    }
+
+    #[test]
+    fn a_log_grows_one_event_at_a_time() {
+        let mut log = CommandLog::default();
+        assert_eq!(
+            log.push(&call("t1", "Bash", ToolKind::Run, "ls")),
+            Touched::Added
+        );
+        assert_eq!(
+            log.push(&call("t2", "Read", ToolKind::Read, "a")),
+            Touched::Nothing
+        );
+        assert_eq!(log.push(&result("t1", false, "out")), Touched::Patched(0));
+        assert_eq!(log.push(&result("zz", false, "")), Touched::Nothing);
+        assert_eq!(log.rows[0].output, "out");
     }
 
     #[test]

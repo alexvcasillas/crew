@@ -156,7 +156,7 @@ fn two_thousand_commands_draw_only_what_is_in_view(cx: &mut TestAppContext) {
     });
     click(cx, window, "inspector-tab-terminal");
     wait_until(cx, "the rows", |cx| {
-        ws.read_with(cx, |ws, _| ws.inspector.term.len() == 2000)
+        ws.read_with(cx, |ws, _| ws.inspector.term.rows.len() == 2000)
     });
 
     let started = Instant::now();
@@ -168,5 +168,99 @@ fn two_thousand_commands_draw_only_what_is_in_view(cx: &mut TestAppContext) {
     assert!(
         !has(cx, window, ("terminal-row", 100usize)),
         "rows out of view aren't drawn"
+    );
+}
+
+fn line(id: &str, command: &str) -> String {
+    let call = serde_json::json!({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+        ]},
+        "session_id": "s"
+    });
+    format!("printf '%s\\n' '{call}'\n")
+}
+
+fn done_line(id: &str) -> String {
+    let result = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "fine"}
+        ]},
+        "session_id": "s"
+    });
+    format!("printf '%s\\n' '{result}'\n")
+}
+
+const INIT: &str = r#"printf '%s\n' '{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"m","tools":["Bash"]}'
+"#;
+const END: &str = r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1,"num_turns":1,"permission_denials":[],"session_id":"s"}'
+"#;
+
+#[gpui_kit::test]
+fn a_command_of_a_finished_run_without_a_result_did_not_finish(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!("{INIT}{}{END}", line("t1", "sleep 99"));
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), fake_claude(tmp.path(), &script));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    w.post("@Forge go");
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    wait_until(cx, "the run to end", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().live_runs(w.thread).is_empty() && ws.state().events(w.thread).len() >= 3
+        })
+    });
+    click(cx, window, "inspector-tab-terminal");
+    wait_until(cx, "the command", |cx| {
+        has(cx, window, ("terminal-state", 0usize))
+    });
+    assert_eq!(
+        label_of(cx, window, ("terminal-state", 0usize)).as_deref(),
+        Some("Didn't finish")
+    );
+}
+
+#[gpui_kit::test]
+fn the_tab_catches_up_and_follows_a_live_run(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let go = tmp.path().join("go");
+    let script = format!(
+        "{INIT}{}{}while [ ! -e '{}' ]; do sleep 0.02; done\n{}{}{END}",
+        line("t1", "first"),
+        done_line("t1"),
+        go.display(),
+        line("t2", "second"),
+        done_line("t2"),
+    );
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), fake_claude(tmp.path(), &script));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    w.post("@Forge go");
+    // Events arrive while another tab is shown.
+    wait_until(cx, "the first command's events", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().events(w.thread).len() >= 3)
+    });
+    assert!(ws.read_with(cx, |ws, _| ws.inspector.term.rows.is_empty()));
+
+    click(cx, window, "inspector-tab-terminal");
+    wait_until(cx, "the first command", |cx| {
+        has(cx, window, ("terminal-command", 0usize))
+    });
+    assert!(!has(cx, window, ("terminal-command", 1usize)));
+    assert_eq!(
+        label_of(cx, window, ("terminal-state", 0usize)).as_deref(),
+        Some("Passed")
+    );
+
+    std::fs::write(&go, "").unwrap();
+    wait_until(cx, "the second command", |cx| {
+        has(cx, window, ("terminal-command", 1usize))
+    });
+    assert_eq!(
+        label_of(cx, window, ("terminal-command", 1usize)).as_deref(),
+        Some("$ second")
     );
 }
