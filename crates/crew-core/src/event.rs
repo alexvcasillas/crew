@@ -53,9 +53,14 @@ pub enum Event {
         is_error: bool,
         output: String,
     },
+    /// A tool call that was refused. `reason` is set when Claude Code's
+    /// auto mode safety check stopped it: the category it gave, such as
+    /// `Destructive or unwanted actions`, or empty if it gave none.
     PermissionDenied {
         tool: String,
         input: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     TurnEnd {
         ok: bool,
@@ -69,6 +74,35 @@ pub enum Event {
     Raw {
         line: String,
     },
+}
+
+/// A safety check category as a short sentence: `[destructive_action]`
+/// or `DestructiveAction` reads `Destructive action`.
+pub fn humanize_reason(raw: &str) -> String {
+    let raw = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut spaced = String::new();
+    let mut prev_lower = false;
+    for c in raw.chars() {
+        if c == '_' || c == '-' {
+            spaced.push(' ');
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower {
+            spaced.push(' ');
+        }
+        prev_lower = c.is_lowercase();
+        spaced.push(c);
+    }
+    let words = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first
+            .to_uppercase()
+            .chain(chars.flat_map(char::to_lowercase))
+            .collect(),
+        None => String::new(),
+    }
 }
 
 /// Lifecycle state of a run.
@@ -112,6 +146,12 @@ mod tests {
             Event::PermissionDenied {
                 tool: "Bash".into(),
                 input: serde_json::json!({"command": "ls"}),
+                reason: None,
+            },
+            Event::PermissionDenied {
+                tool: "Bash".into(),
+                input: serde_json::json!({"command": "rm -rf x"}),
+                reason: Some("Destructive or unwanted actions".into()),
             },
             Event::TurnEnd {
                 ok: true,
@@ -140,6 +180,33 @@ mod tests {
         let json = serde_json::to_string(&call).unwrap();
         assert!(json.contains(r#""type":"tool_call""#));
         assert!(json.contains(r#""kind":"edit""#));
+    }
+
+    #[test]
+    fn an_older_denial_has_no_reason() {
+        let old: Event = serde_json::from_str(
+            r#"{"type":"permission_denied","tool":"Bash","input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old,
+            Event::PermissionDenied {
+                tool: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reasons_read_as_a_sentence() {
+        assert_eq!(
+            humanize_reason("[Destructive or unwanted actions]"),
+            "Destructive or unwanted actions"
+        );
+        assert_eq!(humanize_reason("destructive_action"), "Destructive action");
+        assert_eq!(humanize_reason("DataExfiltration"), "Data exfiltration");
+        assert_eq!(humanize_reason("  "), "");
     }
 
     #[test]

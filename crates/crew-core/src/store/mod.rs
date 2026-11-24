@@ -17,8 +17,8 @@ use crate::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, Th
 use crate::policy::HandoffPolicy;
 
 pub use approval::{
-    ApprovalKind, ApprovalStatus, OUTSIDE_SANDBOX, StoredApproval, handoff_ask_text, paused_text,
-    permission_text, short_ask, short_input,
+    ApprovalKind, ApprovalStatus, OUTSIDE_SANDBOX, StoredApproval, blocked_text, handoff_ask_text,
+    paused_text, permission_text, short_ask, short_input,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");

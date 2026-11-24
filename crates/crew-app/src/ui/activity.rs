@@ -141,7 +141,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     }
                 }
             }
-            Event::PermissionDenied { tool, input } => rows.push(ActivityRow::Denied {
+            Event::PermissionDenied { tool, input, .. } => rows.push(ActivityRow::Denied {
                 tool: tool.clone(),
                 input: short_input(input),
             }),
@@ -753,6 +753,7 @@ mod tests {
                 Event::PermissionDenied {
                     tool: "Bash".into(),
                     input: serde_json::json!({"command": "rm -rf x"}),
+                    reason: None,
                 },
             ),
         ];

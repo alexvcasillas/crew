@@ -3,14 +3,15 @@
 //!
 //! Same lock order as the rest of the service: `state` before `db`.
 
-use crew_core::agent::AgentSpec;
+use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
+use crew_core::claude::{retry_prompt, retry_rule};
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, RunId, ThreadId};
 use crew_core::policy::{self, Decision, PolicyInputs};
 use crew_core::scheduler::Job;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, Store, StoreError, StoredApproval, StoredThread,
-    handoff_ask_text, paused_text, permission_text,
+    blocked_text, handoff_ask_text, paused_text, permission_text,
 };
 use crew_proto::{PermissionAnswer, ServerMsg};
 use tokio::sync::oneshot;
@@ -157,6 +158,73 @@ impl Service {
         if let Err(e) = result {
             crate::service::log(format!("couldn't cancel an abandoned ask: {e}"));
         }
+    }
+
+    /// Puts a call the auto mode safety check stopped to you, if the run's
+    /// agent is a Claude agent in `Auto` mode. Nothing waits on it: the run
+    /// already went on. A call you answered yourself is left out.
+    pub(crate) fn note_blocked(
+        &self,
+        run: RunId,
+        tool: &str,
+        input: serde_json::Value,
+        reason: String,
+    ) {
+        let mut db = self.db();
+        let result = (|| -> Result<(), StoreError> {
+            let stored = db.store.run(run)?;
+            let agents = db.store.agents_with_deleted()?;
+            let spec = spec_of(&agents, stored.agent)?;
+            if spec.permission_mode != PermissionMode::Auto || spec.runtime != Runtime::ClaudeCode {
+                return Ok(());
+            }
+            let answered = db.store.approvals(stored.thread)?.iter().any(|a| {
+                a.run == run
+                    && matches!(&a.kind, ApprovalKind::Permission { tool: t, input: i, .. }
+                        if t == tool && *i == input)
+            });
+            if answered {
+                return Ok(());
+            }
+            let body = blocked_text(&spec.name, tool, &input);
+            let kind = ApprovalKind::Blocked {
+                tool: tool.to_string(),
+                input,
+                reason,
+            };
+            let id = db.store.create_approval(stored.thread, run, &kind)?;
+            self.publish_approval(&mut db, id)?;
+            self.add_approval_message(&mut db, stored.thread, &body, run, id)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            crate::service::log(format!("couldn't note a blocked call of run {run}: {e}"));
+        }
+    }
+
+    /// Queues a run of the agent of `approval`'s run that may make the
+    /// stopped call once. It waits behind whatever runs in the thread, the
+    /// stopped run included. Returns the queued run.
+    fn queue_retry(
+        &self,
+        state: &mut State,
+        db: &mut Db,
+        approval: &StoredApproval,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Result<RunId, StoreError> {
+        let agent = db.store.run(approval.run)?.agent;
+        let thread = approval.thread;
+        let run = db.store.create_run(thread, agent)?;
+        self.publish_status(db, thread, run, RunStatus::Queued);
+        state.scheduler.enqueue(Job {
+            run,
+            thread,
+            agent,
+            prompt: retry_prompt(tool, input),
+        });
+        state.retry_rules.insert(run, vec![retry_rule(tool, input)]);
+        Ok(run)
     }
 
     /// The handoff tool: the agent of live run `run` brings in `agent`.
@@ -319,14 +387,24 @@ impl Service {
             if current.status != ApprovalStatus::Pending {
                 return Err("That request was already answered.".into());
             }
-            if let ApprovalKind::Handoff { to, .. } = &current.kind
-                && approve
-            {
-                let to = db.store.agent(*to).map_err(store_err)?;
-                if to.deleted_at.is_some() {
+            let gone = match &current.kind {
+                ApprovalKind::Handoff { to, .. } if approve => Some(*to),
+                ApprovalKind::Blocked { .. } if approve => {
+                    Some(db.store.run(current.run).map_err(store_err)?.agent)
+                }
+                _ => None,
+            };
+            if let Some(agent) = gone {
+                let agent = db.store.agent(agent).map_err(store_err)?;
+                if agent.deleted_at.is_some() {
                     return Err(format!(
-                        "{} was deleted. Decline this instead.",
-                        to.spec.name
+                        "{} was deleted. {} this instead.",
+                        agent.spec.name,
+                        if matches!(current.kind, ApprovalKind::Blocked { .. }) {
+                            "Dismiss"
+                        } else {
+                            "Decline"
+                        }
                     ));
                 }
             }
@@ -337,6 +415,10 @@ impl Service {
                     from, to, paused, ..
                 } if approve => Some(
                     self.approve_handoff(&mut db, &current, *from, *to, *paused)
+                        .map_err(store_err)?,
+                ),
+                ApprovalKind::Blocked { tool, input, .. } if approve => Some(
+                    self.queue_retry(&mut state, &mut db, &current, tool, input)
                         .map_err(store_err)?,
                 ),
                 _ => None,
@@ -359,6 +441,7 @@ impl Service {
                 },
             );
             match decided.kind {
+                ApprovalKind::Blocked { .. } => {}
                 ApprovalKind::Permission { .. } => {
                     if let Some(tx) = state.waiting.remove(&id) {
                         let message = (!approve).then(|| DECLINED.to_string());

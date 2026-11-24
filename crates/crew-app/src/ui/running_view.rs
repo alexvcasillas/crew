@@ -509,7 +509,8 @@ impl Workspace {
                     .map_or_else(|| "an agent".to_string(), |a| a.spec.name.clone());
                 (true, *paused, format!("Wants to bring in {to}"), false)
             }
-            ApprovalKind::Permission { tool, input, .. } => {
+            ApprovalKind::Permission { tool, input, .. }
+            | ApprovalKind::Blocked { tool, input, .. } => {
                 let text = input_text(input);
                 let first = text.lines().next().unwrap_or_default();
                 (false, false, format!("{tool}: {first}"), true)

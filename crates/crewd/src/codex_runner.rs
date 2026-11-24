@@ -147,7 +147,17 @@ impl CodexInvocation {
     fn sandbox(&self) -> SandboxMode {
         match self.permission_mode {
             PermissionMode::ReadOnly => SandboxMode::ReadOnly,
-            PermissionMode::EditFiles => SandboxMode::WorkspaceWrite,
+            PermissionMode::EditFiles | PermissionMode::Auto => SandboxMode::WorkspaceWrite,
+        }
+    }
+
+    /// When Codex asks. `EditFiles` asks before every command that isn't a
+    /// known safe read; `Auto` and `ReadOnly` only when the sandbox is in
+    /// the way.
+    fn approval_policy(&self) -> ApprovalPolicy {
+        match self.permission_mode {
+            PermissionMode::EditFiles => ApprovalPolicy::Untrusted,
+            PermissionMode::ReadOnly | PermissionMode::Auto => ApprovalPolicy::OnRequest,
         }
     }
 
@@ -156,7 +166,7 @@ impl CodexInvocation {
     pub fn sandbox_policy(&self) -> Value {
         match self.permission_mode {
             PermissionMode::ReadOnly => json!({"type": "readOnly", "networkAccess": false}),
-            PermissionMode::EditFiles => json!({
+            PermissionMode::EditFiles | PermissionMode::Auto => json!({
                 "type": "workspaceWrite",
                 "writableRoots": [self.cwd_text()],
                 "networkAccess": false,
@@ -170,7 +180,8 @@ impl CodexInvocation {
 
     /// The same writable root as config, for the thread itself.
     fn config(&self) -> Option<Value> {
-        (self.permission_mode == PermissionMode::EditFiles)
+        self.permission_mode
+            .edits()
             .then(|| json!({"sandbox_workspace_write": {"writable_roots": [self.cwd_text()]}}))
     }
 
@@ -186,7 +197,7 @@ impl CodexInvocation {
         ThreadStartParams {
             cwd: Some(self.cwd_text()),
             model: self.model(),
-            approval_policy: Some(ApprovalPolicy::OnRequest),
+            approval_policy: Some(self.approval_policy()),
             sandbox: Some(self.sandbox()),
             developer_instructions: self.instructions(),
             config: self.config(),
@@ -200,7 +211,7 @@ impl CodexInvocation {
             thread_id: thread.to_string(),
             cwd: Some(self.cwd_text()),
             model: self.model(),
-            approval_policy: Some(ApprovalPolicy::OnRequest),
+            approval_policy: Some(self.approval_policy()),
             sandbox: Some(self.sandbox()),
             developer_instructions: self.instructions(),
             config: self.config(),
@@ -743,7 +754,7 @@ mod tests {
         );
         let edit = serde_json::to_value(inv(PermissionMode::EditFiles).start_params()).unwrap();
         assert_eq!(edit["sandbox"], "workspace-write");
-        assert_eq!(edit["approvalPolicy"], "on-request");
+        assert_eq!(edit["approvalPolicy"], "untrusted");
         assert_eq!(
             edit["config"],
             json!({"sandbox_workspace_write": {"writable_roots": ["/work/demo"]}})
@@ -758,8 +769,29 @@ mod tests {
             serde_json::to_value(inv(PermissionMode::EditFiles).resume_params("thr")).unwrap();
         assert_eq!(resume["threadId"], "thr");
         assert_eq!(resume["sandbox"], "workspace-write");
+        assert_eq!(resume["approvalPolicy"], "untrusted");
         assert_eq!(resume["excludeTurns"], true);
         assert_eq!(resume["developerInstructions"], "Be brief.");
+    }
+
+    #[test]
+    fn auto_writes_in_the_folder_and_asks_only_on_request() {
+        let auto = inv(PermissionMode::Auto);
+        let start = serde_json::to_value(auto.start_params()).unwrap();
+        assert_eq!(start["sandbox"], "workspace-write");
+        assert_eq!(start["approvalPolicy"], "on-request");
+        assert_eq!(
+            start["config"],
+            json!({"sandbox_workspace_write": {"writable_roots": ["/work/demo"]}})
+        );
+        let resume = serde_json::to_value(auto.resume_params("thr")).unwrap();
+        assert_eq!(resume["sandbox"], "workspace-write");
+        assert_eq!(resume["approvalPolicy"], "on-request");
+        let turn = serde_json::to_value(auto.turn_params("thr", "go")).unwrap();
+        assert_eq!(turn["sandboxPolicy"]["type"], "workspaceWrite");
+        let read =
+            serde_json::to_value(inv(PermissionMode::ReadOnly).resume_params("thr")).unwrap();
+        assert_eq!(read["approvalPolicy"], "on-request");
     }
 
     #[test]

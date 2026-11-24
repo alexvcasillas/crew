@@ -126,6 +126,7 @@ fn error_result() {
             Event::PermissionDenied {
                 tool: "Bash".into(),
                 input: json!({"command": "rm -rf /work/demo/tmp"}),
+                reason: None,
             },
             Event::TurnEnd {
                 ok: false,
@@ -219,25 +220,39 @@ fn denied(tool: &str, input: serde_json::Value) -> Event {
     Event::PermissionDenied {
         tool: tool.into(),
         input,
+        reason: None,
     }
+}
+
+fn blocked(tool: &str, input: serde_json::Value, reason: &str) -> Event {
+    Event::PermissionDenied {
+        tool: tool.into(),
+        input,
+        reason: Some(reason.into()),
+    }
+}
+
+fn stream(name: &str) -> Vec<Event> {
+    let mut parser = StreamParser::new();
+    fixture_lines(name)
+        .iter()
+        .flat_map(|line| parser.parse(line))
+        .collect()
 }
 
 #[test]
 fn stream_parser_drops_noise_and_reports_each_denial_once() {
-    let mut parser = StreamParser::new();
-    let events: Vec<Event> = fixture_lines("denied_stream.jsonl")
-        .iter()
-        .flat_map(|line| parser.parse(line))
-        .collect();
+    // A denial with a tool use id waits for its tool result, which never
+    // comes here, so it is reported with the result.
     assert_eq!(
-        events,
+        stream("denied_stream.jsonl"),
         vec![
             started(),
-            denied("Bash", json!({"command": "rm -rf /work/demo/tmp"})),
             denied("Write", json!({"file_path": "/work/demo/a.txt"})),
             Event::Raw {
                 line: r#"{"type":"system","subtype":"permission_denied","session_id":"00000000-0000-4000-8000-000000000001"}"#.into()
             },
+            denied("Bash", json!({"command": "rm -rf /work/demo/tmp"})),
             denied("Bash", json!({"command": "ls"})),
             Event::TurnEnd {
                 ok: true,
@@ -268,4 +283,98 @@ fn stream_parser_keeps_result_denials_when_none_were_streamed() {
         .flat_map(|line| parser.parse(line))
         .collect();
     assert_eq!(events, parse_fixture("error_result.jsonl"));
+}
+
+#[test]
+fn a_safety_check_refusal_in_a_tool_result_is_a_denial_with_its_reason() {
+    let input = json!({"command": "rm -rf /work/demo/build"});
+    let events = stream("auto_blocked_result.jsonl");
+    assert_eq!(
+        events,
+        vec![
+            started(),
+            Event::ToolCall {
+                id: "toolu_01".into(),
+                name: "Bash".into(),
+                kind: ToolKind::Run,
+                target: Some("rm -rf /work/demo/build".into()),
+                input: input.clone(),
+            },
+            blocked("Bash", input, "Destructive or unwanted actions"),
+            Event::ToolResult {
+                id: "toolu_01".into(),
+                is_error: true,
+                output: "Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions] Removing a folder outright. Find another way, or stop and explain.".into(),
+            },
+            Event::Message {
+                text: "I couldn't remove it.".into()
+            },
+            Event::TurnEnd {
+                ok: true,
+                summary: "I couldn't remove it.".into(),
+                duration_ms: 900,
+                num_turns: 2
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_permission_denied_line_and_its_refused_result_make_one_denial() {
+    let denials: Vec<Event> = stream("auto_blocked_system.jsonl")
+        .into_iter()
+        .filter(|e| matches!(e, Event::PermissionDenied { .. }))
+        .collect();
+    assert_eq!(
+        denials,
+        vec![
+            blocked(
+                "Bash",
+                json!({"command": "git push --force"}),
+                "Unauthorized remote changes"
+            ),
+            blocked(
+                "Write",
+                json!({"file_path": "/work/demo/.env"}),
+                "Credential access"
+            ),
+        ]
+    );
+    // Each denial comes just before its tool result.
+    let events = stream("auto_blocked_system.jsonl");
+    let at = |want: &dyn Fn(&Event) -> bool| events.iter().position(want).unwrap();
+    let denial = at(&|e| matches!(e, Event::PermissionDenied { tool, .. } if tool == "Bash"));
+    let result = at(&|e| matches!(e, Event::ToolResult { id, .. } if id == "toolu_01"));
+    assert_eq!(denial + 1, result);
+}
+
+#[test]
+fn parse_line_reads_the_reason_of_a_permission_denied_line() {
+    let lines = fixture_lines("auto_blocked_system.jsonl");
+    assert_eq!(
+        parse_line(&lines[4]),
+        vec![blocked(
+            "Write",
+            json!({"file_path": "/work/demo/.env"}),
+            "Credential access"
+        )]
+    );
+    assert_eq!(
+        parse_line(&lines[2]),
+        vec![denied("Bash", json!({"command": "git push --force"}))]
+    );
+}
+
+#[test]
+fn an_ordinary_error_result_is_no_denial() {
+    let mut parser = StreamParser::new();
+    let call = json!({"type":"assistant","message":{"content":[
+        {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"false"}}]}})
+    .to_string();
+    let result = json!({"type":"user","message":{"content":[
+        {"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"exit 1"}]}})
+    .to_string();
+    parser.parse(&call);
+    let events = parser.parse(&result);
+    assert!(matches!(events.as_slice(), [Event::ToolResult { .. }]));
 }

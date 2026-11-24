@@ -622,7 +622,8 @@ async fn edit_agents_write_in_the_worktree_and_file_changes_ask() {
     let home = std::fs::canonicalize(&d.home).unwrap();
     assert!(Path::new(cwd).starts_with(home.join("worktrees")), "{cwd}");
     assert_eq!(start["sandbox"], "workspace-write");
-    assert_eq!(start["approvalPolicy"], "on-request");
+    // Edit files asks before every command that isn't a known safe read.
+    assert_eq!(start["approvalPolicy"], "untrusted");
     assert_eq!(
         start["config"]["sandbox_workspace_write"]["writable_roots"],
         json!([cwd])

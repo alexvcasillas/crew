@@ -38,6 +38,47 @@ fn scoped_edit(tool: &str) -> &str {
         .unwrap_or(tool)
 }
 
+/// The path a tool call works on, if it has one.
+fn call_path(input: &serde_json::Value) -> Option<&str> {
+    ["file_path", "notebook_path", "path"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(serde_json::Value::as_str))
+        .filter(|p| !p.is_empty())
+}
+
+/// An allow rule for exactly one call: `Bash(<command>)` for a command,
+/// else the tool with the path it works on, else the bare tool. An
+/// absolute path is written `//path`, as Claude Code reads a single `/`
+/// as relative to the project.
+pub fn retry_rule(tool: &str, input: &serde_json::Value) -> String {
+    if tool == "Bash"
+        && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
+    {
+        return format!("Bash({command})");
+    }
+    match call_path(input) {
+        Some(path) if path.starts_with('/') && !path.starts_with("//") => {
+            format!("{tool}(/{path})")
+        }
+        Some(path) => format!("{tool}({path})"),
+        None => tool.to_string(),
+    }
+}
+
+/// The prompt of the run that retries a call the safety check stopped.
+pub fn retry_prompt(tool: &str, input: &serde_json::Value) -> String {
+    let what = match input.get("command").and_then(serde_json::Value::as_str) {
+        Some(command) if tool == "Bash" => command.to_string(),
+        _ => match call_path(input) {
+            Some(path) => format!("{tool} {path}"),
+            None => tool.to_string(),
+        },
+    };
+    format!(
+        "The safety check stopped `{what}`. The user allowed it once. Run it now if you still need it, then carry on."
+    )
+}
+
 /// What a run needs to reach crewd through crew-mcp.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpWiring {
@@ -141,6 +182,7 @@ impl CrewContext {
         )];
         lines.push(match agent.permission_mode {
             PermissionMode::EditFiles => "You can edit files in this thread's worktree.".into(),
+            PermissionMode::Auto => "You can edit files in this thread's worktree. Commands run without asking unless a safety check stops them.".into(),
             PermissionMode::ReadOnly => {
                 "You are read-only: review and report, don't change files.".into()
             }
@@ -197,8 +239,14 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 /// `mcp__crew_run__approve` before anything but file edits under its working
 /// folder. Every wired agent may use `mcp__crew_run__handoff` without asking.
 ///
+/// An `Auto` agent runs in `auto` mode, wired the same way: a safety
+/// check lets it run what is safe, and anything else still asks.
+///
 /// With `context`, the Crew block goes before the agent's own instructions
 /// in one `--append-system-prompt`.
+///
+/// `extra_allowed` are allow rules for this run only, such as the one
+/// call you let a retry make.
 pub fn build_claude(
     agent: &AgentSpec,
     prompt: &str,
@@ -206,12 +254,14 @@ pub fn build_claude(
     session: SessionArg,
     mcp: Option<McpWiring>,
     context: Option<&CrewContext>,
+    extra_allowed: &[String],
 ) -> ClaudeInvocation {
-    let edits = agent.permission_mode == PermissionMode::EditFiles;
+    let edits = agent.permission_mode.edits();
     let mode = match (&agent.permission_mode, &mcp) {
         (PermissionMode::ReadOnly, _) => "plan",
         (PermissionMode::EditFiles, None) => "acceptEdits",
         (PermissionMode::EditFiles, Some(_)) => "default",
+        (PermissionMode::Auto, _) => "auto",
     };
     let mut args: Vec<String> = [
         "-p",
@@ -272,6 +322,11 @@ pub fn build_claude(
         }
         allowed = merged;
     }
+    for rule in extra_allowed {
+        if !allowed.contains(rule) {
+            allowed.push(rule.clone());
+        }
+    }
     if !allowed.is_empty() {
         args.push("--allowedTools".into());
         args.push(allowed.join(","));
@@ -328,6 +383,7 @@ mod tests {
             SessionArg::New(id),
             None,
             None,
+            &[],
         );
         let id = id.to_string();
         assert_eq!(
@@ -368,6 +424,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             None,
             None,
+            &[],
         );
         assert_eq!(
             inv.args,
@@ -422,6 +479,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             Some(wiring(run)),
             None,
+            &[],
         );
         let config = expected_mcp_config(run);
         assert_eq!(
@@ -468,6 +526,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             Some(wiring(run)),
             None,
+            &[],
         );
         let config = expected_mcp_config(run);
         assert_eq!(
@@ -515,6 +574,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             Some(wiring(RunId::new())),
             None,
+            &[],
         );
         let allowed = inv
             .args
@@ -535,6 +595,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             None,
             None,
+            &[],
         );
         assert!(
             inv.args
@@ -577,6 +638,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             Some(wiring(RunId::new())),
             Some(&context()),
+            &[],
         );
         assert_eq!(
             system_prompt(&inv),
@@ -608,6 +670,7 @@ mod tests {
             SessionArg::Resume("abc".into()),
             None,
             Some(&ctx),
+            &[],
         );
         assert_eq!(
             system_prompt(&inv),
@@ -633,6 +696,128 @@ mod tests {
         let plain = context().render_codex(&a, false);
         assert!(!plain.contains("handoff"));
         assert_eq!(plain, context().render(&a, false));
+    }
+
+    #[test]
+    fn auto_agent_runs_in_auto_mode_wired_like_an_edit_agent() {
+        let run = RunId::new();
+        let mut a = agent(PermissionMode::Auto);
+        a.instructions.clear();
+        a.allowed_tools = vec!["Read".into(), "Bash(npm test)".into()];
+        let extra = vec!["Bash(rm -rf build)".to_string(), "Read".to_string()];
+        let inv = build_claude(
+            &a,
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            Some(wiring(run)),
+            None,
+            &extra,
+        );
+        let config = expected_mcp_config(run);
+        assert_eq!(
+            inv.args,
+            args(&[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-haiku-4-5",
+                "--permission-mode",
+                "auto",
+                "--resume",
+                "abc",
+                "--allowedTools",
+                "Read,Bash(npm test),Edit(./**),Write(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew_run__handoff,Bash(rm -rf build)",
+                "--mcp-config",
+                &config,
+                "--permission-prompt-tool",
+                "mcp__crew_run__approve",
+                "--",
+                "go",
+            ])
+        );
+    }
+
+    #[test]
+    fn auto_agent_without_wiring_turns_prompts_off() {
+        let mut a = agent(PermissionMode::Auto);
+        a.instructions.clear();
+        a.allowed_tools.clear();
+        let extra = vec!["Bash(ls)".to_string(), "Bash(ls)".to_string()];
+        let inv = build_claude(
+            &a,
+            "go",
+            Path::new("/work/demo"),
+            SessionArg::Resume("abc".into()),
+            None,
+            None,
+            &extra,
+        );
+        assert_eq!(
+            inv.args,
+            args(&[
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-haiku-4-5",
+                "--permission-mode",
+                "auto",
+                "--permission-prompts",
+                "none",
+                "--resume",
+                "abc",
+                "--allowedTools",
+                "Bash(ls)",
+                "--",
+                "go",
+            ])
+        );
+    }
+
+    #[test]
+    fn auto_context_says_commands_run_unless_stopped() {
+        let ctx = CrewContext {
+            project: "demo".into(),
+            team: vec![],
+        };
+        assert_eq!(
+            ctx.render(&agent(PermissionMode::Auto), false),
+            "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
+             You can edit files in this thread's worktree. Commands run without asking unless a safety check stops them."
+        );
+    }
+
+    #[test]
+    fn a_retry_allows_exactly_the_stopped_call() {
+        use serde_json::json;
+        assert_eq!(
+            retry_rule("Bash", &json!({"command": "rm -rf build"})),
+            "Bash(rm -rf build)"
+        );
+        assert_eq!(
+            retry_rule("Write", &json!({"file_path": "/work/demo/a.txt"})),
+            "Write(//work/demo/a.txt)"
+        );
+        assert_eq!(
+            retry_rule("Edit", &json!({"file_path": "src/a.rs"})),
+            "Edit(src/a.rs)"
+        );
+        assert_eq!(
+            retry_rule("WebFetch", &json!({"url": "https://x"})),
+            "WebFetch"
+        );
+        assert_eq!(
+            retry_prompt("Bash", &json!({"command": "rm -rf build"})),
+            "The safety check stopped `rm -rf build`. The user allowed it once. Run it now if you still need it, then carry on."
+        );
+        assert_eq!(
+            retry_prompt("Write", &json!({"file_path": "/work/demo/a.txt"})),
+            "The safety check stopped `Write /work/demo/a.txt`. The user allowed it once. Run it now if you still need it, then carry on."
+        );
     }
 
     #[test]
