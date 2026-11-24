@@ -61,7 +61,7 @@ pub(super) fn agent(name: &str, role: &str) -> AgentSpec {
         allowed_tools: vec![],
         handoff_policy: None,
         handoff_budget: None,
-        max_run_minutes: 20,
+        max_run_minutes: crew_core::agent::DEFAULT_MAX_RUN_MINUTES,
     }
 }
 

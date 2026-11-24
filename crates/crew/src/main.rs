@@ -194,12 +194,8 @@ struct AgentAdd {
     /// Handoffs this agent may start on their own. Needs `--policy budget`.
     #[arg(long, requires = "policy")]
     budget: Option<u32>,
-    /// Stop a run after this many minutes.
-    #[arg(
-        long,
-        default_value_t = crew_core::agent::DEFAULT_MAX_RUN_MINUTES,
-        value_parser = clap::value_parser!(u32).range(1..),
-    )]
+    /// Stop a run after this many minutes. 0, the default, is no limit.
+    #[arg(long, default_value_t = crew_core::agent::DEFAULT_MAX_RUN_MINUTES)]
     max_minutes: u32,
     #[arg(long, default_value = "")]
     instructions: String,
@@ -368,7 +364,7 @@ async fn init_demo(c: &mut Client) -> Result<()> {
                     allowed_tools: vec![],
                     handoff_policy: None,
                     handoff_budget: None,
-                    max_run_minutes: 20,
+                    max_run_minutes: crew_core::agent::DEFAULT_MAX_RUN_MINUTES,
                 },
             })
             .await?;

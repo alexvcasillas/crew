@@ -422,7 +422,7 @@ fn agent_add_defaults_to_read_only() {
     let spec = |name: &str| &agents.iter().find(|a| a.spec.name == name).unwrap().spec;
     assert_eq!(spec("Sentinel").permission_mode, PermissionMode::ReadOnly);
     assert_eq!(spec("Sentinel").runtime, Runtime::ClaudeCode);
-    assert_eq!(spec("Sentinel").max_run_minutes, 20);
+    assert_eq!(spec("Sentinel").max_run_minutes, 0, "no limit");
     assert_eq!(spec("Forge").permission_mode, PermissionMode::EditFiles);
 }
 
@@ -658,7 +658,7 @@ fn agent_add_checks_budget_and_minutes() {
         stderr(&mut add(&["--policy", "ask", "--budget", "2"]))
             .contains("--budget needs --policy budget.")
     );
-    assert!(stderr(&mut add(&["--max-minutes", "0"])).contains("--max-minutes"));
+    assert!(stderr(&mut add(&["--max-minutes", "soon"])).contains("--max-minutes"));
     stdout_of(&mut add(&[
         "--policy",
         "budget",

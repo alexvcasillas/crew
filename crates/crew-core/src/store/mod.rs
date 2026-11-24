@@ -22,13 +22,14 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
     include_str!("migrate_v3.sql"),
     include_str!("migrate_v4.sql"),
     include_str!("migrate_v5.sql"),
+    include_str!("migrate_v6.sql"),
 ];
 
 /// Errors from the store.

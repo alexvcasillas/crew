@@ -199,7 +199,12 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
     type_text(cx, window, "Keep answers short.");
     click(cx, window, "agent-tools");
     type_text(cx, window, "Bash(cargo test:*), Bash(git diff:*)");
-    retype(cx, window, "agent-max-minutes", "45");
+    assert_eq!(
+        label_of(cx, window, "agent-max-minutes-value").as_deref(),
+        Some("No limit"),
+        "no limit by default"
+    );
+    pick_limit(cx, window, "1 h");
     click(cx, window, "agent-save");
     wait_to_show(cx, window, "Saved");
     ws.read_with(cx, |ws, _| {
@@ -210,7 +215,7 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
             spec.allowed_tools,
             ["Bash(cargo test:*)", "Bash(git diff:*)"]
         );
-        assert_eq!(spec.max_run_minutes, 45);
+        assert_eq!(spec.max_run_minutes, 60);
         assert_eq!(spec.permission_mode, PermissionMode::ReadOnly, "kept");
     });
     click(cx, window, "agent-role");
@@ -744,8 +749,8 @@ fn duplicate_copies_what_you_typed_and_permission_changes(cx: &mut TestAppContex
         assert_eq!(form.permission, PermissionMode::EditFiles);
     });
 
-    // An invalid longest run is copied as typed.
-    retype(cx, window, "agent-max-minutes", "0");
+    // The longest run is copied as picked.
+    pick_limit(cx, window, "30 min");
     click(cx, window, "agent-duplicate");
     assert_eq!(
         label_of(cx, window, "agent-form-title").as_deref(),
@@ -754,7 +759,7 @@ fn duplicate_copies_what_you_typed_and_permission_changes(cx: &mut TestAppContex
     ws.read_with(cx, |ws, cx| {
         let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
         assert_eq!(form.editing, None);
-        assert_eq!(form.max_minutes.read(cx).value().as_ref(), "0");
+        assert_eq!(form.max_minutes, 30);
         assert_eq!(form.permission, PermissionMode::EditFiles);
         assert_eq!(form.role.read(cx).value().as_ref(), "Forge things");
     });
@@ -794,4 +799,36 @@ fn slow_runtimes_fill_in_later(cx: &mut TestAppContext) {
     ws.read_with(cx, |ws, _| {
         assert_eq!(ws.runtimes[0].version.as_deref(), Some("9.9.9"));
     });
+}
+
+/// Opens the longest run menu and picks `label`.
+fn pick_limit(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) {
+    use super::settings::agents::{RUN_LIMITS, run_limit_label};
+    let ix = RUN_LIMITS
+        .iter()
+        .position(|m| run_limit_label(*m) == label)
+        .unwrap();
+    click(cx, window, "agent-max-minutes");
+    assert!(shows(cx, window, "4 h"), "the menu");
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(ix, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        label_of(cx, window, "agent-max-minutes-value").as_deref(),
+        Some(label)
+    );
+}
+
+#[test]
+fn run_limits_read_short() {
+    use super::settings::agents::run_limit_label;
+    assert_eq!(run_limit_label(0), "No limit");
+    assert_eq!(run_limit_label(30), "30 min");
+    assert_eq!(run_limit_label(60), "1 h");
+    assert_eq!(run_limit_label(240), "4 h");
+    assert_eq!(run_limit_label(45), "45 min");
 }

@@ -886,7 +886,8 @@ impl Service {
     }
 
     /// Starts the run's time limit, which counts from now: the moment its
-    /// `claude` process starts, after any worktree setup.
+    /// `claude` process starts, after any worktree setup. An agent with no
+    /// limit gets no timer.
     fn start_timer(&self, state: &mut State, job: &Job) {
         let minutes = self
             .db()
@@ -897,6 +898,10 @@ impl Service {
             .map_or(crew_core::agent::DEFAULT_MAX_RUN_MINUTES, |(_, spec)| {
                 spec.max_run_minutes
             });
+        // 0 is no limit.
+        if minutes == 0 {
+            return;
+        }
         let limit = self.0.minute.saturating_mul(minutes);
         let (svc, run) = (self.clone(), job.run);
         let timer = tokio::spawn(async move {

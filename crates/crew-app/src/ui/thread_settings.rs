@@ -167,9 +167,13 @@ impl Workspace {
         let limits: Vec<String> = participants
             .iter()
             .filter_map(|p| {
-                state
-                    .agent(p.agent)
-                    .map(|a| format!("{} {} min", a.spec.name, a.spec.max_run_minutes))
+                state.agent(p.agent).map(|a| {
+                    format!(
+                        "{}: {}",
+                        a.spec.name,
+                        super::settings::agents::run_limit_label(a.spec.max_run_minutes)
+                    )
+                })
             })
             .collect();
 
@@ -353,15 +357,19 @@ impl Workspace {
             )
             .child(
                 section("Longest single run")
-                    .child(
+                    .child({
+                        let text = if limits.is_empty() {
+                            "Set per agent".to_string()
+                        } else {
+                            limits.join(" · ")
+                        };
                         div()
+                            .id("thread-run-limits")
                             .text_color(color("text-primary"))
-                            .child(if limits.is_empty() {
-                                "Set per agent".to_string()
-                            } else {
-                                limits.join(" · ")
-                            }),
-                    )
+                            .aria_label(text.clone())
+                            .child(text)
+                            .test_support()
+                    })
                     .child(help("Set per agent in Settings.")),
             )
             .child(
