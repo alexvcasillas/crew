@@ -491,7 +491,21 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
             })
         })
         .child(icon)
-        .child(div().flex_none().child(step.verb.clone()))
+        // A short verb stays whole beside its target; a long tool name
+        // with no target is cut inside the card.
+        .child(
+            div()
+                .id(("run-step-verb", ix))
+                .map(|verb| {
+                    if step.target.trim().is_empty() {
+                        verb.min_w_0().truncate()
+                    } else {
+                        verb.flex_none()
+                    }
+                })
+                .child(step.verb.clone())
+                .test_support(),
+        )
         .when(!step.target.trim().is_empty(), |row| {
             row.child(
                 div()

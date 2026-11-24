@@ -372,13 +372,17 @@ impl Workspace {
                             .flex()
                             .flex_wrap()
                             .gap(px(6.))
-                            .child(div().text_color(color("text-secondary")).child(
-                                if reason.is_some() {
-                                    tool.clone()
-                                } else {
-                                    format!("Not allowed: {tool}")
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(color("text-secondary"))
+                                    .child(if reason.is_some() {
+                                        tool.clone()
+                                    } else {
+                                        format!("Not allowed: {tool}")
+                                    }),
+                            )
                             .when(!input.trim().is_empty(), |row| {
                                 row.child(code(input.clone()))
                             })
@@ -484,10 +488,15 @@ impl Workspace {
             .flex_wrap()
             .items_center()
             .gap(px(6.))
+            // A long name is cut short inside the row.
             .child(
                 div()
+                    .id(("activity-verb", ix))
+                    .min_w_0()
+                    .truncate()
                     .text_color(color("text-secondary"))
-                    .child(tool.verb.clone()),
+                    .child(tool.verb.clone())
+                    .test_support(),
             )
             .when(!tool.target.trim().is_empty(), |head| {
                 head.child(code(tool.target.clone()))

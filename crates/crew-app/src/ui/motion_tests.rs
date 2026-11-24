@@ -349,3 +349,53 @@ fn a_long_tool_name_wraps_inside_its_card(cx: &mut TestAppContext) {
         !has(cx, window, format!("live-{run}"))
     });
 }
+
+/// A tool name too long for the inspector, even read as server and tool.
+const LONG_MCP_TOOL: &str = "mcp__plugin_x_a-server-with-a-very-long-name-for-tests__navigate_to_the_page_and_wait_until_the_network_is_idle";
+
+#[gpui_kit::test]
+fn a_long_activity_title_stays_inside_its_row(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let line = format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_01","name":"{LONG_MCP_TOOL}","input":{{}}}}]}},"session_id":"s"}}"#
+    );
+    let claude = fake_claude(
+        tmp.path(),
+        &format!(
+            "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"session_id\":\"s\",\"model\":\"m\",\"tools\":[]}}'\nprintf '%s\\n' '{line}'\nexec sleep 60"
+        ),
+    );
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge open the page");
+    let run = live_run(cx, &ws, w.thread);
+    click(cx, window, "inspector-tab-activity");
+    let verb: ElementId = ("activity-verb", 0usize).into();
+    wait_until(cx, "the row", |cx| has(cx, window, verb.clone()));
+    let row = bounds_of(cx, window, ("activity-row", 0usize)).unwrap();
+    let title = bounds_of(cx, window, verb).unwrap();
+    assert!(
+        title.origin.x + title.size.width <= row.origin.x + row.size.width,
+        "the title is cut inside the row: {title:?} in {row:?}"
+    );
+    let card = bounds_of(cx, window, format!("run-card-{run}")).unwrap();
+    let step = bounds_of(cx, window, ("run-step-verb", 0usize)).unwrap();
+    assert!(
+        step.origin.x + step.size.width <= card.origin.x + card.size.width,
+        "the step is cut inside the card: {step:?} in {card:?}"
+    );
+    assert_eq!(
+        label_of(cx, window, ("run-step", 0usize)).as_deref(),
+        Some(
+            "a-server-with-a-very-long-name-for-tests · navigate to the page and wait until the network is idle"
+        )
+    );
+
+    click(cx, window, format!("run-stop-{run}"));
+    wait_until(cx, "the run to end", |cx| {
+        !has(cx, window, format!("live-{run}"))
+    });
+}
