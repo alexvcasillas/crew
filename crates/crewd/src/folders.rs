@@ -903,7 +903,22 @@ impl Service {
                         .flatten();
                     let head = worktree::head_blob(&dir, path);
                     let done = match plan_undo(current.as_deref(), head.as_deref(), &runs) {
-                        Undo::To(Before::Content(blob)) => worktree::write_blob(&dir, path, &blob),
+                        Undo::To(Before::Content(blob)) => {
+                            let copy = edits.iter().find_map(|(run, _)| {
+                                let file = snapshot::copy_path(
+                                    &run_dir(&dir_of_snapshots, *run).join("files"),
+                                    &blob,
+                                );
+                                file.is_file().then_some(file)
+                            });
+                            let Some(copy) = copy else {
+                                notes.push(format!(
+                                    "{full} was too big to keep a copy, left as is."
+                                ));
+                                continue;
+                            };
+                            put_back(&dir.join(path), &copy)
+                        }
                         Undo::To(Before::Head) => worktree::restore_from_head(&dir, path),
                         Undo::To(Before::Absent) => {
                             left_new.push(full.clone());
@@ -964,7 +979,8 @@ impl Service {
         };
         let (dir, run) = (self.snapshots_dir(), job.run);
         let taken = blocking(move || {
-            let snap = snapshot::take(&project.root, &project.kind.repos());
+            let files = run_dir(&dir, run).join("files");
+            let snap = snapshot::take(&project.root, &project.kind.repos(), &files);
             save_snapshot(&dir, run, &snap)
         })
         .await;
@@ -1034,7 +1050,16 @@ impl Service {
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > max);
-            if old && let Err(e) = std::fs::remove_file(entry.path()) {
+            if !old {
+                continue;
+            }
+            let path = entry.path();
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(e) = removed {
                 log(format!("couldn't remove {}: {e}", entry.path().display()));
             }
         }
@@ -1121,8 +1146,22 @@ const SNAPSHOTS_DIR: &str = "snapshots";
 /// Days a run snapshot is kept.
 const SNAPSHOT_DAYS: u64 = 30;
 
+/// A run's snapshot folder: its record and the copies it kept.
+fn run_dir(dir: &Path, run: RunId) -> PathBuf {
+    dir.join(run.to_string())
+}
+
+/// Writes the kept copy back over `to`, keeping the file's permissions.
+fn put_back(to: &Path, copy: &Path) -> Result<(), worktree::WorktreeError> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(to, std::fs::read(copy)?)?;
+    Ok(())
+}
+
 fn snapshot_path(dir: &Path, run: RunId) -> PathBuf {
-    dir.join(format!("{run}.json"))
+    run_dir(dir, run).join("snapshot.json")
 }
 
 fn load_snapshot(dir: &Path, run: RunId) -> Option<RunSnapshot> {
@@ -1130,10 +1169,18 @@ fn load_snapshot(dir: &Path, run: RunId) -> Option<RunSnapshot> {
     serde_json::from_str(&text).ok()
 }
 
+/// Saves the record, 0600 in a 0700 folder.
 fn save_snapshot(dir: &Path, run: RunId, snap: &RunSnapshot) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::PermissionsExt;
+    let folder = run_dir(dir, run);
+    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
     let text = serde_json::to_string(snap).map_err(|e| e.to_string())?;
-    std::fs::write(snapshot_path(dir, run), text).map_err(|e| e.to_string())
+    let path = snapshot_path(dir, run);
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())
 }
 
 /// Drops `paths` (folder-relative) from the end records of the runs in

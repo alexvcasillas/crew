@@ -2,8 +2,9 @@
 //! undone without touching yours.
 //!
 //! When a writing run starts in a project folder, Crew notes each repo's
-//! `HEAD` and saves the content of every file that differs from it, yours
-//! included, as git blobs. When the run ends, it saves the content of each
+//! `HEAD` and keeps a copy of every file that differs from it, yours
+//! included, in its own folder (never only in git, whose cleanup could
+//! drop it). Contents are named and compared by their git blob id. When the run ends, it saves the content of each
 //! file the run edited or wrote. Undoing a file then puts back what it was
 //! before the run, but only while it still is what the run left.
 
@@ -26,8 +27,20 @@ pub struct RepoStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyFile {
     pub path: String,
-    /// The content's blob, `None` if the file was deleted.
+    /// The content's blob id, `None` if the file was deleted.
     pub blob: Option<String>,
+    /// Whether a copy of the content was kept. Files over [`MAX_COPY`]
+    /// only have their id.
+    #[serde(default)]
+    pub copied: bool,
+}
+
+/// Largest file a snapshot keeps a copy of, in bytes.
+pub const MAX_COPY: u64 = 20 * 1024 * 1024;
+
+/// Where the copy of content `blob` is kept in a run's `files` folder.
+pub fn copy_path(files: &Path, blob: &str) -> std::path::PathBuf {
+    files.join(blob)
 }
 
 /// A run's record. Paths in `end` are relative to the project folder.
@@ -128,8 +141,14 @@ pub fn plan_undo(
 /// Notes each repo of `repos` (relative to `root`) as it is now: its
 /// `HEAD` and the content of every file that differs from it, saved as
 /// blobs. A repo git can't read is left out.
-pub fn take(root: &Path, repos: &[String]) -> RunSnapshot {
+/// Copies are kept in `files` (made 0700, each copy 0600). A file that
+/// can't be copied is noted without a copy.
+pub fn take(root: &Path, repos: &[String], files: &Path) -> RunSnapshot {
+    use std::os::unix::fs::PermissionsExt;
     let mut out = RunSnapshot::default();
+    let made = std::fs::create_dir_all(files)
+        .and_then(|()| std::fs::set_permissions(files, std::fs::Permissions::from_mode(0o700)));
+    let can_copy = made.is_ok();
     for repo in repos {
         let dir = root.join(repo);
         let Ok(head) = worktree::head_sha(&dir) else {
@@ -138,20 +157,41 @@ pub fn take(root: &Path, repos: &[String]) -> RunSnapshot {
         let Ok(dirty) = worktree::changed_files(&dir) else {
             continue;
         };
-        let Ok(blobs) = worktree::hash_files(&dir, &dirty, true) else {
+        let Ok(blobs) = worktree::hash_files(&dir, &dirty, false) else {
             continue;
         };
+        let dirty = dirty
+            .into_iter()
+            .zip(blobs)
+            .map(|(path, blob)| {
+                let copied = can_copy
+                    && blob.as_ref().is_some_and(|b| {
+                        keep_copy(&dir.join(&path), &copy_path(files, b)).is_ok_and(|kept| kept)
+                    });
+                DirtyFile { path, blob, copied }
+            })
+            .collect();
         out.repos.push(RepoStart {
             repo: repo.clone(),
             head,
-            dirty: dirty
-                .into_iter()
-                .zip(blobs)
-                .map(|(path, blob)| DirtyFile { path, blob })
-                .collect(),
+            dirty,
         });
     }
     out
+}
+
+/// Copies `from` to `to` (0600) unless it is over [`MAX_COPY`]. Returns
+/// whether a copy is there.
+fn keep_copy(from: &Path, to: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::metadata(from)?.len() > MAX_COPY {
+        return Ok(false);
+    }
+    if !to.exists() {
+        std::fs::copy(from, to)?;
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

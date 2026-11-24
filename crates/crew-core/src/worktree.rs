@@ -401,24 +401,6 @@ pub fn blob_at(dir: &Path, rev: &str, path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Writes the content of `blob` to `path` (relative to `dir`). The index
-/// is left as it is.
-pub fn write_blob(dir: &Path, path: &str, blob: &str) -> Result<()> {
-    if !is_plain_relative(path) {
-        return Err(WorktreeError::BadPath(path.to_string()));
-    }
-    let out = command(dir).args(["cat-file", "blob", blob]).output()?;
-    if !out.status.success() {
-        return Err(git_error(["cat-file", "blob", blob], &out.stderr));
-    }
-    let to = dir.join(path);
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(to, out.stdout)?;
-    Ok(())
-}
-
 /// Puts `path` (relative to `dir`) back as `HEAD` has it on disk, and
 /// unstages it.
 pub fn restore_from_head(dir: &Path, path: &str) -> Result<()> {

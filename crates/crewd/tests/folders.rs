@@ -1042,6 +1042,22 @@ async fn in_place_discard_keeps_your_edits_in_files_the_run_touched() {
         "agent\n"
     );
 
+    // Git's cleanup can't take the copies: they live in the crew home,
+    // readable by you only.
+    git(&root, &["gc", "-q", "--prune=now"]);
+    let snaps = d.home.join("snapshots");
+    let run_dir = std::fs::read_dir(&snaps)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&run_dir), 0o700);
+    assert_eq!(mode(&run_dir.join("snapshot.json")), 0o600);
+    for copy in std::fs::read_dir(run_dir.join("files")).unwrap() {
+        assert_eq!(mode(&copy.unwrap().path()), 0o600);
+    }
     discard_all(&mut c, thread).await;
     // Only the run's change is undone; what you had on disk and staged
     // is back as it was.
@@ -1055,6 +1071,35 @@ async fn in_place_discard_keeps_your_edits_in_files_the_run_touched() {
         "your b\n"
     );
     assert_eq!(git(&root, &["show", ":b.txt"]), "your b");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_file_too_big_to_copy_is_left_as_is() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (root, _, thread) = in_place_api(&d, &mut c).await;
+    // Your uncommitted edit, over the copy limit.
+    let big = "x".repeat(21 * 1024 * 1024);
+    std::fs::write(root.join("a.txt"), &big).unwrap();
+    set_edits(scripts.path(), &[("a.txt", "agent")]);
+    post(&mut c, thread, "@Forge edit").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+
+    discard_all(&mut c, thread).await;
+    let seen = c
+        .until(
+            |m| matches!(m, ServerMsg::Message { message, .. } if message.body.contains("too big")),
+        )
+        .await;
+    assert_eq!(
+        system_notes(&seen).last().unwrap(),
+        "a.txt was too big to keep a copy, left as is."
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "agent\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
