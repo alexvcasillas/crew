@@ -6,6 +6,8 @@
 //! assistant line and hold many line types that are not part of the
 //! conversation. Those give nothing.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,6 +43,51 @@ pub struct LineInfo {
 pub struct ParsedLine {
     pub info: LineInfo,
     pub items: Vec<TranscriptItem>,
+    /// The line is a prompt typed while the agent was busy. Claude Code
+    /// may write it again as a plain prompt once it is sent; [`Prompts`]
+    /// drops that copy.
+    pub queued: bool,
+}
+
+/// How many queued prompts are remembered for [`Prompts`].
+const QUEUED_KEPT: usize = 16;
+
+/// Reads a session's lines in order, showing a queued prompt once: when
+/// it is queued, not again when Claude Code sends it.
+#[derive(Debug, Clone, Default)]
+pub struct Prompts {
+    queued: VecDeque<String>,
+}
+
+impl Prompts {
+    /// The items of `line` to show.
+    pub fn take(&mut self, line: ParsedLine) -> Vec<TranscriptItem> {
+        let mut items = line.items;
+        if line.queued {
+            for item in &items {
+                if let TranscriptItem::UserPrompt(text) = item {
+                    if self.queued.len() == QUEUED_KEPT {
+                        self.queued.pop_front();
+                    }
+                    self.queued.push_back(text.clone());
+                }
+            }
+            return items;
+        }
+        items.retain(|item| match item {
+            TranscriptItem::UserPrompt(text) => {
+                match self.queued.iter().position(|q| q.trim() == text.trim()) {
+                    Some(at) => {
+                        self.queued.remove(at);
+                        false
+                    }
+                    None => true,
+                }
+            }
+            TranscriptItem::Event(_) => true,
+        });
+        items
+    }
 }
 
 /// Turns one line of a session file into its items.
@@ -56,10 +103,71 @@ pub fn parse(line: &str) -> ParsedLine {
     if !v.is_object() {
         return ParsedLine::default();
     }
+    let queued = is_queued(&v);
     ParsedLine {
         info: info(&v),
-        items: items(&v),
+        items: if queued { queued_prompt(&v) } else { items(&v) },
+        queued,
     }
+}
+
+fn is_queued(v: &Value) -> bool {
+    str_at(v, "type") == "attachment"
+        && v.pointer("/attachment/type").and_then(Value::as_str) == Some("queued_command")
+}
+
+/// A prompt typed while the agent was busy, unless something other than
+/// the person wrote it.
+fn queued_prompt(v: &Value) -> Vec<TranscriptItem> {
+    let a = &v["attachment"];
+    if flag(v, "isMeta") || flag(a, "isMeta") || !human(v) || !human(a) {
+        return vec![];
+    }
+    a.get("prompt")
+        .and_then(Value::as_str)
+        .and_then(prompt)
+        .into_iter()
+        .collect()
+}
+
+/// Words in an `origin` kind or `promptSource` that say a program, not the
+/// person, wrote the line.
+const NOT_TYPED: &[&str] = &[
+    "agent",
+    "background",
+    "channel",
+    "coordinator",
+    "cron",
+    "hook",
+    "monitor",
+    "notification",
+    "peer",
+    "schedul",
+    "system",
+    "task",
+    "teammate",
+];
+
+/// Whether a line's `origin` and `promptSource`, if any, say the person
+/// typed it. Claude Code leaves `origin` out for what was typed; one that
+/// names who sent it (`from`, `producer`, ...) is never the person.
+fn human(v: &Value) -> bool {
+    let named = |text: &str| {
+        let text = text.to_ascii_lowercase();
+        NOT_TYPED.iter().any(|w| text.contains(w))
+    };
+    if let Some(origin) = v.get("origin").filter(|o| !o.is_null()) {
+        let sender = ["from", "producer", "body", "senderTaskId", "runId"]
+            .iter()
+            .any(|k| origin.get(k).is_some());
+        let kind = origin.get("kind").and_then(Value::as_str).unwrap_or("");
+        if sender || named(kind) || !origin.is_object() {
+            return false;
+        }
+    }
+    !v.get("promptSource")
+        .and_then(Value::as_str)
+        .is_some_and(named)
 }
 
 fn non_empty(v: &Value, key: &str) -> Option<String> {
@@ -86,20 +194,36 @@ fn flag(v: &Value, key: &str) -> bool {
 fn items(v: &Value) -> Vec<TranscriptItem> {
     // Injected context, subagent turns and compaction summaries are not
     // part of what the person sees in their terminal.
-    if flag(v, "isMeta") || flag(v, "isSidechain") || flag(v, "isCompactSummary") {
+    // So are lines shown only in the full transcript view.
+    if flag(v, "isMeta")
+        || flag(v, "isSidechain")
+        || flag(v, "isCompactSummary")
+        || flag(v, "isVisibleInTranscriptOnly")
+    {
         return vec![];
     }
     match str_at(v, "type") {
-        "user" => match v.pointer("/message/content") {
-            Some(Value::String(text)) => prompt(text).into_iter().collect(),
-            _ => blocks(v)
-                .iter()
-                .filter_map(|b| match str_at(b, "type") {
-                    "text" => prompt(str_at(b, "text")),
-                    _ => tool_result(b).map(TranscriptItem::Event),
-                })
-                .collect(),
-        },
+        "user" => {
+            let typed = human(v);
+            match v.pointer("/message/content") {
+                Some(Value::String(text)) if typed => prompt(text).into_iter().collect(),
+                Some(Value::String(_)) => vec![],
+                _ => {
+                    let blocks = blocks(v);
+                    // Text next to tool results was added by Claude Code,
+                    // not typed.
+                    let results = blocks.iter().any(|b| str_at(b, "type") == "tool_result");
+                    blocks
+                        .iter()
+                        .filter_map(|b| match str_at(b, "type") {
+                            "text" if typed && !results => prompt(str_at(b, "text")),
+                            "text" => None,
+                            _ => tool_result(b).map(TranscriptItem::Event),
+                        })
+                        .collect()
+                }
+            }
+        }
         "assistant" => blocks(v)
             .iter()
             .filter_map(assistant_block)
@@ -128,22 +252,26 @@ fn items(v: &Value) -> Vec<TranscriptItem> {
 }
 
 fn prompt(text: &str) -> Option<TranscriptItem> {
-    (!text.trim().is_empty() && !is_command_echo(text))
+    (!text.trim().is_empty() && !is_wrapped(text))
         .then(|| TranscriptItem::UserPrompt(text.to_string()))
 }
 
-/// What Claude Code writes for a slash command or its output, not what
-/// the person typed.
-fn is_command_echo(text: &str) -> bool {
+/// Text Claude Code wraps in a tag of its own, such as
+/// `<system-reminder>`, `<task-notification>` or `<command-name>`: what it
+/// added, not what the person typed. A shell command typed with `!`
+/// (`<bash-input>`) is the person's.
+fn is_wrapped(text: &str) -> bool {
     let text = text.trim_start();
-    [
-        "<command-name>",
-        "<command-message>",
-        "<command-args>",
-        "<local-command-",
-    ]
-    .iter()
-    .any(|tag| text.starts_with(tag))
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    let name = &rest[..name_len];
+    let starts_lower = name.starts_with(|c: char| c.is_ascii_lowercase());
+    // `<local-command-caveat>` and friends, or any `<tag>`.
+    starts_lower && rest[name_len..].starts_with('>') && name != "bash-input"
 }
 
 fn api_error(v: &Value) -> String {
@@ -157,10 +285,10 @@ fn api_error(v: &Value) -> String {
 }
 
 /// A session title from a prompt: its first non-empty line without
-/// control characters, at most 80 characters. `None` for a local command
-/// echo or a prompt with no text.
+/// control characters, at most 80 characters. `None` for text Claude Code
+/// wrapped in a tag, a shell command or a prompt with no text.
 pub fn title_from(prompt: &str) -> Option<String> {
-    if is_command_echo(prompt) || prompt.trim_start().starts_with("<bash-") {
+    if is_wrapped(prompt) || prompt.trim_start().starts_with("<bash-") {
         return None;
     }
     let line = strip_escapes(prompt)
@@ -211,22 +339,7 @@ fn strip_escapes(text: &str) -> String {
     out
 }
 
-/// Tabs become spaces; control, bidi and zero-width characters go.
+/// Tabs become spaces; hidden characters go; the ends are trimmed.
 fn clean(line: &str) -> String {
-    line.chars()
-        .map(|c| if c == '\t' { ' ' } else { c })
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(
-                    c,
-                    '\u{061c}'
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2060}'..='\u{2069}'
-                        | '\u{feff}'
-                )
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
+    crate::text::clean_line(line).trim().to_string()
 }
