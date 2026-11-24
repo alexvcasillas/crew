@@ -180,7 +180,8 @@ pub enum Request {
     Runtimes,
     /// Answered first, then the session's last items as
     /// [`ServerMsg::TerminalEvent`]s, then new ones as they are written.
-    /// Terminal sessions are read-only.
+    /// After a [`ServerMsg::TerminalSessionReset`], send it again. Terminal
+    /// sessions are read-only.
     SubscribeTerminal {
         session: String,
     },
@@ -204,7 +205,7 @@ pub struct TerminalSession {
     pub title: String,
     /// Unix milliseconds.
     pub started_at: i64,
-    /// Unix milliseconds of the last line written.
+    /// Unix milliseconds of the last write to its file.
     pub last_active_at: i64,
     /// Whether Claude Code is working in it now.
     pub live: bool,
@@ -300,12 +301,19 @@ pub enum ServerMsg {
         agents: Vec<StoredAgent>,
         runs: Vec<StoredRun>,
         approvals: Vec<StoredApproval>,
-        /// Terminal sessions in the projects, most recent first.
+        /// Terminal sessions in the projects written to in the last 14
+        /// days, most recent first.
         #[serde(default)]
         terminal_sessions: Vec<TerminalSession>,
     },
     /// A terminal session appeared or changed.
     TerminalSessionChanged { session: TerminalSession },
+    /// A terminal session's file was deleted, or it was not used for 14
+    /// days.
+    TerminalSessionRemoved { id: String },
+    /// A subscribed terminal session's file was cut short or replaced.
+    /// Drop its items and send `SubscribeTerminal` again for the new ones.
+    TerminalSessionReset { session: String },
     /// One item of a subscribed terminal session, with its sequence number
     /// in that session.
     TerminalEvent {
@@ -469,6 +477,10 @@ mod tests {
                     last_active_at: 2,
                     live: true,
                 },
+            },
+            ServerMsg::TerminalSessionRemoved { id: "s1".into() },
+            ServerMsg::TerminalSessionReset {
+                session: "s1".into(),
             },
             ServerMsg::TerminalEvent {
                 session: "s1".into(),

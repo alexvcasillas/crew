@@ -146,7 +146,7 @@ fn titles_take_the_first_line_clean_and_short() {
     );
     assert_eq!(
         title_from("\n\n  Hello\tthere\u{1b}[31m red\u{202e}  ").as_deref(),
-        Some("Hello there[31m red")
+        Some("Hello there red")
     );
     let long = "word ".repeat(40);
     let title = title_from(&long).unwrap();
@@ -155,4 +155,33 @@ fn titles_take_the_first_line_clean_and_short() {
     assert_eq!(title_from(" \n \u{7}\n"), None);
     // Local command echoes are not what the person asked.
     assert_eq!(title_from("<command-name>/clear</command-name>"), None);
+    // Terminal escapes go whole: colours, titles and links.
+    assert_eq!(
+        title_from(
+            "\u{1b}[1;32mGreen\u{1b}[0m and \u{1b}]0;window\u{7}bold\u{1b}]8;;http://x\u{1b}\\ link"
+        )
+        .as_deref(),
+        Some("Green and bold link")
+    );
+    // A lone escape at the end does not eat the title.
+    assert_eq!(title_from("ok \u{1b}").as_deref(), Some("ok"));
+}
+
+#[test]
+fn local_command_echoes_are_not_prompts() {
+    for text in [
+        "<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>",
+        "<command-message>review is running</command-message>",
+        "<command-args>--fast</command-args>",
+        "<local-command-stdout>Cleared</local-command-stdout>",
+        "  <local-command-caveat>Caveat</local-command-caveat>",
+    ] {
+        let line = serde_json::json!({"type": "user", "message": {"content": text}}).to_string();
+        assert!(parse_line(&line).is_empty(), "{text}");
+        let line = serde_json::json!({"type": "user", "message": {"content": [{"type": "text", "text": text}]}}).to_string();
+        assert!(parse_line(&line).is_empty(), "{text}");
+    }
+    // Ordinary text that mentions a tag is still a prompt.
+    let line = serde_json::json!({"type": "user", "message": {"content": "why does <command-name> show?"}}).to_string();
+    assert_eq!(parse_line(&line).len(), 1);
 }

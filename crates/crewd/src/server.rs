@@ -20,7 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::approvals::stopped_answer;
-use crate::service::{CliBins, Notice, Reply, Service};
+use crate::service::{Backlog, CliBins, Notice, Reply, Service};
 
 /// Socket file name inside the crew home.
 pub const SOCKET_NAME: &str = "crewd.sock";
@@ -315,16 +315,38 @@ struct Asks {
     waiting: HashMap<u64, ApprovalId>,
 }
 
+/// The answer to a `SubscribeTerminal`, worked out in its own task: the
+/// request id, the session and its backlog.
+type TerminalAnswer = (u64, String, Result<Backlog, String>);
+
+/// A `SubscribeTerminal` still being worked out.
+#[derive(Default)]
+struct Joining {
+    /// Items that came meanwhile, sent after the backlog.
+    held: Vec<Notice>,
+    /// Unsubscribed before the answer came.
+    cancelled: bool,
+}
+
 /// Terminal sessions one connection subscribes to, each with the serial
 /// its backlog covered. Each counts as a subscriber until the connection
 /// ends.
 struct TerminalSubs {
     service: Service,
     seen: HashMap<String, u64>,
+    joining: HashMap<String, Joining>,
+    answers: mpsc::Receiver<TerminalAnswer>,
 }
 
 impl Drop for TerminalSubs {
     fn drop(&mut self) {
+        // Late answers now fail to send, and their tasks let go.
+        self.answers.close();
+        while let Ok((_, session, result)) = self.answers.try_recv() {
+            if result.is_ok() {
+                self.service.unsubscribe_terminal(&session);
+            }
+        }
         for (session, _) in self.seen.drain() {
             self.service.unsubscribe_terminal(&session);
         }
@@ -398,12 +420,40 @@ async fn requests_and_notices(
         service: service.clone(),
         waiting: HashMap::new(),
     };
+    let (terminal_tx, terminal_rx) = mpsc::channel::<TerminalAnswer>(8);
     let mut terminals = TerminalSubs {
         service: service.clone(),
         seen: HashMap::new(),
+        joining: HashMap::new(),
+        answers: terminal_rx,
     };
     loop {
         tokio::select! {
+            Some((id, session, result)) = terminals.answers.recv() => {
+                let joining = terminals.joining.remove(&session).unwrap_or_default();
+                match result {
+                    Ok(_) if joining.cancelled => {
+                        service.unsubscribe_terminal(&session);
+                        respond(wr, id, Ok(serde_json::Value::Null)).await?;
+                    }
+                    Ok(backlog) => {
+                        // One count per connection, kept until it ends.
+                        if terminals.seen.insert(session.clone(), backlog.serial).is_some() {
+                            service.unsubscribe_terminal(&session);
+                        }
+                        respond(wr, id, Ok(serde_json::Value::Null)).await?;
+                        for msg in &backlog.msgs {
+                            write_frame(wr, msg).await?;
+                        }
+                        for n in joining.held {
+                            if n.serial > backlog.serial {
+                                write_frame(wr, &n.msg).await?;
+                            }
+                        }
+                    }
+                    Err(e) => respond(wr, id, Err(e)).await?,
+                }
+            }
             Some((id, result)) = answer_rx.recv() => {
                 asks.waiting.remove(&id);
                 respond(wr, id, result).await?;
@@ -440,28 +490,35 @@ async fn requests_and_notices(
                         }
                     }
                     Request::SubscribeTerminal { session } => {
-                        notices.get_or_insert_with(|| service.notices());
-                        let counted = terminals.seen.contains_key(&session);
-                        let ready = if counted {
-                            Ok(())
-                        } else {
-                            service.subscribe_terminal(&session).await
-                        };
-                        match ready {
-                            Ok(()) => {
-                                let backlog = service.terminal_backlog(&session);
-                                // Counted before anything is written, so a
-                                // write error still lets it go.
-                                terminals.seen.insert(session, backlog.serial);
-                                respond(wr, id, Ok(serde_json::Value::Null)).await?;
-                                for msg in &backlog.msgs {
-                                    write_frame(wr, msg).await?;
-                                }
-                            }
-                            Err(e) => respond(wr, id, Err(e)).await?,
+                        if terminals.joining.contains_key(&session) {
+                            let msg = "Already subscribing to that terminal session.";
+                            respond(wr, id, Err(msg.into())).await?;
+                            continue;
                         }
+                        // Taken before the backlog is read, so nothing falls
+                        // between the two.
+                        notices.get_or_insert_with(|| service.notices());
+                        terminals.joining.insert(session.clone(), Joining::default());
+                        // Reading the backlog can take a while: answered
+                        // when it is ready.
+                        let (svc, tx) = (service.clone(), terminal_tx.clone());
+                        tokio::spawn(async move {
+                            let result = match svc.subscribe_terminal(&session).await {
+                                Ok(()) => Ok(svc.terminal_backlog(&session)),
+                                Err(e) => Err(e),
+                            };
+                            if let Err(mpsc::error::SendError((_, session, Ok(_)))) =
+                                tx.send((id, session, result)).await
+                            {
+                                // The connection is gone.
+                                svc.unsubscribe_terminal(&session);
+                            }
+                        });
                     }
                     Request::UnsubscribeTerminal { session } => {
+                        if let Some(joining) = terminals.joining.get_mut(&session) {
+                            joining.cancelled = true;
+                        }
                         if terminals.seen.remove(&session).is_some() {
                             service.unsubscribe_terminal(&session);
                         }
@@ -507,7 +564,12 @@ async fn requests_and_notices(
             }
             notice = next_notice(&mut notices) => match notice {
                 Ok(n) => {
-                    if wanted(&n, all, &subscribed, &terminals.seen) {
+                    if let ServerMsg::TerminalEvent { session, .. } = &n.msg
+                        && let Some(joining) = terminals.joining.get_mut(session)
+                        && !joining.cancelled
+                    {
+                        joining.held.push(n);
+                    } else if wanted(&n, all, &subscribed, &terminals.seen) {
                         write_frame(wr, &n.msg).await?;
                     }
                 }

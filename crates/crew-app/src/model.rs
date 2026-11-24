@@ -254,7 +254,9 @@ impl State {
             | ServerMsg::Resync
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::TerminalSessionChanged { .. }
-            | ServerMsg::TerminalEvent { .. } => {}
+            | ServerMsg::TerminalEvent { .. }
+            | ServerMsg::TerminalSessionRemoved { .. }
+            | ServerMsg::TerminalSessionReset { .. } => {}
         }
     }
 

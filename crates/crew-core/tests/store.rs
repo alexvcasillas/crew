@@ -363,7 +363,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -732,7 +732,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -786,9 +786,56 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V4: &str = include_str!("../src/store/schema_v4.sql");
+
+fn index_names(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn migrates_v4_db_to_v5_with_runs_by_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+    }
+    drop(Store::open(&path).unwrap());
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+    assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
+    // Session lookups use it.
+    let mut stmt = migrated
+        .prepare("EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM runs WHERE session_id = 'x')")
+        .unwrap();
+    let plan: Vec<String> = stmt
+        .query_map([], |r| r.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let plan = plan.join(" / ");
+    assert!(plan.contains("runs_by_session"), "{plan}");
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
     assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
 }
