@@ -663,10 +663,16 @@ fn policy_inputs(
         .into_iter()
         .find(|c| c.id == thread.channel)
         .ok_or(StoreError::NotFound("channel"))?;
+    // The global limits are the last layer, so they act as the channel's
+    // fallback.
+    let global = db.store.limits()?;
     Ok(PolicyInputs {
         thread: (thread.handoff_policy, thread.handoff_budget),
         agent: agent.map_or((None, None), |a| (a.handoff_policy, a.handoff_budget)),
-        channel: (channel.handoff_policy, channel.handoff_budget),
+        channel: (
+            channel.handoff_policy.or(Some(global.handoff_policy)),
+            channel.handoff_budget.or(Some(global.handoff_budget)),
+        ),
         used: thread.handoffs_used,
     })
 }

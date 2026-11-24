@@ -10,7 +10,7 @@ use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun, StoredThread,
 };
 use crew_proto::{
-    ClientMsg, PROTO_VERSION, PermissionAnswer, Request, ServerMsg, read_frame, write_frame,
+    ClientMsg, Limits, PROTO_VERSION, PermissionAnswer, Request, ServerMsg, read_frame, write_frame,
 };
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
@@ -1332,4 +1332,33 @@ async fn handoffs_used_and_worktree_changes_are_broadcast() {
     while row.worktree.is_some() {
         row = next_thread_change(&mut app, chat.thread).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_budget_applies_when_nothing_narrower_sets_one() {
+    let d = Daemon::start(Duration::from_secs(60)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 20).await;
+    c.call(Request::SetLimits {
+        limits: Limits {
+            handoff_policy: HandoffPolicy::Budget,
+            handoff_budget: 1,
+            ..Limits::default()
+        },
+    })
+    .await
+    .unwrap();
+    let run = start_forge(&mut c, chat.thread).await;
+
+    let mut mcp = d.client().await;
+    let text = handoff(&mut mcp, run, "Scout", "look").await.unwrap();
+    assert_eq!(text, "Scout will pick this up after you finish.");
+    until_system(&mut c, "Forge brought in Scout.").await;
+    let text = handoff(&mut mcp, run, "Triage", "sort it").await.unwrap();
+    assert_eq!(
+        text,
+        "This thread used its handoffs. Asked the user whether to continue."
+    );
+    until_system(&mut c, "Paused. This thread used its 1 handoffs.").await;
+    c.call(Request::StopAll).await.unwrap();
 }

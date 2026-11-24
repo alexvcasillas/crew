@@ -4,7 +4,7 @@ use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, RunFilter, Store, StoreError, ThreadWorktree,
+    ApprovalKind, ApprovalStatus, Author, Limits, RunFilter, Store, StoreError, ThreadWorktree,
 };
 
 fn spec(name: &str) -> AgentSpec {
@@ -363,7 +363,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -739,7 +739,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -793,7 +793,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -826,7 +826,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -899,11 +899,89 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
     assert_eq!(index_names(&migrated), index_names(&fresh));
     assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V6: &str = include_str!("../src/store/schema_v6.sql");
+
+#[test]
+fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root, main_branch, created_at) VALUES ('00000000-0000-4000-8000-000000000001', 'demo', '/work/demo', 'main', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.projects().unwrap().len(), 1);
+    assert_eq!(store.limits().unwrap(), Limits::default());
+    store
+        .set_limits(&Limits {
+            max_runs: 2,
+            ..Limits::default()
+        })
+        .unwrap();
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn limits_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    let limits = Limits {
+        max_runs: 6,
+        paused: true,
+        handoff_policy: HandoffPolicy::Budget,
+        handoff_budget: 7,
+    };
+    store.set_limits(&limits).unwrap();
+    assert_eq!(store.limits().unwrap(), limits);
+}
+
+#[test]
+fn garbage_limits_fall_back_or_clamp() {
+    let store = Store::open_in_memory().unwrap();
+    store.set_setting("max_runs", "abc").unwrap();
+    store.set_setting("paused", "maybe").unwrap();
+    store.set_setting("handoff_policy", "per_agent").unwrap();
+    store.set_setting("handoff_budget", "-4").unwrap();
+    assert_eq!(store.limits().unwrap(), Limits::default());
+
+    store.set_setting("max_runs", "0").unwrap();
+    store.set_setting("handoff_budget", "99").unwrap();
+    let l = store.limits().unwrap();
+    assert_eq!((l.max_runs, l.handoff_budget), (1, 10));
+    store.set_setting("max_runs", "99").unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 8);
+}
+
+#[test]
+fn max_runs_seed_only_fills_a_missing_row() {
+    let store = Store::open_in_memory().unwrap();
+    store.seed_max_runs(2).unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 2);
+    store.seed_max_runs(7).unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 2);
 }

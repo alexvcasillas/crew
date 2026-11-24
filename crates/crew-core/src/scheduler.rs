@@ -17,6 +17,7 @@ pub struct Job {
 /// first in, first out order.
 pub struct Scheduler {
     cap: usize,
+    paused: bool,
     queue: Vec<Job>,
     active: HashSet<ThreadId>,
 }
@@ -26,6 +27,7 @@ impl Scheduler {
     pub fn new(cap: usize) -> Self {
         Self {
             cap,
+            paused: false,
             queue: Vec::new(),
             active: HashSet::new(),
         }
@@ -36,9 +38,29 @@ impl Scheduler {
         self.queue.push(job);
     }
 
+    /// Changes the cap. Active runs above a lowered cap keep going; new
+    /// ones wait until fewer than `cap` are active.
+    pub fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// While paused nothing new starts. Queued jobs keep their order.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// How many jobs wait in the queue.
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Takes the next job that may start and marks its thread active.
     pub fn next_ready(&mut self) -> Option<Job> {
-        if self.active.len() >= self.cap {
+        if self.paused || self.active.len() >= self.cap {
             return None;
         }
         let pos = self
@@ -203,5 +225,39 @@ mod tests {
         assert!(s.next_ready().is_none());
         s.finished(t1);
         assert!(s.next_ready().is_none());
+    }
+
+    #[test]
+    fn paused_holds_jobs_and_resumes_in_order() {
+        let mut s = Scheduler::new(4);
+        let (t1, t2) = (ThreadId::new(), ThreadId::new());
+        s.set_paused(true);
+        assert!(s.is_paused());
+        s.enqueue(job(t1, "a"));
+        s.enqueue(job(t2, "b"));
+        assert!(s.next_ready().is_none());
+        assert_eq!(s.queued_len(), 2);
+        s.set_paused(false);
+        assert_eq!(s.next_ready().unwrap().prompt, "a");
+        assert_eq!(s.next_ready().unwrap().prompt, "b");
+        assert_eq!(s.queued_len(), 0);
+    }
+
+    #[test]
+    fn lowered_cap_waits_for_live_runs_to_drop_below_it() {
+        let mut s = Scheduler::new(3);
+        let ts: Vec<_> = (0..4).map(|_| ThreadId::new()).collect();
+        for (i, t) in ts.iter().take(3).enumerate() {
+            s.enqueue(job(*t, &i.to_string()));
+            assert!(s.next_ready().is_some());
+        }
+        s.set_cap(1);
+        s.enqueue(job(ts[3], "x"));
+        assert!(s.next_ready().is_none());
+        s.finished(ts[0]);
+        s.finished(ts[1]);
+        assert!(s.next_ready().is_none());
+        s.finished(ts[2]);
+        assert_eq!(s.next_ready().unwrap().prompt, "x");
     }
 }

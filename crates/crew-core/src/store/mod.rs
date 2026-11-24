@@ -22,7 +22,7 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -30,7 +30,49 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v4.sql"),
     include_str!("migrate_v5.sql"),
     include_str!("migrate_v6.sql"),
+    include_str!("migrate_v7.sql"),
 ];
+
+/// The global limits you set in the app. Stored as rows of `settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Agents that may run at once, 1 to 8.
+    pub max_runs: u32,
+    /// While set, new runs stay queued. Live runs are not touched.
+    pub paused: bool,
+    /// The handoff policy when nothing narrower sets one. Only `AskFirst`
+    /// and `Budget` are valid here.
+    pub handoff_policy: HandoffPolicy,
+    /// Handoffs per thread when nothing narrower sets a budget, 1 to 10.
+    pub handoff_budget: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_runs: 4,
+            paused: false,
+            handoff_policy: HandoffPolicy::AskFirst,
+            handoff_budget: 3,
+        }
+    }
+}
+
+impl Limits {
+    /// Checks the ranges and policy a client may set.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(1..=8).contains(&self.max_runs) {
+            return Err("Choose between 1 and 8 agents at once.".into());
+        }
+        if !(1..=10).contains(&self.handoff_budget) {
+            return Err("Choose between 1 and 10 handoffs.".into());
+        }
+        if self.handoff_policy == HandoffPolicy::PerAgent {
+            return Err("Choose Ask first or Run with budget.".into());
+        }
+        Ok(())
+    }
+}
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -273,6 +315,89 @@ impl Store {
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         Ok(Store { conn })
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Saves one setting, replacing its value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The limits. A missing or unreadable row gives its default and a
+    /// number out of range is clamped, so this never fails on bad data.
+    pub fn limits(&self) -> Result<Limits> {
+        let d = Limits::default();
+        let number = |key: &str, default: u32, range: std::ops::RangeInclusive<u32>| {
+            let Some(raw) = self.setting(key)? else {
+                return Ok::<u32, StoreError>(default);
+            };
+            Ok(match raw.parse::<u32>() {
+                Ok(n) => n.clamp(*range.start(), *range.end()),
+                Err(_) => {
+                    eprintln!("crew: ignoring setting {key} = {raw:?}");
+                    default
+                }
+            })
+        };
+        let paused = match self.setting("paused")?.as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(raw) => {
+                eprintln!("crew: ignoring setting paused = {raw:?}");
+                d.paused
+            }
+        };
+        let handoff_policy = match self.setting("handoff_policy")?.as_deref() {
+            None | Some("ask_first") => HandoffPolicy::AskFirst,
+            Some("budget") => HandoffPolicy::Budget,
+            Some(raw) => {
+                eprintln!("crew: ignoring setting handoff_policy = {raw:?}");
+                d.handoff_policy
+            }
+        };
+        Ok(Limits {
+            max_runs: number("max_runs", d.max_runs, 1..=8)?,
+            paused,
+            handoff_policy,
+            handoff_budget: number("handoff_budget", d.handoff_budget, 1..=10)?,
+        })
+    }
+
+    /// Saves all four limits. The caller validates them first.
+    pub fn set_limits(&self, limits: &Limits) -> Result<()> {
+        let policy = match limits.handoff_policy {
+            HandoffPolicy::Budget => "budget",
+            _ => "ask_first",
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        self.set_setting("max_runs", &limits.max_runs.to_string())?;
+        self.set_setting("paused", if limits.paused { "true" } else { "false" })?;
+        self.set_setting("handoff_policy", policy)?;
+        self.set_setting("handoff_budget", &limits.handoff_budget.to_string())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sets `max_runs` to `n` (clamped) unless it was saved before.
+    pub fn seed_max_runs(&self, n: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('max_runs', ?1)",
+            [n.clamp(1, 8).to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn create_project(&self, name: &str, root: &Path, main_branch: &str) -> Result<ProjectId> {

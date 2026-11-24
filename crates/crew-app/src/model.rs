@@ -262,6 +262,7 @@ impl State {
                 runs,
                 approvals,
                 terminal_sessions,
+                limits: _,
             } => {
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
                 self.terminal = terminal_sessions
@@ -325,7 +326,10 @@ impl State {
                 }
             }
             // The workspace keeps the runtimes.
-            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
+            ServerMsg::Response { .. }
+            | ServerMsg::Resync
+            | ServerMsg::RuntimesChanged { .. }
+            | ServerMsg::LimitsChanged { .. } => {}
         }
     }
 
@@ -1003,6 +1007,7 @@ mod tests {
             runs: vec![],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         (state, p, c, t)
     }
@@ -1258,6 +1263,7 @@ mod tests {
             runs: vec![r2.clone()],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -1634,6 +1640,7 @@ mod tests {
                 session(p.id, "new", 30, false),
                 session(other, "elsewhere", 50, true),
             ],
+            limits: Default::default(),
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -1725,6 +1732,7 @@ mod tests {
             runs: vec![],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

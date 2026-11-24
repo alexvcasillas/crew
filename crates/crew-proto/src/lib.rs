@@ -9,6 +9,7 @@ use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
+pub use crew_core::store::Limits;
 use crew_core::store::{
     StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
     StoredThread,
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -85,6 +86,11 @@ pub enum Request {
         thread: ThreadId,
     },
     StopAll,
+    /// Saves the global limits and applies them at once. Answered with
+    /// null; every client gets a [`ServerMsg::LimitsChanged`].
+    SetLimits {
+        limits: Limits,
+    },
     ListRuns {
         status: Option<RunStatus>,
     },
@@ -305,7 +311,12 @@ pub enum ServerMsg {
         /// days, most recent first.
         #[serde(default)]
         terminal_sessions: Vec<TerminalSession>,
+        /// The global limits.
+        #[serde(default)]
+        limits: Limits,
     },
+    /// The global limits were saved.
+    LimitsChanged { limits: Limits },
     /// A terminal session appeared or changed.
     TerminalSessionChanged { session: TerminalSession },
     /// A terminal session's file was deleted, or it was not used for 14
@@ -504,12 +515,34 @@ mod tests {
         let json = r#"{"type":"snapshot","projects":[],"channels":[],"threads":[],
             "agents":[],"runs":[],"approvals":[]}"#;
         let ServerMsg::Snapshot {
-            terminal_sessions, ..
+            terminal_sessions,
+            limits,
+            ..
         } = serde_json::from_str(json).unwrap()
         else {
             panic!("not a snapshot");
         };
         assert!(terminal_sessions.is_empty());
+        assert_eq!(limits, Limits::default());
+    }
+
+    #[test]
+    fn limits_messages_round_trip() {
+        let limits = Limits {
+            max_runs: 2,
+            paused: true,
+            handoff_policy: HandoffPolicy::Budget,
+            handoff_budget: 5,
+        };
+        let msg = ClientMsg::Request {
+            id: 1,
+            req: Request::SetLimits { limits },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+        let msg = ServerMsg::LimitsChanged { limits };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
     }
 
     #[tokio::test]
