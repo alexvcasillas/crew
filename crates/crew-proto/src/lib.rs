@@ -486,6 +486,9 @@ pub struct RepoChanges {
     pub branch: Option<String>,
     /// Paths relative to the repo. The patch names them under the repo.
     pub diff: Diff,
+    /// In place: files of `diff` the thread's runs didn't touch, changed
+    /// outside this thread. Commit and discard leave them alone.
+    pub outside_thread: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1173,6 +1176,7 @@ mod tests {
                 repo: "api".into(),
                 branch: Some("main".into()),
                 diff: Diff::default(),
+                outside_thread: vec!["b.rs".into()],
             }],
             outside_git: vec![OutsideFile {
                 path: "notes.md".into(),

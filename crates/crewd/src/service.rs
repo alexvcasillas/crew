@@ -113,6 +113,8 @@ pub(crate) struct State {
     pub(crate) retry_rules: HashMap<RunId, Vec<String>>,
     /// The run writing in each project folder agents work in in place.
     pub(crate) writers: HashMap<ProjectId, RunId>,
+    /// Project folders with a commit or discard in place under way.
+    pub(crate) changing: std::collections::HashSet<ProjectId>,
 }
 
 struct Inner {
@@ -232,6 +234,7 @@ impl Service {
                 timed_out: HashMap::new(),
                 retry_rules: HashMap::new(),
                 writers: HashMap::new(),
+                changing: std::collections::HashSet::new(),
             }),
             tx,
             bins,
@@ -886,6 +889,9 @@ impl Service {
             copy_files,
             setup_command,
         } = new;
+        if !root.is_dir() {
+            return Err("Folder not found.".into());
+        }
         let kind = detect_kind(root);
         let mode = work_mode.unwrap_or_else(|| kind.default_mode());
         kind.allows(mode)?;
@@ -1077,23 +1083,19 @@ impl Service {
     /// Removes the thread's worktree, uncommitted changes included. Its
     /// branch goes too, unless it has commits beyond the worktree's base
     /// and `delete_branch` is off: then it is kept and the thread is told.
-    pub(crate) async fn discard(&self, thread: ThreadId, delete_branch: bool) -> Reply {
+    /// The thread is claimed by the caller, which releases it.
+    pub(crate) async fn discard_claimed(
+        &self,
+        thread: ThreadId,
+        wt: ThreadWorktree,
+        delete_branch: bool,
+    ) -> Result<(), String> {
         let root = self
             .db()
             .store
             .project_of_thread(thread)
             .map_err(|e| e.to_string())?
             .root;
-        let wt = self
-            .claim_for_change(thread, |name| format!("Stop {name} first."))?
-            .ok_or("This thread has no worktree.");
-        let wt = match wt {
-            Ok(wt) => wt,
-            Err(e) => {
-                self.release_change(thread);
-                return Err(e.into());
-            }
-        };
         let (path, branch) = (wt.path.clone(), wt.branch.clone());
         let result = blocking(move || {
             let keep = !delete_branch && worktree::has_commits_beyond(&root, &wt.branch, &wt.base)?;
@@ -1120,11 +1122,8 @@ impl Service {
         } else {
             Ok(())
         };
-        self.release_change(thread);
-        self.thread_overview_stale(thread);
-        result?;
-        cleared?;
-        Ok(serde_json::Value::Null)
+        result.map_err(|e| e.to_string())?;
+        cleared
     }
 
     /// Holds the thread so no run starts there while its changes are
@@ -1523,10 +1522,13 @@ impl Service {
             // In place, one agent writes in a folder at a time.
             let job = {
                 let State {
-                    scheduler, writers, ..
+                    scheduler,
+                    writers,
+                    changing,
+                    ..
                 } = &mut *state;
                 let db = self.db();
-                scheduler.next_ready_where(|job| self.lock_holder(&db, writers, job).is_none())
+                scheduler.next_ready_where(|job| self.may_write(&db, writers, changing, job))
             };
             let Some(job) = job else { break };
             let writes_in = self.in_place_writer(&self.db(), &job);
@@ -1536,7 +1538,8 @@ impl Service {
             let pending = state.pending.remove(&job.run);
             // Forget watchers that are done, so the set stays small.
             while state.watchers.try_join_next().is_some() {}
-            if self.needs_worktree(&job) {
+            // A run that writes in place first notes what the folder holds.
+            if self.needs_worktree(&job) || writes_in.is_some() {
                 self.begin_setup(&mut state, job, pending);
             } else if let Some(watch) = self.launch(&mut state, job, pending, true) {
                 state.watchers.spawn(watch);
@@ -1667,7 +1670,14 @@ impl Service {
         pending: Option<Pending>,
         stop_rx: watch::Receiver<bool>,
     ) {
-        let next = match self.set_up_worktree(&job, stop_rx).await {
+        let in_place = self.in_place_writer(&self.db(), &job).is_some();
+        let prepared = if in_place {
+            self.take_snapshot(&job).await;
+            Ok(())
+        } else {
+            self.set_up_worktree(&job, stop_rx).await
+        };
+        let next = match prepared {
             Ok(()) => {
                 let mut state = self.state();
                 let stopped = state
@@ -1702,7 +1712,7 @@ impl Service {
         }
     }
 
-    fn agent_name(&self, agent: AgentId) -> String {
+    pub(crate) fn agent_name(&self, agent: AgentId) -> String {
         let agents = self.db().store.agents_with_deleted().unwrap_or_default();
         agents
             .into_iter()
@@ -1905,12 +1915,12 @@ impl Service {
         let project = db.store.project_of_thread(job.thread)?;
         // A thread folder of repo worktrees leaves plain files out; the
         // agent may read them in the original folder.
-        let read_only_root = db
-            .store
-            .thread(job.thread)?
-            .worktree
+        let worktree = db.store.thread(job.thread)?.worktree;
+        let read_only_root = worktree
+            .as_ref()
             .is_some_and(|wt| !wt.repos.is_empty())
             .then(|| project.root.clone());
+        let in_place = worktree.is_none() && project.work_mode == WorkMode::InPlace;
         let filter = RunFilter {
             status: None,
             thread: Some(job.thread),
@@ -1978,6 +1988,7 @@ impl Service {
             crew_home: home.clone(),
         });
         let context = CrewContext {
+            in_place,
             project: project.name.clone(),
             team: db
                 .store
@@ -2104,6 +2115,8 @@ impl Service {
         let outcome = join
             .await
             .unwrap_or_else(|e| RunOutcome::Failed(format!("The run task ended: {e}")));
+        // In place: what the run left, so its changes can be undone.
+        self.record_end(thread, run).await;
         let reply = if !answered && outcome != RunOutcome::Done {
             // A run stopped before it answered has nothing to post.
             String::new()

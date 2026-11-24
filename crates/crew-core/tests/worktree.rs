@@ -483,3 +483,29 @@ fn ignored_files_at_the_top_are_listed() {
     changed.sort();
     assert!(changed.is_empty(), "{changed:?}");
 }
+
+#[test]
+fn a_failed_commit_only_unstages_what_it_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("api");
+    repo(&root);
+    let hook = root.join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // You staged b.txt; the run changed a.txt and made new.txt.
+    fs::write(root.join("b.txt"), "you\n").unwrap();
+    git(&root, &["add", "b.txt"]);
+    fs::write(root.join("a.txt"), "agent\n").unwrap();
+    fs::write(root.join("new.txt"), "agent\n").unwrap();
+    let paths = vec![
+        "a.txt".to_string(),
+        "new.txt".to_string(),
+        "b.txt".to_string(),
+    ];
+    assert!(worktree::commit_only(&root, "m", &paths).is_err());
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(!status.contains("M  a.txt"), "{status}");
+    assert!(status.contains("M a.txt"), "{status}");
+    assert!(status.contains("?? new.txt"), "{status}");
+    assert!(status.contains("M  b.txt"), "{status}");
+}

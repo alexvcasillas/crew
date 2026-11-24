@@ -12,6 +12,7 @@ pub mod project_kind;
 pub mod review;
 pub mod scheduler;
 pub mod slug;
+pub mod snapshot;
 pub mod store;
 pub mod text;
 pub mod worktree;

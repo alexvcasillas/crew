@@ -94,41 +94,69 @@ pub fn detect_kind(path: &Path) -> ProjectKind {
 /// Repos under `path`, relative to it and sorted, found as
 /// [`detect_kind`] says.
 pub fn find_repos(path: &Path) -> Vec<String> {
-    let mut repos = Vec::new();
+    let mut repos: Vec<(bool, String, std::path::PathBuf)> = Vec::new();
+    let real_root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut queue: VecDeque<(std::path::PathBuf, usize)> = VecDeque::new();
     queue.push_back((path.to_path_buf(), 0));
     let mut read = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
         if read >= MAX_DIRS {
+            eprintln!(
+                "crew: stopped looking for repos in {} after {MAX_DIRS} folders",
+                path.display()
+            );
             break;
         }
         read += 1;
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut children: Vec<_> = entries
+        let mut children: Vec<(std::path::PathBuf, bool)> = entries
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .filter(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 !name.starts_with('.') && !SKIPPED.contains(&name.as_ref())
             })
-            .map(|e| e.path())
+            .filter_map(|e| {
+                let t = e.file_type().ok()?;
+                if t.is_dir() {
+                    return Some((e.path(), false));
+                }
+                // A link counts only if it leads to a folder inside the root.
+                if t.is_symlink() {
+                    let target = e.path().canonicalize().ok()?;
+                    if target.is_dir() && target.starts_with(&real_root) {
+                        return Some((e.path(), true));
+                    }
+                }
+                None
+            })
             .collect();
         children.sort();
-        for child in children {
+        for (child, linked) in children {
             if child.join(".git").exists() {
                 if let Ok(rel) = child.strip_prefix(path) {
-                    repos.push(rel.to_string_lossy().into_owned());
+                    let real = child.canonicalize().unwrap_or_else(|_| child.clone());
+                    repos.push((linked, rel.to_string_lossy().into_owned(), real));
                 }
-            } else if depth + 1 < MAX_DEPTH {
+            } else if !linked && depth + 1 < MAX_DEPTH {
+                // Links are never walked into, so a loop can't form.
                 queue.push_back((child, depth + 1));
             }
         }
     }
+    // A repo reached both directly and through a link counts once, by
+    // its own path.
     repos.sort();
-    repos
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = repos
+        .into_iter()
+        .filter(|(_, _, real)| seen.insert(real.clone()))
+        .map(|(_, rel, _)| rel)
+        .collect();
+    out.sort();
+    out
 }
 
 fn inside_checkout(path: &Path) -> bool {

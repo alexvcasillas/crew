@@ -1613,9 +1613,12 @@ mod gpui_tests {
         let (other, _events) = client::spawn(ConnectionConfig {
             crew_home: home.to_path_buf(),
         });
+        // crewd only takes a folder that exists.
+        let root = home.join("demo");
+        std::fs::create_dir_all(&root).unwrap();
         futures::executor::block_on(other.request(Request::CreateProject {
             name: "demo".into(),
-            root: "/work/demo".into(),
+            root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
             work_mode: None,
             copy_files: vec![],
@@ -1679,10 +1682,12 @@ mod gpui_tests {
             crew_home: home.path().to_path_buf(),
         });
         let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
-        let add = |name: &str, root: &str| -> (ProjectId, ChannelId) {
+        let add = |name: &str| -> (ProjectId, ChannelId) {
+            let root = home.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
             let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
                 name: name.into(),
-                root: root.into(),
+                root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
                 work_mode: None,
                 copy_files: vec![],
@@ -1696,8 +1701,8 @@ mod gpui_tests {
             .unwrap();
             (project, channel)
         };
-        let (gone, gone_channel) = add("gone", "/work/gone");
-        let (kept, kept_channel) = add("kept", "/work/kept");
+        let (gone, gone_channel) = add("gone");
+        let (kept, kept_channel) = add("kept");
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel: gone_channel,
             title: "fix the login".into(),
@@ -1752,9 +1757,11 @@ mod gpui_tests {
             crew_home: home.path().to_path_buf(),
         });
         let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
+        let root = home.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
         let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
             name: "demo".into(),
-            root: "/work/demo".into(),
+            root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
             work_mode: None,
             copy_files: vec![],

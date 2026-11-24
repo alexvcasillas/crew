@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ChannelId, ThreadId};
+use crew_core::project_kind::{ProjectKind, WorkMode};
 use crew_core::store::{StoredRun, StoredThread, ThreadActivity, ThreadWorktree};
 use crew_core::text::clean_line;
 use crew_core::worktree::ChangeCounts;
@@ -170,18 +171,43 @@ impl Service {
         &self,
         channel: ChannelId,
     ) -> Result<ChannelOverview, String> {
-        let (threads, activity, runs, copied) = {
+        let (threads, activity, runs, project) = {
             let db = self.db();
             let found = db.store.channel(channel).and_then(|c| {
                 Ok((
                     db.store.threads(channel)?,
                     db.store.thread_activity(channel)?,
                     db.store.channel_runs(channel)?,
-                    db.store.project(c.project)?.copy_files,
+                    db.store.project(c.project)?,
                 ))
             });
             found.map_err(|e| e.to_string())?
         };
+        let copied = project.copy_files.clone();
+        // What each thread's changes are counted on: its worktree, or in
+        // place the files its runs touched. Read before the cache is locked.
+        let mut targets: HashMap<ThreadId, CountTarget> = HashMap::new();
+        for thread in &threads {
+            match &thread.worktree {
+                Some(wt) => {
+                    targets.insert(thread.id, CountTarget::Copy(wt.clone()));
+                }
+                None if project.work_mode == WorkMode::InPlace && thread.archived_at.is_none() => {
+                    let edits = self.thread_edits(thread.id, &project.root)?;
+                    if !edits.is_empty() {
+                        targets.insert(
+                            thread.id,
+                            CountTarget::InPlace {
+                                root: project.root.clone(),
+                                kind: project.kind.clone(),
+                                edits,
+                            },
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
         let deadline = tokio::time::Instant::now() + OVERVIEW_WAIT;
 
         let mut wanted = Vec::new();
@@ -189,14 +215,16 @@ impl Service {
             let mut cache = self.changes();
             let now = Instant::now();
             for thread in &threads {
-                let Some(wt) = &thread.worktree else { continue };
+                let Some(target) = targets.get(&thread.id) else {
+                    continue;
+                };
                 cache.apply_due(thread.id, now);
                 if thread.archived_at.is_some() || cache.fresh(thread.id).is_some() {
                     continue;
                 }
                 wanted.push(thread.id);
                 if let Some(generation) = cache.claim(thread.id) {
-                    self.count_in_background(thread.id, generation, wt.clone(), copied.clone());
+                    self.count_in_background(thread.id, generation, target.clone(), copied.clone());
                 }
             }
         }
@@ -233,7 +261,9 @@ impl Service {
         {
             let cache = self.changes();
             for thread in &threads {
-                let Some(wt) = &thread.worktree else { continue };
+                let Some(target) = targets.get(&thread.id) else {
+                    continue;
+                };
                 let c = match cache.fresh(thread.id) {
                     Some(c) => c,
                     None => {
@@ -244,7 +274,7 @@ impl Service {
                     }
                 };
                 // A folder deleted outside Crew since the counts were made.
-                let c = if wt.path.is_dir() {
+                let c = if target.exists() {
                     c
                 } else {
                     counting.remove(&thread.id);
@@ -301,7 +331,7 @@ impl Service {
         &self,
         thread: ThreadId,
         mut generation: u64,
-        wt: ThreadWorktree,
+        target: CountTarget,
         copied: Vec<String>,
     ) {
         let svc = self.clone();
@@ -310,11 +340,11 @@ impl Service {
                 let counts = match svc.count_slots().acquire_owned().await {
                     Ok(slot) => {
                         let delay = svc.count_delay();
-                        let (wt, copied) = (wt.clone(), copied.clone());
+                        let (target, copied) = (target.clone(), copied.clone());
                         let job = tokio::task::spawn_blocking(move || {
                             let _slot = slot;
                             std::thread::sleep(delay);
-                            count_changes(thread, &wt, &copied)
+                            count_changes(thread, &target, &copied)
                         });
                         job.await.unwrap_or_else(|e| {
                             log(format!(
@@ -340,16 +370,43 @@ impl Service {
 
 /// The thread's change counts, every repo's added up. A missing folder or
 /// a git failure gives zeros; a failure is logged.
-fn count_changes(thread: ThreadId, wt: &ThreadWorktree, copied: &[String]) -> ChangeCounts {
-    if !wt.path.is_dir() {
+fn count_changes(thread: ThreadId, target: &CountTarget, copied: &[String]) -> ChangeCounts {
+    if !target.exists() {
         return ChangeCounts::default();
     }
-    crate::folders::thread_counts(wt, copied).unwrap_or_else(|e| {
+    let counted = match target {
+        CountTarget::Copy(wt) => crate::folders::thread_counts(wt, copied),
+        CountTarget::InPlace { root, kind, edits } => {
+            crate::folders::in_place_counts(root, kind, edits)
+        }
+    };
+    counted.unwrap_or_else(|e| {
         log(format!(
             "couldn't count the changes of thread {thread}: {e}"
         ));
         ChangeCounts::default()
     })
+}
+
+/// What a thread's changes are counted on.
+#[derive(Clone)]
+enum CountTarget {
+    Copy(ThreadWorktree),
+    /// The project folder, where the thread's runs touched `edits`.
+    InPlace {
+        root: std::path::PathBuf,
+        kind: ProjectKind,
+        edits: Vec<String>,
+    },
+}
+
+impl CountTarget {
+    fn exists(&self) -> bool {
+        match self {
+            CountTarget::Copy(wt) => wt.path.is_dir(),
+            CountTarget::InPlace { root, .. } => root.is_dir(),
+        }
+    }
 }
 
 /// How long a run ran, or has run so far. A queued run, or one that ended

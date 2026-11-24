@@ -2,9 +2,12 @@
 //! folder itself.
 //!
 //! A thread's changes are grouped per repo. In a copy per thread they are
-//! whatever differs in each repo's worktree. In place they are only the
-//! files the thread's runs edited or wrote, by their tool calls, that git
-//! sees as changed: your own edits in the same folder stay yours.
+//! whatever differs in each repo's worktree. In place, review shows every
+//! change git sees in the repos and marks those the thread's runs didn't
+//! touch (by their tool calls); commit and discard only take the touched
+//! ones. Discard puts each file back as it was before the run that changed
+//! it, from a snapshot, and only while it still is what that run left, so
+//! your own edits survive.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,6 +18,7 @@ use crew_core::project_kind::{
     ProjectKind, WorkMode, detect_kind, looks_secret, relative_to, repo_of,
 };
 use crew_core::scheduler::Job;
+use crew_core::snapshot::{self, Before, RunSnapshot, Undo, plan_undo};
 use crew_core::store::{Author, RunFilter, StoredProject, ThreadWorktree};
 use crew_core::worktree::{self, Diff};
 use crew_proto::{FolderInfo, OutsideFile, RepoChanges, SetupFile, SetupFileSize, ThreadChanges};
@@ -74,7 +78,13 @@ fn copied_in(copied: &[String], repo: &str) -> Vec<String> {
 }
 
 /// Adds one repo's changes to the whole.
-fn push_repo(out: &mut ThreadChanges, repo: &str, branch: Option<String>, diff: Diff) {
+fn push_repo(
+    out: &mut ThreadChanges,
+    repo: &str,
+    branch: Option<String>,
+    diff: Diff,
+    outside_thread: Vec<String>,
+) {
     let p = prefix(repo);
     for f in &diff.files {
         let mut f = f.clone();
@@ -86,36 +96,49 @@ fn push_repo(out: &mut ThreadChanges, repo: &str, branch: Option<String>, diff: 
         repo: repo.to_string(),
         branch,
         diff,
+        outside_thread,
     });
 }
 
-/// Paths the thread's runs changed in place, per repo (relative to it),
-/// and those outside any repo or ignored by git (relative to the folder).
+/// A repo's changes in place: what the thread's runs touched and git
+/// sees as changed, and the other changed files. Paths relative to the
+/// repo.
+pub(crate) struct RepoWork {
+    pub(crate) repo: String,
+    pub(crate) touched: Vec<String>,
+    pub(crate) others: Vec<String>,
+}
+
+/// The thread's changes in place, per repo with any, and the touched
+/// files outside any repo or ignored by git (relative to the folder).
 pub(crate) struct InPlace {
-    pub(crate) repos: Vec<(String, Vec<String>)>,
+    pub(crate) repos: Vec<RepoWork>,
     pub(crate) outside: Vec<String>,
 }
 
-/// Sorts the folder-relative `edits` into repos, keeping only what git
-/// sees as changed. Reads git, so off the async threads.
+/// Sorts the folder-relative `edits` into the folder's repos next to
+/// what git sees as changed there. Reads git, so off the async threads.
 pub(crate) fn in_place_changes(root: &Path, kind: &ProjectKind, edits: &[String]) -> InPlace {
     let repos = kind.repos();
-    let mut by_repo: Vec<(String, Vec<String>)> = Vec::new();
+    let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
     let mut outside = Vec::new();
     for path in edits {
         match repo_of(&repos, path) {
-            Some((repo, inner)) => match by_repo.iter_mut().find(|(r, _)| r == repo) {
-                Some((_, paths)) => paths.push(inner.to_string()),
-                None => by_repo.push((repo.to_string(), vec![inner.to_string()])),
-            },
+            Some((repo, inner)) => by_repo
+                .entry(repo.to_string())
+                .or_default()
+                .push(inner.to_string()),
             None => outside.push(path.clone()),
         }
     }
     let mut out = Vec::new();
-    for (repo, paths) in by_repo {
+    for repo in repos {
         let dir = root.join(&repo);
-        let changed: HashSet<String> = match worktree::changed_files(&dir) {
-            Ok(changed) => changed.into_iter().collect(),
+        if !dir.is_dir() {
+            continue;
+        }
+        let changed = match worktree::changed_files(&dir) {
+            Ok(changed) => changed,
             Err(e) => {
                 log(format!(
                     "couldn't read the changes in {}: {e}",
@@ -124,16 +147,26 @@ pub(crate) fn in_place_changes(root: &Path, kind: &ProjectKind, edits: &[String]
                 continue;
             }
         };
-        let mut kept = Vec::new();
-        for path in paths {
-            if changed.contains(&path) {
-                kept.push(path);
-            } else if worktree::is_ignored(&dir, &path) {
+        let edited = by_repo.remove(&repo).unwrap_or_default();
+        let set: HashSet<&String> = changed.iter().collect();
+        let mut touched = Vec::new();
+        for path in &edited {
+            if set.contains(path) {
+                touched.push(path.clone());
+            } else if worktree::is_ignored(&dir, path) {
                 outside.push(format!("{}{path}", prefix(&repo)));
             }
         }
-        if !kept.is_empty() {
-            out.push((repo, kept));
+        let others: Vec<String> = changed
+            .into_iter()
+            .filter(|p| !touched.contains(p))
+            .collect();
+        if !touched.is_empty() || !others.is_empty() {
+            out.push(RepoWork {
+                repo,
+                touched,
+                others,
+            });
         }
     }
     InPlace {
@@ -148,6 +181,7 @@ pub(crate) fn in_place_changes(root: &Path, kind: &ProjectKind, edits: &[String]
 /// that stopped it, if any.
 fn remove_repo_worktrees(
     root: &Path,
+    own: &Path,
     wt: &ThreadWorktree,
     repos: &[String],
     delete_branch: bool,
@@ -159,6 +193,18 @@ fn remove_repo_worktrees(
             continue;
         };
         let (src, dest) = (root.join(repo), wt.path.join(repo));
+        // The repo is gone from the folder: no git to ask, so only Crew's
+        // own copy of it goes.
+        if !src.join(".git").exists() {
+            if dest.exists()
+                && dest.starts_with(own)
+                && let Err(e) = std::fs::remove_dir_all(&dest)
+            {
+                return (removed, kept, Some(format!("{repo}: {e}")));
+            }
+            removed.push(repo.clone());
+            continue;
+        }
         let done = (|| {
             let keep = !delete_branch && worktree::has_commits_beyond(&src, &wt.branch, &r.base)?;
             worktree::remove(&src, &dest, &wt.branch, !keep)?;
@@ -399,40 +445,76 @@ impl Service {
         }
     }
 
-    /// The folder-relative files the thread's runs edited or wrote, in
-    /// the order first touched.
-    fn thread_edits(&self, thread: ThreadId, root: &Path) -> Result<Vec<String>, String> {
-        let events = self.with_reader(|store| {
+    /// The folder-relative files each run of the thread edited or wrote,
+    /// oldest run first.
+    fn run_edits(
+        &self,
+        thread: ThreadId,
+        root: &Path,
+    ) -> Result<Vec<(RunId, Vec<String>)>, String> {
+        let runs = self.with_reader(|store| {
             let runs = store.runs(RunFilter {
                 status: None,
                 thread: Some(thread),
             })?;
             let mut all = Vec::new();
             for run in runs {
-                all.extend(store.events(run.id, 0)?.into_iter().map(|(_, e)| e));
+                let events: Vec<_> = store
+                    .events(run.id, 0)?
+                    .into_iter()
+                    .map(|(_, e)| e)
+                    .collect();
+                all.push((run.id, events));
             }
             Ok::<_, crew_core::store::StoreError>(all)
         });
-        let events = events.map_err(|e| e.to_string())?;
+        let runs = runs.map_err(|e| e.to_string())?;
+        Ok(runs
+            .into_iter()
+            .map(|(run, events)| {
+                let mut paths: Vec<String> = Vec::new();
+                for path in edited_paths(&events) {
+                    if let Some(rel) = relative_to(root, &path)
+                        && !paths.contains(&rel)
+                    {
+                        paths.push(rel);
+                    }
+                }
+                (run, paths)
+            })
+            .collect())
+    }
+
+    /// The folder-relative files the thread's runs edited or wrote, in
+    /// the order first touched.
+    pub(crate) fn thread_edits(
+        &self,
+        thread: ThreadId,
+        root: &Path,
+    ) -> Result<Vec<String>, String> {
         let mut out: Vec<String> = Vec::new();
-        for path in edited_paths(&events) {
-            if let Some(rel) = relative_to(root, &path)
-                && !out.contains(&rel)
-            {
-                out.push(rel);
+        for (_, paths) in self.run_edits(thread, root)? {
+            for p in paths {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
             }
         }
         Ok(out)
     }
 
-    /// Where the thread's changes live, with its project.
-    fn work_of(&self, thread: ThreadId) -> Result<(StoredProject, Work), String> {
-        let db = self.db();
-        let project = db
+    /// Where the thread's changes live, given its worktree, with its
+    /// project.
+    fn work_of(
+        &self,
+        thread: ThreadId,
+        wt: Option<ThreadWorktree>,
+    ) -> Result<(StoredProject, Work), String> {
+        let project = self
+            .db()
             .store
             .project_of_thread(thread)
             .map_err(|e| e.to_string())?;
-        let wt = db.store.thread(thread).map_err(|e| e.to_string())?.worktree;
         let work = match wt {
             Some(wt) => Work::Copy(wt),
             None if project.work_mode == WorkMode::InPlace => Work::InPlace,
@@ -444,7 +526,13 @@ impl Service {
     /// Answers `ThreadDiff`: the thread's uncommitted changes per repo.
     /// Files copied in from the project folder are left out.
     pub(crate) async fn thread_changes(&self, thread: ThreadId) -> Reply {
-        let (project, work) = self.work_of(thread)?;
+        let wt = self
+            .db()
+            .store
+            .thread(thread)
+            .map_err(|e| e.to_string())?
+            .worktree;
+        let (project, work) = self.work_of(thread, wt)?;
         let edits = match work {
             Work::InPlace => self.thread_edits(thread, &project.root)?,
             _ => Vec::new(),
@@ -455,27 +543,29 @@ impl Service {
                 Work::None => {}
                 Work::Copy(wt) if wt.repos.is_empty() => {
                     let diff = worktree::diff(&wt.path, "HEAD", &project.copy_files)?;
-                    push_repo(&mut out, "", Some(wt.branch.clone()), diff);
+                    push_repo(&mut out, "", Some(wt.branch.clone()), diff, Vec::new());
                 }
                 Work::Copy(wt) => {
                     for r in &wt.repos {
                         let dir = wt.path.join(&r.repo);
-                        if !dir.is_dir() {
+                        // A repo gone from the folder leaves a worktree git can't read.
+                        if !dir.is_dir() || !project.root.join(&r.repo).is_dir() {
                             continue;
                         }
                         let copied = copied_in(&project.copy_files, &r.repo);
                         let diff =
                             worktree::diff_scoped(&dir, "HEAD", &copied, None, &prefix(&r.repo))?;
-                        push_repo(&mut out, &r.repo, Some(wt.branch.clone()), diff);
+                        push_repo(&mut out, &r.repo, Some(wt.branch.clone()), diff, Vec::new());
                     }
                 }
                 Work::InPlace => {
                     let found = in_place_changes(&project.root, &project.kind, &edits);
-                    for (repo, paths) in found.repos {
-                        let dir = project.root.join(&repo);
+                    for work in found.repos {
+                        let dir = project.root.join(&work.repo);
                         let diff =
-                            worktree::diff_scoped(&dir, "HEAD", &[], Some(&paths), &prefix(&repo))?;
-                        push_repo(&mut out, &repo, worktree::current_branch(&dir), diff);
+                            worktree::diff_scoped(&dir, "HEAD", &[], None, &prefix(&work.repo))?;
+                        let branch = worktree::current_branch(&dir);
+                        push_repo(&mut out, &work.repo, branch, diff, work.others);
                     }
                     out.outside_git = found
                         .outside
@@ -493,6 +583,56 @@ impl Service {
         json(changes)
     }
 
+    /// Holds the project folder for a commit or discard in place: no
+    /// agent writes there meanwhile. Refused while one does.
+    fn claim_folder(&self, project: ProjectId) -> Result<(), String> {
+        let mut state = self.state();
+        if let Some(run) = state.writers.get(&project).copied() {
+            let agent = self.db().store.run(run).map(|r| r.agent);
+            let name = match agent {
+                Ok(agent) => self.agent_name(agent),
+                Err(_) => "the agent".to_string(),
+            };
+            return Err(format!("Wait for {name} to finish writing, or stop it."));
+        }
+        if !state.changing.insert(project) {
+            return Err("Another change to this folder is in progress.".into());
+        }
+        Ok(())
+    }
+
+    /// Takes the thread, and for work in place its project folder, so
+    /// nothing runs there while its changes are committed or dropped.
+    /// Returns the project and where the thread's changes live.
+    fn claim_work(
+        &self,
+        thread: ThreadId,
+        busy: impl FnOnce(&str) -> String,
+    ) -> Result<(StoredProject, Work), String> {
+        let wt = self.claim_for_change(thread, busy)?;
+        let found = self.work_of(thread, wt).and_then(|(project, work)| {
+            if matches!(work, Work::InPlace) {
+                self.claim_folder(project.id)?;
+            }
+            Ok((project, work))
+        });
+        if found.is_err() {
+            self.release_change(thread);
+        }
+        found
+    }
+
+    /// Lets runs start in the thread and its folder again after a commit
+    /// or discard, and drops what may have changed.
+    fn after_change(&self, thread: ThreadId, project: &StoredProject, work: &Work) {
+        self.changes_may_differ(thread);
+        if matches!(work, Work::InPlace) {
+            self.project_files_may_differ(project);
+            self.state().changing.remove(&project.id);
+        }
+        self.release_change(thread);
+    }
+
     /// Answers `Commit`: commits the thread's changes in one repo.
     pub(crate) async fn commit_in(
         &self,
@@ -504,15 +644,34 @@ impl Service {
         if message.is_empty() {
             return Err("Write a commit message.".into());
         }
-        let (project, work) = self.work_of(thread)?;
-        let edits = match work {
-            Work::InPlace => self.thread_edits(thread, &project.root)?,
-            _ => Vec::new(),
-        };
+        let (project, work) = self.claim_work(thread, |name| {
+            format!("Wait for {name} to finish, or stop it.")
+        })?;
+        let result = self
+            .commit_claimed(thread, &project, &work, repo, message)
+            .await;
+        self.after_change(thread, &project, &work);
+        if matches!(result, Ok(Some(_))) {
+            self.thread_overview_stale(thread);
+        }
+        match result? {
+            Some(sha) => json(sha),
+            None => Err("Nothing to commit.".into()),
+        }
+    }
+
+    async fn commit_claimed(
+        &self,
+        thread: ThreadId,
+        project: &StoredProject,
+        work: &Work,
+        repo: Option<String>,
+        message: String,
+    ) -> Result<Option<String>, String> {
         let repo = repo.filter(|r| !r.is_empty());
         // Which folder to commit in, and what: everything but the copied
-        // files, or only the run's paths.
-        let (dir, only, copied) = match &work {
+        // files, or only the thread's paths.
+        let (dir, only, copied) = match work {
             Work::None => return Err("This thread has no worktree.".into()),
             Work::Copy(wt) if wt.repos.is_empty() => {
                 if repo.is_some() {
@@ -544,166 +703,341 @@ impl Service {
                 (project.root.join(&repo), Some(repo), Vec::new())
             }
         };
-        self.claim_for_change(thread, |name| {
-            format!("Wait for {name} to finish, or stop it.")
-        })?;
-        let root = project.root.clone();
-        let kind = project.kind.clone();
-        let result = blocking(move || match only {
-            Some(repo) => {
-                let found = in_place_changes(&root, &kind, &edits);
-                let paths = found
-                    .repos
-                    .into_iter()
-                    .find(|(r, _)| *r == repo)
-                    .map(|(_, p)| p)
-                    .unwrap_or_default();
-                if paths.is_empty() {
-                    return Ok(None);
-                }
-                worktree::commit_only(&dir, &message, &paths).map(Some)
-            }
-            None => {
+        let edits = match work {
+            Work::InPlace => self.run_edits(thread, &project.root)?,
+            _ => Vec::new(),
+        };
+        let (root, kind) = (project.root.clone(), project.kind.clone());
+        let snapshots = self.snapshots_dir();
+        blocking(move || {
+            let Some(repo) = only else {
                 if worktree::diff(&dir, "HEAD", &copied)?.files.is_empty() {
                     return Ok(None);
                 }
-                worktree::commit(&dir, &message, &copied).map(Some)
+                return worktree::commit(&dir, &message, &copied).map(Some);
+            };
+            let all: Vec<String> = edits.iter().flat_map(|(_, p)| p.clone()).collect();
+            let found = in_place_changes(&root, &kind, &all);
+            let paths = found
+                .repos
+                .into_iter()
+                .find(|w| w.repo == repo)
+                .map(|w| w.touched)
+                .unwrap_or_default();
+            if paths.is_empty() {
+                return Ok(None);
             }
+            let sha = worktree::commit_only(&dir, &message, &paths)?;
+            // Committed work is no longer the runs' to undo.
+            let done: Vec<String> = paths
+                .iter()
+                .map(|p| format!("{}{p}", prefix(&repo)))
+                .collect();
+            forget_in_snapshots(&snapshots, &edits, &done);
+            Ok::<_, worktree::WorktreeError>(Some(sha))
         })
-        .await;
-        self.after_change(thread, &project);
-        if matches!(result, Ok(Some(_))) {
-            self.thread_overview_stale(thread);
-        }
-        match result? {
-            Some(sha) => json(sha),
-            None => Err("Nothing to commit.".into()),
-        }
+        .await
     }
 
-    /// Answers `Discard` for a folder of repos, or in place. A single
-    /// repo's worktree goes through [`Service::discard`].
+    /// Answers `Discard`.
     pub(crate) async fn discard_in(
         &self,
         thread: ThreadId,
         repos: Option<Vec<String>>,
         delete_branch: bool,
     ) -> Reply {
-        let (project, work) = self.work_of(thread)?;
-        match work {
-            Work::None => Err("This thread has no worktree.".into()),
-            Work::Copy(wt) if wt.repos.is_empty() => self.discard(thread, delete_branch).await,
-            Work::Copy(wt) => {
-                let all: Vec<String> = wt.repos.iter().map(|r| r.repo.clone()).collect();
-                let chosen = repos.unwrap_or_else(|| all.clone());
-                if let Some(bad) = chosen.iter().find(|r| !all.contains(r)) {
-                    return Err(format!("{bad} isn't a repo of this thread."));
-                }
-                self.claim_for_change(thread, |name| format!("Stop {name} first."))?;
-                let (root, own) = (project.root.clone(), self.worktrees().to_path_buf());
-                let held = wt.clone();
-                let (removed, kept, failed, gone) = blocking(move || {
-                    let (removed, kept, failed) =
-                        remove_repo_worktrees(&root, &held, &chosen, delete_branch);
-                    let left = held.repos.iter().any(|r| !removed.contains(&r.repo));
-                    // The thread folder is Crew's own; it goes once empty of repos.
-                    let mut gone = false;
-                    if !left && held.path.starts_with(&own) {
-                        if held.path.exists()
-                            && let Err(e) = std::fs::remove_dir_all(&held.path)
-                        {
-                            log(format!("couldn't remove {}: {e}", held.path.display()));
-                        }
-                        gone = true;
-                    }
-                    Ok::<_, String>((removed, kept, failed, gone))
-                })
-                .await?;
-                let saved = {
-                    let mut db = self.db();
-                    let left = ThreadWorktree {
-                        repos: wt
-                            .repos
-                            .iter()
-                            .filter(|r| !removed.contains(&r.repo))
-                            .cloned()
-                            .collect(),
-                        ..wt.clone()
-                    };
-                    let next = (!gone && !left.repos.is_empty()).then_some(&left);
-                    let mut saved = db.store.set_thread_worktree(thread, next);
-                    if saved.is_ok() {
-                        self.thread_changed_or_log(&mut db, thread);
-                    }
-                    for repo in &kept {
-                        let body = format!(
-                            "Kept branch {} in {repo} because it has commits that aren't merged.",
-                            wt.branch
-                        );
-                        if saved.is_ok() {
-                            saved = self
-                                .add_message(&mut db, thread, Author::System, &body, None)
-                                .map(|_| ());
-                        }
-                    }
-                    saved.map_err(|e| e.to_string())
-                };
-                self.after_change(thread, &project);
-                self.thread_overview_stale(thread);
-                if let Some(e) = failed {
-                    return Err(e);
-                }
-                saved?;
-                Ok(serde_json::Value::Null)
+        let (project, work) = self.claim_work(thread, |name| format!("Stop {name} first."))?;
+        let result = match &work {
+            Work::None => Err("This thread has no worktree.".to_string()),
+            Work::Copy(wt) if wt.repos.is_empty() => {
+                self.discard_claimed(thread, wt.clone(), delete_branch)
+                    .await
             }
-            Work::InPlace => {
-                let all = project.kind.repos();
-                let chosen = repos.unwrap_or_else(|| all.clone());
-                if let Some(bad) = chosen.iter().find(|r| !all.contains(r)) {
-                    return Err(format!("{bad} isn't a repo of this folder."));
+            Work::Copy(wt) => {
+                self.discard_repos(thread, &project, wt, repos, delete_branch)
+                    .await
+            }
+            Work::InPlace => self.discard_in_place(thread, &project, repos).await,
+        };
+        self.after_change(thread, &project, &work);
+        self.thread_overview_stale(thread);
+        result.map(|()| serde_json::Value::Null)
+    }
+
+    /// Removes the chosen repo worktrees of a thread folder, and the
+    /// folder once none is left.
+    async fn discard_repos(
+        &self,
+        thread: ThreadId,
+        project: &StoredProject,
+        wt: &ThreadWorktree,
+        repos: Option<Vec<String>>,
+        delete_branch: bool,
+    ) -> Result<(), String> {
+        let all: Vec<String> = wt.repos.iter().map(|r| r.repo.clone()).collect();
+        let chosen = repos.unwrap_or_else(|| all.clone());
+        if let Some(bad) = chosen.iter().find(|r| !all.contains(r)) {
+            return Err(format!("{bad} isn't a repo of this thread."));
+        }
+        let (root, own) = (project.root.clone(), self.worktrees().to_path_buf());
+        let held = wt.clone();
+        let (removed, kept, failed, gone) = blocking(move || {
+            let (removed, kept, failed) =
+                remove_repo_worktrees(&root, &own, &held, &chosen, delete_branch);
+            let left = held.repos.iter().any(|r| !removed.contains(&r.repo));
+            // The thread folder is Crew's own; it goes once empty of repos.
+            let mut gone = false;
+            if !left && held.path.starts_with(&own) {
+                if held.path.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&held.path)
+                {
+                    log(format!("couldn't remove {}: {e}", held.path.display()));
                 }
-                let edits = self.thread_edits(thread, &project.root)?;
-                self.claim_for_change(thread, |name| format!("Stop {name} first."))?;
-                let (root, kind) = (project.root.clone(), project.kind.clone());
-                let result = blocking(move || {
-                    let found = in_place_changes(&root, &kind, &edits);
-                    let mut left = Vec::new();
-                    for (repo, paths) in found.repos {
-                        if !chosen.contains(&repo) {
+                gone = true;
+            }
+            Ok::<_, String>((removed, kept, failed, gone))
+        })
+        .await?;
+        let saved = {
+            let mut db = self.db();
+            let left = ThreadWorktree {
+                repos: wt
+                    .repos
+                    .iter()
+                    .filter(|r| !removed.contains(&r.repo))
+                    .cloned()
+                    .collect(),
+                ..wt.clone()
+            };
+            let next = (!gone && !left.repos.is_empty()).then_some(&left);
+            let mut saved = db.store.set_thread_worktree(thread, next);
+            if saved.is_ok() {
+                self.thread_changed_or_log(&mut db, thread);
+            }
+            for repo in &kept {
+                let body = format!(
+                    "Kept branch {} in {repo} because it has commits that aren't merged.",
+                    wt.branch
+                );
+                if saved.is_ok() {
+                    saved = self
+                        .add_message(&mut db, thread, Author::System, &body, None)
+                        .map(|_| ());
+                }
+            }
+            saved.map_err(|e| e.to_string())
+        };
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        saved
+    }
+
+    /// Undoes the thread's runs in the project folder, file by file, from
+    /// their snapshots. A file is put back only while it still is what the
+    /// last run that touched it left; your edits made before the run come
+    /// back with it. Files git doesn't have are never touched.
+    async fn discard_in_place(
+        &self,
+        thread: ThreadId,
+        project: &StoredProject,
+        repos: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        let all = project.kind.repos();
+        let chosen = repos.unwrap_or_else(|| all.clone());
+        if let Some(bad) = chosen.iter().find(|r| !all.contains(r)) {
+            return Err(format!("{bad} isn't a repo of this folder."));
+        }
+        let edits = self.run_edits(thread, &project.root)?;
+        let (root, kind) = (project.root.clone(), project.kind.clone());
+        let dir_of_snapshots = self.snapshots_dir();
+        let (notes, failed) = blocking(move || {
+            let snaps: HashMap<RunId, RunSnapshot> = edits
+                .iter()
+                .filter_map(|(run, _)| Some((*run, load_snapshot(&dir_of_snapshots, *run)?)))
+                .collect();
+            let every: Vec<String> = edits.iter().flat_map(|(_, p)| p.clone()).collect();
+            let found = in_place_changes(&root, &kind, &every);
+            let mut notes = Vec::new();
+            let mut left_new = Vec::new();
+            let mut undone = Vec::new();
+            let mut failed = None;
+            for work in found.repos {
+                if !chosen.contains(&work.repo) {
+                    continue;
+                }
+                let dir = root.join(&work.repo);
+                for path in &work.touched {
+                    let full = format!("{}{path}", prefix(&work.repo));
+                    let runs: Vec<(Option<Before>, Option<Option<String>>)> = edits
+                        .iter()
+                        .rev()
+                        .filter(|(_, paths)| paths.contains(&full))
+                        .map(|(run, _)| match snaps.get(run) {
+                            Some(snap) => {
+                                let before = snap.before(&work.repo, path).map(|b| match b {
+                                    // Clean then, but only if the start HEAD had it.
+                                    Before::Head => {
+                                        let head = snap
+                                            .repos
+                                            .iter()
+                                            .find(|r| r.repo == work.repo)
+                                            .map(|r| r.head.clone())
+                                            .unwrap_or_default();
+                                        if worktree::blob_at(&dir, &head, path).is_some() {
+                                            Before::Head
+                                        } else {
+                                            Before::Absent
+                                        }
+                                    }
+                                    other => other,
+                                });
+                                (before, snap.end_of(&full))
+                            }
+                            None => (None, None),
+                        })
+                        .collect();
+                    let current = worktree::hash_files(&dir, std::slice::from_ref(path), false)
+                        .ok()
+                        .and_then(|mut v| v.pop())
+                        .flatten();
+                    let head = worktree::head_blob(&dir, path);
+                    let done = match plan_undo(current.as_deref(), head.as_deref(), &runs) {
+                        Undo::To(Before::Content(blob)) => worktree::write_blob(&dir, path, &blob),
+                        Undo::To(Before::Head) => worktree::restore_from_head(&dir, path),
+                        Undo::To(Before::Absent) => {
+                            left_new.push(full.clone());
                             continue;
                         }
-                        let done = worktree::restore_tracked(&root.join(&repo), &paths)?;
-                        left.extend(done.kept.iter().map(|p| format!("{}{p}", prefix(&repo))));
-                    }
-                    Ok::<_, worktree::WorktreeError>(left)
-                })
-                .await;
-                if let Ok(left) = &result
-                    && !left.is_empty()
-                {
-                    let mut db = self.db();
-                    if let Err(e) =
-                        self.add_message(&mut db, thread, Author::System, &left_note(left), None)
-                    {
-                        log(e);
+                        Undo::ChangedAfter => {
+                            notes.push(format!("{full} changed after the run, left as is."));
+                            continue;
+                        }
+                        Undo::NoRecord => {
+                            notes.push(format!(
+                                "{full} has no record from before the run, left as is."
+                            ));
+                            continue;
+                        }
+                    };
+                    match done {
+                        Ok(()) => undone.push(full),
+                        Err(e) => {
+                            failed.get_or_insert_with(|| format!("Couldn't put back {full}: {e}"));
+                        }
                     }
                 }
-                self.after_change(thread, &project);
-                self.thread_overview_stale(thread);
-                result?;
-                Ok(serde_json::Value::Null)
             }
+            forget_in_snapshots(&dir_of_snapshots, &edits, &undone);
+            if !left_new.is_empty() {
+                notes.insert(0, left_note(&left_new));
+            }
+            Ok::<_, String>((notes, failed))
+        })
+        .await?;
+        {
+            let mut db = self.db();
+            for body in notes {
+                if let Err(e) = self.add_message(&mut db, thread, Author::System, &body, None) {
+                    log(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
-    /// Lets runs start in the thread again after a commit or discard, and
-    /// drops what may have changed.
-    fn after_change(&self, thread: ThreadId, project: &StoredProject) {
-        self.changes_may_differ(thread);
-        if project.work_mode == WorkMode::InPlace {
-            self.project_files_may_differ(project);
+    /// Where run snapshots are kept: next to the worktrees.
+    pub(crate) fn snapshots_dir(&self) -> PathBuf {
+        let worktrees = self.worktrees();
+        worktrees.parent().unwrap_or(worktrees).join(SNAPSHOTS_DIR)
+    }
+
+    /// Notes what the project's repos hold before an in-place run writes.
+    /// A snapshot that can't be saved is logged; the run's files then
+    /// can't be undone and are left as they are.
+    pub(crate) async fn take_snapshot(&self, job: &Job) {
+        let Ok(project) = self.db().store.project_of_thread(job.thread) else {
+            return;
+        };
+        let (dir, run) = (self.snapshots_dir(), job.run);
+        let taken = blocking(move || {
+            let snap = snapshot::take(&project.root, &project.kind.repos());
+            save_snapshot(&dir, run, &snap)
+        })
+        .await;
+        if let Err(e) = taken {
+            log(format!("couldn't save the snapshot of run {run}: {e}"));
         }
-        self.release_change(thread);
+    }
+
+    /// Notes what an in-place run left in each file it touched. Does
+    /// nothing for a run without a snapshot. Then lists the folder's files
+    /// again for search.
+    pub(crate) async fn record_end(&self, thread: ThreadId, run: RunId) {
+        let dir = self.snapshots_dir();
+        if !snapshot_path(&dir, run).exists() {
+            return;
+        }
+        let Ok(project) = self.db().store.project_of_thread(thread) else {
+            return;
+        };
+        let edits = match self.run_edits(thread, &project.root) {
+            Ok(edits) => edits
+                .into_iter()
+                .find(|(r, _)| *r == run)
+                .map(|(_, p)| p)
+                .unwrap_or_default(),
+            Err(e) => {
+                log(format!("couldn't read what run {run} changed: {e}"));
+                return;
+            }
+        };
+        let (root, kind) = (project.root.clone(), project.kind.clone());
+        let saved = blocking(move || {
+            let mut snap = load_snapshot(&dir, run).unwrap_or_default();
+            let repos = kind.repos();
+            let mut end = Vec::new();
+            for path in edits {
+                let Some((repo, inner)) = repo_of(&repos, &path) else {
+                    continue;
+                };
+                let blob = worktree::hash_files(&root.join(repo), &[inner.to_string()], false)
+                    .map_err(|e| e.to_string())?
+                    .pop()
+                    .flatten();
+                end.push((path.clone(), blob));
+            }
+            snap.end = Some(end);
+            save_snapshot(&dir, run, &snap)
+        })
+        .await;
+        if let Err(e) = saved {
+            log(format!("couldn't save how run {run} ended: {e}"));
+        }
+        self.project_files_may_differ(&project);
+    }
+
+    /// Deletes snapshots older than [`SNAPSHOT_DAYS`]. Run once at start.
+    pub fn clean_snapshots(&self) {
+        let dir = self.snapshots_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let max = std::time::Duration::from_secs(SNAPSHOT_DAYS * 24 * 60 * 60);
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > max);
+            if old && let Err(e) = std::fs::remove_file(entry.path()) {
+                log(format!("couldn't remove {}: {e}", entry.path().display()));
+            }
+        }
     }
 
     /// The project whose folder `job` would write in, if its agent may
@@ -736,6 +1070,23 @@ impl Service {
         writers.get(&project).copied().filter(|r| *r != job.run)
     }
 
+    /// Whether `job` may start now: it doesn't write in place, or its
+    /// folder has no other writer and no commit or discard under way.
+    pub(crate) fn may_write(
+        &self,
+        db: &Db,
+        writers: &HashMap<ProjectId, RunId>,
+        changing: &HashSet<ProjectId>,
+        job: &Job,
+    ) -> bool {
+        match self.in_place_writer(db, job) {
+            Some(project) => {
+                !changing.contains(&project) && writers.get(&project).is_none_or(|r| *r == job.run)
+            }
+            None => true,
+        }
+    }
+
     /// Saves which run each queued run waits for, telling the thread when
     /// that changed.
     pub(crate) fn update_waiting(&self, state: &State) {
@@ -763,4 +1114,70 @@ impl Service {
             }
         }
     }
+}
+
+/// Folder in the crew home that holds run snapshots.
+const SNAPSHOTS_DIR: &str = "snapshots";
+/// Days a run snapshot is kept.
+const SNAPSHOT_DAYS: u64 = 30;
+
+fn snapshot_path(dir: &Path, run: RunId) -> PathBuf {
+    dir.join(format!("{run}.json"))
+}
+
+fn load_snapshot(dir: &Path, run: RunId) -> Option<RunSnapshot> {
+    let text = std::fs::read_to_string(snapshot_path(dir, run)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_snapshot(dir: &Path, run: RunId, snap: &RunSnapshot) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(snap).map_err(|e| e.to_string())?;
+    std::fs::write(snapshot_path(dir, run), text).map_err(|e| e.to_string())
+}
+
+/// Drops `paths` (folder-relative) from the end records of the runs in
+/// `edits`, so they are no longer the runs' to undo.
+fn forget_in_snapshots(dir: &Path, edits: &[(RunId, Vec<String>)], paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    for (run, touched) in edits {
+        if !touched.iter().any(|p| paths.contains(p)) {
+            continue;
+        }
+        let Some(mut snap) = load_snapshot(dir, *run) else {
+            continue;
+        };
+        if let Some(end) = &mut snap.end {
+            end.retain(|(p, _)| !paths.contains(p));
+        }
+        if let Err(e) = save_snapshot(dir, *run, &snap) {
+            log(format!("couldn't update the snapshot of run {run}: {e}"));
+        }
+    }
+}
+
+/// What the thread's runs changed in place, counted for a channel
+/// overview: the touched files git sees as changed.
+pub(crate) fn in_place_counts(
+    root: &Path,
+    kind: &ProjectKind,
+    edits: &[String],
+) -> Result<worktree::ChangeCounts, worktree::WorktreeError> {
+    let mut total = worktree::ChangeCounts::default();
+    for work in in_place_changes(root, kind, edits).repos {
+        if work.touched.is_empty() {
+            continue;
+        }
+        let dir = root.join(&work.repo);
+        let diff = worktree::diff_scoped(&dir, "HEAD", &[], Some(&work.touched), "")?;
+        for f in diff.files {
+            total.files += 1;
+            total.added += f.added;
+            total.removed += f.removed;
+        }
+    }
+    total.uncommitted = total.files;
+    Ok(total)
 }

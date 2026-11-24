@@ -171,3 +171,19 @@ fn secret_looking_setup_files() {
     assert!(!looks_secret("certs/"));
     assert!(!looks_secret("keyboard.json"));
 }
+
+#[test]
+fn linked_repos_count_only_inside_the_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("platform");
+    repo(&root.join("real/api"));
+    let outside = tmp.path().join("elsewhere");
+    repo(&outside);
+    // Deeper than the walk goes, reached through a link.
+    repo(&root.join("deep/a/b/web"));
+    std::os::unix::fs::symlink(root.join("deep/a/b/web"), root.join("web")).unwrap();
+    // The same repo directly and through a link counts once.
+    std::os::unix::fs::symlink(root.join("real/api"), root.join("api")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("other")).unwrap();
+    assert_eq!(detect_kind(&root), multi(&["real/api", "web"]));
+}

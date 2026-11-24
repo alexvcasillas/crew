@@ -769,15 +769,34 @@ async fn in_place_review_commit_and_discard_touch_only_the_runs_files() {
     std::fs::write(root.join("api/user.txt"), "mine\n").unwrap();
     std::fs::write(root.join("web/a.txt"), "my edit\n").unwrap();
 
+    // Review shows every change, yours marked as outside this thread.
     let changes: ThreadChanges = c.ok(Request::ThreadDiff { thread }).await;
     let paths: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, ["api/a.txt", "web/b.txt"]);
-    let groups: Vec<(&str, Option<&str>)> = changes
+    assert_eq!(
+        paths,
+        ["api/a.txt", "api/user.txt", "web/a.txt", "web/b.txt"]
+    );
+    let groups: Vec<(&str, Option<&str>, Vec<&str>)> = changes
         .repos
         .iter()
-        .map(|r| (r.repo.as_str(), r.branch.as_deref()))
+        .map(|r| {
+            (
+                r.repo.as_str(),
+                r.branch.as_deref(),
+                r.outside_thread.iter().map(String::as_str).collect(),
+            )
+        })
         .collect();
-    assert_eq!(groups, [("api", Some("main")), ("web", Some("main"))]);
+    assert_eq!(
+        groups,
+        [
+            ("api", Some("main"), vec!["user.txt"]),
+            ("web", Some("main"), vec!["a.txt"])
+        ]
+    );
+    // The channel counts only the thread's own changes.
+    let overview: ChannelOverview = c.ok(Request::ChannelOverview { channel }).await;
+    assert_eq!(overview.threads[0].files, 2);
     let outside: Vec<&str> = changes
         .outside_git
         .iter()
@@ -976,6 +995,202 @@ async fn two_writers_mentioned_at_once_take_turns_in_place() {
     c.call(Request::StopRun { run: writer.id }).await.unwrap();
     let next = until_run(&mut c, thread, RunStatus::Done).await;
     assert_eq!(next.id, details.id);
+}
+
+/// `api` as a project worked on in place, with Forge and friends.
+async fn in_place_api(d: &Daemon, c: &mut Client) -> (PathBuf, ChannelId, ThreadId) {
+    agents(c).await;
+    let root = d.tmp.path().join("api");
+    repo(&root);
+    std::fs::write(root.join("b.txt"), "bee\n").unwrap();
+    git(&root, &["add", "b.txt"]);
+    git(&root, &["commit", "-q", "-m", "b"]);
+    let (_, channel) = add_project(c, &root, Some(WorkMode::InPlace)).await;
+    let thread = new_thread(c, channel, "Edit").await;
+    (root, channel, thread)
+}
+
+async fn discard_all(c: &mut Client, thread: ThreadId) {
+    c.call(Request::Discard {
+        thread,
+        repos: None,
+        delete_branch: false,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_place_discard_keeps_your_edits_in_files_the_run_touched() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (root, _, thread) = in_place_api(&d, &mut c).await;
+    // Your work before the run: a staged version and a newer one on disk
+    // in a.txt, and a staged edit in b.txt.
+    std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+    git(&root, &["add", "a.txt"]);
+    std::fs::write(root.join("a.txt"), "mine\n").unwrap();
+    std::fs::write(root.join("b.txt"), "your b\n").unwrap();
+    git(&root, &["add", "b.txt"]);
+
+    set_edits(scripts.path(), &[("a.txt", "agent"), ("b.txt", "agent b")]);
+    post(&mut c, thread, "@Forge edit").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "agent\n"
+    );
+
+    discard_all(&mut c, thread).await;
+    // Only the run's change is undone; what you had on disk and staged
+    // is back as it was.
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(git(&root, &["show", ":a.txt"]), "staged");
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.txt")).unwrap(),
+        "your b\n"
+    );
+    assert_eq!(git(&root, &["show", ":b.txt"]), "your b");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_place_discard_skips_files_changed_after_the_run() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (root, _, thread) = in_place_api(&d, &mut c).await;
+    set_edits(scripts.path(), &[("a.txt", "agent"), ("b.txt", "agent b")]);
+    post(&mut c, thread, "@Forge edit").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+    // You change a.txt after the run.
+    std::fs::write(root.join("a.txt"), "agent, then you\n").unwrap();
+
+    discard_all(&mut c, thread).await;
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::Message { message, .. } if message.body.contains("changed after the run")))
+        .await;
+    assert_eq!(
+        system_notes(&seen).last().unwrap(),
+        "a.txt changed after the run, left as is."
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "agent, then you\n"
+    );
+    // b.txt was clean before the run, so it is back as git has it.
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.txt")).unwrap(),
+        "bee\n"
+    );
+    assert_eq!(git(&root, &["status", "--porcelain"]), "M a.txt");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_place_commit_and_discard_wait_for_a_writer() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (_, channel, thread) = in_place_api(&d, &mut c).await;
+    set_edits(scripts.path(), &[("a.txt", "agent")]);
+    post(&mut c, thread, "@Forge edit").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+
+    let other = new_thread(&mut c, channel, "Other").await;
+    post(&mut c, other, "@Sleeper write").await;
+    let writer = until_run(&mut c, other, RunStatus::Working).await;
+    let wait = Err("Wait for Sleeper to finish writing, or stop it.".to_string());
+    let commit = c
+        .call(Request::Commit {
+            thread,
+            repo: None,
+            message: "m".into(),
+        })
+        .await;
+    assert_eq!(commit.map(|_| ()), wait);
+    let discard = c
+        .call(Request::Discard {
+            thread,
+            repos: None,
+            delete_branch: false,
+        })
+        .await;
+    assert_eq!(discard.map(|_| ()), wait);
+
+    c.call(Request::StopRun { run: writer.id }).await.unwrap();
+    until_run(&mut c, other, RunStatus::Stopped).await;
+    let _: String = c
+        .ok(Request::Commit {
+            thread,
+            repo: None,
+            message: "m".into(),
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repo_gone_from_the_folder_still_lets_a_thread_be_discarded() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    agents(&mut c).await;
+    let root = platform(d.tmp.path());
+    let (project, channel) = add_project(&mut c, &root, None).await;
+    let thread = new_thread(&mut c, channel, "Old").await;
+    set_edits(scripts.path(), &[("web/a.txt", "web change")]);
+    post(&mut c, thread, "@Forge go").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+    let folder = real(&d.home).join("worktrees/platform/old");
+    assert!(folder.join("web").exists());
+
+    std::fs::remove_dir_all(root.join("web")).unwrap();
+    // Opening the project sees the folder as it is now.
+    let _: serde_json::Value = c.ok(Request::ProjectOverview { project }).await;
+    assert_eq!(
+        stored_project(&mut c, project).await.kind,
+        ProjectKind::MultiRepo {
+            repos: vec!["api".into()]
+        }
+    );
+    // The old thread keeps its worktrees, and review skips the lost repo.
+    let wt = stored_thread(&mut c, channel, thread)
+        .await
+        .worktree
+        .unwrap();
+    assert_eq!(wt.repos.len(), 2);
+    let changes: ThreadChanges = c.ok(Request::ThreadDiff { thread }).await;
+    assert!(changes.repos.iter().all(|r| r.repo == "api"));
+
+    discard_all(&mut c, thread).await;
+    assert!(!folder.exists());
+    assert!(
+        stored_thread(&mut c, channel, thread)
+            .await
+            .worktree
+            .is_none()
+    );
+    assert_eq!(git(&root.join("api"), &["branch", "--list", "crew/*"]), "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_folder_is_refused() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let got = c
+        .call(Request::CreateProject {
+            name: "gone".into(),
+            root: d.tmp.path().join("gone").to_string_lossy().into_owned(),
+            main_branch: String::new(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
+        })
+        .await;
+    assert_eq!(got, Err("Folder not found.".to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
