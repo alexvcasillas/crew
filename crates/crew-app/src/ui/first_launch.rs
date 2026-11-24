@@ -1,18 +1,18 @@
 //! The first launch: no projects yet. Add one, check the agent CLIs and
 //! make a starter agent, then land in `#general`.
 
-use crew_core::agent::{AgentSpec, PermissionMode};
+use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::ids::{AgentId, ChannelId, ProjectId};
-use crew_proto::Request;
+use crew_proto::{Request, RuntimeInfo};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::settings::Page;
-use super::settings::agents::{INSTALL_CLAUDE, blank_spec};
+use super::settings::agents::{INSTALL_CLAUDE, blank_spec, default_codex_model, models_of};
 use super::settings::projects::{FIRST_CHANNEL, FolderFor, Repo, create_project, folder_name};
-use super::settings::runtimes::{listed_state, runtime_name};
+use super::settings::runtimes::{runtime_name, runtime_state};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -29,6 +29,38 @@ pub fn starter_spec() -> AgentSpec {
         permission_mode: PermissionMode::EditFiles,
         ..blank_spec()
     }
+}
+
+/// The starter for the CLIs crewd found: Claude Code unless it isn't
+/// installed and Codex is, then Codex on its default model.
+pub fn starter_for(runtimes: &[RuntimeInfo]) -> AgentSpec {
+    let installed = |runtime: Runtime| {
+        runtimes
+            .iter()
+            .find(|r| r.runtime == runtime)
+            .map(|r| r.installed)
+    };
+    match (installed(Runtime::ClaudeCode), installed(Runtime::Codex)) {
+        (Some(false), Some(true)) => AgentSpec {
+            runtime: Runtime::Codex,
+            model: default_codex_model(models_of(runtimes, &Runtime::Codex)),
+            ..starter_spec()
+        },
+        _ => starter_spec(),
+    }
+}
+
+/// Step 3's line about the starter.
+fn starter_about(spec: &AgentSpec, runtimes: &[RuntimeInfo]) -> String {
+    let model = match spec.runtime {
+        Runtime::ClaudeCode => "Sonnet".to_string(),
+        Runtime::Codex => models_of(runtimes, &Runtime::Codex)
+            .iter()
+            .find(|m| m.id == spec.model)
+            .map_or_else(|| "its default model".to_string(), |m| m.label.clone()),
+    };
+    let runtime = super::settings::runtimes::runtime_name(&spec.runtime);
+    format!("{STARTER_NAME}: {runtime} · {model} · edits files. You can change it in Settings.")
 }
 
 /// Where the first launch is.
@@ -123,14 +155,11 @@ impl Workspace {
                 .map(|c| c.id)
         });
         let client = self.client.clone();
+        let spec = starter_for(&self.runtimes);
         self.spawn_request(window, cx, async move |this, cx| {
             let made = async {
                 if !has_starter {
-                    let agent = client
-                        .request(Request::CreateAgent {
-                            spec: starter_spec(),
-                        })
-                        .await?;
+                    let agent = client.request(Request::CreateAgent { spec }).await?;
                     serde_json::from_value::<AgentId>(agent).map_err(|e| e.to_string())?;
                 }
                 match existing {
@@ -222,7 +251,7 @@ impl Workspace {
                 .iter()
                 .map(|info| {
                     let name = runtime_name(&info.runtime);
-                    let (word, token) = listed_state(info);
+                    let (word, token) = runtime_state(info);
                     let version = info
                         .version
                         .as_ref()
@@ -240,10 +269,14 @@ impl Workspace {
                 })
                 .collect()
         };
-        let claude_missing = self
-            .runtimes
-            .iter()
-            .any(|r| r.runtime == crew_core::agent::Runtime::ClaudeCode && !r.installed);
+        let starter = starter_for(&self.runtimes);
+        // No word on installing Claude Code when Codex makes the starter.
+        let claude_missing = starter.runtime == Runtime::ClaudeCode
+            && self
+                .runtimes
+                .iter()
+                .any(|r| r.runtime == Runtime::ClaudeCode && !r.installed);
+        let about = starter_about(&starter, &self.runtimes);
 
         div()
             .id("first-launch")
@@ -309,7 +342,7 @@ impl Workspace {
                     .child(step(
                         3,
                         "Create a starter agent",
-                        "Forge: Claude Code · Sonnet · edits files. You can change it in Settings.",
+                        about,
                         div().flex().child(
                             Button::new("first-launch-starter")
                                 .primary()
@@ -347,9 +380,10 @@ fn line(text: &'static str) -> impl IntoElement {
 fn step(
     n: u8,
     title: &'static str,
-    about: &'static str,
+    about: impl Into<SharedString>,
     body: impl IntoElement,
 ) -> impl IntoElement {
+    let about: SharedString = about.into();
     div()
         .flex()
         .gap(px(12.))
@@ -379,7 +413,10 @@ fn step(
                     div()
                         .text_size(px(12.))
                         .text_color(color("text-tertiary"))
-                        .child(about),
+                        .id(SharedString::from(format!("first-launch-step-{n}")))
+                        .aria_label(about.clone())
+                        .child(about)
+                        .test_support(),
                 )
                 .child(body),
         )
@@ -387,8 +424,9 @@ fn step(
 
 #[cfg(test)]
 mod tests {
-    use super::starter_spec;
-    use crew_core::agent::PermissionMode;
+    use super::{starter_for, starter_spec};
+    use crew_core::agent::{PermissionMode, Runtime};
+    use crew_proto::{ModelInfo, RuntimeInfo};
 
     #[test]
     fn the_starter_is_forge_on_sonnet_editing_files() {
@@ -398,5 +436,40 @@ mod tests {
         assert_eq!(spec.model, "sonnet");
         assert_eq!(spec.permission_mode, PermissionMode::EditFiles);
         assert_eq!(spec.runtime, crew_core::agent::Runtime::ClaudeCode);
+    }
+
+    #[test]
+    fn the_starter_runs_on_codex_only_without_claude() {
+        let info = |runtime, installed| RuntimeInfo {
+            runtime,
+            installed,
+            version: None,
+            signed_in: None,
+            path: None,
+            models: vec![
+                ModelInfo {
+                    id: "gpt-6.1-sol".into(),
+                    label: "GPT-6.1-Sol".into(),
+                },
+                ModelInfo {
+                    id: "gpt-6-luna".into(),
+                    label: "GPT-6-Luna".into(),
+                },
+            ],
+        };
+        let both = [info(Runtime::ClaudeCode, true), info(Runtime::Codex, true)];
+        assert_eq!(starter_for(&both), starter_spec());
+        assert_eq!(starter_for(&[]), starter_spec(), "still checking");
+        let codex_only = [info(Runtime::ClaudeCode, false), info(Runtime::Codex, true)];
+        let spec = starter_for(&codex_only);
+        assert_eq!(spec.runtime, Runtime::Codex);
+        assert_eq!(spec.model, "gpt-6-luna");
+        assert_eq!(spec.name, "Forge");
+        assert_eq!(spec.permission_mode, PermissionMode::EditFiles);
+        let neither = [
+            info(Runtime::ClaudeCode, false),
+            info(Runtime::Codex, false),
+        ];
+        assert_eq!(starter_for(&neither), starter_spec());
     }
 }

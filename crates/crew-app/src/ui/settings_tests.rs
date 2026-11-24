@@ -575,7 +575,9 @@ fn settings_open_from_the_title_bar_and_list_shortcuts(cx: &mut TestAppContext) 
     assert!(shows(cx, window, "Settings ⌘,"));
     click(cx, window, "settings-nav-runtimes");
     wait_to_show(cx, window, "Claude Code Not installed");
-    assert!(shows(cx, window, "Codex Coming soon"));
+    // No codex in this test's crewd; Codex is no longer "Coming soon".
+    assert!(shows(cx, window, "Codex Not installed"));
+    assert!(!shows(cx, window, "Codex Coming soon"));
     wait_until(cx, "the first ask to end", |cx| {
         ws.read_with(cx, |ws, _| !ws.runtimes_checking)
     });

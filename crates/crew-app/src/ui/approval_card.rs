@@ -30,13 +30,39 @@ pub(super) struct BriefEditor {
     pub(super) input: Entity<TextareaState>,
 }
 
-/// The text a tool's input shows as: its command if it has one, else its
-/// JSON, pretty.
+/// The text a tool's input shows as: the files of a change list, else
+/// crewd's label, else its command, else its JSON, pretty.
 pub fn input_text(input: &serde_json::Value) -> String {
-    match input.get("command").and_then(|c| c.as_str()) {
+    let files: Vec<&str> = input
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("path").and_then(|p| p.as_str()))
+        .collect();
+    if !files.is_empty() {
+        return files.join("\n");
+    }
+    if let Some(label) = text_field(input, "label") {
+        return label.to_string();
+    }
+    match text_field(input, "command") {
         Some(command) => command.to_string(),
         None => serde_json::to_string_pretty(input).unwrap_or_default(),
     }
+}
+
+/// The full command behind a labelled ask, when the label shows less.
+pub fn full_command(input: &serde_json::Value) -> Option<&str> {
+    let label = text_field(input, "label")?;
+    text_field(input, "command").filter(|c| *c != label)
+}
+
+fn text_field<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// The one-line summary of a decided approval, such as `Handoff to Scout
@@ -355,8 +381,22 @@ impl Workspace {
                 .join("\n")
         };
         let more = lines.saturating_sub(INPUT_LINES);
+        let command = full_command(input).map(str::to_string);
         needs_you_card(id, &wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
+            .when_some(command, |card, command| {
+                card.child(
+                    div()
+                        .id(format!("approval-command-{id}"))
+                        .truncate()
+                        .font_family(mono_font())
+                        .text_size(px(11.))
+                        .text_color(color("text-tertiary"))
+                        .aria_label(command.clone())
+                        .child(command)
+                        .test_support(),
+                )
+            })
             .when(more > 0 && !open, |card| {
                 card.child(
                     div()
@@ -572,7 +612,7 @@ fn card_footer(buttons: Vec<AnyElement>, hint: bool) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{decided_text, input_text};
+    use super::{decided_text, full_command, input_text};
     use crew_core::ids::{AgentId, ApprovalId, RunId, ThreadId};
     use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval};
 
@@ -586,6 +626,22 @@ mod tests {
             input_text(&serde_json::json!({"file_path": "a"})),
             "{\n  \"file_path\": \"a\"\n}"
         );
+    }
+
+    #[test]
+    fn codex_asks_show_their_label_or_files() {
+        let bash = serde_json::json!({"command": "/bin/zsh -lc 'mkdir sub'", "cwd": "/work/demo", "label": "mkdir sub"});
+        assert_eq!(input_text(&bash), "mkdir sub");
+        assert_eq!(full_command(&bash), Some("/bin/zsh -lc 'mkdir sub'"));
+        let plain = serde_json::json!({"command": "ls", "cwd": "/work/demo"});
+        assert_eq!(input_text(&plain), "ls");
+        assert_eq!(full_command(&plain), None);
+        let access = serde_json::json!({"label": "network, write /work/demo/out", "cwd": "/work/demo", "permissions": {}});
+        assert_eq!(input_text(&access), "network, write /work/demo/out");
+        assert_eq!(full_command(&access), None);
+        let edit = serde_json::json!({"path": "/work/demo/a.md, /work/demo/b.md", "changes": [
+            {"path": "/work/demo/a.md", "diff": "x"}, {"path": "/work/demo/b.md", "diff": "y"}]});
+        assert_eq!(input_text(&edit), "/work/demo/a.md\n/work/demo/b.md");
     }
 
     #[test]

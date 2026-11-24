@@ -3,7 +3,7 @@
 use crew_core::agent::{AgentSpec, DEFAULT_MAX_RUN_MINUTES, PermissionMode, Runtime};
 use crew_core::ids::AgentId;
 use crew_core::policy::HandoffPolicy;
-use crew_proto::{Request, RuntimeInfo};
+use crew_proto::{ModelInfo, Request, RuntimeInfo};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -25,12 +25,16 @@ pub const MODELS: [(&str, &str); 3] = [("opus", "Opus"), ("sonnet", "Sonnet"), (
 /// What the instructions add to.
 const INSTRUCTIONS_HELP: &str =
     "Added on top of the project's own CLAUDE.md or AGENTS.md, which still load.";
-pub const CREDENTIALS: &str = "Your sign-ins stay with each CLI. Crew never reads, stores or sends a login token, and never calls a provider's API itself. It starts `claude` and reads what the CLI prints.";
+pub const CREDENTIALS: &str = "Your sign-ins stay with each CLI. Crew never reads, stores or sends a login token, and never calls a provider's API itself. It starts `claude` or `codex` and reads what the CLI prints.";
 pub const INSTALL_CLAUDE: &str = "Install Claude Code and run `claude auth login`.";
+pub const CODEX_LOGIN: &str = "Run `codex login` in a terminal.";
+pub const INSTALL_CODEX: &str = "Install Codex to run agents with it.";
 const COMING_SOON: &str = "Coming soon.";
+/// Codex models up to this many show as a segmented control; more go in a
+/// menu.
+const MODEL_SEGMENTS: usize = 4;
 /// Runtimes shown but not usable yet.
-pub const COMING_RUNTIMES: [(&str, &str); 4] = [
-    ("codex", "Codex"),
+pub const COMING_RUNTIMES: [(&str, &str); 3] = [
     ("grok", "Grok Build"),
     ("cursor", "Cursor"),
     ("acp", "Other ACP"),
@@ -74,8 +78,11 @@ pub struct AgentForm {
     pub editing: Option<AgentId>,
     pub name: Entity<InputState>,
     pub role: Entity<InputState>,
-    /// One of [`MODELS`], used unless `other_model` holds a name.
-    pub model: &'static str,
+    pub runtime: Runtime,
+    /// One of the runtime's models, used unless `other_model` holds a
+    /// name. Empty for a Codex agent before crewd listed its models: the
+    /// default one is then used.
+    pub model: String,
     pub other_model: Entity<InputState>,
     pub instructions: Entity<TextareaState>,
     pub permission: PermissionMode,
@@ -110,6 +117,7 @@ pub fn blank_spec() -> AgentSpec {
 pub struct Draft<'a> {
     pub name: &'a str,
     pub role: &'a str,
+    pub runtime: Runtime,
     pub model: &'a str,
     pub other_model: &'a str,
     pub instructions: &'a str,
@@ -143,7 +151,7 @@ pub fn build_spec(d: &Draft<'_>, taken: &[&str]) -> Result<AgentSpec, String> {
     Ok(AgentSpec {
         name: name.to_string(),
         role: d.role.trim().to_string(),
-        runtime: Runtime::ClaudeCode,
+        runtime: d.runtime.clone(),
         model: if other.is_empty() { d.model } else { other }.to_string(),
         instructions: d.instructions.trim().to_string(),
         permission_mode: d.permission.clone(),
@@ -200,6 +208,37 @@ pub fn split_tools(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The Codex model a new agent starts on: the first Luna model, else the
+/// first listed. Empty if none is listed, which leaves it to Codex.
+pub fn default_codex_model(models: &[ModelInfo]) -> String {
+    models
+        .iter()
+        .find(|m| m.id.contains("luna"))
+        .or(models.first())
+        .map(|m| m.id.clone())
+        .unwrap_or_default()
+}
+
+/// The models crewd listed for `runtime`.
+pub fn models_of<'a>(runtimes: &'a [RuntimeInfo], runtime: &Runtime) -> &'a [ModelInfo] {
+    runtimes
+        .iter()
+        .find(|r| r.runtime == *runtime)
+        .map_or(&[], |r| r.models.as_slice())
+}
+
+/// Whether an agent on `runtime` can be saved: Claude Code isn't known to
+/// be missing, or Codex is installed and not known to be signed out.
+pub fn runtime_usable(runtime: &Runtime, runtimes: &[RuntimeInfo]) -> bool {
+    match runtime {
+        Runtime::ClaudeCode => claude_check(runtimes) != ClaudeCheck::NotInstalled,
+        Runtime::Codex => runtimes
+            .iter()
+            .find(|r| r.runtime == Runtime::Codex)
+            .is_some_and(|r| r.installed && r.signed_in != Some(false)),
+    }
+}
+
 /// What the app knows about the `claude` CLI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClaudeCheck {
@@ -232,7 +271,8 @@ pub fn claude_check(runtimes: &[RuntimeInfo]) -> ClaudeCheck {
 struct Fields {
     name: String,
     role: String,
-    model: &'static str,
+    runtime: Runtime,
+    model: String,
     other_model: String,
     instructions: String,
     permission: PermissionMode,
@@ -243,13 +283,28 @@ struct Fields {
 }
 
 impl Fields {
-    fn of(spec: &AgentSpec) -> Self {
-        let known = MODELS.iter().find(|(m, _)| *m == spec.model).map(|m| m.0);
+    /// The fields of `spec`, with `runtimes` telling which Codex models
+    /// are known.
+    fn of(spec: &AgentSpec, runtimes: &[RuntimeInfo]) -> Self {
+        let known = match spec.runtime {
+            Runtime::ClaudeCode => MODELS.iter().any(|(m, _)| *m == spec.model),
+            Runtime::Codex => {
+                let models = models_of(runtimes, &Runtime::Codex);
+                // Not listed yet: kept as the pick, not as another model.
+                models.is_empty() || models.iter().any(|m| m.id == spec.model)
+            }
+        };
+        let model = match (&spec.runtime, known) {
+            (_, true) => spec.model.clone(),
+            (Runtime::ClaudeCode, false) => "sonnet".into(),
+            (Runtime::Codex, false) => default_codex_model(models_of(runtimes, &Runtime::Codex)),
+        };
         Self {
             name: spec.name.clone(),
             role: spec.role.clone(),
-            model: known.unwrap_or("sonnet"),
-            other_model: if known.is_some() {
+            runtime: spec.runtime.clone(),
+            model,
+            other_model: if known {
                 String::new()
             } else {
                 spec.model.clone()
@@ -323,6 +378,7 @@ impl AgentForm {
             editing,
             name,
             role,
+            runtime: f.runtime,
             model: f.model,
             other_model,
             instructions,
@@ -344,7 +400,8 @@ impl AgentForm {
         Fields {
             name: text(&self.name),
             role: text(&self.role),
-            model: self.model,
+            runtime: self.runtime.clone(),
+            model: self.model.clone(),
             other_model: text(&self.other_model),
             instructions: self.instructions.read(cx).value().to_string(),
             permission: self.permission.clone(),
@@ -360,13 +417,20 @@ impl AgentForm {
         self.name.entity_id()
     }
 
-    fn spec(&self, taken: &[&str], cx: &App) -> Result<AgentSpec, String> {
+    /// The spec to save. A Codex agent with no model picked yet gets the
+    /// default of `models`.
+    fn spec(&self, taken: &[&str], models: &[ModelInfo], cx: &App) -> Result<AgentSpec, String> {
         let f = self.fields(cx);
+        let model = match (&f.runtime, f.model.is_empty()) {
+            (Runtime::Codex, true) => default_codex_model(models),
+            _ => f.model.clone(),
+        };
         build_spec(
             &Draft {
                 name: &f.name,
                 role: &f.role,
-                model: f.model,
+                runtime: f.runtime.clone(),
+                model: &model,
                 other_model: &f.other_model,
                 instructions: &f.instructions,
                 permission: f.permission.clone(),
@@ -401,7 +465,7 @@ impl Workspace {
 
     /// Opens an empty form.
     pub(crate) fn new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let form = AgentForm::new(None, Fields::of(&blank_spec()), window, cx);
+        let form = AgentForm::new(None, Fields::of(&blank_spec(), &self.runtimes), window, cx);
         self.set_agent_form(form, window, cx);
     }
 
@@ -414,7 +478,7 @@ impl Workspace {
         let Some(spec) = self.state().agent(agent).map(|a| a.spec.clone()) else {
             return;
         };
-        let form = AgentForm::new(Some(agent), Fields::of(&spec), window, cx);
+        let form = AgentForm::new(Some(agent), Fields::of(&spec, &self.runtimes), window, cx);
         self.set_agent_form(form, window, cx);
     }
 
@@ -447,7 +511,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_model(&mut self, model: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_model(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.model = model;
             form.saved = false;
@@ -455,6 +519,19 @@ impl Workspace {
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
+    }
+
+    /// Picks the runtime, starting on its default model.
+    fn set_runtime(&mut self, runtime: Runtime, window: &mut Window, cx: &mut Context<Self>) {
+        let model = match runtime {
+            Runtime::ClaudeCode => "sonnet".to_string(),
+            Runtime::Codex => default_codex_model(models_of(&self.runtimes, &Runtime::Codex)),
+        };
+        let Some(form) = self.agent_form_mut().filter(|f| f.runtime != runtime) else {
+            return;
+        };
+        form.runtime = runtime;
+        self.set_model(model, window, cx);
     }
 
     fn set_permission(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
@@ -476,13 +553,10 @@ impl Workspace {
     /// Saves the form: a new agent, or the changes to one. Its next run
     /// uses them.
     pub(crate) fn save_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.claude_usable() {
-            return;
-        }
         let Some(form) = self.settings.as_ref().and_then(|s| s.agents.form.as_ref()) else {
             return;
         };
-        if form.saving {
+        if form.saving || !runtime_usable(&form.runtime, &self.runtimes) {
             return;
         }
         let editing = form.editing;
@@ -494,7 +568,7 @@ impl Workspace {
             .filter(|a| Some(a.id) != editing)
             .map(|a| a.spec.name.as_str())
             .collect();
-        let spec = form.spec(&taken, cx);
+        let spec = form.spec(&taken, models_of(&self.runtimes, &Runtime::Codex), cx);
         let spec = match spec {
             Ok(spec) => spec,
             Err(error) => {
@@ -605,11 +679,6 @@ impl Workspace {
         });
     }
 
-    /// Whether agents can be saved: `claude` isn't known to be missing.
-    fn claude_usable(&self) -> bool {
-        claude_check(&self.runtimes) != ClaudeCheck::NotInstalled
-    }
-
     pub(super) fn render_agents_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let form = self.settings.as_ref().and_then(|s| s.agents.form.as_ref());
         div()
@@ -674,7 +743,13 @@ impl Workspace {
                                     .child(a.spec.role.clone()),
                             ),
                     )
-                    .child(chip(runtime_chip(&a.spec)))
+                    .child({
+                        let text = runtime_chip(&a.spec);
+                        chip(text.clone())
+                            .id(SharedString::from(format!("settings-agent-chip-{id}")))
+                            .aria_label(text)
+                            .test_support()
+                    })
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.edit_agent(id, window, cx)),
                     )
@@ -731,27 +806,13 @@ impl Workspace {
         } else {
             name.trim().to_string()
         };
-        let usable = self.claude_usable();
+        let usable = runtime_usable(&form.runtime, &self.runtimes);
         let other_set = !form.other_model.read(cx).value().trim().is_empty();
         let sub = match form.editing.and_then(|a| self.state().agent(a)) {
             Some(a) => runtime_chip(&a.spec),
             None => "Not saved yet".to_string(),
         };
-
-        let models: Vec<AnyElement> = MODELS
-            .iter()
-            .map(|(value, label)| {
-                let value: &'static str = value;
-                segment(
-                    format!("agent-model-{value}"),
-                    label,
-                    !other_set && form.model == value,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| this.set_model(value, window, cx)))
-                .test_support()
-                .into_any_element()
-            })
-            .collect();
+        let models = self.render_model_picker(form, other_set, cx);
         let permission_label = PERMISSIONS
             .iter()
             .find(|(m, ..)| *m == form.permission)
@@ -880,7 +941,7 @@ impl Workspace {
                     .child(field(
                         "Runtime",
                         Some("The CLI that runs this agent."),
-                        self.render_runtime_cards(),
+                        self.render_runtime_cards(&form.runtime, cx),
                     ))
                     .child(field(
                         "Model",
@@ -889,7 +950,7 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap(px(6.))
-                            .child(segmented(models))
+                            .child(models)
                             .child(control("agent-other-model", Input::new(&form.other_model))),
                     ))
                     .child(field(
@@ -981,59 +1042,83 @@ impl Workspace {
             .test_support()
     }
 
-    /// Claude Code, then the runtimes that are coming.
-    fn render_runtime_cards(&self) -> impl IntoElement {
-        let info = self
-            .runtimes
-            .iter()
-            .find(|r| r.runtime == Runtime::ClaudeCode);
-        let (detail, status, token) = match (self.runtimes.is_empty(), info) {
-            (true, _) => (String::new(), "Checking…", "text-tertiary"),
-            (false, Some(info)) if info.installed => {
-                let version = info.version.as_deref().unwrap_or("(version unknown)");
-                let detail = [Some(format!("claude {version}")), info.path.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                let (word, token) = runtime_state(info);
-                (detail, word, token)
-            }
-            (false, info) => {
-                let (word, token) = info.map_or(("Not installed", "text-tertiary"), runtime_state);
-                (INSTALL_CLAUDE.to_string(), word, token)
-            }
+    /// The runtime's models: Claude's three, or the ones Codex lists, as
+    /// a segmented control, or a menu when Codex lists more than
+    /// [`MODEL_SEGMENTS`].
+    fn render_model_picker(
+        &self,
+        form: &AgentForm,
+        other_set: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let models: Vec<ModelInfo> = match form.runtime {
+            Runtime::ClaudeCode => MODELS
+                .iter()
+                .map(|(id, label)| ModelInfo {
+                    id: (*id).into(),
+                    label: (*label).into(),
+                })
+                .collect(),
+            Runtime::Codex => models_of(&self.runtimes, &Runtime::Codex).to_vec(),
         };
-        let claude = runtime_card("runtime-claude", true, true)
-            .aria_label(format!("Claude Code {status}"))
+        let picked = match (&form.runtime, form.model.is_empty()) {
+            (Runtime::Codex, true) => default_codex_model(&models),
+            _ => form.model.clone(),
+        };
+        if models.is_empty() {
+            return help("Codex lists its models once you're signed in.").into_any_element();
+        }
+        if models.len() <= MODEL_SEGMENTS {
+            let segments = models
+                .into_iter()
+                .map(|m| {
+                    let selected = !other_set && picked == m.id;
+                    let id = m.id;
+                    segment(format!("agent-model-{id}"), &m.label, selected)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_model(id.clone(), window, cx);
+                        }))
+                        .test_support()
+                        .into_any_element()
+                })
+                .collect();
+            return segmented(segments).into_any_element();
+        }
+        let label = models
+            .iter()
+            .find(|m| !other_set && m.id == picked)
+            .map_or_else(|| "Other model".to_string(), |m| m.label.clone());
+        let this = cx.entity().downgrade();
+        div()
+            .flex()
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().font_weight(FontWeight::MEDIUM).child("Claude Code"))
-                    .when(!detail.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .id("runtime-claude-detail")
-                                .text_size(px(12.))
-                                .text_color(color("text-tertiary"))
-                                .font_family(mono_font())
-                                .aria_label(detail.clone())
-                                .child(detail.clone())
-                                .test_support(),
-                        )
+                Button::new("agent-model-menu")
+                    .outline()
+                    .small()
+                    .label(label)
+                    .icon(IconName::ChevronDown)
+                    .dropdown_menu(move |menu, _, _| {
+                        models.iter().fold(menu, |menu, m| {
+                            let this = this.clone();
+                            let id = m.id.clone();
+                            menu.item(PopupMenuItem::new(m.label.clone()).on_click(
+                                move |_, window, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.set_model(id.clone(), window, cx);
+                                    })
+                                    .ok();
+                                },
+                            ))
+                        })
                     }),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(12.))
-                    .text_color(color(token))
-                    .child(status),
-            )
-            .test_support();
+            .into_any_element()
+    }
+
+    /// Claude Code and Codex, then the runtimes that are coming.
+    fn render_runtime_cards(&self, picked: &Runtime, cx: &mut Context<Self>) -> impl IntoElement {
+        let claude = self.render_runtime_card(Runtime::ClaudeCode, picked, cx);
+        let codex = self.render_runtime_card(Runtime::Codex, picked, cx);
         let coming = COMING_RUNTIMES.iter().map(|(key, name)| {
             runtime_card(SharedString::from(format!("runtime-{key}")), false, false)
                 .aria_label(format!("{name} Coming soon"))
@@ -1049,7 +1134,92 @@ impl Workspace {
             .flex_col()
             .gap(px(6.))
             .child(claude)
+            .child(codex)
             .children(coming)
+    }
+
+    /// One runtime's card: its version and path, or how to make it ready,
+    /// and its state. You can pick it once it is installed.
+    fn render_runtime_card(
+        &self,
+        runtime: Runtime,
+        picked: &Runtime,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (key, bin, name, install, login) = match runtime {
+            Runtime::ClaudeCode => ("claude", "claude", "Claude Code", INSTALL_CLAUDE, None),
+            Runtime::Codex => ("codex", "codex", "Codex", INSTALL_CODEX, Some(CODEX_LOGIN)),
+        };
+        let info = self.runtimes.iter().find(|r| r.runtime == runtime);
+        let (detail, status, token) = match (self.runtimes.is_empty(), info) {
+            (true, _) => (String::new(), "Checking…", "text-tertiary"),
+            (false, Some(info)) if info.installed => {
+                let (word, token) = runtime_state(info);
+                let detail = match login.filter(|_| info.signed_in == Some(false)) {
+                    Some(login) => login.to_string(),
+                    None => {
+                        let version = info.version.as_deref().unwrap_or("(version unknown)");
+                        [Some(format!("{bin} {version}")), info.path.clone()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    }
+                };
+                (detail, word, token)
+            }
+            (false, info) => {
+                let (word, token) = info.map_or(("Not installed", "text-tertiary"), runtime_state);
+                (install.to_string(), word, token)
+            }
+        };
+        // Claude Code stays pickable while crewd checks, as before.
+        let enabled = match runtime {
+            Runtime::ClaudeCode => true,
+            Runtime::Codex => info.is_some_and(|i| i.installed),
+        };
+        let selected = *picked == runtime;
+        runtime_card(
+            SharedString::from(format!("runtime-{key}")),
+            selected,
+            enabled,
+        )
+        .aria_label(format!("{name} {status}"))
+        .when(enabled, |card| {
+            card.cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_runtime(runtime.clone(), window, cx);
+                }))
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                .when(!detail.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .id(SharedString::from(format!("runtime-{key}-detail")))
+                            .text_size(px(12.))
+                            .text_color(color("text-tertiary"))
+                            .font_family(mono_font())
+                            .aria_label(detail.clone())
+                            .child(detail.clone())
+                            .test_support(),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(12.))
+                .text_color(color(token))
+                .child(status),
+        )
+        .test_support()
+        .into_any_element()
     }
 }
 
@@ -1094,14 +1264,18 @@ fn runtime_card(id: impl Into<SharedString>, selected: bool, enabled: bool) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeCheck, Draft, build_spec, check_name, claude_check, split_tools};
+    use super::{
+        ClaudeCheck, Draft, build_spec, check_name, claude_check, default_codex_model,
+        runtime_usable, split_tools,
+    };
     use crew_core::agent::{PermissionMode, Runtime};
-    use crew_proto::RuntimeInfo;
+    use crew_proto::{ModelInfo, RuntimeInfo};
 
     fn draft<'a>(name: &'a str) -> Draft<'a> {
         Draft {
             name,
             role: " Engineer ",
+            runtime: Runtime::ClaudeCode,
             model: "sonnet",
             other_model: "",
             instructions: "",
@@ -1197,6 +1371,60 @@ mod tests {
         assert!(matches!(
             claude_check(&[there]),
             ClaudeCheck::Installed { .. }
+        ));
+    }
+
+    fn model(id: &str) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            label: id.into(),
+        }
+    }
+
+    #[test]
+    fn codex_starts_on_luna_else_the_first_model() {
+        let models = [
+            model("gpt-6.1-sol"),
+            model("gpt-6-luna"),
+            model("gpt-6-astra"),
+        ];
+        assert_eq!(default_codex_model(&models), "gpt-6-luna");
+        assert_eq!(default_codex_model(&models[..1]), "gpt-6.1-sol");
+        assert_eq!(default_codex_model(&[]), "");
+    }
+
+    #[test]
+    fn a_codex_draft_keeps_its_runtime() {
+        let mut d = draft("Nova");
+        d.runtime = Runtime::Codex;
+        d.model = "gpt-6-luna";
+        let spec = build_spec(&d, &[]).unwrap();
+        assert_eq!(spec.runtime, Runtime::Codex);
+        assert_eq!(spec.model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn codex_is_usable_once_installed_and_not_signed_out() {
+        let codex = |installed, signed_in| RuntimeInfo {
+            runtime: Runtime::Codex,
+            installed,
+            version: None,
+            signed_in,
+            path: None,
+            models: vec![],
+        };
+        assert!(!runtime_usable(&Runtime::Codex, &[]));
+        assert!(runtime_usable(&Runtime::Codex, &[codex(true, Some(true))]));
+        assert!(runtime_usable(&Runtime::Codex, &[codex(true, None)]));
+        assert!(!runtime_usable(
+            &Runtime::Codex,
+            &[codex(true, Some(false))]
+        ));
+        assert!(!runtime_usable(&Runtime::Codex, &[codex(false, None)]));
+        // Claude Code is judged on its own: not listed is not installed.
+        assert!(!runtime_usable(
+            &Runtime::ClaudeCode,
+            &[codex(true, Some(true))]
         ));
     }
 }
