@@ -281,6 +281,9 @@ async fn setup(d: &Daemon, c: &mut Client, forge_minutes: u32) -> Chat {
             name: "demo".into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel: ChannelId = c
@@ -1329,6 +1332,7 @@ async fn handoffs_used_and_worktree_changes_are_broadcast() {
         while c
             .call(Request::Discard {
                 thread: chat.thread,
+                repos: None,
                 delete_branch: false,
             })
             .await

@@ -13,7 +13,6 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Task, TestAppContext};
 use super::first_launch::STARTER_NAME;
 use super::settings::Page;
 use super::settings::agents::{COMING_RUNTIMES, CREDENTIALS, INSTALL_CLAUDE};
-use super::settings::projects::NOT_GIT;
 use super::settings::runtimes::runtime_state;
 use super::test_ui::{
     click, click_quickly, has, label_of, notifications, open_tall, press, shows, type_text,
@@ -87,13 +86,15 @@ fn first_launch_creates_project_agent_and_lands_in_general(cx: &mut TestAppConte
     let word = ws.read_with(cx, |ws, _| runtime_state(&ws.runtimes[0]).0);
     assert!(shows(cx, window, &format!("Claude Code 9.9.9 {word}")));
 
+    // Step 1 adds the project through the Add project dialog.
     picks(cx, &ws, &plain);
     click(cx, window, "first-launch-pick");
-    wait_to_show(cx, window, NOT_GIT);
-    ws.read_with(cx, |ws, _| assert!(ws.state().projects().is_empty()));
-
+    wait_to_show(cx, window, "Plain folder, no git");
     picks(cx, &ws, &repo);
-    click(cx, window, "first-launch-pick");
+    click(cx, window, "add-project-change");
+    wait_to_show(cx, window, "Git repo on main");
+    ws.read_with(cx, |ws, _| assert!(ws.state().projects().is_empty()));
+    click(cx, window, "dialog-confirm");
     wait_to_show(cx, window, "demo added");
     ws.read_with(cx, |ws, _| {
         let projects = ws.state().projects();
@@ -102,7 +103,8 @@ fn first_launch_creates_project_agent_and_lands_in_general(cx: &mut TestAppConte
         assert_eq!(projects[0].root, repo);
         assert_eq!(projects[0].main_branch, "main");
     });
-    assert!(!shows(cx, window, NOT_GIT), "the error is gone");
+    assert!(shows(cx, window, "demo added"));
+    assert!(!has(cx, window, "add-project"), "the dialog closed");
     assert!(!has(cx, window, "first-launch-pick"), "step 1 is done");
     wait_until(cx, "#general with the project", |cx| {
         ws.read_with(cx, |ws, _| {
@@ -487,73 +489,6 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn adding_a_project_needs_a_git_folder(cx: &mut TestAppContext) {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = short_home();
-    let _daemon = Daemon::start(home.path().to_path_buf());
-    let w = world(home.path(), &tmp.path().join("repo"), &[]);
-    let plain = tmp.path().join("plain");
-    std::fs::create_dir_all(&plain).unwrap();
-    let shop = git_repo(&tmp.path().join("shop"));
-    let (window, ws) = open_tall(cx, home.path());
-    wait_until(cx, "the project", |cx| {
-        ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
-    });
-
-    picks(cx, &ws, &plain);
-    click(cx, window, "sidebar-projects-add");
-    assert_eq!(page(cx, &ws), Some(Page::Projects));
-    wait_to_show(cx, window, NOT_GIT);
-
-    picks(cx, &ws, &shop);
-    click(cx, window, "settings-add-project");
-    wait_until(cx, "the add form", |cx| has(cx, window, "project-adding"));
-    assert_eq!(
-        label_of(cx, window, "project-add-branch").as_deref(),
-        Some("main")
-    );
-    retype(cx, window, "project-add-name", "Shop");
-    click(cx, window, "project-add-confirm");
-    wait_until(cx, "the new project", |cx| {
-        ws.read_with(cx, |ws, _| {
-            ws.state()
-                .projects()
-                .iter()
-                .any(|p| p.name == "Shop" && p.root == shop && p.main_branch == "main")
-        })
-    });
-    wait_until(cx, "its form", |cx| {
-        label_of(cx, window, "project-form-title").as_deref() == Some("Shop")
-    });
-    wait_until(cx, "Shop's #general", |cx| {
-        ws.read_with(cx, |ws, _| {
-            let shop = ws
-                .state()
-                .projects()
-                .into_iter()
-                .find(|p| p.name == "Shop")
-                .unwrap()
-                .id;
-            let names: Vec<String> = ws
-                .state()
-                .channels(shop)
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
-            names == ["general"]
-        })
-    });
-
-    // The same folder again.
-    click(cx, window, "settings-add-project");
-    wait_to_show(
-        cx,
-        window,
-        "shop is already a project. Open it from the sidebar.",
-    );
-}
-
-#[gpui_kit::test]
 fn settings_open_from_the_title_bar_and_list_shortcuts(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let crewd_home = short_home();
@@ -632,8 +567,9 @@ fn choosing_a_folder_twice_adds_one_project(cx: &mut TestAppContext) {
     wait_to_show(cx, window, "Welcome to Crew");
     let picker = slow_picker(cx, &ws);
 
+    // The first launch opens the picker with the dialog.
     click(cx, window, "first-launch-pick");
-    click(cx, window, "first-launch-pick");
+    click(cx, window, "add-project-choose");
     assert_eq!(picker.opened.get(), 1, "one picker at a time");
     picker
         .answer
@@ -642,39 +578,34 @@ fn choosing_a_folder_twice_adds_one_project(cx: &mut TestAppContext) {
         .unwrap()
         .send(repo.clone())
         .unwrap();
+    wait_to_show(cx, window, "Git repo on main");
+    // Two quick clicks on Add project add one project.
+    click_quickly(
+        cx,
+        window,
+        &["dialog-confirm".into(), "dialog-confirm".into()],
+    );
     wait_to_show(cx, window, "demo added");
-    // Nothing to pick any more, and a late second answer adds nothing.
-    assert!(!has(cx, window, "first-launch-pick"));
-    ws.update(cx, |ws, _| {
-        ws.set_folder_picker(Rc::new(move |_| Task::ready(Some(repo.clone()))));
-    });
-    cx.update_window(window, |_, window, cx| {
-        ws.update(cx, |ws, cx| {
-            ws.choose_folder(
-                super::settings::projects::FolderFor::FirstLaunch,
-                window,
-                cx,
-            )
-        })
-    })
-    .unwrap();
     for _ in 0..20 {
         cx.run_until_parked();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     ws.read_with(cx, |ws, _| assert_eq!(ws.state().projects().len(), 1));
+    assert!(!has(cx, window, "first-launch-pick"));
 
-    // Settings' Add project is off while a picker is open.
-    press(cx, window, "cmd-,");
-    click(cx, window, "settings-nav-projects");
+    // A picker closed without a folder leaves the dialog as it was.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_add_project(window, cx))
+    })
+    .unwrap();
     let picker = slow_picker(cx, &ws);
-    click(cx, window, "settings-add-project");
-    click(cx, window, "settings-add-project");
+    click(cx, window, "add-project-choose");
     assert_eq!(picker.opened.get(), 1);
     drop(picker.answer.borrow_mut().take());
     wait_until(cx, "the picker to close", |cx| {
         ws.read_with(cx, |ws, _| ws.folder_task.is_none())
     });
+    assert!(shows(cx, window, "Choose a folder"));
 }
 
 #[gpui_kit::test]

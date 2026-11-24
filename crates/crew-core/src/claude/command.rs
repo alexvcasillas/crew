@@ -186,6 +186,8 @@ pub struct CrewContext {
     pub project: String,
     /// Live agents other than the one running.
     pub team: Vec<Teammate>,
+    /// Agents work in the project folder itself, not a worktree.
+    pub in_place: bool,
 }
 
 impl CrewContext {
@@ -218,9 +220,16 @@ impl CrewContext {
             "You are {who}, working in Crew with other agents in project {}.",
             self.project
         )];
+        let place = if self.in_place {
+            "You can edit files in the project folder itself. Other threads share it and may have changes of their own there; leave those alone."
+        } else {
+            "You can edit files in this thread's worktree."
+        };
         lines.push(match agent.permission_mode {
-            PermissionMode::EditFiles => "You can edit files in this thread's worktree.".into(),
-            PermissionMode::Auto => "You can edit files in this thread's worktree. Commands run without asking unless a safety check stops them.".into(),
+            PermissionMode::EditFiles => place.into(),
+            PermissionMode::Auto => {
+                format!("{place} Commands run without asking unless a safety check stops them.")
+            }
             PermissionMode::ReadOnly => {
                 "You are read-only: review and report, don't change files.".into()
             }
@@ -263,6 +272,59 @@ pub struct ClaudeInvocation {
     pub cwd: PathBuf,
     /// Extra environment for the process.
     pub env: Vec<(String, String)>,
+}
+
+impl ClaudeInvocation {
+    /// Lets the agent read `dir` besides its working folder, with
+    /// `--add-dir`, and denies edits and writes there. The deny rules go
+    /// in `--settings` as JSON, so a path with spaces or commas stays one
+    /// rule; glob characters in the path are escaped.
+    pub fn add_read_only_dir(&mut self, dir: &Path) {
+        let at = self
+            .args
+            .iter()
+            .rposition(|a| a == "--")
+            .unwrap_or(self.args.len());
+        let text = dir.to_string_lossy().into_owned();
+        let mut escaped = String::new();
+        for c in text.trim_end_matches('/').chars() {
+            if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+        }
+        let deny: Vec<serde_json::Value> = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+            .iter()
+            .map(|tool| serde_json::Value::String(format!("{tool}(/{escaped}/**)")))
+            .collect();
+        let settings = self.args[..at].iter().rposition(|a| a == "--settings");
+        match settings {
+            Some(i) if i + 1 < at => {
+                let mut value: serde_json::Value = serde_json::from_str(&self.args[i + 1])
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let list = value["permissions"]["deny"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                value["permissions"]["deny"] =
+                    serde_json::Value::Array(list.into_iter().chain(deny).collect());
+                self.args[i + 1] = value.to_string();
+                self.args.splice(at..at, ["--add-dir".to_string(), text]);
+            }
+            _ => {
+                let value = serde_json::json!({ "permissions": { "deny": deny } });
+                self.args.splice(
+                    at..at,
+                    [
+                        "--add-dir".to_string(),
+                        text,
+                        "--settings".into(),
+                        value.to_string(),
+                    ],
+                );
+            }
+        }
+    }
 }
 
 /// Picks the binary: the given override if set, else `claude` on `PATH`.
@@ -415,6 +477,64 @@ mod tests {
             handoff_budget: None,
             max_run_minutes: 20,
         }
+    }
+
+    #[test]
+    fn a_read_only_dir_goes_before_the_prompt() {
+        let mut inv = build_claude(
+            &agent(PermissionMode::EditFiles),
+            "-p fix it",
+            Path::new("/work/crew/platform/fix"),
+            SessionArg::New(Uuid::nil()),
+            None,
+            None,
+            &[],
+        );
+        inv.add_read_only_dir(Path::new("/work/platform"));
+        let n = inv.args.len();
+        assert_eq!(&inv.args[n - 2..], ["--", "-p fix it"]);
+        assert_eq!(
+            &inv.args[n - 6..n - 3],
+            ["--add-dir", "/work/platform", "--settings"]
+        );
+        let settings: serde_json::Value = serde_json::from_str(&inv.args[n - 3]).unwrap();
+        assert_eq!(
+            settings["permissions"]["deny"],
+            serde_json::json!([
+                "Edit(//work/platform/**)",
+                "Write(//work/platform/**)",
+                "MultiEdit(//work/platform/**)",
+                "NotebookEdit(//work/platform/**)"
+            ])
+        );
+        // A path with spaces and glob characters stays one escaped rule,
+        // and joins allow rules already given.
+        let mut odd = build_claude(
+            &agent(PermissionMode::EditFiles),
+            "go",
+            Path::new("/work/crew/x"),
+            SessionArg::New(Uuid::nil()),
+            None,
+            None,
+            &["Bash(ls)".to_string()],
+        );
+        odd.add_read_only_dir(Path::new("/work/my notes, [old]"));
+        let at = odd.args.iter().position(|a| a == "--settings").unwrap();
+        assert_eq!(odd.args.iter().filter(|a| *a == "--settings").count(), 1);
+        let settings: serde_json::Value = serde_json::from_str(&odd.args[at + 1]).unwrap();
+        assert_eq!(
+            settings["permissions"]["allow"],
+            serde_json::json!(["Bash(ls)"])
+        );
+        assert_eq!(
+            settings["permissions"]["deny"][0],
+            r"Edit(//work/my notes, \[old\]/**)"
+        );
+        let n = odd.args.len();
+        assert_eq!(
+            &odd.args[n - 4..n - 2],
+            ["--add-dir", "/work/my notes, [old]"]
+        );
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -666,6 +786,7 @@ mod tests {
                     edits: false,
                 },
             ],
+            in_place: false,
         }
     }
 
@@ -711,6 +832,7 @@ mod tests {
         let ctx = CrewContext {
             project: "demo".into(),
             team: vec![],
+            in_place: false,
         };
         let inv = build_claude(
             &a,
@@ -832,10 +954,26 @@ mod tests {
     }
 
     #[test]
+    fn in_place_context_says_the_folder_is_shared() {
+        let ctx = CrewContext {
+            project: "notes".into(),
+            team: vec![],
+            in_place: true,
+        };
+        let text = ctx.render(&agent(PermissionMode::EditFiles), false);
+        assert!(
+            text.contains("You can edit files in the project folder itself."),
+            "{text}"
+        );
+        assert!(!text.contains("worktree"), "{text}");
+    }
+
+    #[test]
     fn auto_context_says_commands_run_unless_stopped() {
         let ctx = CrewContext {
             project: "demo".into(),
             team: vec![],
+            in_place: false,
         };
         assert_eq!(
             ctx.render(&agent(PermissionMode::Auto), false),

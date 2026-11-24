@@ -787,3 +787,62 @@ fn agent_add_waits_for_a_slow_codex_model_list() {
     ]));
     assert!(out.contains("Nova uses gpt-6-luna (GPT-6-Luna)."), "{out}");
 }
+
+#[test]
+fn commit_takes_a_repo_in_a_folder_of_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("crew");
+    std::fs::create_dir(&home).unwrap();
+    let platform = tmp.path().join("platform");
+    for repo in ["api", "web"] {
+        let dir = platform.join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(&dir, &["add", "a.txt"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+    }
+    // Forge writes a file in each repo of its thread folder.
+    let script = tmp.path().join("claude-repos.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf 'x\n' > api/x.txt
+printf 'y\n' > web/y.txt
+printf '{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"m","tools":[]}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"result":"Done.","duration_ms":1,"num_turns":1,"permission_denials":[],"session_id":"s"}\n'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    start_crewd(&home, script);
+    let thread = stdout_of(crew(&home, &platform).arg("init-demo"))
+        .trim()
+        .to_string();
+    stdout_of(crew(&home, &platform).args([
+        "agent", "add", "Forge", "--model", "haiku", "--role", "Builds", "--edit",
+    ]));
+    stdout_of(crew(&home, &platform).args(["say", &thread, "@Forge", "go"]));
+    stdout_of(crew(&home, &platform).args(["watch", &thread, "--until-idle"]));
+
+    let sha =
+        stdout_of(crew(&home, &platform).args(["commit", &thread, "--repo", "api", "-m", "Add x"]));
+    assert_eq!(sha.trim().len(), 8);
+    let folder = std::fs::read_dir(home.join("worktrees/demo"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    assert_eq!(
+        git(&folder.join("api"), &["log", "-1", "--format=%s"]),
+        "Add x"
+    );
+    assert_eq!(
+        git(&folder.join("web"), &["status", "--porcelain"]),
+        "?? y.txt"
+    );
+}

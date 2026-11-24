@@ -93,6 +93,10 @@ enum Command {
         thread: String,
         #[arg(short, long)]
         message: String,
+        /// The repo to commit in, for a project that holds several, such
+        /// as `api`.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Remove a thread's worktree, changes included. Its branch goes too,
     /// unless it has commits.
@@ -347,6 +351,9 @@ async fn init_demo(c: &mut Client) -> Result<()> {
                 name: "demo".into(),
                 root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             })
             .await?
         }
@@ -841,9 +848,19 @@ async fn run(cli: Cli) -> Result<()> {
             print_diff(&diff, stat);
             Ok(())
         }
-        Command::Commit { thread, message } => {
+        Command::Commit {
+            thread,
+            message,
+            repo,
+        } => {
             let thread = resolve_thread(&mut c, &thread).await?;
-            let sha: String = c.ask(Request::Commit { thread, message }).await?;
+            let sha: String = c
+                .ask(Request::Commit {
+                    thread,
+                    repo,
+                    message,
+                })
+                .await?;
             println!("{}", sha.chars().take(8).collect::<String>());
             Ok(())
         }
@@ -854,6 +871,7 @@ async fn run(cli: Cli) -> Result<()> {
             let thread = resolve_thread(&mut c, &thread).await?;
             c.call(Request::Discard {
                 thread,
+                repos: None,
                 delete_branch: false,
             })
             .await?;

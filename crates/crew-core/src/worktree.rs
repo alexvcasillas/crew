@@ -96,12 +96,34 @@ fn is_plain_relative(path: &str) -> bool {
 /// `exclude` (relative to `dest`) are left out. The real index is left
 /// untouched.
 pub fn diff(dest: &Path, base: &str, exclude: &[String]) -> Result<Diff> {
+    diff_scoped(dest, base, exclude, None, "")
+}
+
+/// Like [`diff`], narrowed to the paths in `only` when set. File paths stay
+/// relative to `dest`; the patch names them under `prefix` (such as
+/// `api/`), so patches of several repos read as one.
+pub fn diff_scoped(
+    dest: &Path,
+    base: &str,
+    exclude: &[String],
+    only: Option<&[String]>,
+    prefix: &str,
+) -> Result<Diff> {
+    if only.is_some_and(<[String]>::is_empty) {
+        return Ok(Diff::default());
+    }
     let index = TempIndex::new(dest)?;
     index.git(["add", "-A"])?;
-    let mut paths = vec![".".to_string()];
+    let mut paths = match only {
+        Some(only) => only.iter().map(|p| format!(":(literal){p}")).collect(),
+        None => vec![".".to_string()],
+    };
     paths.extend(exclude.iter().map(|p| format!(":(exclude,literal){p}")));
+    let src = format!("--src-prefix=a/{prefix}");
+    let dst = format!("--dst-prefix=b/{prefix}");
+    // Paths relative to `dest`, which may be a folder inside its repo.
     let diff = |opts: &[&str]| {
-        let mut args = vec!["diff", "--cached", "--no-renames"];
+        let mut args = vec!["diff", "--cached", "--no-renames", "--relative"];
         args.extend_from_slice(opts);
         args.extend([base, "--"]);
         args.extend(paths.iter().map(String::as_str));
@@ -109,7 +131,7 @@ pub fn diff(dest: &Path, base: &str, exclude: &[String]) -> Result<Diff> {
     };
     let names = diff(&["-z", "--name-status"])?;
     let counts = diff(&["-z", "--numstat"])?;
-    let patch = diff(&[])?;
+    let patch = diff(&[src.as_str(), dst.as_str()])?;
 
     let mut files = Vec::new();
     let mut fields = names.split('\0').filter(|s| !s.is_empty());
@@ -216,6 +238,286 @@ pub fn commit(dest: &Path, message: &str, exclude: &[String]) -> Result<String> 
     args.extend(["commit", "-q", "-m", message].map(String::from));
     git(dest, &args)?;
     head(dest)
+}
+
+/// Commits only `paths` (relative to `dest`) on the current branch,
+/// leaving anything else you staged or changed as it was. New files among
+/// them are added. Returns the sha.
+pub fn commit_only(dest: &Path, message: &str, paths: &[String]) -> Result<String> {
+    if paths.is_empty() {
+        return Err(WorktreeError::BadPath(String::new()));
+    }
+    if let Some(bad) = paths.iter().find(|f| !is_plain_relative(f)) {
+        return Err(WorktreeError::BadPath(bad.clone()));
+    }
+    let literal: Vec<String> = paths.iter().map(|p| format!(":(literal){p}")).collect();
+    // What you had staged among them stays staged if the commit fails.
+    let mut args = vec![
+        "diff".to_string(),
+        "--cached".into(),
+        "--name-only".into(),
+        "-z".into(),
+        "--relative".into(),
+        "--".into(),
+    ];
+    args.extend(literal.iter().cloned());
+    let staged: Vec<String> = git(dest, &args)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut args = vec!["add".to_string(), "-A".into(), "--".into()];
+    args.extend(literal.iter().cloned());
+    git(dest, &args)?;
+    let unstage = || {
+        let ours: Vec<String> = paths
+            .iter()
+            .filter(|p| !staged.contains(p))
+            .map(|p| format!(":(literal){p}"))
+            .collect();
+        if ours.is_empty() {
+            return;
+        }
+        let mut args = vec!["reset".to_string(), "-q".into(), "--".into()];
+        args.extend(ours);
+        let _ = git(dest, &args);
+    };
+    let mut args: Vec<String> = Vec::new();
+    for (key, fallback) in [("user.name", "Crew"), ("user.email", "crew@localhost")] {
+        if config(dest, key)?.is_none() {
+            args.extend(["-c".into(), format!("{key}={fallback}")]);
+        }
+    }
+    args.extend(["commit", "-q", "-m", message, "--only", "--"].map(String::from));
+    args.extend(literal);
+    if let Err(e) = git(dest, &args) {
+        unstage();
+        return Err(e);
+    }
+    head(dest)
+}
+
+/// What [`restore_tracked`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restored {
+    /// Put back as they are in `HEAD`.
+    pub restored: Vec<String>,
+    /// Left alone: not in `HEAD`, so git can't put them back.
+    pub kept: Vec<String>,
+}
+
+/// Puts each of `paths` (relative to `dest`) back as it is in `HEAD`, in
+/// the index and on disk. Only files `HEAD` has are touched; new files
+/// are listed as kept and never deleted.
+pub fn restore_tracked(dest: &Path, paths: &[String]) -> Result<Restored> {
+    if let Some(bad) = paths.iter().find(|f| !is_plain_relative(f)) {
+        return Err(WorktreeError::BadPath(bad.clone()));
+    }
+    let mut out = Restored::default();
+    for path in paths {
+        let spec = format!("HEAD:./{path}");
+        let tracked = command(dest)
+            .args(["cat-file", "-e", spec.as_str()])
+            .output()?
+            .status
+            .success();
+        if tracked {
+            out.restored.push(path.clone());
+        } else {
+            out.kept.push(path.clone());
+        }
+    }
+    if !out.restored.is_empty() {
+        let mut args = vec![
+            "restore".to_string(),
+            "--source=HEAD".into(),
+            "--staged".into(),
+            "--worktree".into(),
+            "--".into(),
+        ];
+        args.extend(out.restored.iter().map(|p| format!(":(literal){p}")));
+        git(dest, &args)?;
+    }
+    Ok(out)
+}
+
+/// The blob id of each of `paths` (relative to `dir`) as it is on disk,
+/// `None` for one that is missing. With `write`, the blobs are saved in
+/// the repo, so their content can be put back later.
+pub fn hash_files(dir: &Path, paths: &[String], write: bool) -> Result<Vec<Option<String>>> {
+    let present: Vec<&String> = paths.iter().filter(|p| dir.join(p).is_file()).collect();
+    let mut ids = Vec::new();
+    if !present.is_empty() {
+        let mut cmd = command(dir);
+        cmd.args(["hash-object", "--no-filters", "--stdin-paths"]);
+        if write {
+            cmd.arg("-w");
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            for p in &present {
+                writeln!(stdin, "{p}")?;
+            }
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            return Err(git_error(["hash-object", "--stdin-paths"], &out.stderr));
+        }
+        ids = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+    }
+    let mut ids = ids.into_iter();
+    Ok(paths
+        .iter()
+        .map(|p| {
+            if dir.join(p).is_file() {
+                ids.next()
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// The blob id of `path` (relative to `dir`) in `HEAD`, if it is there.
+pub fn head_blob(dir: &Path, path: &str) -> Option<String> {
+    blob_at(dir, "HEAD", path)
+}
+
+/// The blob id of `path` (relative to `dir`) in commit `rev`, if it is
+/// there.
+pub fn blob_at(dir: &Path, rev: &str, path: &str) -> Option<String> {
+    let spec = format!("{rev}:./{path}");
+    git(dir, ["rev-parse", "-q", "--verify", spec.as_str()])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Puts `path` (relative to `dir`) back as `HEAD` has it on disk, and
+/// unstages it.
+pub fn restore_from_head(dir: &Path, path: &str) -> Result<()> {
+    if !is_plain_relative(path) {
+        return Err(WorktreeError::BadPath(path.to_string()));
+    }
+    let spec = format!(":(literal){path}");
+    git(
+        dir,
+        [
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            spec.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Files in the checkout at `dir` that differ from `HEAD`, relative to
+/// `dir`, new files one by one.
+pub fn changed_files(dir: &Path) -> Result<Vec<String>> {
+    let prefix = show_prefix(dir)?;
+    Ok(changed_paths(dir)?
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+        .collect())
+}
+
+/// Whether git ignores `path` (relative to `dir`).
+pub fn is_ignored(dir: &Path, path: &str) -> bool {
+    command(dir)
+        .args(["check-ignore", "-q", "--", path])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Files in the checkout at `dir` that git doesn't track and doesn't
+/// ignore, relative to `dir`.
+pub fn untracked_files(dir: &Path) -> Result<Vec<String>> {
+    let prefix = show_prefix(dir)?;
+    let status = git(
+        dir,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--",
+            ".",
+        ],
+    )?;
+    Ok(status
+        .split('\0')
+        .filter(|e| e.starts_with("?? "))
+        .filter_map(|e| e[3..].strip_prefix(&prefix).map(str::to_string))
+        .collect())
+}
+
+/// The checked out branch, or `None` if detached or not a checkout.
+pub fn current_branch(dir: &Path) -> Option<String> {
+    git(dir, ["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// The sha `HEAD` points at.
+pub fn head_sha(dir: &Path) -> Result<String> {
+    head(dir)
+}
+
+/// Files and folders right inside `dir` that git ignores, folders with a
+/// trailing `/`. Nothing deeper is read.
+pub fn ignored_top_level(dir: &Path) -> Result<Vec<String>> {
+    let out = git(
+        dir,
+        [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+        ],
+    )?;
+    let top: Vec<&str> = out
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim_end_matches('/').contains('/'))
+        .collect();
+    // A folder that only holds ignored files is listed too: keep those
+    // that are ignored themselves.
+    let dirs: Vec<&str> = top.iter().copied().filter(|p| p.ends_with('/')).collect();
+    let ignored_dirs: Vec<String> = if dirs.is_empty() {
+        Vec::new()
+    } else {
+        let mut args = vec!["check-ignore", "--"];
+        args.extend(dirs.iter().copied());
+        let out = command(dir).args(&args).output()?;
+        match out.status.code() {
+            Some(0) | Some(1) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim_end_matches('/').to_string())
+                .collect(),
+            _ => return Err(git_error(args, &out.stderr)),
+        }
+    };
+    Ok(top
+        .into_iter()
+        .filter(|p| !p.ends_with('/') || ignored_dirs.iter().any(|d| d == p.trim_end_matches('/')))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Removes the worktree at `dest`, discarding its changes, and optionally
@@ -361,10 +663,7 @@ pub fn root_info(root: &Path) -> RootInfo {
             ..RootInfo::default()
         };
     }
-    let branch = git(root, ["symbolic-ref", "--short", "-q", "HEAD"])
-        .ok()
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty());
+    let branch = current_branch(root);
     let uncommitted = changed_paths(root).map_or(0, |p| p.len());
     let remote_url = git(root, ["remote", "get-url", "origin"])
         .ok()

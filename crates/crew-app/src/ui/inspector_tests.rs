@@ -473,6 +473,8 @@ fn policy_switch_to_budget_runs_without_asking(cx: &mut TestAppContext) {
     let claude = waiting_claude(tmp.path());
     let home = short_home();
     let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    // A repo, so threads get a worktree of their own.
+    git_repo(&tmp.path().join("repo"));
     let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
     let (forge, scout) = (w.agents[0], w.agents[1]);
     let (window, ws) = open_thread(cx, home.path(), &w);

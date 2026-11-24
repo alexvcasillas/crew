@@ -26,7 +26,7 @@ use super::markdown_view::DocCache;
 use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
 use super::service_control::ServiceAction;
-use super::settings::projects::{PickFolder, native_picker};
+use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
@@ -154,6 +154,8 @@ pub struct Workspace {
     review_pending: Option<ThreadId>,
     /// Commit messages of closed reviews, per thread.
     pub(super) commit_messages: HashMap<ThreadId, SavedMessage>,
+    /// The same, per thread and repo, for folder projects.
+    pub(super) repo_messages: HashMap<(ThreadId, String), SavedMessage>,
     /// Numbers the thread diff reads, so only the latest lands.
     pub(super) diff_seq: u64,
     /// Running now, shown in place of the body.
@@ -178,8 +180,12 @@ pub struct Workspace {
     snapshot_seen: bool,
     /// Opens a folder picker.
     pub(super) pick_folder: PickFolder,
-    /// Picking a folder and asking git about it.
+    /// Opens a picker for a setup file to add.
+    pub(super) pick_file: PickFolder,
+    /// Picking a folder or a setup file.
     pub(super) folder_task: Option<Task<()>>,
+    /// Folders being dragged over the window from outside.
+    pub(super) dragged_paths: Option<ExternalPaths>,
     /// The editor you chose in settings, if you did.
     pub(super) editor_choice: Option<String>,
     /// The editors found on this Mac.
@@ -309,6 +315,7 @@ impl Workspace {
             viewed: HashMap::new(),
             review_pending: hooks.review,
             commit_messages: HashMap::new(),
+            repo_messages: HashMap::new(),
             diff_seq: 0,
             running,
             stopping_all: false,
@@ -321,7 +328,9 @@ impl Workspace {
             first_launch: None,
             snapshot_seen: false,
             pick_folder: native_picker(),
+            pick_file: native_file_picker(),
             folder_task: None,
+            dragged_paths: None,
             editor_choice,
             editors,
             opener: crate::editor::system_opener(),
@@ -361,6 +370,12 @@ impl Workspace {
     #[cfg(test)]
     pub(super) fn set_folder_picker(&mut self, pick: PickFolder) {
         self.pick_folder = pick;
+    }
+
+    /// Replaces the setup file picker, as tests do.
+    #[cfg(test)]
+    pub(super) fn set_file_picker(&mut self, pick: PickFolder) {
+        self.pick_file = pick;
     }
 
     /// Moves focus off any field onto the window, as clicking empty space
@@ -653,10 +668,14 @@ impl Workspace {
             .filter(|r| r.status == RunStatus::Working)
             .filter_map(|r| self.state.agent(r.agent).map(|a| a.spec.name.clone()))
             .collect();
+        let queued = self
+            .nav
+            .thread
+            .and_then(|t| super::folder::queue_hint(&self.state, t));
         let hint = if live.is_empty() {
             self.last_agent().map(|name| reply_hint(&name))
         } else {
-            working_hint(&working)
+            queued.or_else(|| working_hint(&working))
         };
         let busy = self.creating.is_some()
             && matches!(self.draft_key(), Some(DraftKey::NewThread(c)) if self.creating == Some(c));
@@ -679,7 +698,16 @@ impl Workspace {
                 .running()
                 .iter()
                 .any(|r| r.status == RunStatus::Working);
-        if working.is_empty() && !running_ticks && !self.channel_ticks() {
+        // An agent writing in the open thread's folder from another thread
+        // shows its time in the Working copy.
+        let folder_ticks = self.nav.thread.is_some_and(|t| {
+            super::folder::folder_mode(&self.state, t) == Some(super::folder::FolderMode::InPlace)
+                && self
+                    .state
+                    .thread_project(t)
+                    .is_some_and(|p| !super::folder::writers(&self.state, p).is_empty())
+        });
+        if working.is_empty() && !running_ticks && !folder_ticks && !self.channel_ticks() {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -814,7 +842,7 @@ impl Workspace {
 
     /// Writes the recents to the prefs file, off the UI thread, after any
     /// write still pending, so none is dropped and the latest lands last.
-    fn save_recents(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_recents(&mut self, cx: &mut Context<Self>) {
         let recents = self.recents.clone();
         let home = self.conn.crew_home.clone();
         let pending = self.recents_task.take();
@@ -1314,8 +1342,8 @@ impl Render for Workspace {
         }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
-        div()
-            .id("workspace")
+        let root = div().id("workspace");
+        self.add_project_drop_target(root, cx)
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread(window, cx)))
@@ -1658,10 +1686,16 @@ mod gpui_tests {
         let (other, _events) = client::spawn(ConnectionConfig {
             crew_home: home.to_path_buf(),
         });
+        // crewd only takes a folder that exists.
+        let root = home.join("demo");
+        std::fs::create_dir_all(&root).unwrap();
         futures::executor::block_on(other.request(Request::CreateProject {
             name: "demo".into(),
-            root: "/work/demo".into(),
+            root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         }))
         .unwrap();
     }
@@ -1721,11 +1755,16 @@ mod gpui_tests {
             crew_home: home.path().to_path_buf(),
         });
         let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
-        let add = |name: &str, root: &str| -> (ProjectId, ChannelId) {
+        let add = |name: &str| -> (ProjectId, ChannelId) {
+            let root = home.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
             let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
                 name: name.into(),
-                root: root.into(),
+                root: root.to_string_lossy().into_owned(),
                 main_branch: "main".into(),
+                work_mode: None,
+                copy_files: vec![],
+                setup_command: None,
             }))
             .unwrap();
             let channel = serde_json::from_value(ask(Request::CreateChannel {
@@ -1735,8 +1774,8 @@ mod gpui_tests {
             .unwrap();
             (project, channel)
         };
-        let (gone, gone_channel) = add("gone", "/work/gone");
-        let (kept, kept_channel) = add("kept", "/work/kept");
+        let (gone, gone_channel) = add("gone");
+        let (kept, kept_channel) = add("kept");
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel: gone_channel,
             title: "fix the login".into(),
@@ -1791,10 +1830,15 @@ mod gpui_tests {
             crew_home: home.path().to_path_buf(),
         });
         let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
+        let root = home.path().join("demo");
+        std::fs::create_dir_all(&root).unwrap();
         let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
             name: "demo".into(),
-            root: "/work/demo".into(),
+            root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         }))
         .unwrap();
         let channel: ChannelId = serde_json::from_value(ask(Request::CreateChannel {

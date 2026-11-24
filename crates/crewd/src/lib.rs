@@ -3,6 +3,7 @@
 mod approvals;
 mod codex_asks;
 pub mod codex_runner;
+mod folders;
 mod overview;
 mod peer;
 mod profile;

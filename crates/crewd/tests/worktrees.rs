@@ -280,6 +280,9 @@ async fn setup(d: &Daemon, c: &mut Client) -> Setup {
             name: "Demo".into(),
             root: d.root().to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel: ChannelId = c
@@ -612,6 +615,7 @@ async fn copied_files_stay_out_of_commits() {
     let _: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
@@ -699,6 +703,7 @@ async fn diff_then_commit() {
     let sha: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
@@ -722,6 +727,7 @@ async fn diff_then_commit() {
     let err = c
         .call(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "  ".into(),
         })
         .await
@@ -739,6 +745,7 @@ async fn discard_removes_worktree() {
     let err = c
         .call(Request::Discard {
             thread: s.thread,
+            repos: None,
             delete_branch: false,
         })
         .await
@@ -752,6 +759,7 @@ async fn discard_removes_worktree() {
 
     c.call(Request::Discard {
         thread: s.thread,
+        repos: None,
         delete_branch: false,
     })
     .await
@@ -791,6 +799,7 @@ async fn commit_refused_while_running() {
     let err = c
         .call(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Too soon".into(),
         })
         .await
@@ -800,6 +809,7 @@ async fn commit_refused_while_running() {
         let err = c
             .call(Request::Discard {
                 thread: s.thread,
+                repos: None,
                 delete_branch,
             })
             .await
@@ -830,12 +840,14 @@ async fn discard_keeps_a_branch_with_commits() {
     let _: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
 
     c.call(Request::Discard {
         thread: s.thread,
+        repos: None,
         delete_branch: false,
     })
     .await
@@ -874,6 +886,7 @@ async fn slow_commit_does_not_hold_up_other_requests() {
     let commit = c
         .send(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
@@ -1060,12 +1073,14 @@ async fn discard_can_delete_a_branch_with_commits() {
     let _: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
 
     c.call(Request::Discard {
         thread: s.thread,
+        repos: None,
         delete_branch: true,
     })
     .await
@@ -1330,6 +1345,7 @@ async fn channel_overview_sums_up_each_thread() {
     let _: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Fix login".into(),
         })
         .await;
@@ -1349,6 +1365,7 @@ async fn channel_overview_sums_up_each_thread() {
     // Discarding leaves no worktree at all.
     c.call(Request::Discard {
         thread: s.thread,
+        repos: None,
         delete_branch: false,
     })
     .await
@@ -1611,6 +1628,7 @@ async fn a_commit_or_a_discard_tells_the_app_the_counts_changed() {
     let _: String = c
         .ok(Request::Commit {
             thread: s.thread,
+            repo: None,
             message: "Add file".into(),
         })
         .await;
@@ -1622,6 +1640,7 @@ async fn a_commit_or_a_discard_tells_the_app_the_counts_changed() {
 
     c.call(Request::Discard {
         thread: s.thread,
+        repos: None,
         delete_branch: true,
     })
     .await

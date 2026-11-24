@@ -4,8 +4,10 @@ use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
+use crew_core::project_kind::{ProjectKind, WorkMode};
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, Limits, RunFilter, Store, StoreError, ThreadWorktree,
+    ApprovalKind, ApprovalStatus, Author, Limits, RepoWorktree, RunFilter, Store, StoreError,
+    ThreadWorktree,
 };
 
 fn spec(name: &str) -> AgentSpec {
@@ -416,7 +418,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -448,6 +450,7 @@ fn threads_keep_worktree_and_handoff_settings() {
         branch: "crew/first".into(),
         base: "abc123".into(),
         ready: false,
+        repos: vec![],
     };
     let root = store.thread_cwd(t).unwrap();
     store.set_thread_worktree(t, Some(&wt)).unwrap();
@@ -792,7 +795,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -846,7 +849,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -879,7 +882,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -952,7 +955,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -991,7 +994,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1222,7 +1225,7 @@ fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1372,7 +1375,7 @@ fn migrates_v8_db_to_v9_keeping_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1602,4 +1605,92 @@ fn runs_of_a_project_and_of_an_agent() {
     let ids = |v: Vec<crew_core::store::StoredRun>| v.iter().map(|r| r.id).collect::<Vec<_>>();
     assert_eq!(ids(store.project_runs(p).unwrap()), [r1, r3]);
     assert_eq!(ids(store.agent_runs(ada).unwrap()), [r1, r2]);
+}
+
+const SCHEMA_V9: &str = include_str!("../src/store/schema_v9.sql");
+
+#[test]
+fn migrates_v9_db_to_v10_as_a_repo_with_its_own_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V9).unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, main_branch, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000001', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000002',
+                        '00000000-0000-4000-8000-000000000001', 'general', 2);
+             INSERT INTO threads (id, channel_id, title, created_at, worktree_path,
+                                  worktree_branch, worktree_base, worktree_ready)
+                VALUES ('00000000-0000-4000-8000-000000000003',
+                        '00000000-0000-4000-8000-000000000002', 'Fix login', 3,
+                        '/work/crew/demo/fix-login', 'crew/fix-login', 'abc', 1);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let project = &store.projects().unwrap()[0];
+    assert_eq!(project.kind, ProjectKind::Repo);
+    assert_eq!(project.work_mode, WorkMode::OwnCopy);
+    let thread = &store.project_threads(project.id).unwrap()[0];
+    let wt = thread.worktree.as_ref().unwrap();
+    assert!(wt.ready && wt.repos.is_empty());
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 10);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn projects_keep_their_kind_mode_and_repo_worktrees() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("platform", Path::new("/work/platform"), "")
+        .unwrap();
+    let kind = ProjectKind::MultiRepo {
+        repos: vec!["api".into(), "web".into()],
+    };
+    store.set_project_kind(p, &kind).unwrap();
+    store.set_project_mode(p, WorkMode::InPlace).unwrap();
+    let got = store.project(p).unwrap();
+    assert_eq!(got.kind, kind);
+    assert_eq!(got.work_mode, WorkMode::InPlace);
+
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "first").unwrap();
+    let wt = ThreadWorktree {
+        path: PathBuf::from("/work/crew/worktrees/platform/first"),
+        branch: "crew/first".into(),
+        base: String::new(),
+        ready: true,
+        repos: vec![RepoWorktree {
+            repo: "api".into(),
+            base: "abc".into(),
+        }],
+    };
+    store.set_thread_worktree(t, Some(&wt)).unwrap();
+    assert_eq!(store.thread(t).unwrap().worktree, Some(wt));
+
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    let first = store.create_run(t, a).unwrap();
+    let second = store.create_run(t, a).unwrap();
+    store.set_run_waiting(second, Some(first)).unwrap();
+    assert_eq!(store.run(second).unwrap().waiting_for, Some(first));
+    // Once it starts, it no longer waits.
+    store.begin_run(second).unwrap();
+    assert_eq!(store.run(second).unwrap().waiting_for, None);
+    store.set_run_waiting(second, Some(first)).unwrap();
+    store.set_run_status(second, RunStatus::Stopped).unwrap();
+    assert_eq!(store.run(second).unwrap().waiting_for, None);
 }

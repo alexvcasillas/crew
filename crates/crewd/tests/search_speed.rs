@@ -103,6 +103,7 @@ fn fixture(tmp: &Path) -> (Store, ProjectId) {
                 branch,
                 base,
                 ready: true,
+                repos: vec![],
             };
             store.set_thread_worktree(t, Some(&wt)).unwrap();
         }

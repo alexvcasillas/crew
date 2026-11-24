@@ -40,6 +40,9 @@ fn shop(w: &World, root: &Path) -> Shop {
         name: "shop".into(),
         root: root.to_string_lossy().into_owned(),
         main_branch: "main".into(),
+        work_mode: None,
+        copy_files: vec![],
+        setup_command: None,
     });
     let channel: ChannelId = w.ask(Request::CreateChannel {
         project,

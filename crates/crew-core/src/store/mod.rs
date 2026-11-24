@@ -15,6 +15,7 @@ use crate::agent::{AgentSpec, Runtime};
 use crate::event::{Event, RunStatus};
 use crate::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crate::policy::HandoffPolicy;
+use crate::project_kind::{ProjectKind, WorkMode};
 
 pub use approval::{
     ApprovalKind, ApprovalStatus, OUTSIDE_SANDBOX, StoredApproval, blocked_text, handoff_ask_text,
@@ -24,7 +25,7 @@ pub use approval::{
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -35,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v7.sql"),
     include_str!("migrate_v8.sql"),
     include_str!("migrate_v9.sql"),
+    include_str!("migrate_v10.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -159,6 +161,12 @@ pub struct StoredProject {
     pub setup_command: Option<String>,
     /// Files copied from the root into a new worktree, relative to the root.
     pub copy_files: Vec<String>,
+    /// What the folder holds, as last seen.
+    #[serde(default)]
+    pub kind: ProjectKind,
+    /// Where agents write.
+    #[serde(default)]
+    pub work_mode: WorkMode,
 }
 
 /// A channel as saved in the store.
@@ -186,6 +194,19 @@ pub struct ThreadWorktree {
     /// Set once files were copied in and the setup command succeeded.
     #[serde(default)]
     pub ready: bool,
+    /// For a folder of repos: one worktree per repo at the same path
+    /// inside `path`, each on `branch`. Empty when `path` is the worktree.
+    #[serde(default)]
+    pub repos: Vec<RepoWorktree>,
+}
+
+/// One repo's worktree inside a thread folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoWorktree {
+    /// Relative to the project folder and to the thread folder.
+    pub repo: String,
+    /// Sha of the repo's branch when the worktree was made.
+    pub base: String,
 }
 
 /// A thread as saved in the store.
@@ -239,6 +260,9 @@ pub struct StoredRun {
     /// The CLI that ran it. Set when it starts; Claude Code until then.
     #[serde(default = "claude_code")]
     pub runtime: Runtime,
+    /// While queued: the run writing in the same folder it waits for.
+    #[serde(default)]
+    pub waiting_for: Option<RunId>,
 }
 
 fn claude_code() -> Runtime {
@@ -502,6 +526,30 @@ impl Store {
                 setup_command,
                 serde_json::to_string(copy_files)?
             ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(())
+    }
+
+    /// Saves what the project's folder holds.
+    pub fn set_project_kind(&self, p: ProjectId, kind: &ProjectKind) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET kind = ?2 WHERE id = ?1",
+            params![p.to_string(), serde_json::to_string(kind)?],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(())
+    }
+
+    /// Sets where the project's agents write.
+    pub fn set_project_mode(&self, p: ProjectId, mode: WorkMode) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET work_mode = ?2 WHERE id = ?1",
+            params![p.to_string(), enum_text(&mode)?],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound("project"));
@@ -920,13 +968,14 @@ impl Store {
     pub fn set_thread_worktree(&self, t: ThreadId, wt: Option<&ThreadWorktree>) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE threads SET worktree_path = ?2, worktree_branch = ?3, worktree_base = ?4,
-             worktree_ready = ?5 WHERE id = ?1",
+             worktree_ready = ?5, worktree_repos = ?6 WHERE id = ?1",
             params![
                 t.to_string(),
                 wt.map(|w| w.path.to_string_lossy().into_owned()),
                 wt.map(|w| &w.branch),
                 wt.map(|w| &w.base),
-                wt.is_some_and(|w| w.ready)
+                wt.is_some_and(|w| w.ready),
+                serde_json::to_string(&wt.map_or(&[][..], |w| &w.repos[..]))?
             ],
         )?;
         if changed == 0 {
@@ -1167,7 +1216,8 @@ impl Store {
     /// id. `started_at` becomes now.
     pub fn start_run(&self, r: RunId, runtime: &Runtime, session_id: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE runs SET session_id = ?2, status = ?3, started_at = ?4, runtime = ?5 WHERE id = ?1",
+            "UPDATE runs SET session_id = ?2, status = ?3, started_at = ?4, runtime = ?5,
+             waiting_for = NULL WHERE id = ?1",
             params![
                 r.to_string(),
                 session_id,
@@ -1187,7 +1237,7 @@ impl Store {
     /// doesn't count. [`Self::start_run`] sets it again once the CLI runs.
     pub fn begin_run(&self, r: RunId) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE runs SET status = ?2, started_at = ?3 WHERE id = ?1",
+            "UPDATE runs SET status = ?2, started_at = ?3, waiting_for = NULL WHERE id = ?1",
             params![r.to_string(), status_text(&RunStatus::Working)?, now_ms()],
         )?;
         if changed == 0 {
@@ -1217,11 +1267,25 @@ impl Store {
         Ok(())
     }
 
-    /// Sets the status. A terminal status also sets `ended_at`.
+    /// Sets the run a queued run waits for, or clears it.
+    pub fn set_run_waiting(&self, r: RunId, waiting_for: Option<RunId>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET waiting_for = ?2 WHERE id = ?1",
+            params![r.to_string(), waiting_for.map(|w| w.to_string())],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    /// Sets the status. A terminal status also sets `ended_at`. Only a
+    /// queued run waits for another.
     pub fn set_run_status(&self, r: RunId, s: RunStatus) -> Result<()> {
         let ended = is_terminal(&s).then(now_ms);
         let changed = self.conn.execute(
-            "UPDATE runs SET status = ?2, ended_at = ?3 WHERE id = ?1",
+            "UPDATE runs SET status = ?2, ended_at = ?3,
+             waiting_for = CASE WHEN ?2 = 'queued' THEN waiting_for END WHERE id = ?1",
             params![r.to_string(), status_text(&s)?, ended],
         )?;
         if changed == 0 {
@@ -1408,7 +1472,7 @@ const OPEN_CHANNELS: &str = "SELECT c.id FROM channels c JOIN projects p ON p.id
      WHERE p.removed_at IS NULL AND (?1 IS NULL OR p.id = ?1)";
 
 const PROJECT_COLUMNS: &str = "SELECT p.id, p.name, p.root, p.main_branch, p.created_at,
-     p.setup_command, p.copy_files FROM projects p";
+     p.setup_command, p.copy_files, p.kind, p.work_mode FROM projects p";
 
 fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
     let copy_files: String = r.get(6)?;
@@ -1420,13 +1484,18 @@ fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
         created_at: r.get(4)?,
         setup_command: r.get(5)?,
         copy_files: Vec::new(),
+        kind: ProjectKind::Repo,
+        work_mode: WorkMode::OwnCopy,
     };
-    Ok(serde_json::from_str(&copy_files)
-        .map(|copy_files| StoredProject {
-            copy_files,
+    let (kind, mode): (String, String) = (r.get(7)?, r.get(8)?);
+    Ok((|| {
+        Ok(StoredProject {
+            copy_files: serde_json::from_str(&copy_files)?,
+            kind: serde_json::from_str(&kind)?,
+            work_mode: parse_enum(&mode)?,
             ..project
         })
-        .map_err(StoreError::from))
+    })())
 }
 
 const CHANNEL_COLUMNS: &str = "SELECT id, project_id, name, created_at, handoff_policy,
@@ -1451,7 +1520,7 @@ fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
 
 const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,
      worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used,
-     worktree_ready, archived_at FROM threads";
+     worktree_ready, archived_at, worktree_repos FROM threads";
 
 fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
     let path: Option<String> = r.get(4)?;
@@ -1463,6 +1532,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
             branch,
             base,
             ready: r.get(10)?,
+            repos: Vec::new(),
         }),
         _ => None,
     };
@@ -1478,14 +1548,23 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
         archived_at: r.get(11)?,
     };
     let policy: Option<String> = r.get(7)?;
-    Ok(parse_policy(policy).map(|handoff_policy| StoredThread {
-        handoff_policy,
-        ..thread
-    }))
+    let repos: String = r.get(12)?;
+    Ok((|| {
+        let repos: Vec<RepoWorktree> = serde_json::from_str(&repos)?;
+        Ok(StoredThread {
+            handoff_policy: parse_policy(policy)?,
+            worktree: thread
+                .worktree
+                .clone()
+                .map(|w| ThreadWorktree { repos, ..w }),
+            ..thread
+        })
+    })())
 }
 
 const RUN_COLUMNS: &str =
-    "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime FROM runs";
+    "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime,
+     waiting_for FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -1498,6 +1577,10 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
         started_at: r.get(5)?,
         ended_at: r.get(6)?,
         runtime: Runtime::ClaudeCode,
+        waiting_for: r
+            .get::<_, Option<String>>(8)?
+            .and_then(|w| Uuid::parse_str(&w).ok())
+            .map(RunId),
     };
     let runtime: String = r.get(7)?;
     Ok(parse_status(&status).and_then(|status| {

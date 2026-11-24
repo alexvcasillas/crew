@@ -3,16 +3,20 @@
 
 use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
-use crew_core::ids::{AgentId, ThreadId};
+use crew_core::ids::{AgentId, ProjectId, ThreadId};
 use crew_core::policy::{self, HandoffPolicy, PolicyInputs};
-use crew_core::store::StoredThread;
+use crew_core::store::{StoredRun, StoredThread};
 use crew_proto::Request;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{elapsed, monogram, now_ms, runtime_badge_for, runtime_chip};
+use super::folder::{
+    BRANCH_ICON, FolderMode, IN_PLACE_WARNING, folder_mode, ordinal, small_icon, warning_note,
+    write_queue, writers,
+};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
 use crate::theme::color;
@@ -229,7 +233,9 @@ impl Workspace {
         };
 
         let wt = t.worktree.clone();
+        let folder = self.folder_working_copy(thread, cx);
         let working_copy = match &wt {
+            _ if folder.is_some() => Vec::new(),
             None => vec![
                 div()
                     .id("working-none")
@@ -403,7 +409,10 @@ impl Workspace {
                         ))
                     }),
             )
-            .child(section("Working copy").children(working_copy))
+            .map(|tab| match folder {
+                Some(sections) => tab.children(sections),
+                None => tab.child(section("Working copy").children(working_copy)),
+            })
             .child(
                 Button::new("stop-thread")
                     .outline()
@@ -418,6 +427,269 @@ impl Workspace {
             .test_support()
             .into_any_element()
     }
+}
+
+impl Workspace {
+    /// The Working copy of a folder project's thread and what follows
+    /// it, or `None` for a single repo with a worktree per thread.
+    fn folder_working_copy(
+        &self,
+        thread: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<AnyElement>> {
+        let state = self.state();
+        let mode = folder_mode(state, thread)?;
+        let project_id = state.thread_project(thread)?;
+        let project = state.project(project_id)?;
+        let sections = match mode {
+            FolderMode::OwnCopy => self.own_copy_sections(thread, project_id),
+            FolderMode::InPlace => {
+                let mut working = section("Working copy").child(path_hint(
+                    "working-in-place",
+                    "Edits go straight to",
+                    home_relative(&project.root),
+                ));
+                let name = |run: &StoredRun| {
+                    state
+                        .agent(run.agent)
+                        .map_or_else(|| "Agent".to_string(), |a| a.spec.name.clone())
+                };
+                for (ix, run) in writers(state, project_id).into_iter().enumerate() {
+                    let who = name(run);
+                    working = working.child(
+                        kv_row(("working-writer", ix))
+                            .aria_label(format!("{who} is writing"))
+                            .child(ringed(monogram(&who, 18.)))
+                            .child(div().text_color(color("text-primary")).child(who))
+                            .child(div().flex_1().child("is writing"))
+                            .child(
+                                div()
+                                    .font_family(code_family())
+                                    .text_color(color("accent-blue"))
+                                    .child(elapsed(now_ms() - run.started_at)),
+                            )
+                            .test_support(),
+                    );
+                }
+                for (ix, run) in write_queue(state, project_id).into_iter().enumerate() {
+                    let who = name(run);
+                    let id = run.id;
+                    let place = format!("waits to write · {} in queue", ordinal(ix + 1));
+                    working = working.child(
+                        kv_row(("working-waiting", ix))
+                            .aria_label(format!("{who} {place}"))
+                            .child(monogram(&who, 18.))
+                            .child(div().text_color(color("text-primary")).child(who))
+                            .child(div().flex_1().min_w_0().truncate().child(place))
+                            .child(
+                                Button::new(("working-cancel", ix))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.stop_run(id, window, cx);
+                                    })),
+                            )
+                            .test_support(),
+                    );
+                }
+                let mut sections = vec![working.into_any_element()];
+                let changes = &self.inspector.changes;
+                if !changes.is_empty() {
+                    sections.push(
+                        section("Changed so far")
+                            .children(changes.iter().enumerate().map(|(ix, f)| {
+                                let mut label = f.path.clone();
+                                if f.added > 0 {
+                                    label.push_str(&format!(" +{}", f.added));
+                                }
+                                if f.removed > 0 {
+                                    label.push_str(&format!(" −{}", f.removed));
+                                }
+                                kv_row(("working-changed", ix))
+                                    .aria_label(label)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_family(code_family())
+                                            .text_color(color("text-primary"))
+                                            .child(f.path.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap(ui_px(4.))
+                                            .font_family(code_family())
+                                            .when(f.added > 0, |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_color(color("success"))
+                                                        .child(format!("+{}", f.added)),
+                                                )
+                                            })
+                                            .when(f.removed > 0, |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_color(color("danger"))
+                                                        .child(format!("−{}", f.removed)),
+                                                )
+                                            }),
+                                    )
+                                    .test_support()
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                sections.push(warning_note("working-warning", IN_PLACE_WARNING).into_any_element());
+                sections
+            }
+        };
+        Some(sections)
+    }
+
+    /// A thread folder of a folder of repos: each repo's worktree, then
+    /// the plain files it leaves out.
+    fn own_copy_sections(&self, thread: ThreadId, project_id: ProjectId) -> Vec<AnyElement> {
+        let state = self.state();
+        let Some(project) = state.project(project_id) else {
+            return Vec::new();
+        };
+        let Some(wt) = state.thread(thread).and_then(|t| t.worktree.as_ref()) else {
+            return vec![
+                section("Working copy")
+                    .child(
+                        div()
+                            .id("working-none")
+                            .text_color(color("text-tertiary"))
+                            .aria_label(NO_WORKING_COPY)
+                            .child(NO_WORKING_COPY)
+                            .test_support(),
+                    )
+                    .into_any_element(),
+            ];
+        };
+        let mut working = section("Working copy").child(path_hint(
+            "working-folder-hint",
+            "Thread folder",
+            format!("{} · {}", project.name, wt.branch),
+        ));
+        for (ix, repo) in wt.repos.iter().enumerate() {
+            let changed = self.inspector.diff.as_ref().map(|d| {
+                d.repos
+                    .iter()
+                    .find(|r| r.repo == repo.repo)
+                    .map_or(0, |r| r.diff.files.len())
+            });
+            let changed = match changed {
+                None => "Checking…".to_string(),
+                Some(0) => "clean".to_string(),
+                Some(n) => format!("{n} changed"),
+            };
+            working = working.child(
+                kv_row(("working-repo", ix))
+                    .aria_label(format!("{} {} {changed}", repo.repo, wt.branch))
+                    .child(small_icon(BRANCH_ICON, "text-secondary"))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(scale::mono(48.))
+                            .truncate()
+                            .font_family(code_family())
+                            .text_color(color("text-primary"))
+                            .child(repo.repo.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(code_family())
+                            .child(wt.branch.clone()),
+                    )
+                    .child(div().flex_none().child(changed))
+                    .test_support(),
+            );
+        }
+        let mut sections = vec![working.into_any_element()];
+        let top = self
+            .inspector
+            .top_files
+            .as_ref()
+            .filter(|(p, _)| *p == project_id)
+            .map(|(_, files)| files.clone())
+            .unwrap_or_default();
+        if !top.is_empty() {
+            let folder = project
+                .root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| project.name.clone());
+            let text = format!(
+                "Plain files at the top of {folder}/ stay out of the thread folder: {}. Agents can read them from the original folder but not change them.",
+                top.join(", ")
+            );
+            sections.push(
+                section("Not copied")
+                    .child(
+                        div()
+                            .id("working-not-copied")
+                            .line_height(scale::line(18.))
+                            .text_color(color("text-tertiary"))
+                            .aria_label(text.clone())
+                            .child(text)
+                            .test_support(),
+                    )
+                    .into_any_element(),
+            );
+        }
+        sections
+    }
+}
+
+/// "{words} {path}", the path in mono, as the Working copy's first line.
+fn path_hint(id: &'static str, words: &'static str, path: String) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .gap(ui_px(4.))
+        .line_height(scale::line(18.))
+        .text_color(color("text-tertiary"))
+        .aria_label(format!("{words} {path}"))
+        .child(div().flex_none().child(words))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family(code_family())
+                .text_color(color("text-secondary"))
+                .child(path),
+        )
+        .test_support()
+}
+
+/// A 24 px row of the Working copy: things side by side, 12 px.
+fn kv_row(id: impl Into<ElementId>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(ui_px(8.))
+        .h(scale::row(24.))
+        .whitespace_nowrap()
+        .text_color(color("text-secondary"))
+}
+
+/// An avatar with the blue ring of an agent at work.
+fn ringed(avatar: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex_none()
+        .p(ui_px(1.))
+        .rounded(ui_px(7.))
+        .border_1()
+        .border_color(color("accent-blue"))
+        .child(avatar)
 }
 
 /// A titled group of the Thread tab.

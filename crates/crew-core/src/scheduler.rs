@@ -53,6 +53,11 @@ impl Scheduler {
         self.paused
     }
 
+    /// The queued jobs, first in first.
+    pub fn queued(&self) -> &[Job] {
+        &self.queue
+    }
+
     /// How many jobs wait in the queue.
     pub fn queued_len(&self) -> usize {
         self.queue.len()
@@ -60,13 +65,19 @@ impl Scheduler {
 
     /// Takes the next job that may start and marks its thread active.
     pub fn next_ready(&mut self) -> Option<Job> {
+        self.next_ready_where(|_| true)
+    }
+
+    /// Like [`Scheduler::next_ready`], skipping jobs `may_start` says no to.
+    /// They keep their place in the queue.
+    pub fn next_ready_where(&mut self, mut may_start: impl FnMut(&Job) -> bool) -> Option<Job> {
         if self.paused || self.active.len() >= self.cap {
             return None;
         }
         let pos = self
             .queue
             .iter()
-            .position(|j| !self.active.contains(&j.thread))?;
+            .position(|j| !self.active.contains(&j.thread) && may_start(j))?;
         let job = self.queue.remove(pos);
         self.active.insert(job.thread);
         Some(job)
@@ -124,6 +135,18 @@ mod tests {
         assert!(s.next_ready().is_none());
         s.finished(t);
         assert_eq!(s.next_ready().unwrap().prompt, "b");
+    }
+
+    #[test]
+    fn skipped_jobs_keep_their_place() {
+        let mut s = Scheduler::new(4);
+        let (a, b) = (ThreadId::new(), ThreadId::new());
+        s.enqueue(job(a, "blocked"));
+        s.enqueue(job(b, "free"));
+        let got = s.next_ready_where(|j| j.prompt != "blocked").unwrap();
+        assert_eq!(got.prompt, "free");
+        assert_eq!(s.queued().len(), 1);
+        assert_eq!(s.next_ready().unwrap().prompt, "blocked");
     }
 
     #[test]

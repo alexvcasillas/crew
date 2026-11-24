@@ -6,6 +6,7 @@ use std::path::Path;
 use crew_core::edits::run_edits;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ProjectId, RunId, ThreadId};
+use crew_core::project_kind::{looks_secret, repo_of};
 use crew_core::store::StoredRun;
 use crew_core::worktree;
 use crew_proto::{
@@ -168,13 +169,19 @@ impl Service {
             .filter_map(|t| t.worktree.as_ref().map(|w| w.path.clone()))
             .collect();
         let (root, copy_files) = (stored.root.clone(), stored.copy_files.clone());
+        let svc = self.clone();
         let (info, on_disk, setup) = blocking(move || {
+            // Opening the project looks at what its folder holds again.
+            let repos = svc.refresh_kind(project).unwrap_or_default().repos();
             let info = worktree::root_info(&root);
             let on_disk = worktrees.iter().filter(|p| p.is_dir()).count();
             let setup: Vec<SetupFile> = copy_files
                 .into_iter()
                 .map(|path| SetupFile {
                     size: setup_size(&root, &path),
+                    ignored: repo_of(&repos, &path)
+                        .is_some_and(|(repo, inner)| worktree::is_ignored(&root.join(repo), inner)),
+                    looks_secret: looks_secret(&path),
                     path,
                 })
                 .collect();
@@ -338,6 +345,7 @@ mod tests {
             started_at: 1,
             ended_at: None,
             runtime: Runtime::ClaudeCode,
+            waiting_for: None,
         }
     }
 

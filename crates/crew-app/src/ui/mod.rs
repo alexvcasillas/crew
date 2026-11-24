@@ -11,6 +11,7 @@ mod dev_hooks;
 mod dialogs;
 pub mod diff_view;
 mod first_launch;
+mod folder;
 mod inspector;
 mod markdown_view;
 mod mention_menu;
@@ -29,6 +30,8 @@ mod title_bar;
 pub mod workspace;
 
 #[cfg(test)]
+mod add_project_tests;
+#[cfg(test)]
 mod appearance_tests;
 #[cfg(test)]
 mod auto_tests;
@@ -40,6 +43,8 @@ mod codex_tests;
 mod dialog_tests;
 #[cfg(test)]
 mod diff_tests;
+#[cfg(test)]
+mod folder_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]

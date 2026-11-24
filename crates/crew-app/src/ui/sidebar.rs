@@ -11,7 +11,6 @@ use gpui_kit::*;
 
 use super::common::{ago, dot, monogram, now_ms, status_word, with_font_probe};
 use super::settings::Page;
-use super::settings::projects::FolderFor;
 use super::workspace::Workspace;
 use crate::model::ThreadStatus;
 use crate::theme::color;
@@ -74,8 +73,7 @@ impl Workspace {
                         "Projects",
                         "Add project",
                         cx.listener(|this, _, window, cx| {
-                            this.open_settings(Page::Projects, window, cx);
-                            this.choose_folder(FolderFor::Settings, window, cx);
+                            this.open_add_project(window, cx);
                         }),
                     ))
                     .children(projects)

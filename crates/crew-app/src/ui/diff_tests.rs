@@ -846,3 +846,32 @@ fn general_offers_finder_and_the_detected_editors(cx: &mut TestAppContext) {
         "Finder means no app"
     );
 }
+
+#[gpui_kit::test]
+fn the_file_bar_names_the_shown_file_and_marks_it_viewed(cx: &mut TestAppContext) {
+    let s = setup(
+        "mkdir -p src/auth\nprintf 'one\\n' > src/auth/session.rs\nprintf 'two\\n' > top.txt",
+    );
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 2);
+    review_from_inspector(cx, window);
+    wait_until(cx, "the bar", |cx| {
+        label_of(cx, window, "review-file-bar").as_deref() == Some("src/auth/session.rs")
+    });
+    assert!(
+        !has(cx, window, "review-file-bar-repo"),
+        "one repo, no chip"
+    );
+
+    click(cx, window, ("review-file", 1usize));
+    wait_until(cx, "the second file", |cx| {
+        label_of(cx, window, "review-file-bar").as_deref() == Some("top.txt")
+    });
+    click(cx, window, "review-top-viewed");
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.viewed_files(s.w.thread)),
+        ["top.txt"]
+    );
+}

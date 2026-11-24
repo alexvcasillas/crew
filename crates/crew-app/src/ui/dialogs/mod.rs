@@ -1,7 +1,8 @@
-//! The thread and channel dialogs: rename, archive, discard the worktree,
-//! and channel settings. One is open at a time; what it shows lives in
+//! The dialogs: add project, rename, archive, discard the worktree, and
+//! channel settings. One is open at a time; what it shows lives in
 //! [`OpenDialog`] so an answer from crewd can land in it.
 
+mod add_project;
 mod archive;
 mod channel_settings;
 mod discard;
@@ -22,10 +23,16 @@ use super::workspace::Workspace;
 use crate::theme::color;
 
 use crate::theme::scale::{self, ui_px, weight};
+#[cfg(test)]
+pub(crate) use add_project::NOT_A_FOLDER;
 use discard::discard_label;
 
 /// The dialogs' width.
 const WIDTH: f32 = 420.;
+/// Space at the dialogs' sides, as the board has it.
+const PADDING_X: f32 = 20.;
+/// Space above and below the footer's buttons.
+const FOOTER_Y: f32 = 12.;
 
 /// The dialog on screen.
 pub(super) struct OpenDialog {
@@ -39,6 +46,7 @@ pub(super) struct OpenDialog {
 }
 
 pub(super) enum DialogKind {
+    AddProject(Box<add_project::AddProject>),
     Rename {
         thread: ThreadId,
         title: Entity<InputState>,
@@ -68,12 +76,18 @@ impl Workspace {
             busy: false,
             task: None,
         });
+        let width = match self.dialog.as_ref().map(|d| &d.kind) {
+            Some(DialogKind::AddProject(_)) => add_project::WIDTH,
+            _ => WIDTH,
+        };
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let closed = this.clone();
             let confirmed = this.clone();
             let dialog = dialog
-                .w(ui_px(WIDTH))
+                .w(ui_px(width))
+                .px(ui_px(PADDING_X))
+                .pb(ui_px(FOOTER_Y))
                 // ↵ confirms. The dialog closes once crewd says it's done.
                 .on_ok(move |_, window, cx| {
                     confirmed
@@ -98,6 +112,7 @@ impl Workspace {
             return dialog;
         };
         let body = match &open.kind {
+            DialogKind::AddProject(add) => self.add_project_body(add, this.clone()),
             DialogKind::Rename { thread, title, .. } => self.rename_body(*thread, title),
             DialogKind::Archive { thread } => self.archive_dialog_body(*thread),
             DialogKind::Discard {
@@ -110,6 +125,7 @@ impl Workspace {
             } => self.channel_settings_body(name, description),
         };
         let (confirm, danger) = match &open.kind {
+            DialogKind::AddProject(_) => ("Add project".to_string(), false),
             DialogKind::Rename { .. } => ("Rename".to_string(), false),
             DialogKind::Archive { .. } => ("Archive".to_string(), false),
             DialogKind::Discard { thread, diff, .. } => (
@@ -119,6 +135,8 @@ impl Workspace {
             DialogKind::ChannelSettings { .. } => ("Save".to_string(), false),
         };
         let busy = open.busy;
+        let off =
+            busy || (matches!(open.kind, DialogKind::AddProject(_)) && !self.add_project_ready());
         let cancel = this.clone();
         dialog
             .when(danger, |d| d.border_color(color("danger-border")))
@@ -141,7 +159,13 @@ impl Workspace {
                     .test_support(),
             )
             .footer(
+                // Full width with a line above it, as the board has it.
                 DialogFooter::new()
+                    .mx(ui_px(-PADDING_X))
+                    .px(ui_px(PADDING_X))
+                    .pt(ui_px(FOOTER_Y))
+                    .border_t_1()
+                    .border_color(color("border-100"))
                     .child(
                         Button::new("dialog-cancel")
                             .ghost()
@@ -155,7 +179,7 @@ impl Workspace {
                         Button::new("dialog-confirm")
                             .map(|b| if danger { b.danger() } else { b.primary() })
                             .label(confirm)
-                            .disabled(busy)
+                            .disabled(off)
                             .on_click(move |_, window, cx| {
                                 this.update(cx, |ws, cx| ws.confirm_dialog(window, cx)).ok();
                             }),
@@ -172,6 +196,7 @@ impl Workspace {
             return;
         }
         let checked = match &open.kind {
+            DialogKind::AddProject(_) => return self.confirm_add_project(window, cx),
             DialogKind::Rename { thread, title, .. } => {
                 let title = title.read(cx).value().trim().to_string();
                 if title.is_empty() {
@@ -193,6 +218,7 @@ impl Workspace {
                 ..
             } => Ok(Request::Discard {
                 thread: *thread,
+                repos: None,
                 delete_branch: *delete_branch,
             }),
             DialogKind::ChannelSettings {

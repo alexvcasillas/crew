@@ -277,6 +277,9 @@ async fn setup(d: &Daemon, c: &mut Client) -> ThreadId {
             name: "demo".into(),
             root: root.to_string_lossy().into_owned(),
             main_branch: "main".into(),
+            work_mode: None,
+            copy_files: vec![],
+            setup_command: None,
         })
         .await;
     let channel: ChannelId = c

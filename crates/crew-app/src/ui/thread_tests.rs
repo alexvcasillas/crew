@@ -68,6 +68,17 @@ pub(super) fn agent(name: &str, role: &str) -> AgentSpec {
 /// A project rooted at `root` with `#general`, the named agents and one
 /// thread.
 pub(super) fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
+    world_named(home, root, "demo", None, agents)
+}
+
+/// Like [`world`], with the project's name and how agents work there.
+pub(super) fn world_named(
+    home: &Path,
+    root: &Path,
+    name: &str,
+    work_mode: Option<crew_core::project_kind::WorkMode>,
+    agents: &[&str],
+) -> World {
     std::fs::create_dir_all(root).unwrap();
     let (client, events) = client::spawn(ConnectionConfig {
         crew_home: home.to_path_buf(),
@@ -75,9 +86,16 @@ pub(super) fn world(home: &Path, root: &Path, agents: &[&str]) -> World {
     let project: ProjectId = ask(
         &client,
         Request::CreateProject {
-            name: "demo".into(),
+            name: name.into(),
             root: root.to_string_lossy().into_owned(),
-            main_branch: "main".into(),
+            main_branch: if work_mode.is_some() {
+                String::new()
+            } else {
+                "main".into()
+            },
+            work_mode,
+            copy_files: vec![],
+            setup_command: None,
         },
     );
     let channel: ChannelId = ask(

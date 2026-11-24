@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crew_core::event::{Event, RunStatus};
-use crew_core::ids::{RunId, ThreadId};
+use crew_core::ids::{ProjectId, RunId, ThreadId};
 use crew_core::store::StoredRun;
-use crew_core::worktree::Diff;
+use crew_proto::ThreadChanges;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{Disableable as _, Icon, IconName, IndexPath, Sizable as _};
@@ -16,6 +16,7 @@ use gpui_kit::*;
 
 use super::activity::{ActivityRow, activity_rows_asked};
 use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
+use super::folder::{FolderMode, folder_mode};
 use super::run_card::{FileChange, decided_asks, summarize};
 use super::terminal_tab::CommandLog;
 use super::workspace::Workspace;
@@ -59,11 +60,15 @@ pub(super) struct Inspector {
     select: Option<(Entity<RunSelect>, Subscription)>,
     /// The picker's runs and their labels, oldest first.
     choices: Vec<(RunId, SharedString)>,
-    /// Uncommitted changes in the open thread's working copy.
-    pub(super) diff: Option<Diff>,
+    /// Uncommitted changes in the open thread's working copy, per repo.
+    pub(super) diff: Option<ThreadChanges>,
     /// What `diff` was asked for: thread, worktree and finished runs.
     diff_for: Option<(ThreadId, Option<PathBuf>, usize)>,
     pub(super) diff_task: Option<Task<()>>,
+    /// The plain files at the top of a folder of repos, which a thread
+    /// folder leaves out, once read.
+    pub(super) top_files: Option<(ProjectId, Vec<String>)>,
+    top_files_task: Option<Task<()>>,
     /// The shown run's commands, for the Terminal tab.
     pub(super) term: CommandLog,
     pub(super) term_list: ListState,
@@ -99,6 +104,8 @@ impl Default for Inspector {
             diff: None,
             diff_for: None,
             diff_task: None,
+            top_files: None,
+            top_files_task: None,
             term: CommandLog::default(),
             term_list: activity_list(),
             term_run: None,
@@ -318,6 +325,8 @@ impl Workspace {
             );
         }
 
+        self.read_top_files(thread, cx);
+
         // Read on every tab: the Done card and Changes need it to offer a
         // review.
         let key = (thread, worktree, finished);
@@ -325,6 +334,42 @@ impl Workspace {
             self.inspector.diff_for = Some(key);
             self.load_thread_diff(thread, cx);
         }
+    }
+
+    /// Lists the plain files at the top of the folder of repos the
+    /// thread copies, once per thread shown.
+    fn read_top_files(&mut self, thread: ThreadId, cx: &mut Context<Self>) {
+        let state = self.state();
+        if folder_mode(state, thread) != Some(FolderMode::OwnCopy) {
+            return;
+        }
+        let Some(project) = state.thread_project(thread) else {
+            return;
+        };
+        if self.inspector.top_files_task.is_some()
+            || self
+                .inspector
+                .top_files
+                .as_ref()
+                .is_some_and(|(p, _)| *p == project)
+        {
+            return;
+        }
+        let Some(root) = state.project(project).map(|p| p.root.clone()) else {
+            return;
+        };
+        let read = cx
+            .background_executor()
+            .spawn(async move { plain_top_files(&root) });
+        self.inspector.top_files_task = Some(cx.spawn(async move |this, cx| {
+            let files = read.await;
+            this.update(cx, |this, cx| {
+                this.inspector.top_files_task = None;
+                this.inspector.top_files = Some((project, files));
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Keeps the run picker's items and choice in line.
@@ -808,6 +853,22 @@ impl Workspace {
             )
             .test_support()
     }
+}
+
+/// The files right in `root`, not hidden, sorted. Folders aren't listed.
+fn plain_top_files(root: &std::path::Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
 }
 
 #[cfg(test)]

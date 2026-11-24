@@ -35,6 +35,7 @@ pub fn repo(dir: &Path) {
 }
 
 /// Root repo plus a fresh worktree for `crew/t`. Returns (root, dest, base).
+#[allow(dead_code)]
 pub fn setup(tmp: &Path) -> (PathBuf, PathBuf, String) {
     let root = tmp.join("root");
     repo(&root);
