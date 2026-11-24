@@ -3,7 +3,7 @@
 //! budget. Once decided, a card folds into one line.
 
 use crew_core::agent::PermissionMode;
-use crew_core::event::humanize_reason;
+use crew_core::event::{humanize_reason, tool_label};
 use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval};
 use crew_proto::Request;
@@ -99,17 +99,21 @@ pub fn decided_text(approval: &StoredApproval, name_of: impl Fn(AgentId) -> Stri
             format!("Handoff to {} no longer needed", name_of(*to))
         }
         (ApprovalKind::Permission { tool, .. }, ApprovalStatus::Approved) => {
-            format!("{tool} allowed by you")
+            format!("{} allowed by you", tool_label(tool))
         }
         (ApprovalKind::Permission { tool, .. }, ApprovalStatus::Declined) => {
-            format!("{tool} denied by you")
+            format!("{} denied by you", tool_label(tool))
         }
-        (ApprovalKind::Permission { tool, .. }, _) => format!("{tool} no longer needed"),
+        (ApprovalKind::Permission { tool, .. }, _) => {
+            format!("{} no longer needed", tool_label(tool))
+        }
         (ApprovalKind::Blocked { .. }, ApprovalStatus::Approved) => {
             "Allowed and retried by you".to_string()
         }
         (ApprovalKind::Blocked { .. }, ApprovalStatus::Declined) => "Dismissed by you".to_string(),
-        (ApprovalKind::Blocked { tool, .. }, _) => format!("{tool} no longer needed"),
+        (ApprovalKind::Blocked { tool, .. }, _) => {
+            format!("{} no longer needed", tool_label(tool))
+        }
     };
     if time.is_empty() {
         what
@@ -277,7 +281,7 @@ impl Workspace {
         };
         let reason = humanize_reason(reason);
         let deciding = self.deciding.contains(&id);
-        let card = needs_you_card(id, &wants)
+        let card = needs_you_card(id, &wants, &wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
             .when(!reason.is_empty(), |card| {
                 let line = format!("Reason: {reason}");
@@ -413,7 +417,7 @@ impl Workspace {
                 decline(id, "Decline", cx).into_any_element(),
             ]
         };
-        let card = needs_you_card(id, &wants)
+        let card = needs_you_card(id, &wants, &wants)
             .child(
                 div()
                     .flex()
@@ -462,7 +466,9 @@ impl Workspace {
             .state()
             .run(approval.run)
             .map_or_else(|| "An agent".to_string(), |r| self.name_of(r.agent));
+        // The card reads the tool's name; its label keeps the real one.
         let wants = format!("{asker} wants to run {tool}");
+        let shown_wants = format!("{asker} wants to run {}", tool_label(tool));
         let text = input_text(input);
         let lines = text.lines().count();
         let open = self.open_inputs.contains(&id);
@@ -476,7 +482,7 @@ impl Workspace {
         };
         let more = lines.saturating_sub(INPUT_LINES);
         let command = full_command(input);
-        let card = needs_you_card(id, &wants)
+        let card = needs_you_card(id, &wants, &shown_wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
             .when_some(command, |card, command| {
                 card.child(
@@ -627,7 +633,8 @@ fn decline(id: ApprovalId, label: &'static str, cx: &mut Context<Workspace>) -> 
 }
 
 /// The amber frame and "Needs you · …" heading every pending card has.
-fn needs_you_card(id: ApprovalId, wants: &str) -> Stateful<Div> {
+/// `wants` is its label, `shown` what it reads.
+fn needs_you_card(id: ApprovalId, wants: &str, shown: &str) -> Stateful<Div> {
     let label = format!("Needs you · {wants}");
     div()
         .id(format!("approval-{id}"))
@@ -643,26 +650,39 @@ fn needs_you_card(id: ApprovalId, wants: &str) -> Stateful<Div> {
         .bg(color("warning-subtle"))
         .aria_label(label)
         .child(
+            // A long tool name wraps inside the card rather than running
+            // past its edge.
             div()
+                .id(format!("approval-title-{id}"))
                 .flex()
-                .items_center()
+                .items_start()
                 .gap(px(8.))
+                .min_w_0()
                 .child(
-                    Icon::new(IconName::TriangleAlert)
-                        .size(px(14.))
-                        .text_color(color("warning")),
+                    div().flex_none().pt(px(2.)).child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(14.))
+                            .text_color(color("warning")),
+                    ),
                 )
                 .child(
                     div()
+                        .flex_none()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(color("warning"))
                         .child("Needs you"),
                 )
                 .child(
                     div()
+                        .id(format!("approval-wants-{id}"))
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
                         .text_color(color("text-primary"))
-                        .child(format!("· {wants}")),
-                ),
+                        .child(format!("· {shown}"))
+                        .test_support(),
+                )
+                .test_support(),
         )
 }
 
@@ -790,6 +810,15 @@ mod tests {
         assert_eq!(
             decided_text(&a, name),
             format!("Bash allowed by you · {at}")
+        );
+        a.kind = ApprovalKind::Permission {
+            tool: "mcp__github__create_issue".into(),
+            input: serde_json::Value::Null,
+            tool_use_id: None,
+        };
+        assert_eq!(
+            decided_text(&a, name),
+            format!("github · create issue allowed by you · {at}")
         );
         a.kind = ApprovalKind::Blocked {
             tool: "Bash".into(),

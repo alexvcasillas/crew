@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crew_core::claude::parse::classifier_reason;
-use crew_core::event::{Event, ToolKind, humanize_reason};
+use crew_core::event::{Event, ToolKind, humanize_reason, tool_label};
 use crew_core::ids::RunId;
 use crew_core::store::short_input;
 use gpui_kit::component::{Icon, IconName};
@@ -125,7 +125,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     id: id.clone(),
                     name: name.clone(),
                     kind: kind.clone(),
-                    verb: verb(kind, name).to_string(),
+                    verb: verb(kind, name),
                     target: target.unwrap_or_else(|| short_input(input)),
                     state: StepState::Running,
                     lines: logged.lines,
@@ -180,7 +180,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                 match (call, reason) {
                     (Some(row), Some(reason)) => block(row, reason),
                     _ => rows.push(ActivityRow::Denied {
-                        tool: tool.clone(),
+                        tool: tool_label(tool),
                         input: short_input(input),
                         reason: reason.as_deref().map(humanize_reason),
                     }),
@@ -240,15 +240,16 @@ fn block(row: &mut ToolRow, reason: &str) {
     row.output = None;
 }
 
-pub(super) fn verb<'a>(kind: &ToolKind, name: &'a str) -> &'a str {
+pub(super) fn verb(kind: &ToolKind, name: &str) -> String {
     match kind {
         ToolKind::Read => "Read",
         ToolKind::Search => "Search",
         ToolKind::Edit => "Edit",
         ToolKind::Create => "Create",
         ToolKind::Run => "Run",
-        ToolKind::Other => name,
+        ToolKind::Other => return tool_label(name),
     }
+    .to_string()
 }
 
 /// What a finished call reports beside its target.
@@ -436,6 +437,17 @@ impl Workspace {
             .text_size(px(12.))
             .line_height(px(18.))
             .aria_label(row_label(row))
+            .when_some(
+                match row {
+                    ActivityRow::Tool(tool) => super::run_card::raw_name(&tool.name),
+                    _ => None,
+                },
+                |row, raw| {
+                    row.tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(raw.clone()).build(window, cx)
+                    })
+                },
+            )
             .child(div().flex_none().w(px(16.)).pt(px(2.)).child(
                 if matches!(row, ActivityRow::Tool(t) if t.state == StepState::Running) {
                     spinner(("activity-spinner", ix), 14., token).into_any_element()
@@ -1022,6 +1034,33 @@ mod tests {
             ]
         );
         assert_eq!(super::row_label(&rows[0]), "Error: not logged in");
+    }
+
+    #[test]
+    fn mcp_rows_read_as_server_and_tool() {
+        let run = RunId::new();
+        let name = "mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page";
+        let events = vec![
+            at(run, 1, call(name, "t1", None, serde_json::json!({}))),
+            at(
+                run,
+                2,
+                Event::PermissionDenied {
+                    tool: "mcp__github__create_issue".into(),
+                    input: serde_json::json!({}),
+                    reason: None,
+                },
+            ),
+        ];
+        let rows = activity_rows(&events, run);
+        assert_eq!(
+            super::row_label(&rows[0]),
+            "chrome-devtools · navigate page"
+        );
+        assert_eq!(
+            super::row_label(&rows[1]),
+            "Not allowed: github · create issue"
+        );
     }
 
     #[test]

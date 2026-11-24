@@ -305,3 +305,47 @@ fn budget_pause_cards_line_up_with_message_bodies(cx: &mut TestAppContext) {
     std::fs::write(tmp.path().join("go"), "").unwrap();
     let () = w.ask(Request::StopThread { thread: w.thread });
 }
+
+const MCP_TOOL: &str = "mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page";
+
+#[gpui_kit::test]
+fn a_long_tool_name_wraps_inside_its_card(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Sentinel"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Sentinel open the page");
+    let run = live_run(cx, &ws, w.thread);
+    let client = w.client.clone();
+    std::thread::spawn(move || {
+        let _ = futures::executor::block_on(client.request(Request::PermissionAsk {
+            run,
+            tool: MCP_TOOL.into(),
+            input: serde_json::json!({"url": "https://example.com"}),
+            tool_use_id: None,
+        }));
+    });
+    let id = pending(cx, &ws, w.thread);
+    let card = format!("approval-{id}");
+    wait_until(cx, "the card", |cx| has(cx, window, card.clone()));
+    assert_eq!(
+        label_of(cx, window, card.clone()),
+        Some(format!("Needs you · Sentinel wants to run {MCP_TOOL}")),
+        "the label keeps the real name"
+    );
+    let outer = bounds_of(cx, window, card.clone()).unwrap();
+    let title = bounds_of(cx, window, format!("approval-wants-{id}")).unwrap();
+    assert!(outer.size.width.as_f32() <= 560.);
+    assert!(
+        title.origin.x + title.size.width <= outer.origin.x + outer.size.width,
+        "the title stays inside the card: {title:?} in {outer:?}"
+    );
+
+    click(cx, window, format!("approval-decline-{id}"));
+    click(cx, window, format!("run-stop-{run}"));
+    wait_until(cx, "the run to end", |cx| {
+        !has(cx, window, format!("live-{run}"))
+    });
+}

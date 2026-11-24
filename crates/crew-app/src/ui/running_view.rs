@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use crew_core::agent::Runtime;
-use crew_core::event::RunStatus;
+use crew_core::event::{RunStatus, tool_label};
 use crew_core::ids::{ApprovalId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalKind, StoredApproval, StoredRun};
 use crew_proto::TerminalSession;
@@ -516,7 +516,7 @@ impl Workspace {
             | ApprovalKind::Blocked { tool, input, .. } => {
                 let text = input_text(input);
                 let first = text.lines().next().unwrap_or_default();
-                (false, false, format!("{tool}: {first}"), true)
+                (false, false, format!("{}: {first}", tool_label(tool)), true)
             }
         };
         let mut row = self.row_base(

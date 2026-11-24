@@ -4,6 +4,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use super::{Result, Store, StoreError, enum_text, now_ms, parse_enum, uuid_col};
+use crate::event::tool_label;
 use crate::ids::{AgentId, ApprovalId, RunId, ThreadId};
 
 /// What is being asked. On the wire:
@@ -131,7 +132,7 @@ fn short_by(input: &serde_json::Value, keys: &[&str]) -> String {
 }
 
 /// The thread note for a permission ask of `agent`.
-/// MCP tools, named `mcp__<server>__<tool>`, read as `server/tool`. A
+/// MCP tools read as `server · tool`, see [`tool_label`]. A
 /// Codex `Permissions` ask reads as wanting more access, with its whole
 /// label: crewd builds it short and puts what is granted first, so cutting
 /// it could hide that.
@@ -142,10 +143,12 @@ pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> St
         return format!("{agent} wants more access: {label}");
     }
     let shown = short_ask(tool, input);
-    let (verb, what) = match tool.strip_prefix("mcp__") {
-        Some(rest) => ("use", rest.replacen("__", "/", 1)),
-        None => ("run", tool.to_string()),
+    let verb = if tool.starts_with("mcp__") {
+        "use"
+    } else {
+        "run"
     };
+    let what = tool_label(tool);
     if shown.is_empty() {
         format!("{agent} wants to {verb} {what}.")
     } else {
@@ -157,7 +160,10 @@ pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> St
 pub fn blocked_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
     let shown = short_ask(tool, input);
     if shown.is_empty() {
-        format!("Claude's safety check stopped {agent}: {tool}.")
+        format!(
+            "Claude's safety check stopped {agent}: {}.",
+            tool_label(tool)
+        )
     } else {
         format!("Claude's safety check stopped {agent}: {shown}")
     }
@@ -388,11 +394,11 @@ mod tests {
         );
         assert_eq!(
             permission_text("Ada", "mcp__github__create_issue", &json!({})),
-            "Ada wants to use github/create_issue."
+            "Ada wants to use github · create issue."
         );
         assert_eq!(
             permission_text("Ada", "mcp__github__create_issue", &json!({"title": "x"})),
-            r#"Ada wants to use github/create_issue: {"title":"x"}"#
+            r#"Ada wants to use github · create issue: {"title":"x"}"#
         );
         assert_eq!(
             permission_text("Ada", "mcp__github", &json!({})),
