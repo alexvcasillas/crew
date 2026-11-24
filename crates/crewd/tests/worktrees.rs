@@ -968,3 +968,59 @@ async fn time_limit_starts_after_setup() {
         }
     )));
 }
+
+/// A run that waited in the queue starts its clock when its setup starts,
+/// so the wait doesn't count as run time.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_starts_the_run_clock() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    c.call(Request::UpdateProject {
+        project: s.project,
+        setup_command: Some("sleep 60".into()),
+        copy_files: vec![],
+    })
+    .await
+    .unwrap();
+    let paused = crew_proto::Limits {
+        paused: true,
+        ..Default::default()
+    };
+    c.call(Request::SetLimits { limits: paused }).await.unwrap();
+
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Queued).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let resumed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    c.call(Request::SetLimits {
+        limits: crew_proto::Limits {
+            paused: false,
+            ..paused
+        },
+    })
+    .await
+    .unwrap();
+    let seen = c.until_status(RunStatus::Working).await;
+    let run = seen
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            ServerMsg::RunStatus { details, .. } if details.status == RunStatus::Working => {
+                Some(details.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        run.started_at >= resumed,
+        "started {} before setup at {resumed}",
+        run.started_at
+    );
+    c.call(Request::StopRun { run: run.id }).await.unwrap();
+    c.until_status(RunStatus::Stopped).await;
+}

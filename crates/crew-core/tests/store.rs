@@ -148,6 +148,58 @@ fn runs_start_queued_then_get_a_session() {
 }
 
 #[test]
+fn beginning_a_run_starts_its_clock() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let r = store.create_run(t, a).unwrap();
+    let queued_at = store.run(r).unwrap().started_at;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.begin_run(r).unwrap();
+    let run = store.run(r).unwrap();
+    assert_eq!(run.status, RunStatus::Working);
+    assert!(run.started_at > queued_at);
+    assert!(run.session_id.is_empty());
+    assert!(matches!(
+        store.begin_run(crew_core::ids::RunId::new()),
+        Err(StoreError::NotFound("run"))
+    ));
+}
+
+/// A run cut off by a restart ends at its last sign of life, not when
+/// crewd came back, so a night away doesn't count as run time.
+#[test]
+fn an_interrupted_run_ends_at_its_last_activity() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let talked = store.create_run(t, a).unwrap();
+    store.start_run(talked, &Runtime::ClaudeCode, "s1").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let said = store
+        .add_message(t, Author::Agent(a), "half way", Some(talked))
+        .unwrap();
+    let said_at = store
+        .messages(t)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == said)
+        .unwrap()
+        .created_at;
+    let silent = store.create_run(t, a).unwrap();
+    store.start_run(silent, &Runtime::ClaudeCode, "s2").unwrap();
+    let silent_start = store.run(silent).unwrap().started_at;
+    let queued = store.create_run(t, a).unwrap();
+    let queued_at = store.run(queued).unwrap().started_at;
+
+    // The long gap before crewd comes back.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(store.mark_unfinished_runs_interrupted().unwrap(), 3);
+
+    assert_eq!(store.run(talked).unwrap().ended_at, Some(said_at));
+    assert_eq!(store.run(silent).unwrap().ended_at, Some(silent_start));
+    assert_eq!(store.run(queued).unwrap().ended_at, Some(queued_at));
+}
+
+#[test]
 fn unfinished_runs_become_interrupted_on_startup() {
     let store = Store::open_in_memory().unwrap();
     let (t, a) = setup_run(&store);

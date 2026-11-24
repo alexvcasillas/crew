@@ -1095,7 +1095,7 @@ impl Service {
         let (handle, stop_rx) = RunHandle::idle();
         {
             let mut db = self.db();
-            match db.store.set_run_status(job.run, RunStatus::Working) {
+            match db.store.begin_run(job.run) {
                 Ok(()) => self.publish_status(&mut db, job.thread, job.run, RunStatus::Working),
                 Err(e) => log(format!("couldn't mark run {} working: {e}", job.run)),
             }

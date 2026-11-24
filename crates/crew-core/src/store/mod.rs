@@ -852,6 +852,20 @@ impl Store {
         Ok(())
     }
 
+    /// Moves a run to `Working` before its CLI starts, as while its
+    /// worktree is set up. `started_at` becomes now, so time spent queued
+    /// doesn't count. [`Self::start_run`] sets it again once the CLI runs.
+    pub fn begin_run(&self, r: RunId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = ?2, started_at = ?3 WHERE id = ?1",
+            params![r.to_string(), status_text(&RunStatus::Working)?, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     /// Whether any run has this session id.
     pub fn has_run_session(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -1001,12 +1015,22 @@ impl Store {
 
     /// Marks every `Queued` or `Working` run as `Interrupted`. Returns how
     /// many changed.
+    ///
+    /// Each ends at its last known activity: its latest message or
+    /// approval, else its start. Events carry no time, so a run that only
+    /// streamed events counts from its start to its last message. The time
+    /// crewd was down never counts.
     pub fn mark_unfinished_runs_interrupted(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE runs SET status = ?1, ended_at = ?2 WHERE status IN (?3, ?4)",
+            "UPDATE runs SET status = ?1, ended_at = MAX(
+                 started_at,
+                 COALESCE((SELECT MAX(created_at) FROM messages WHERE run_id = runs.id), 0),
+                 COALESCE((SELECT MAX(COALESCE(decided_at, created_at))
+                           FROM approvals WHERE run_id = runs.id), 0)
+             )
+             WHERE status IN (?2, ?3)",
             params![
                 status_text(&RunStatus::Interrupted)?,
-                now_ms(),
                 status_text(&RunStatus::Queued)?,
                 status_text(&RunStatus::Working)?
             ],
