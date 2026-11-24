@@ -13,7 +13,9 @@ use super::super::common::{
 };
 use super::super::run_card::summarize;
 use super::super::workspace::Workspace;
-use super::{Card, CardStatus, card_time, counts_line, strip_widths, working_line, worktree_word};
+use super::{
+    Card, CardStatus, card_time, counts_line, stop_label, strip_layout, working_line, worktree_word,
+};
 use crate::fonts::mono_font;
 use crate::theme::color;
 
@@ -21,6 +23,8 @@ use crate::theme::color;
 const SELECTED_BORDER: u32 = 0x3a3a3a;
 /// The run strip's width.
 const STRIP_WIDTH: f32 = 112.;
+/// The space between a run strip's segments.
+const STRIP_GAP: f32 = 2.;
 /// Most runtime chips a card shows.
 const CHIPS_MAX: usize = 2;
 
@@ -32,7 +36,7 @@ fn pill_tokens(status: CardStatus) -> (&'static str, Option<&'static str>, &'sta
         CardStatus::Done => ("success", Some("success-subtle"), "success-border"),
         CardStatus::Stopped => ("text-secondary", Some("surface-200"), "border-200"),
         CardStatus::Failed => ("danger", Some("danger-subtle"), "danger-border"),
-        CardStatus::Idle => ("text-tertiary", None, "border-200"),
+        CardStatus::Queued | CardStatus::Idle => ("text-tertiary", None, "border-200"),
     }
 }
 
@@ -53,7 +57,7 @@ fn pill(thread: ThreadId, status: CardStatus) -> impl IntoElement {
         CardStatus::Done => Some(icon(IconName::Check)),
         CardStatus::Stopped => Some(icon(IconName::Square)),
         CardStatus::Failed => Some(icon(IconName::CircleX)),
-        CardStatus::Idle => None,
+        CardStatus::Queued | CardStatus::Idle => None,
     };
     div()
         .id(SharedString::from(format!("thread-status-{thread}")))
@@ -83,8 +87,8 @@ struct MenuFor {
     archived: bool,
     branch: Option<String>,
     has_worktree: bool,
-    /// The working agent, for "Stop {Agent}".
-    working: Option<String>,
+    /// "Stop {Agent}" or "Stop all in thread", while agents work.
+    stop: Option<String>,
 }
 
 /// A menu row with its shortcut on the right.
@@ -128,8 +132,7 @@ fn thread_menu(
             menu_row("Open", None, false)
                 .on_click(act(|this, t, window, cx| this.open_thread(t, window, cx))),
         );
-        if let Some(agent) = &item.working {
-            let label = format!("Stop {agent}");
+        if let Some(label) = item.stop.clone() {
             menu = menu.item(
                 PopupMenuItem::new(label)
                     .on_click(act(|this, t, window, cx| this.stop_thread(t, window, cx))),
@@ -247,13 +250,21 @@ impl Workspace {
         let id = card.thread;
         let hovered = self.channel_view.hovered == Some(id);
         let selected = self.channel_view.selected == Some(id);
-        let working = state
+        let working_runs: Vec<_> = state
             .live_runs(id)
             .into_iter()
-            .find(|r| r.status == RunStatus::Working);
-        let working_agent = working
-            .and_then(|r| state.agent(r.agent))
-            .map(|a| a.spec.name.clone());
+            .filter(|r| r.status == RunStatus::Working)
+            .collect();
+        let working = working_runs.first().copied();
+        let mut working_names: Vec<String> = Vec::new();
+        for run in &working_runs {
+            if let Some(agent) = state.agent(run.agent)
+                && !working_names.contains(&agent.spec.name)
+            {
+                working_names.push(agent.spec.name.clone());
+            }
+        }
+        let working_agent = working_names.first().cloned();
         let summary = &card.summary;
 
         let excerpt = match (card.status, &working_agent) {
@@ -263,11 +274,16 @@ impl Workspace {
                     .and_then(|run| summarize(state.events(id), run.id).steps.pop());
                 working_line(agent, step.as_ref())
             }
+            (CardStatus::Queued, _) => "Waiting to start.".to_string(),
             _ => clean_line(&summary.excerpt),
         };
         let running = working.map(|r| elapsed(now - r.started_at));
         let counts = counts_line(summary, running.as_deref());
-        let has_changes = summary.files > 0;
+        // Review changes shows only what isn't committed yet.
+        let has_changes = matches!(
+            summary.worktree,
+            crew_proto::WorktreeState::Uncommitted { .. }
+        );
 
         let top_right = if hovered {
             self.render_card_actions(card, working_agent.is_some(), has_changes, cx)
@@ -290,7 +306,7 @@ impl Workspace {
             archived: card.archived,
             branch: card.branch.clone(),
             has_worktree: card.branch.is_some(),
-            working: working_agent.clone(),
+            stop: stop_label(&working_names),
         };
         let this = cx.entity().downgrade();
         div()
@@ -402,7 +418,7 @@ impl Workspace {
             archived: card.archived,
             branch: card.branch.clone(),
             has_worktree: card.branch.is_some(),
-            working: None,
+            stop: None,
         };
         let this = cx.entity().downgrade();
         div()
@@ -577,41 +593,37 @@ impl Workspace {
             .collect();
         let total: i64 = ms.iter().sum();
         let scale = self.channel_view.scale.max(total);
-        let widths = strip_widths(&ms, scale, STRIP_WIDTH);
-        let segments =
-            card.summary
-                .runs
-                .iter()
-                .zip(widths)
-                .enumerate()
-                .map(|(ix, (run, width))| {
-                    let token = match run.status {
-                        RunStatus::Done => "success",
-                        RunStatus::Stopped | RunStatus::Interrupted => "text-tertiary",
-                        RunStatus::Failed => "danger",
-                        RunStatus::Working if waiting => "warning",
-                        RunStatus::Working => "accent-blue",
-                        RunStatus::Queued => "border-200",
-                    };
-                    let bar = div()
-                        .flex_none()
-                        .w(px(width))
-                        .h(px(4.))
-                        .rounded(px(1.))
-                        .bg(color(token));
-                    if run.status == RunStatus::Working && !waiting {
-                        pulsing(SharedString::from(format!("strip-{id}-{ix}")), bar)
-                            .into_any_element()
-                    } else {
-                        bar.into_any_element()
-                    }
-                });
+        let layout = strip_layout(&ms, scale, STRIP_WIDTH, STRIP_GAP);
+        let segments = layout
+            .into_iter()
+            .map(|(ix, width)| (ix, &card.summary.runs[ix], width))
+            .map(|(ix, run, width)| {
+                let token = match run.status {
+                    RunStatus::Done => "success",
+                    RunStatus::Stopped | RunStatus::Interrupted => "text-tertiary",
+                    RunStatus::Failed => "danger",
+                    RunStatus::Working if waiting => "warning",
+                    RunStatus::Working => "accent-blue",
+                    RunStatus::Queued => "border-200",
+                };
+                let bar = div()
+                    .flex_none()
+                    .w(px(width))
+                    .h(px(4.))
+                    .rounded(px(1.))
+                    .bg(color(token));
+                if run.status == RunStatus::Working && !waiting {
+                    pulsing(SharedString::from(format!("strip-{id}-{ix}")), bar).into_any_element()
+                } else {
+                    bar.into_any_element()
+                }
+            });
         let n = card.summary.runs.len();
         div()
             .id(SharedString::from(format!("thread-strip-{id}")))
             .flex()
             .flex_none()
-            .gap(px(2.))
+            .gap(px(STRIP_GAP))
             .w(px(STRIP_WIDTH))
             .h(px(4.))
             .overflow_hidden()

@@ -20,7 +20,7 @@ use super::thread_tests::{World, agent, ask, world};
 use super::workspace::Workspace;
 use crate::client::{self, ClientHandle};
 use crate::connection::ConnectionConfig;
-use crate::test_support::{Daemon, fake_claude, fixture, short_home};
+use crate::test_support::{Daemon, failing_overview_proxy, fake_claude, fixture, short_home};
 
 /// A claude that edits a file, starts the tests, then works until it is
 /// stopped.
@@ -222,6 +222,25 @@ fn cards_show_title_status_counts_and_branch(cx: &mut TestAppContext) {
     ws.read_with(cx, |ws, _| {
         assert_eq!(ws.channel_view.selected, Some(t));
     });
+
+    // Once everything is committed there is nothing to review.
+    let _: serde_json::Value = w.ask(Request::Commit {
+        thread: t,
+        message: "Fix it".into(),
+    });
+    // crewd doesn't announce a commit; the thread's next change brings it.
+    let _: serde_json::Value = w.ask(Request::RenameThread {
+        thread: t,
+        title: "fix the login".into(),
+    });
+    let tree = format!("thread-worktree-{t}");
+    wait_until(cx, "the committed worktree", |cx| {
+        cx.executor().advance_clock(Duration::from_millis(600));
+        label_of(cx, window, tree.clone()).as_deref() == Some("committed")
+    });
+    hover(cx, window, card(t));
+    assert!(has(cx, window, format!("thread-open-{t}")));
+    assert!(!has(cx, window, format!("thread-review-{t}")));
 }
 
 /// A project with four threads: one waiting on you, one working, one
@@ -591,4 +610,93 @@ fn counts_crewd_finishes_later_land_on_the_card(cx: &mut TestAppContext) {
         label_of(cx, window, format!("thread-worktree-{}", w.thread)).as_deref(),
         Some("2 uncommitted")
     );
+}
+
+#[gpui_kit::test]
+fn a_queued_thread_waits_to_start(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let () = w.ask(Request::SetLimits {
+        limits: crew_proto::Limits {
+            paused: true,
+            ..Default::default()
+        },
+    });
+    let (window, ws) = open(cx, home.path());
+    go_to_channel(cx, window, w.channel);
+    w.post("@Forge go");
+    run_of(cx, &ws, w.thread, w.agents[0], RunStatus::Queued);
+    let t = w.thread;
+    wait_label(cx, window, format!("thread-status-{t}"), "Queued");
+    assert_eq!(
+        label_of(cx, window, format!("thread-excerpt-{t}")).as_deref(),
+        Some("Waiting to start.")
+    );
+    assert_eq!(
+        label_of(cx, window, "channel-filter-working").as_deref(),
+        Some("Working 0")
+    );
+    hover(cx, window, card(t));
+    assert!(has(cx, window, format!("thread-open-{t}")));
+    assert!(!has(cx, window, format!("thread-stop-{t}")));
+}
+
+#[gpui_kit::test]
+fn a_failed_overview_says_so_and_backs_off(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    let crewd_home = short_home();
+    let _daemon = Daemon::start(crewd_home.path().to_path_buf());
+    let home = short_home();
+    let (failing, asked) = failing_overview_proxy(
+        &home.path().join("crewd.sock"),
+        crewd_home.path().join("crewd.sock"),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let w = world(crewd_home.path(), &tmp.path().join("repo"), &[]);
+    let (window, _ws) = open(cx, home.path());
+    go_to_channel(cx, window, w.channel);
+    wait_label(
+        cx,
+        window,
+        "channel-stat-threads".into(),
+        "Threads 1 · 1 this week",
+    );
+
+    // A change asks again, and that fails.
+    failing.store(true, Ordering::SeqCst);
+    w.post("a note");
+    let error = "Couldn't load this channel. crewd is having a bad day.";
+    wait_until(cx, "the error", |cx| {
+        cx.executor().advance_clock(Duration::from_millis(600));
+        label_of(cx, window, "channel-error").as_deref() == Some(error)
+    });
+    // The last good overview stays.
+    assert_eq!(
+        label_of(cx, window, "channel-stat-threads").as_deref(),
+        Some("Threads 1 · 1 this week")
+    );
+    // No asking again in a loop.
+    let after_error = asked.load(Ordering::SeqCst);
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), after_error);
+    // 2 s later it asks once more.
+    cx.executor().advance_clock(Duration::from_millis(2100));
+    wait_until(cx, "the first retry", |_| {
+        asked.load(Ordering::SeqCst) == after_error + 1
+    });
+    // Then 5 s; this time crewd answers and the error goes.
+    failing.store(false, Ordering::SeqCst);
+    cx.executor().advance_clock(Duration::from_millis(4000));
+    cx.run_until_parked();
+    assert!(has(cx, window, "channel-error"), "not before 5 s");
+    cx.executor().advance_clock(Duration::from_millis(1100));
+    wait_until(cx, "the error to go", |cx| {
+        !has(cx, window, "channel-error")
+    });
+    assert!(asked.load(Ordering::SeqCst) >= after_error + 2);
 }

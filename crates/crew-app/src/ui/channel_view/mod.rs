@@ -30,6 +30,8 @@ pub const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub enum CardStatus {
     NeedsYou,
     Working,
+    /// Runs wait for a free slot and none works yet.
+    Queued,
     Done,
     Stopped,
     Failed,
@@ -41,6 +43,7 @@ impl CardStatus {
         match self {
             Self::NeedsYou => "Needs you",
             Self::Working => "Working",
+            Self::Queued => "Queued",
             Self::Done => "Done",
             Self::Stopped => "Stopped",
             Self::Failed => "Failed",
@@ -49,14 +52,22 @@ impl CardStatus {
     }
 }
 
-/// A card's status: an ask waiting on you comes first, then a live run,
-/// then how the latest run ended.
-pub fn card_status(pending: bool, live: bool, last: Option<&RunStatus>) -> CardStatus {
+/// A card's status: an ask waiting on you comes first, then a working
+/// run, then one waiting for a slot, then how the latest run ended.
+pub fn card_status(
+    pending: bool,
+    working: bool,
+    queued: bool,
+    last: Option<&RunStatus>,
+) -> CardStatus {
     if pending {
         return CardStatus::NeedsYou;
     }
-    if live {
+    if working {
         return CardStatus::Working;
+    }
+    if queued {
+        return CardStatus::Queued;
     }
     match last {
         Some(RunStatus::Done) => CardStatus::Done,
@@ -65,6 +76,28 @@ pub fn card_status(pending: bool, live: bool, last: Option<&RunStatus>) -> CardS
         // Not live any more, and how it ended isn't known yet.
         Some(RunStatus::Queued | RunStatus::Working) | None => CardStatus::Idle,
     }
+}
+
+/// The right-click menu's Stop item: `Stop Forge` for one working agent,
+/// `Stop all in thread` for more, nothing when none works.
+pub fn stop_label(working: &[String]) -> Option<String> {
+    match working {
+        [] => None,
+        [one] => Some(format!("Stop {one}")),
+        _ => Some("Stop all in thread".into()),
+    }
+}
+
+/// How long to wait before asking again after `failures` failed
+/// overviews in a row: 2 s, 5 s, 15 s, then 30 s.
+pub fn retry_after(failures: u32) -> Duration {
+    let secs = match failures {
+        0 | 1 => 2,
+        2 => 5,
+        3 => 15,
+        _ => 30,
+    };
+    Duration::from_secs(secs)
 }
 
 /// The toolbar's filters.
@@ -403,13 +436,44 @@ pub fn working_line(agent: &str, step: Option<&Step>) -> String {
     }
 }
 
-/// Widths of a run strip's segments: each run's share of `scale` ms on a
-/// `track` px wide strip, at least 3 px.
-pub fn strip_widths(runs: &[i64], scale: i64, track: f32) -> Vec<f32> {
+/// A run strip's segments as (run index, width): each run's share of
+/// `scale` ms on a `track` px wide strip, at least 3 px, with `gap` px
+/// between. When they don't fit, every width shrinks alike down to 2 px,
+/// then the oldest runs are left out, so the newest always show.
+pub fn strip_layout(runs: &[i64], scale: i64, track: f32, gap: f32) -> Vec<(usize, f32)> {
     let scale = scale.max(1) as f32;
-    runs.iter()
-        .map(|ms| (track * (*ms).max(0) as f32 / scale).clamp(3., track))
-        .collect()
+    let mut segments: Vec<(usize, f32)> = runs
+        .iter()
+        .enumerate()
+        .map(|(ix, ms)| (ix, (track * (*ms).max(0) as f32 / scale).clamp(3., track)))
+        .collect();
+    let gaps = |n: usize| gap * n.saturating_sub(1) as f32;
+    let total: f32 = segments.iter().map(|(_, w)| w).sum();
+    let room = track - gaps(segments.len());
+    if total > room {
+        let factor = room.max(0.) / total;
+        for (_, w) in &mut segments {
+            *w = (*w * factor).max(2.);
+        }
+    }
+    let fits =
+        |s: &[(usize, f32)]| s.iter().map(|(_, w)| w).sum::<f32>() + gaps(s.len()) <= track + 0.01;
+    while segments.len() > 1 && !fits(&segments) {
+        segments.remove(0);
+    }
+    segments
+}
+
+/// What a channel's rows were built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowsKey {
+    channel: ChannelId,
+    generation: u64,
+    filter: Filter,
+    sort: Sort,
+    query: String,
+    folded: Vec<Section>,
+    hour: i64,
 }
 
 /// What the channel view keeps between redraws.
@@ -421,6 +485,16 @@ pub struct ChannelView {
     refetch: Option<Task<()>>,
     /// Asks again if crewd never says counts it was working out are done.
     fallback: Option<Task<()>>,
+    /// Why the last overview failed, shown until one loads.
+    pub(super) error: Option<String>,
+    /// Failed overviews in a row.
+    failures: u32,
+    /// Asks again after a failure, backing off.
+    retry: Option<Task<()>>,
+    /// Moves whenever something the cards are built from changes.
+    generation: u64,
+    /// What the rows were last built from.
+    built: Option<RowsKey>,
     /// Something changed in the channel since the last overview.
     dirty: bool,
     /// Whether the view was shown when last synced.
@@ -458,6 +532,11 @@ impl ChannelView {
             fetch: None,
             refetch: None,
             fallback: None,
+            error: None,
+            failures: 0,
+            retry: None,
+            generation: 0,
+            built: None,
             dirty: false,
             shown: false,
             filter: Filter::All,
@@ -484,6 +563,10 @@ impl ChannelView {
         self.fetch = None;
         self.refetch = None;
         self.fallback = None;
+        self.error = None;
+        self.failures = 0;
+        self.retry = None;
+        self.generation += 1;
         self.dirty = false;
         self.filter = Filter::All;
         self.sort = Sort::Latest;
@@ -547,6 +630,7 @@ impl Workspace {
                 .any(|t| state.thread(*t).is_some_and(|t| t.channel == channel));
         if touched {
             self.channel_view.dirty = true;
+            self.channel_view.generation += 1;
         }
     }
 
@@ -565,7 +649,9 @@ impl Workspace {
         if view.fetch.is_some() {
             return;
         }
-        if view.overview.is_none() || (view.dirty && !was_shown) {
+        // After a failure only the retry timer or a change asks again.
+        let first = view.overview.is_none() && view.error.is_none();
+        if first || (view.dirty && !was_shown) {
             self.fetch_overview(channel, cx);
         } else if view.dirty && view.refetch.is_none() {
             view.refetch = Some(cx.spawn(async move |this, cx| {
@@ -595,6 +681,11 @@ impl Workspace {
                 this.channel_view.fetch = None;
                 match overview {
                     Ok(overview) if this.channel_view.channel == Some(channel) => {
+                        let view = &mut this.channel_view;
+                        view.error = None;
+                        view.failures = 0;
+                        view.retry = None;
+                        view.generation += 1;
                         // crewd says when counts it is still working out
                         // are done; ask again later in case it never does.
                         if overview.threads.iter().any(|t| t.counting) {
@@ -603,8 +694,30 @@ impl Workspace {
                         this.channel_view.overview = Some(overview);
                     }
                     Ok(_) => {}
-                    // Kept as it was; the next change asks again.
-                    Err(e) => eprintln!("crew: couldn't load the channel: {e}"),
+                    // The last good overview stays. A change or the retry
+                    // timer asks again.
+                    Err(e) if this.channel_view.channel == Some(channel) => {
+                        let view = &mut this.channel_view;
+                        view.failures += 1;
+                        let wait = retry_after(view.failures);
+                        if view.error.as_deref() != Some(e.as_str()) {
+                            eprintln!("crew: couldn't load the channel: {e}");
+                        }
+                        view.error = Some(e);
+                        view.retry = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(wait).await;
+                            this.update(cx, |this, cx| {
+                                this.channel_view.retry = None;
+                                if this.channel_view.channel == Some(channel)
+                                    && this.channel_view.fetch.is_none()
+                                {
+                                    this.fetch_overview(channel, cx);
+                                }
+                            })
+                            .ok();
+                        }));
+                    }
+                    Err(_) => {}
                 }
                 this.sync_channel(cx);
                 cx.notify();
@@ -643,13 +756,30 @@ impl Workspace {
         })
     }
 
-    /// Works out the cards and rows to draw from what is known now. The
-    /// list keeps its place unless the toolbar changed.
+    /// Works out the cards and rows to draw, only when what they are built
+    /// from changed since the last time. The list keeps its place unless
+    /// the toolbar changed.
     pub(super) fn refresh_channel_rows(&mut self, cx: &App) {
         let Some(channel) = self.shown_channel() else {
             return;
         };
         let now = super::common::now_ms();
+        let view = &self.channel_view;
+        let mut folded: Vec<Section> = view.folded.iter().copied().collect();
+        folded.sort_by_key(|s| s.key());
+        let key = RowsKey {
+            channel,
+            generation: view.generation,
+            filter: view.filter,
+            sort: view.sort,
+            query: view.search.read(cx).value().to_string(),
+            folded,
+            // Recent turns Older as time passes.
+            hour: now / (60 * 60 * 1000),
+        };
+        if view.built.as_ref() == Some(&key) {
+            return;
+        }
         let state = self.state();
         let summaries: HashMap<ThreadId, &ThreadSummary> = self
             .channel_view
@@ -668,7 +798,13 @@ impl Workspace {
                 latest.insert(run.thread, run);
             }
         }
-        let live: HashSet<ThreadId> = state.running().iter().map(|r| r.thread).collect();
+        let (mut working, mut queued) = (HashSet::new(), HashSet::new());
+        for run in state.running() {
+            match run.status {
+                RunStatus::Working => working.insert(run.thread),
+                _ => queued.insert(run.thread),
+            };
+        }
         let pending: HashSet<ThreadId> = state
             .needs_you()
             .iter()
@@ -700,8 +836,12 @@ impl Workspace {
                     .get(&t.id)
                     .map(|r| r.status.clone())
                     .or_else(|| summary.runs.last().map(|r| r.status.clone()));
-                let status =
-                    card_status(pending.contains(&t.id), live.contains(&t.id), last.as_ref());
+                let status = card_status(
+                    pending.contains(&t.id),
+                    working.contains(&t.id),
+                    queued.contains(&t.id),
+                    last.as_ref(),
+                );
                 Card {
                     thread: t.id,
                     title: t.title.clone(),
@@ -714,18 +854,18 @@ impl Workspace {
                 }
             })
             .collect();
-        let query = self.channel_view.search.read(cx).value().to_string();
         let view = &mut self.channel_view;
         let rows = arrange(
             &cards,
             &Shown {
                 filter: view.filter,
                 sort: view.sort,
-                query: &query,
+                query: &key.query,
                 folded: Some(&view.folded),
             },
             now,
         );
+        view.built = Some(key);
         view.counts = filter_counts(&cards);
         view.scale = cards.iter().map(|c| c.summary.agent_ms).max().unwrap_or(0);
         view.cards = cards.into_iter().map(|c| (c.thread, c)).collect();
@@ -780,6 +920,19 @@ impl Workspace {
             .child(self.render_channel_header(channel, cx))
             .child(self.render_channel_stats())
             .child(self.render_channel_toolbar(cx))
+            .children(self.channel_view.error.as_ref().map(|error| {
+                let text = format!("Couldn't load this channel. {error}");
+                div()
+                    .id("channel-error")
+                    .flex_none()
+                    .px(px(24.))
+                    .pb(px(8.))
+                    .text_size(px(12.))
+                    .text_color(color("danger"))
+                    .aria_label(text.clone())
+                    .child(text)
+                    .test_support()
+            }))
             .child(if empty {
                 div()
                     .id("channel-empty")
@@ -944,8 +1097,8 @@ mod tests {
 
     use super::{
         Card, CardStatus, Filter, Row, Section, Shown, Sort, WEEK_MS, arrange, card_status,
-        card_time, counts_line, filter_counts, strip_widths, thousands, working_line,
-        worktree_word,
+        card_time, counts_line, filter_counts, retry_after, stop_label, strip_layout, thousands,
+        working_line, worktree_word,
     };
     use crate::ui::run_card::{Step, StepState};
 
@@ -1006,24 +1159,45 @@ mod tests {
 
     #[test]
     fn a_status_puts_asks_first_then_live_runs_then_the_last_end() {
-        assert_eq!(card_status(true, true, None), CardStatus::NeedsYou);
+        assert_eq!(card_status(true, true, false, None), CardStatus::NeedsYou);
         assert_eq!(
-            card_status(false, true, Some(&RunStatus::Done)),
+            card_status(false, true, true, Some(&RunStatus::Done)),
             CardStatus::Working
         );
         assert_eq!(
-            card_status(false, false, Some(&RunStatus::Done)),
+            card_status(false, false, true, Some(&RunStatus::Done)),
+            CardStatus::Queued,
+            "waiting for a slot isn't working"
+        );
+        assert_eq!(
+            card_status(false, false, false, Some(&RunStatus::Done)),
             CardStatus::Done
         );
         assert_eq!(
-            card_status(false, false, Some(&RunStatus::Interrupted)),
+            card_status(false, false, false, Some(&RunStatus::Interrupted)),
             CardStatus::Stopped
         );
         assert_eq!(
-            card_status(false, false, Some(&RunStatus::Failed)),
+            card_status(false, false, false, Some(&RunStatus::Failed)),
             CardStatus::Failed
         );
-        assert_eq!(card_status(false, false, None), CardStatus::Idle);
+        assert_eq!(card_status(false, false, false, None), CardStatus::Idle);
+    }
+
+    #[test]
+    fn stop_names_one_agent_or_says_all() {
+        assert_eq!(stop_label(&[]), None);
+        assert_eq!(stop_label(&["Forge".into()]).as_deref(), Some("Stop Forge"));
+        assert_eq!(
+            stop_label(&["Forge".into(), "Scout".into()]).as_deref(),
+            Some("Stop all in thread")
+        );
+    }
+
+    #[test]
+    fn failed_overviews_back_off() {
+        let secs: Vec<u64> = (1..=6).map(|n| retry_after(n).as_secs()).collect();
+        assert_eq!(secs, [2, 5, 15, 30, 30, 30]);
     }
 
     #[test]
@@ -1236,7 +1410,26 @@ mod tests {
 
     #[test]
     fn run_strips_scale_each_run_with_a_floor() {
-        assert_eq!(strip_widths(&[50, 25, 0], 100, 112.), [56., 28., 3.]);
-        assert_eq!(strip_widths(&[10], 0, 112.), [112.]);
+        let widths = |l: Vec<(usize, f32)>| -> Vec<f32> { l.into_iter().map(|(_, w)| w).collect() };
+        assert_eq!(
+            widths(strip_layout(&[50, 25, 0], 1000, 112., 2.)),
+            [5.6, 3., 3.]
+        );
+        assert_eq!(widths(strip_layout(&[10], 0, 112., 2.)), [112.]);
+    }
+
+    #[test]
+    fn a_full_strip_shrinks_then_drops_the_oldest_runs() {
+        // 20 runs of 5 px with 2 px gaps need 138 px: they shrink alike.
+        let layout = strip_layout(&[5; 20], 112, 112., 2.);
+        assert_eq!(layout.len(), 20);
+        let total: f32 = layout.iter().map(|(_, w)| w).sum::<f32>() + 2. * 19.;
+        assert!(total <= 112.01, "{total}");
+        assert!(layout.iter().all(|(_, w)| *w >= 2.));
+        // 60 runs can't fit even at 2 px: the oldest go, the newest stay.
+        let layout = strip_layout(&[5; 60], 112, 112., 2.);
+        assert_eq!(layout.last().unwrap().0, 59);
+        assert_eq!(layout.len(), 28, "28 × 2 px + 27 × 2 px gaps = 110 px");
+        assert_eq!(layout[0].0, 32);
     }
 }
