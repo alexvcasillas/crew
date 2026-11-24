@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::activity::{ActivityRow, activity_rows};
-use super::common::{clock, elapsed, monogram, now_ms, rolling_text};
+use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
 use super::run_card::{FileChange, summarize};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -433,16 +433,25 @@ impl Workspace {
                         if run.status == RunStatus::Working {
                             // `Working ·` stays still while the time rolls.
                             let ms = now_ms() - run.started_at;
+                            // Mono digits keep their width as they change, and
+                            // one line height keeps the roll level with the
+                            // words.
                             state
                                 .flex()
                                 .items_center()
                                 .gap(px(4.))
+                                .line_height(px(ROLL_LINE))
                                 .child("Working ·")
-                                .child(rolling_text(
-                                    "inspector-elapsed",
-                                    &elapsed(ms - 1000),
-                                    &elapsed(ms),
-                                ))
+                                .child(
+                                    rolling_text(
+                                        "inspector-elapsed",
+                                        &elapsed(ms - 1000),
+                                        &elapsed(ms),
+                                    )
+                                    .font_family(mono_font())
+                                    .text_size(px(12.))
+                                    .test_support(),
+                                )
                         } else {
                             state.child(word)
                         }

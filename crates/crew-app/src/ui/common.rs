@@ -266,7 +266,7 @@ pub fn changed_positions(prev: &str, cur: &str) -> Vec<usize> {
 }
 
 /// Height of one line of rolling text.
-const ROLL_LINE: f32 = 16.;
+pub const ROLL_LINE: f32 = 16.;
 
 /// `cur` drawn so each character that changed from `prev` rolls up into
 /// place like an odometer. Unchanged characters stay still. When the

@@ -192,3 +192,29 @@ fn approval_cards_line_up_with_message_bodies(cx: &mut TestAppContext) {
         !has(cx, window, format!("live-{run}"))
     });
 }
+
+#[gpui_kit::test]
+fn the_inspector_timer_sits_level_with_its_words(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge fix the tests");
+    let run = live_run(cx, &ws, w.thread);
+    wait_until(cx, "the timer", |cx| has(cx, window, "inspector-elapsed"));
+    let state = bounds_of(cx, window, "inspector-run-state").unwrap();
+    let timer = bounds_of(cx, window, "inspector-elapsed").unwrap();
+    assert_eq!(timer.size.height.as_f32(), 16.);
+    assert_eq!(
+        timer.center().y,
+        state.center().y,
+        "the roll line is centred on the words"
+    );
+
+    click(cx, window, format!("run-stop-{run}"));
+    wait_until(cx, "the run to end", |cx| {
+        !has(cx, window, format!("live-{run}"))
+    });
+}
