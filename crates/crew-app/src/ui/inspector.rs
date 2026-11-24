@@ -17,6 +17,7 @@ use gpui_kit::*;
 use super::activity::{ActivityRow, activity_rows_asked};
 use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
 use super::run_card::{FileChange, decided_asks, summarize};
+use super::terminal_tab::Command;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
@@ -32,6 +33,7 @@ pub enum InspectorTab {
     #[default]
     Activity,
     Changes,
+    Terminal,
     Thread,
 }
 
@@ -62,6 +64,17 @@ pub(super) struct Inspector {
     /// What `diff` was asked for: thread, worktree and finished runs.
     diff_for: Option<(ThreadId, Option<PathBuf>, usize)>,
     pub(super) diff_task: Option<Task<()>>,
+    /// The shown run's commands, for the Terminal tab.
+    pub(super) term: Vec<Command>,
+    pub(super) term_list: ListState,
+    /// The run and event count `term` was made from.
+    pub(super) term_from: Option<(RunId, usize)>,
+    /// The directory the shown run started in.
+    pub(super) term_cwd: Option<String>,
+    /// Commands, by run and call id, whose whole output is shown.
+    pub(super) term_expanded: HashSet<(RunId, String)>,
+    /// A command to scroll to once the rows have it.
+    pub(super) term_reveal: Option<(RunId, String)>,
 }
 
 impl Default for Inspector {
@@ -80,6 +93,12 @@ impl Default for Inspector {
             diff: None,
             diff_for: None,
             diff_task: None,
+            term: Vec::new(),
+            term_list: activity_list(),
+            term_from: None,
+            term_cwd: None,
+            term_expanded: HashSet::new(),
+            term_reveal: None,
         }
     }
 }
@@ -271,6 +290,8 @@ impl Workspace {
             }
         }
 
+        self.sync_commands(thread, shown, shown.map_or(0, count_of));
+
         let mut changed = false;
         for (run, n) in &counts {
             if self.inspector.run_files.get(run).map(|f| f.0) != Some(*n) {
@@ -365,18 +386,22 @@ impl Workspace {
         }
     }
 
-    /// Shows `run`'s activity in the inspector.
-    pub(super) fn show_run_activity(
+    /// Shows `run`'s Terminal tab, scrolled to the command `call`, even
+    /// when the inspector was hidden.
+    pub(super) fn show_run_command(
         &mut self,
         thread: ThreadId,
         run: RunId,
+        call: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.state().thread_runs(thread).iter().any(|r| r.id == run) {
             self.inspector.picked = Some(run);
         }
-        self.inspector.tab = InspectorTab::Activity;
+        self.inspector.tab = InspectorTab::Terminal;
+        self.inspector.term_reveal = Some((run, call));
+        self.inspector_open = Some(true);
         self.sync_inspector(window, cx);
         cx.notify();
     }
@@ -405,6 +430,7 @@ impl Workspace {
         let body = match self.inspector.tab {
             InspectorTab::Activity => self.render_activity(thread, cx).into_any_element(),
             InspectorTab::Changes => self.render_changes(thread, cx).into_any_element(),
+            InspectorTab::Terminal => self.render_commands(cx).into_any_element(),
             InspectorTab::Thread => self.render_thread_tab(thread, cx).into_any_element(),
         };
         div()
@@ -573,15 +599,13 @@ impl Workspace {
                     })
                     .test_support(),
             )
+            .child(tab("inspector-tab-terminal", "Terminal", InspectorTab::Terminal).test_support())
             .child(tab("inspector-tab-thread", "Thread", InspectorTab::Thread).test_support())
     }
 
-    fn render_activity(
-        &self,
-        thread: ThreadId,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let picker = self.inspector.select.as_ref().map(|(select, _)| {
+    /// The run picker, once the thread has several runs.
+    pub(super) fn render_picker(&self) -> Option<impl IntoElement + use<>> {
+        self.inspector.select.as_ref().map(|(select, _)| {
             div()
                 .id("inspector-run-picker")
                 .flex_none()
@@ -591,7 +615,15 @@ impl Workspace {
                 .border_color(color("border-100"))
                 .child(Select::new(select).small().accessibility_label("Run"))
                 .test_support()
-        });
+        })
+    }
+
+    fn render_activity(
+        &self,
+        thread: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let picker = self.render_picker();
         let empty = self.inspector.rows.is_empty();
         let branch = self
             .state()

@@ -321,14 +321,14 @@ impl Workspace {
         checks(state.events(thread), &runs, &live)
     }
 
-    /// Goes back to the thread with the inspector on the run that ran a
-    /// check.
+    /// Goes back to the thread with the inspector's Terminal tab on the
+    /// command that ran a check.
     fn open_check(&mut self, check: &Check, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
             return;
         };
         self.close_review(window, cx);
-        self.show_run_activity(thread, check.run, window, cx);
+        self.show_run_command(thread, check.run, check.call.clone(), window, cx);
     }
 
     /// Reads the open thread's uncommitted changes, for the inspector and

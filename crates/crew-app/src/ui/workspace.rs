@@ -132,7 +132,7 @@ pub struct Workspace {
     pub(super) deciding: HashSet<ApprovalId>,
     /// Whether you showed or hid the inspector. Until you do, it follows
     /// the window's width.
-    inspector_open: Option<bool>,
+    pub(super) inspector_open: Option<bool>,
     /// Whether the inspector is shown, as last drawn.
     pub(super) inspector_shown: bool,
     /// The open review of a thread's changes, shown in place of the body.
