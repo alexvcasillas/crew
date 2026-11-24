@@ -116,6 +116,8 @@ pub(super) struct Review {
     failed: Option<String>,
     /// The file you last picked in the list, by path.
     current_file: Option<String>,
+    /// A file to scroll to once the diff is read.
+    reveal_file: Option<String>,
     /// The checks the agent ran, read again when the thread's activity
     /// changes.
     checks: Vec<Check>,
@@ -361,6 +363,7 @@ impl Workspace {
             busy: false,
             failed: None,
             current_file: None,
+            reveal_file: None,
             checks: Vec::new(),
             synced: None,
             open_error: None,
@@ -369,6 +372,26 @@ impl Workspace {
         self.sync_review_comments(cx);
         self.load_thread_diff(thread, cx);
         cx.notify();
+    }
+
+    /// Shows the thread's changes, scrolled to `file` once they are read.
+    pub(super) fn open_review_at(
+        &mut self,
+        thread: ThreadId,
+        file: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review(thread, window, cx);
+        if let Some(review) = self.review.as_mut() {
+            review.reveal_file = Some(file);
+        }
+    }
+
+    /// The file the review is on, by path.
+    #[cfg(test)]
+    pub(super) fn review_file(&self) -> Option<String> {
+        self.review.as_ref().and_then(|r| r.current_file.clone())
     }
 
     /// Goes back to the thread.
@@ -656,6 +679,16 @@ impl Workspace {
                                 review.current_file = None;
                             }
                             rebuild_rows_from(review, kept);
+                            if let Some(path) = review.reveal_file.take()
+                                && let Some(ix) = review.files.iter().position(|f| f.path == path)
+                                && let Some(&row) = review.file_rows.get(ix)
+                            {
+                                review.current_file = Some(path);
+                                review.list.scroll_to(ListOffset {
+                                    item_ix: row,
+                                    offset_in_item: px(0.),
+                                });
+                            }
                         }
                         this.inspector.diff = Some(diff);
                     }

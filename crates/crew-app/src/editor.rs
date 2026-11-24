@@ -17,9 +17,6 @@ pub const KNOWN: [&str; 5] = [
     "Sublime Text",
 ];
 
-/// The file in the Crew home that remembers app-only choices.
-const PREFS_FILE: &str = "app-prefs.json";
-
 /// The known editors found in `/Applications` or `<home>/Applications`.
 /// `exists` answers whether a path is there.
 pub fn detect(home: Option<&Path>, exists: impl Fn(&Path) -> bool) -> Vec<String> {
@@ -96,24 +93,14 @@ pub fn open_failed(app: Option<&str>) -> String {
 
 /// The editor you chose, if you chose one: an app name or [`FINDER`].
 pub fn load_choice(crew_home: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(crew_home.join(PREFS_FILE)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get("editor")?.as_str().map(str::to_string)
+    crate::prefs::read(crew_home, "editor")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Remembers your choice, keeping other keys in the file.
 pub fn save_choice(crew_home: &Path, choice: &str) -> std::io::Result<()> {
-    let path = crew_home.join(PREFS_FILE);
-    let mut value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    value["editor"] = choice.into();
-    std::fs::create_dir_all(crew_home)?;
-    let temp = crew_home.join(format!("{PREFS_FILE}.tmp"));
-    std::fs::write(&temp, value.to_string())?;
-    std::fs::rename(&temp, path)
+    crate::prefs::write(crew_home, "editor", choice.into())
 }
 
 #[cfg(test)]

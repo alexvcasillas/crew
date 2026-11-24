@@ -694,11 +694,11 @@ fn the_list_keeps_its_place_when_the_rows_change(cx: &mut TestAppContext) {
 }
 
 /// Launch arguments `open` would have got, in order.
-type Launches = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+pub(super) type Launches = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
 
 /// Swaps in these editors and an opener that records its arguments, or
 /// fails when `fail` is set. Nothing is launched.
-fn fake_editors(
+pub(super) fn fake_editors(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
     ws: &Entity<Workspace>,
@@ -723,7 +723,11 @@ fn fake_editors(
     launches
 }
 
-fn wait_for_launches(cx: &mut TestAppContext, launches: &Launches, n: usize) -> Vec<Vec<String>> {
+pub(super) fn wait_for_launches(
+    cx: &mut TestAppContext,
+    launches: &Launches,
+    n: usize,
+) -> Vec<Vec<String>> {
     wait_until(cx, "the editor to be launched", |_| {
         launches.lock().unwrap().len() >= n
     });

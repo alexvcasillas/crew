@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_proto::{Request, RuntimeInfo};
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
@@ -37,6 +37,7 @@ use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
 use crate::fonts::ui_font;
 use crate::model::{Handoff, State};
+use crate::recents::Recents;
 use crate::theme::color;
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
@@ -188,6 +189,20 @@ pub struct Workspace {
     pub(super) channel_view: ChannelView,
     /// The thread or channel dialog on screen, if any.
     pub(super) dialog: Option<super::dialogs::OpenDialog>,
+    /// The ⌘K palette, while it is open.
+    pub(super) palette: Option<Entity<super::palette::Palette>>,
+    /// What you opened lately, for the palette.
+    pub(super) recents: Recents,
+    /// Writing the recents to the prefs file.
+    recents_task: Option<Task<()>>,
+}
+
+/// A place the palette, and the sidebar, can take you to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Place {
+    Thread(ThreadId),
+    Channel(ChannelId),
+    Agent(AgentId),
 }
 
 /// The Editor select of General.
@@ -211,6 +226,7 @@ impl Workspace {
                 },
             );
         let editor_choice = crate::editor::load_choice(&conn.crew_home);
+        let recents = Recents::load(&conn.crew_home);
         let editors = crate::editor::detect_installed();
         let editor_select = cx.new(|cx| {
             let (labels, ix) = editor_items(editor_choice.as_deref(), &editors);
@@ -296,6 +312,9 @@ impl Workspace {
             _editor_events: editor_events,
             channel_view,
             dialog: None,
+            palette: None,
+            recents,
+            recents_task: None,
         }
     }
 
@@ -609,6 +628,9 @@ impl Workspace {
         self.close_thread(cx);
         self.nav.drafting = false;
         self.look_at(Some(channel));
+        if self.recents.visited_channel(channel) {
+            self.save_recents(cx);
+        }
         self.reset_channel_view(channel, window, cx);
         self.sync_composer_mode(window, cx);
         if self.composer_mode() != ComposerMode::Empty {
@@ -640,12 +662,53 @@ impl Workspace {
         self.nav.drafting = false;
         let channel = self.state.thread(thread).map(|t| t.channel);
         self.look_at(channel.or(self.nav.channel));
+        if self.recents.opened_thread(thread) {
+            self.save_recents(cx);
+        }
         self.sync_composer_mode(window, cx);
         self.composer
             .update(cx, |composer, cx| composer.focus(window, cx));
         self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Takes you to `place`, leaving settings, Running now or a review.
+    /// Every way to a thread, channel or agent from the palette goes
+    /// through here. An agent opens its settings for now.
+    pub(super) fn open_place(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_pages(cx);
+        match place {
+            Place::Thread(thread) => self.open_thread(thread, window, cx),
+            Place::Channel(channel) => self.select_channel(channel, window, cx),
+            Place::Agent(agent) => {
+                if self.recents.visited_agent(agent) {
+                    self.save_recents(cx);
+                }
+                self.open_settings(Page::Agents, window, cx);
+                self.edit_agent(agent, window, cx);
+            }
+        }
+    }
+
+    /// Closes settings, Running now and the review, which show in place
+    /// of the body.
+    pub(super) fn leave_pages(&mut self, cx: &mut Context<Self>) {
+        self.settings = None;
+        self.running = None;
+        self.drop_review(cx);
+        cx.notify();
+    }
+
+    /// Writes the recents to the prefs file, off the UI thread.
+    fn save_recents(&mut self, cx: &mut Context<Self>) {
+        let recents = self.recents.clone();
+        let home = self.conn.crew_home.clone();
+        self.recents_task = Some(cx.background_executor().spawn(async move {
+            if let Err(e) = recents.save(&home) {
+                eprintln!("crew: couldn't save recent places: {e}");
+            }
+        }));
     }
 
     /// Starts a new thread in the selected channel: the composer takes its
@@ -1147,13 +1210,7 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
-            .on_action(cx.listener(|_, _: &Search, window, cx| {
-                struct SearchSoon;
-                window.push_notification(
-                    Notification::info(super::title_bar::SEARCH_SOON).id::<SearchSoon>(),
-                    cx,
-                );
-            }))
+            .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(Page::General, window, cx);
             }))
@@ -1385,9 +1442,7 @@ mod tests {
 
 #[cfg(test)]
 mod gpui_tests {
-    use super::super::test_ui::{
-        click, description_of, has, notifications, open, press, shows, wait_to_show, wait_until,
-    };
+    use super::super::test_ui::{click, has, notifications, open, shows, wait_to_show, wait_until};
     use crate::client;
     use crate::connection::ConnectionConfig;
     use crate::test_support::{Daemon, refuse_hello, short_home};
@@ -1415,21 +1470,6 @@ mod gpui_tests {
         assert!(shows(cx, window, "Crew"), "the app name");
         assert!(shows(cx, window, "Search threads, agents, files…"));
         assert!(shows(cx, window, "Projects"), "the sidebar");
-    }
-
-    #[gpui_kit::test]
-    fn search_says_it_is_coming_soon(cx: &mut TestAppContext) {
-        let home = short_home();
-        let (window, _) = open(cx, home.path());
-        assert_eq!(
-            description_of(cx, window, "title-search").as_deref(),
-            Some("Search is coming soon.")
-        );
-        assert_eq!(notifications(cx, window), 0);
-        press(cx, window, "cmd-k");
-        assert_eq!(notifications(cx, window), 1);
-        press(cx, window, "cmd-k");
-        assert_eq!(notifications(cx, window), 1, "said once");
     }
 
     #[gpui_kit::test]
