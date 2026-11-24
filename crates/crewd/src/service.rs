@@ -765,7 +765,10 @@ impl Service {
         Ok((msg, db.serial))
     }
 
-    /// Saves the message, then queues a run for each mentioned agent.
+    /// Saves the message, then queues a run for each mentioned agent. A
+    /// message that mentions no one goes to the agent that ran last in
+    /// the thread, if none is queued or working there; otherwise it is
+    /// context for the next run.
     pub fn post_message(&self, thread: ThreadId, body: &str) -> Result<MessageId, StoreError> {
         let id = {
             let mut state = self.state();
@@ -782,10 +785,17 @@ impl Service {
             } else {
                 format!("{context}\n\n{body}")
             };
-            for name in known {
-                let Some((agent, _)) = agents.iter().find(|(_, a)| a.name == name) else {
-                    continue;
-                };
+            let mut called: Vec<AgentId> = known
+                .iter()
+                .filter_map(|name| agents.iter().find(|(_, a)| a.name == *name))
+                .map(|(agent, _)| *agent)
+                .collect();
+            if called.is_empty() && unknown.is_empty() {
+                // A reply to nobody in particular goes to whoever answered
+                // last, unless someone is still at work.
+                called.extend(self.last_agent(&db, thread, &agents)?);
+            }
+            for agent in &called {
                 let run = db.store.create_run(thread, *agent)?;
                 self.publish_status(&mut db, thread, run, RunStatus::Queued);
                 state.scheduler.enqueue(Job {
@@ -815,6 +825,31 @@ impl Service {
         };
         self.start_ready();
         Ok(id)
+    }
+
+    /// The agent that ran last in `thread`, if it still exists and no run
+    /// there is queued or working.
+    fn last_agent(
+        &self,
+        db: &Db,
+        thread: ThreadId,
+        agents: &[(AgentId, AgentSpec)],
+    ) -> Result<Option<AgentId>, StoreError> {
+        let runs = db.store.runs(RunFilter {
+            status: None,
+            thread: Some(thread),
+        })?;
+        if runs
+            .iter()
+            .any(|r| matches!(r.status, RunStatus::Queued | RunStatus::Working))
+        {
+            return Ok(None);
+        }
+        Ok(runs
+            .iter()
+            .rev()
+            .map(|r| r.agent)
+            .find(|agent| agents.iter().any(|(id, _)| id == agent)))
     }
 
     /// Stops a live run, or takes a queued one out of the queue.

@@ -424,6 +424,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The name of the agent that ran last in the open thread, if it still
+    /// exists. A reply that mentions no one goes to it.
+    fn last_agent(&self) -> Option<String> {
+        let thread = self.nav.thread?;
+        let agents = self.state.agents();
+        self.state
+            .thread_runs(thread)
+            .into_iter()
+            .rev()
+            .find_map(|r| agents.iter().find(|a| a.id == r.agent))
+            .map(|a| a.spec.name.clone())
+    }
+
     /// Brings the composer, the timer and the scroll position in line
     /// with what is known and open.
     pub(super) fn sync(&mut self, cx: &mut Context<Self>) {
@@ -446,16 +459,21 @@ impl Workspace {
                 status: self.state.agent_status(a.id),
             })
             .collect();
-        let working: Vec<String> = self
+        let live = self
             .nav
             .thread
             .map(|t| self.state.live_runs(t))
-            .unwrap_or_default()
-            .into_iter()
+            .unwrap_or_default();
+        let working: Vec<String> = live
+            .iter()
             .filter(|r| r.status == RunStatus::Working)
             .filter_map(|r| self.state.agent(r.agent).map(|a| a.spec.name.clone()))
             .collect();
-        let hint = working_hint(&working);
+        let hint = if live.is_empty() {
+            self.last_agent().map(|name| reply_hint(&name))
+        } else {
+            working_hint(&working)
+        };
         let busy =
             self.nav.drafting && self.creating.is_some() && self.creating == self.nav.channel;
         self.composer.update(cx, |composer, cx| {
@@ -931,6 +949,11 @@ fn dev_hooks() -> StartupHooks {
     }
 }
 
+/// "Replying to Forge. Type @ to bring in someone else."
+fn reply_hint(name: &str) -> String {
+    format!("Replying to {name}. Type @ to bring in someone else.")
+}
+
 /// "Forge is working. Replies without @Forge become context for its next
 /// turn."
 fn working_hint(names: &[String]) -> Option<String> {
@@ -1118,7 +1141,7 @@ fn merge_runtimes(known: &[RuntimeInfo], answer: Vec<RuntimeInfo>) -> Vec<Runtim
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_runtimes, near_bottom, thread_title, working_hint};
+    use super::{merge_runtimes, near_bottom, reply_hint, thread_title, working_hint};
     use crew_core::agent::Runtime;
     use crew_proto::RuntimeInfo;
 
@@ -1178,6 +1201,14 @@ mod tests {
         assert!(near_bottom(-470., 500.), "within 40 px");
         assert!(!near_bottom(-400., 500.), "you scrolled up to read");
         assert!(near_bottom(0., 0.), "nothing to scroll");
+    }
+
+    #[test]
+    fn the_hint_names_who_a_reply_goes_to() {
+        assert_eq!(
+            reply_hint("Forge"),
+            "Replying to Forge. Type @ to bring in someone else."
+        );
     }
 
     #[test]

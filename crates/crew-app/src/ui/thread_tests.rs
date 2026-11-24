@@ -199,6 +199,14 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
         "and the project"
     );
     assert!(has(cx, window, "title-path"), "and its folder");
+    assert!(
+        !shows(
+            cx,
+            window,
+            "Replying to Forge. Type @ to bring in someone else."
+        ),
+        "no one has answered here yet"
+    );
 
     click(cx, window, "composer-input");
     type_text(cx, window, "@Forge read a.txt");
@@ -223,6 +231,12 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
     wait_until(cx, "the run to end", |cx| {
         ws.read_with(cx, |ws, _| ws.state().live_runs(w.thread).is_empty())
     });
+    // A reply without a mention now goes to Forge, and the hint says so.
+    wait_to_show(
+        cx,
+        window,
+        "Replying to Forge. Type @ to bring in someone else.",
+    );
 }
 
 #[gpui_kit::test]
