@@ -13,6 +13,7 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::diff_tests::repo_with_readme;
 use super::inspector_tests::run_of;
+use super::sidebar::row_probe::row_of;
 use super::test_ui::{
     bounds_of, click, has, label_of, open, open_tall, press, type_text, wait_to_show, wait_until,
 };
@@ -44,11 +45,10 @@ fn wait_label(cx: &mut TestAppContext, window: AnyWindowHandle, id: String, want
 
 /// Clicks the channel in the sidebar and waits for its view.
 fn go_to_channel(cx: &mut TestAppContext, window: AnyWindowHandle, channel: ChannelId) {
-    let row = format!("channel-{channel}");
     wait_until(cx, "the channel in the sidebar", |cx| {
-        has(cx, window, row.clone())
+        has(cx, window, row_of(channel))
     });
-    click(cx, window, row);
+    click(cx, window, row_of(channel));
     wait_until(cx, "the channel view", |cx| has(cx, window, "channel-view"));
 }
 

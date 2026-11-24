@@ -14,6 +14,7 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Role, TestAppContext};
 use serde::de::DeserializeOwned;
 
 use super::mention_menu::NO_AGENTS;
+use super::sidebar::row_probe::{row_of, status_of};
 use super::test_ui::{
     click, has, label_of, open, press, shows, shows_within, type_text, wait_to_show, wait_until,
 };
@@ -154,11 +155,10 @@ pub(super) fn go_to(
     channel: ChannelId,
     thread: ThreadId,
 ) {
-    let channel = format!("channel-{channel}");
     wait_until(cx, "the channel in the sidebar", |cx| {
-        has(cx, window, channel.clone())
+        has(cx, window, row_of(channel))
     });
-    click(cx, window, channel);
+    click(cx, window, row_of(channel));
     let row = format!("thread-{thread}");
     wait_until(cx, "the thread in the list", |cx| {
         has(cx, window, row.clone())
@@ -512,7 +512,8 @@ fn sidebar_shows_working_dot_while_a_run_is_live(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
     let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
     let (window, ws) = open(cx, home.path());
-    let channel_status = format!("channel-status-{}", w.channel);
+    wait_until(cx, "the project", |cx| has(cx, window, row_of(w.channel)));
+    let channel_status = status_of(w.channel);
     let agent_status = format!("agent-status-{}", w.agents[0]);
     wait_until(cx, "the sidebar", |cx| {
         has(cx, window, channel_status.clone())
@@ -554,7 +555,9 @@ fn new_thread_takes_its_title_from_the_first_line(cx: &mut TestAppContext) {
     let (window, ws) = open_thread(cx, home.path(), &w);
 
     press(cx, window, "cmd-n");
-    wait_to_show(cx, window, "New thread");
+    wait_until(cx, "the new thread composer", |cx| {
+        ws.read_with(cx, |ws, _| ws.nav.drafting)
+    });
     assert_eq!(ws.read_with(cx, |ws, _| ws.open_thread_id()), None);
     type_text(cx, window, "Tidy the README");
     press(cx, window, "shift-enter");

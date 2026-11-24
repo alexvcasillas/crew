@@ -40,6 +40,16 @@ pub enum ThreadStatus {
     NeedsYou,
 }
 
+/// What the sidebar sorts and groups a project by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectFacts {
+    /// The most urgent status among its threads.
+    pub status: ThreadStatus,
+    /// When anything last happened in it, in Unix ms: the project, a
+    /// channel or thread made, a run started or ended, a message known.
+    pub activity: i64,
+}
+
 /// A pending approval: something waiting for you to decide.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NeedsYou<'a> {
@@ -788,6 +798,62 @@ impl State {
         }
     }
 
+    /// Every project's status and latest activity, in one pass over what
+    /// is known.
+    pub fn project_facts(&self) -> HashMap<ProjectId, ProjectFacts> {
+        let mut facts: HashMap<ProjectId, ProjectFacts> = self
+            .projects
+            .values()
+            .map(|p| {
+                let facts = ProjectFacts {
+                    status: ThreadStatus::Idle,
+                    activity: p.created_at,
+                };
+                (p.id, facts)
+            })
+            .collect();
+        let mut bump = |project: Option<ProjectId>, at: i64, status: ThreadStatus| {
+            if let Some(f) = project.and_then(|p| facts.get_mut(&p)) {
+                f.activity = f.activity.max(at);
+                f.status = f.status.max(status);
+            }
+        };
+        for c in self.channels.values() {
+            bump(Some(c.project), c.created_at, ThreadStatus::Idle);
+        }
+        for t in self.threads.values() {
+            bump(self.thread_project(t.id), t.created_at, ThreadStatus::Idle);
+        }
+        for r in self.runs.values() {
+            let status = match r.status {
+                RunStatus::Working => ThreadStatus::Working,
+                RunStatus::Queued => ThreadStatus::Queued,
+                _ => ThreadStatus::Idle,
+            };
+            let at = r.ended_at.unwrap_or(r.started_at).max(r.started_at);
+            bump(self.thread_project(r.thread), at, status);
+        }
+        for a in self.approvals.values() {
+            if a.status == ApprovalStatus::Pending {
+                bump(
+                    self.thread_project(a.thread),
+                    a.created_at,
+                    ThreadStatus::NeedsYou,
+                );
+            }
+        }
+        for (thread, messages) in &self.messages {
+            if let Some(last) = messages.last() {
+                bump(
+                    self.thread_project(*thread),
+                    last.created_at,
+                    ThreadStatus::Idle,
+                );
+            }
+        }
+        facts
+    }
+
     /// Threads whose channel `matches` accepts.
     fn thread_ids(&self, matches: impl Fn(ChannelId) -> bool) -> HashSet<ThreadId> {
         self.threads
@@ -1011,6 +1077,39 @@ mod tests {
             limits: Default::default(),
         });
         (state, p, c, t)
+    }
+
+    #[test]
+    fn project_facts_take_the_latest_activity_and_most_urgent_status() {
+        let (mut state, p, _, t) = one_thread();
+        assert_eq!(
+            state.project_facts()[&p.id],
+            ProjectFacts {
+                status: ThreadStatus::Idle,
+                activity: 1,
+            }
+        );
+        let working = run(t.id, RunStatus::Working, 50);
+        state.apply(status(&working));
+        let m = message(t.id, "hello", 70);
+        state.apply(ServerMsg::Message {
+            thread: t.id,
+            message: m,
+        });
+        assert_eq!(
+            state.project_facts()[&p.id],
+            ProjectFacts {
+                status: ThreadStatus::Working,
+                activity: 70,
+            }
+        );
+        state.apply(ServerMsg::Approval {
+            thread: t.id,
+            approval: approval(t.id, 90),
+        });
+        let facts = state.project_facts()[&p.id];
+        assert_eq!(facts.status, ThreadStatus::NeedsYou);
+        assert_eq!(facts.activity, 90);
     }
 
     fn texts(state: &State, thread: ThreadId) -> Vec<String> {

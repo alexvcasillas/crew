@@ -199,6 +199,8 @@ pub struct Workspace {
     pub(super) channel_view: ChannelView,
     /// The thread or channel dialog on screen, if any.
     pub(super) dialog: Option<super::dialogs::OpenDialog>,
+    /// The sidebar's filter, groups and list.
+    pub(super) sidebar: super::sidebar::Sidebar,
     /// The ⌘K palette, while it is open.
     pub(super) palette: Option<Entity<super::palette::Palette>>,
     /// What you opened lately, for the palette.
@@ -257,6 +259,7 @@ impl Workspace {
         });
         let editor_events = cx.subscribe_in(&editor_select, window, Self::editor_picked);
         let channel_view = ChannelView::new(window, cx);
+        let sidebar = super::sidebar::Sidebar::new(&conn.crew_home, window, cx);
         let hooks = dev_hooks();
         let bundled_crewd = std::env::current_exe()
             .ok()
@@ -338,6 +341,7 @@ impl Workspace {
             _editor_events: editor_events,
             channel_view,
             dialog: None,
+            sidebar,
             palette: None,
             recents,
             recents_task: None,
@@ -358,6 +362,7 @@ impl Workspace {
         self.inspector.list.remeasure();
         self.inspector.term_list.remeasure();
         self.channel_view.list.remeasure();
+        self.sidebar.list.remeasure();
         if let Some(terminal) = &self.terminal {
             terminal.list.remeasure();
         }
@@ -1342,6 +1347,7 @@ impl Render for Workspace {
         }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
+        self.refresh_sidebar();
         let root = div().id("workspace");
         self.add_project_drop_target(root, cx)
             .key_context("Workspace")
@@ -1629,7 +1635,7 @@ mod gpui_tests {
         assert!(has(cx, window, "status-bar"));
         assert!(shows(cx, window, "Crew"), "the app name");
         assert!(shows(cx, window, "Search threads, agents, files…"));
-        assert!(shows(cx, window, "Projects"), "the sidebar");
+        assert!(shows(cx, window, "Filter options"), "the sidebar");
     }
 
     #[gpui_kit::test]

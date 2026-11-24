@@ -25,7 +25,7 @@ use crate::theme::color;
 
 use crate::theme::scale::{self, code_family, ui_px, weight};
 use rows::{Inputs, Lead, Row, Section, sections};
-pub(super) use rows::{Remote, SectionKind, Target};
+pub(super) use rows::{Remote, SectionKind, Target, match_range};
 
 actions!(
     palette,
@@ -511,7 +511,7 @@ fn key_chip(keys: &'static str) -> impl IntoElement {
 }
 
 /// `label` with `range` on a blue tint.
-fn highlighted(label: &str, range: Option<std::ops::Range<usize>>) -> StyledText {
+pub(super) fn highlighted(label: &str, range: Option<std::ops::Range<usize>>) -> StyledText {
     let style = HighlightStyle {
         color: Some(color("text-primary")),
         background_color: Some(color("accent-blue").opacity(MATCH_ALPHA)),

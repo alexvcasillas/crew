@@ -6,9 +6,10 @@ mod add_project;
 mod archive;
 mod channel_settings;
 mod discard;
+mod project;
 mod rename;
 
-use crew_core::ids::{ChannelId, ThreadId};
+use crew_core::ids::{ChannelId, ProjectId, ThreadId};
 use crew_core::worktree::Diff;
 use crew_proto::Request;
 use gpui_kit::component::Disableable as _;
@@ -64,6 +65,18 @@ pub(super) enum DialogKind {
         channel: ChannelId,
         name: Entity<InputState>,
         description: Entity<InputState>,
+    },
+    NewChannel {
+        project: ProjectId,
+        name: Entity<InputState>,
+        description: Entity<InputState>,
+    },
+    RenameProject {
+        project: ProjectId,
+        name: Entity<InputState>,
+    },
+    RemoveProject {
+        project: ProjectId,
     },
 }
 
@@ -123,6 +136,13 @@ impl Workspace {
             DialogKind::ChannelSettings {
                 name, description, ..
             } => self.channel_settings_body(name, description),
+            DialogKind::NewChannel {
+                project,
+                name,
+                description,
+            } => self.new_channel_body(*project, name, description),
+            DialogKind::RenameProject { name, .. } => self.rename_project_body(name),
+            DialogKind::RemoveProject { project } => self.remove_project_body(*project),
         };
         let (confirm, danger) = match &open.kind {
             DialogKind::AddProject(_) => ("Add project".to_string(), false),
@@ -133,6 +153,9 @@ impl Workspace {
                 true,
             ),
             DialogKind::ChannelSettings { .. } => ("Save".to_string(), false),
+            DialogKind::NewChannel { .. } => ("Create channel".to_string(), false),
+            DialogKind::RenameProject { .. } => ("Rename".to_string(), false),
+            DialogKind::RemoveProject { .. } => ("Remove".to_string(), true),
         };
         let busy = open.busy;
         let off =
@@ -195,6 +218,8 @@ impl Workspace {
         if open.busy {
             return;
         }
+        // A new channel's name and description, set once it is made.
+        let mut new_channel: Option<(String, String)> = None;
         let checked = match &open.kind {
             DialogKind::AddProject(_) => return self.confirm_add_project(window, cx),
             DialogKind::Rename { thread, title, .. } => {
@@ -235,6 +260,49 @@ impl Workspace {
                 name,
                 description: description.read(cx).value().trim().to_string(),
             }),
+            DialogKind::NewChannel {
+                project,
+                name,
+                description,
+            } => {
+                let state = self.state();
+                let taken: Vec<&str> = state
+                    .channels(*project)
+                    .into_iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                let project_name = state
+                    .project(*project)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or_default();
+                super::settings::projects::channel_name(
+                    &name.read(cx).value(),
+                    &taken,
+                    project_name,
+                )
+                .map(|name| {
+                    let description = description.read(cx).value().trim().to_string();
+                    new_channel = Some((name.clone(), description));
+                    Request::CreateChannel {
+                        project: *project,
+                        name,
+                    }
+                })
+            }
+            DialogKind::RenameProject { project, name } => {
+                let name = name.read(cx).value().trim().to_string();
+                if name.is_empty() {
+                    Err("Give the project a name.".to_string())
+                } else {
+                    Ok(Request::RenameProject {
+                        project: *project,
+                        name,
+                    })
+                }
+            }
+            DialogKind::RemoveProject { project } => {
+                Ok(Request::RemoveProject { project: *project })
+            }
         };
         let request = match checked {
             Ok(request) => request,
@@ -248,13 +316,41 @@ impl Workspace {
             }
         };
         let answer = self.client.request(request);
+        let client = self.client.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result = answer.await;
+            let mut result = answer.await;
+            // A new channel: its description, then it opens.
+            let mut made = None;
+            let mut described = Ok(serde_json::Value::Null);
+            if let (Ok(value), Some((name, description))) = (&result, new_channel) {
+                match serde_json::from_value::<ChannelId>(value.clone()) {
+                    Ok(channel) => {
+                        made = Some(channel);
+                        if !description.is_empty() {
+                            described = client
+                                .request(Request::UpdateChannel {
+                                    channel,
+                                    name,
+                                    description,
+                                })
+                                .await;
+                        }
+                    }
+                    Err(e) => result = Err(e.to_string()),
+                }
+            }
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(_) => {
                         this.dialog = None;
                         window.close_dialog(cx);
+                        if let Some(channel) = made {
+                            this.leave_pages(cx);
+                            this.select_channel(channel, window, cx);
+                        }
+                        if let Err(error) = described {
+                            this.show_error(error, window, cx);
+                        }
                     }
                     Err(error) => {
                         if let Some(open) = &mut this.dialog {
@@ -283,6 +379,8 @@ impl Workspace {
         let field = match self.dialog.as_ref().map(|d| &d.kind) {
             Some(DialogKind::Rename { title, .. }) => title.clone(),
             Some(DialogKind::ChannelSettings { name, .. }) => name.clone(),
+            Some(DialogKind::NewChannel { name, .. }) => name.clone(),
+            Some(DialogKind::RenameProject { name, .. }) => name.clone(),
             _ => return,
         };
         field.update(cx, |input, cx| input.focus(window, cx));

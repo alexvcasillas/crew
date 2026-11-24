@@ -734,6 +734,7 @@ fn preview(a: &Appearance) -> impl IntoElement {
                                 "preview-channel-general".into(),
                                 "general".into(),
                                 true,
+                                true,
                                 "preview-channel-general".into(),
                             )
                             .child(dot("warning")),
@@ -742,6 +743,7 @@ fn preview(a: &Appearance) -> impl IntoElement {
                             channel_row(
                                 "preview-channel-bugs".into(),
                                 "bugs".into(),
+                                false,
                                 false,
                                 "preview-channel-bugs".into(),
                             )

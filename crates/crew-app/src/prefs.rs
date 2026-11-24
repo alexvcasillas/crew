@@ -267,6 +267,64 @@ impl Appearance {
     }
 }
 
+/// The prefs key the sidebar's filter menu choices live under.
+pub const SIDEBAR_KEY: &str = "sidebar";
+
+/// Which projects the sidebar lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowProjects {
+    #[default]
+    All,
+    /// Pinned and active ones, without Other projects.
+    Active,
+    Pinned,
+}
+
+/// How the sidebar orders projects in each group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortProjects {
+    #[default]
+    Recent,
+    Name,
+}
+
+/// The sidebar's filter menu choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SidebarPrefs {
+    pub show: ShowProjects,
+    pub sort: SortProjects,
+    /// Lists the agents under the projects.
+    pub agents: bool,
+}
+
+impl Default for SidebarPrefs {
+    fn default() -> Self {
+        Self {
+            show: ShowProjects::All,
+            sort: SortProjects::Recent,
+            agents: true,
+        }
+    }
+}
+
+impl SidebarPrefs {
+    /// What the prefs file in `crew_home` holds, or the defaults.
+    pub fn load(crew_home: &Path) -> Self {
+        read(crew_home, SIDEBAR_KEY)
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
+    }
+
+    /// Writes them to the prefs file. Blocks, so call it off the UI thread.
+    pub fn save(&self, crew_home: &Path) -> std::io::Result<()> {
+        let value = serde_json::to_value(self).map_err(std::io::Error::other)?;
+        write(crew_home, SIDEBAR_KEY, value)
+    }
+}
+
 /// The offered size closest to `n`, the smaller on a tie.
 fn nearest(n: u64, sizes: &[u8]) -> u8 {
     sizes
@@ -293,9 +351,33 @@ pub fn step_zoom(zoom: u16, direction: i8) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        APPEARANCE_KEY, Appearance, CODE_SIZES, Density, LineHeight, PREFS_FILE, SidebarMode,
-        ZOOM_MIN, read, step_zoom, write,
+        APPEARANCE_KEY, Appearance, CODE_SIZES, Density, LineHeight, PREFS_FILE, ShowProjects,
+        SidebarMode, SidebarPrefs, SortProjects, ZOOM_MIN, read, step_zoom, write,
     };
+
+    #[test]
+    fn sidebar_prefs_round_trip_and_default_on_bad_values() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(SidebarPrefs::load(home.path()), SidebarPrefs::default());
+        assert!(SidebarPrefs::default().agents);
+        let prefs = SidebarPrefs {
+            show: ShowProjects::Pinned,
+            sort: SortProjects::Name,
+            agents: false,
+        };
+        prefs.save(home.path()).unwrap();
+        assert_eq!(SidebarPrefs::load(home.path()), prefs);
+        assert_eq!(
+            read(home.path(), "sidebar").unwrap(),
+            serde_json::json!({"show": "pinned", "sort": "name", "agents": false})
+        );
+        write(home.path(), "sidebar", serde_json::json!({"sort": "name"})).unwrap();
+        let partial = SidebarPrefs::load(home.path());
+        assert_eq!(partial.sort, SortProjects::Name);
+        assert_eq!(partial.show, ShowProjects::All);
+        write(home.path(), "sidebar", serde_json::json!({"show": 3})).unwrap();
+        assert_eq!(SidebarPrefs::load(home.path()), SidebarPrefs::default());
+    }
 
     #[test]
     fn keys_are_saved_side_by_side() {

@@ -119,7 +119,7 @@ impl Workspace {
         self.settings.as_mut().map(|s| &mut s.projects)
     }
 
-    pub(super) fn select_project(
+    pub(crate) fn select_project(
         &mut self,
         project: ProjectId,
         window: &mut Window,
