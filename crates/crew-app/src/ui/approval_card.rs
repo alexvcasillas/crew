@@ -12,7 +12,7 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{chip, clean_line, clean_lines, clock, monogram, runtime_chip};
+use super::common::{clean_line, clean_lines, clock, monogram, runtime_badge};
 use super::thread_settings::effective;
 use super::thread_view::indented;
 use super::workspace::Workspace;
@@ -338,7 +338,7 @@ impl Workspace {
                 decline(id, "Decline", cx).into_any_element(),
             ]
         };
-        needs_you_card(id, &wants)
+        let card = needs_you_card(id, &wants)
             .child(
                 div()
                     .flex()
@@ -354,8 +354,8 @@ impl Workspace {
                                 .child(role),
                         )
                     })
-                    .when_some(target.map(|a| runtime_chip(&a.spec)), |row, c| {
-                        row.child(chip(c))
+                    .when_some(target.map(|a| runtime_badge(&a.spec)), |row, badge| {
+                        row.child(badge)
                     }),
             )
             .child(brief_box)
@@ -371,7 +371,8 @@ impl Workspace {
                     .test_support()
             })
             .child(card_footer(buttons, true))
-            .test_support()
+            .test_support();
+        indented(card)
     }
 
     fn render_permission(
@@ -400,7 +401,7 @@ impl Workspace {
         };
         let more = lines.saturating_sub(INPUT_LINES);
         let command = full_command(input);
-        needs_you_card(id, &wants)
+        let card = needs_you_card(id, &wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
             .when_some(command, |card, command| {
                 card.child(
@@ -445,7 +446,8 @@ impl Workspace {
                 ],
                 true,
             ))
-            .test_support()
+            .test_support();
+        indented(card)
     }
 
     fn render_paused(

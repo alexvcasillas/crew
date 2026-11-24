@@ -12,7 +12,7 @@ use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{chip, clock, elapsed, monogram, runtime_chip};
+use super::common::{clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::summarize;
 use super::thread_settings::policy_name;
@@ -272,7 +272,7 @@ impl Workspace {
                 let agent = state.agent(*agent);
                 let name =
                     agent.map_or_else(|| "Deleted agent".to_string(), |a| a.spec.name.clone());
-                let runtime = agent.map(|a| runtime_chip(&a.spec));
+                let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
                 (name.clone(), monogram(&name, 32.), runtime)
             }
             _ => ("You".to_string(), you_avatar(), None),
@@ -297,11 +297,11 @@ impl Workspace {
                             .items_center()
                             .gap(px(8.))
                             .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-                            .when_some(runtime, |row, runtime| {
+                            .when_some(runtime, |row, (badge, text)| {
                                 row.child(
-                                    chip(runtime.clone())
+                                    badge
                                         .id(format!("message-chip-{id}"))
-                                        .aria_label(runtime)
+                                        .aria_label(text)
                                         .test_support(),
                                 )
                             })
@@ -332,33 +332,26 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// An agent at work: its avatar with a blue ring and its run card.
+    /// An agent at work: its avatar, ringed in blue and pulsing while
+    /// it works, and its run card.
     fn render_live_run(&self, run: &StoredRun, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let state = self.state();
         let agent = state.agent(run.agent);
         let name = agent.map_or_else(|| "Agent".to_string(), |a| a.spec.name.clone());
-        let runtime = agent.map(|a| runtime_chip(&a.spec));
+        let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
         let summary = summarize(state.events(run.thread), run.id);
+        let id = run.id;
         div()
-            .id(format!("live-{}", run.id))
+            .id(format!("live-{id}"))
             .flex()
             .gap(px(12.))
             .px(px(24.))
             .py(px(8.))
             .bg(color("surface-100"))
-            .child(
-                div()
-                    .flex_none()
-                    .p(px(1.))
-                    .rounded(px(8.))
-                    .border_2()
-                    .border_color(color(if run.status == RunStatus::Working {
-                        "accent-blue"
-                    } else {
-                        "border-200"
-                    }))
-                    .child(monogram(&name, 30.)),
-            )
+            .child(live_avatar(
+                &name,
+                (run.status == RunStatus::Working).then(|| format!("live-ring-{id}")),
+            ))
             .child(
                 div()
                     .flex()
@@ -371,10 +364,18 @@ impl Workspace {
                             .items_center()
                             .gap(px(8.))
                             .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-                            .when_some(runtime, |row, runtime| row.child(chip(runtime))),
+                            .when_some(runtime, |row, (badge, text)| {
+                                row.child(
+                                    badge
+                                        .id(format!("live-chip-{id}"))
+                                        .aria_label(text)
+                                        .test_support(),
+                                )
+                            }),
                     )
                     .child(self.render_live_card(run, &summary, cx)),
             )
+            .test_support()
     }
 
     /// Overlapping monograms of the agents in the thread.
@@ -407,6 +408,42 @@ impl Workspace {
                     .when(ix > 0, |m| m.ml(px(-6.)))
             }))
     }
+}
+
+/// Size of a message avatar.
+const AVATAR: f32 = 32.;
+/// Space between an avatar and its ring, and the ring's width.
+const RING_GAP: f32 = 2.;
+const RING_WIDTH: f32 = 2.;
+
+/// A 32 px monogram in a slot of its own size, so it lines up with every
+/// other avatar. With `ring`, a pulsing blue ring of that id hugs it,
+/// drawn outside the slot so the row doesn't grow or stretch it.
+fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
+    let out = RING_GAP + RING_WIDTH;
+    div()
+        .relative()
+        .flex_none()
+        .self_start()
+        .size(px(AVATAR))
+        .child(monogram(name, AVATAR))
+        .when_some(ring, |slot, ring| {
+            slot.child(pulsing(
+                SharedString::from(format!("{ring}-pulse")),
+                div()
+                    .id(SharedString::from(ring))
+                    .absolute()
+                    .top(px(-out))
+                    .left(px(-out))
+                    .size(px(AVATAR + 2. * out))
+                    // The monogram's 6 px corner plus the gap, at the
+                    // ring's inner edge.
+                    .rounded(px(6. + RING_GAP + RING_WIDTH))
+                    .border_2()
+                    .border_color(color("accent-blue"))
+                    .test_support(),
+            ))
+        })
 }
 
 /// Lines up with a message's text, past the avatar.
