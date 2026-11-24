@@ -595,6 +595,11 @@ impl Service {
                     .set_thread_archived(thread, archived)
                     .map_err(|e| e.to_string())?;
                 self.thread_changed(&mut db, thread)?;
+                drop(db);
+                // An archived thread's runs are no longer undone.
+                if archived {
+                    self.forget_thread_snapshots(thread);
+                }
                 Ok(serde_json::Value::Null)
             }
             Request::UpdateChannel {

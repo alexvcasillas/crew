@@ -440,6 +440,29 @@ pub fn is_ignored(dir: &Path, path: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Files in the checkout at `dir` that git doesn't track and doesn't
+/// ignore, relative to `dir`.
+pub fn untracked_files(dir: &Path) -> Result<Vec<String>> {
+    let prefix = show_prefix(dir)?;
+    let status = git(
+        dir,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--",
+            ".",
+        ],
+    )?;
+    Ok(status
+        .split('\0')
+        .filter(|e| e.starts_with("?? "))
+        .filter_map(|e| e[3..].strip_prefix(&prefix).map(str::to_string))
+        .collect())
+}
+
 /// The checked out branch, or `None` if detached or not a checkout.
 pub fn current_branch(dir: &Path) -> Option<String> {
     git(dir, ["symbolic-ref", "--short", "-q", "HEAD"])

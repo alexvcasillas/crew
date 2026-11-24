@@ -18,7 +18,7 @@ use crew_core::project_kind::{
     ProjectKind, WorkMode, detect_kind, looks_secret, relative_to, repo_of,
 };
 use crew_core::scheduler::Job;
-use crew_core::snapshot::{self, Before, RunSnapshot, Undo, plan_undo};
+use crew_core::snapshot::{self, Before, Copy, RunSnapshot, Undo, plan_undo};
 use crew_core::store::{Author, RunFilter, StoredProject, ThreadWorktree};
 use crew_core::worktree::{self, Diff};
 use crew_proto::{FolderInfo, OutsideFile, RepoChanges, SetupFile, SetupFileSize, ThreadChanges};
@@ -851,6 +851,7 @@ impl Service {
         let edits = self.run_edits(thread, &project.root)?;
         let (root, kind) = (project.root.clone(), project.kind.clone());
         let dir_of_snapshots = self.snapshots_dir();
+        let store = blob_store(&dir_of_snapshots);
         let (notes, failed) = blocking(move || {
             let snaps: HashMap<RunId, RunSnapshot> = edits
                 .iter()
@@ -903,21 +904,34 @@ impl Service {
                         .flatten();
                     let head = worktree::head_blob(&dir, path);
                     let done = match plan_undo(current.as_deref(), head.as_deref(), &runs) {
-                        Undo::To(Before::Content(blob)) => {
-                            let copy = edits.iter().find_map(|(run, _)| {
-                                let file = snapshot::copy_path(
-                                    &run_dir(&dir_of_snapshots, *run).join("files"),
-                                    &blob,
-                                );
-                                file.is_file().then_some(file)
-                            });
-                            let Some(copy) = copy else {
-                                notes.push(format!(
-                                    "{full} was too big to keep a copy, left as is."
-                                ));
+                        Undo::To(Before::Content(kept)) => {
+                            let copy = match kept.copy {
+                                Copy::TooBig => {
+                                    notes.push(format!(
+                                        "{full} was too big to keep a copy, left as is."
+                                    ));
+                                    continue;
+                                }
+                                Copy::Failed => {
+                                    notes.push(format!(
+                                        "Crew couldn't copy {full} before the run, left as is."
+                                    ));
+                                    continue;
+                                }
+                                Copy::Kept => snapshot::copy_path(&store, &kept.blob),
+                            };
+                            let Some(copy) = copy.filter(|c| c.is_file()) else {
+                                notes.push(format!("{full}'s copy is missing, left as is."));
                                 continue;
                             };
-                            put_back(&dir.join(path), &copy)
+                            // The copy must still be what was kept.
+                            if snapshot::id_of(&dir, &copy).ok().as_deref()
+                                != Some(kept.blob.as_str())
+                            {
+                                notes.push(format!("{full}'s copy is damaged, left as is."));
+                                continue;
+                            }
+                            put_back(&dir, path, &copy, kept.mode)
                         }
                         Undo::To(Before::Head) => worktree::restore_from_head(&dir, path),
                         Undo::To(Before::Absent) => {
@@ -979,13 +993,34 @@ impl Service {
         };
         let (dir, run) = (self.snapshots_dir(), job.run);
         let taken = blocking(move || {
-            let files = run_dir(&dir, run).join("files");
-            let snap = snapshot::take(&project.root, &project.kind.repos(), &files);
-            save_snapshot(&dir, run, &snap)
+            let store = blob_store(&dir);
+            let snap = snapshot::take(
+                &project.root,
+                &project.kind.repos(),
+                &store,
+                snapshot::Caps::default(),
+            );
+            save_snapshot(&dir, run, &snap)?;
+            Ok::<_, String>(snap.skipped())
         })
         .await;
-        if let Err(e) = taken {
-            log(format!("couldn't save the snapshot of run {run}: {e}"));
+        let note = match taken {
+            Ok(0) => None,
+            Ok(1) => Some("Crew couldn't keep a copy of 1 file, so it won't undo it.".to_string()),
+            Ok(n) => Some(format!(
+                "Crew couldn't keep copies of {n} files, so it won't undo them."
+            )),
+            Err(e) => {
+                log(format!("couldn't save the snapshot of run {run}: {e}"));
+                None
+            }
+        };
+        if let Some(body) = note {
+            let mut db = self.db();
+            if let Err(e) = self.add_message(&mut db, job.thread, Author::System, &body, Some(run))
+            {
+                log(e);
+            }
         }
     }
 
@@ -1016,8 +1051,12 @@ impl Service {
             let mut snap = load_snapshot(&dir, run).unwrap_or_default();
             let repos = kind.repos();
             let mut end = Vec::new();
+            let mut untracked = Vec::new();
             for path in edits {
                 let Some((repo, inner)) = repo_of(&repos, &path) else {
+                    if through_link(&root, &repos, &path) {
+                        untracked.push(path);
+                    }
                     continue;
                 };
                 let blob = worktree::hash_files(&root.join(repo), &[inner.to_string()], false)
@@ -1026,42 +1065,51 @@ impl Service {
                     .flatten();
                 end.push((path.clone(), blob));
             }
-            snap.end = Some(end);
-            save_snapshot(&dir, run, &snap)
+            if end.is_empty() {
+                // Nothing of the run to undo.
+                forget_run(&dir, run);
+            } else {
+                snap.end = Some(end);
+                save_snapshot(&dir, run, &snap)?;
+            }
+            Ok::<_, String>(untracked)
         })
         .await;
-        if let Err(e) = saved {
-            log(format!("couldn't save how run {run} ended: {e}"));
+        match saved {
+            Ok(untracked) if !untracked.is_empty() => {
+                let mut db = self.db();
+                for path in untracked {
+                    let body = format!("Edits through {path} aren't tracked by Crew.");
+                    if let Err(e) =
+                        self.add_message(&mut db, thread, Author::System, &body, Some(run))
+                    {
+                        log(e);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log(format!("couldn't save how run {run} ended: {e}")),
         }
         self.project_files_may_differ(&project);
     }
 
-    /// Deletes snapshots older than [`SNAPSHOT_DAYS`]. Run once at start.
+    /// Deletes run records older than [`SNAPSHOT_DAYS`] and copies no
+    /// record points to. Run once at start, before any run.
     pub fn clean_snapshots(&self) {
-        let dir = self.snapshots_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
         let max = std::time::Duration::from_secs(SNAPSHOT_DAYS * 24 * 60 * 60);
-        for entry in entries.flatten() {
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > max);
-            if !old {
-                continue;
-            }
-            let path = entry.path();
-            let removed = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            if let Err(e) = removed {
-                log(format!("couldn't remove {}: {e}", entry.path().display()));
-            }
+        gc_snapshots(&self.snapshots_dir(), max);
+    }
+
+    /// Drops the run records of a thread: nothing of it is left to undo,
+    /// as when it is archived.
+    pub(crate) fn forget_thread_snapshots(&self, thread: ThreadId) {
+        let runs = self.db().store.runs(RunFilter {
+            status: None,
+            thread: Some(thread),
+        });
+        let dir = self.snapshots_dir();
+        for run in runs.unwrap_or_default() {
+            forget_run(&dir, run.id);
         }
     }
 
@@ -1146,22 +1194,18 @@ const SNAPSHOTS_DIR: &str = "snapshots";
 /// Days a run snapshot is kept.
 const SNAPSHOT_DAYS: u64 = 30;
 
-/// A run's snapshot folder: its record and the copies it kept.
-fn run_dir(dir: &Path, run: RunId) -> PathBuf {
-    dir.join(run.to_string())
+/// Where copies are kept, by blob id, shared by all runs.
+fn blob_store(dir: &Path) -> PathBuf {
+    dir.join("blobs")
 }
 
-/// Writes the kept copy back over `to`, keeping the file's permissions.
-fn put_back(to: &Path, copy: &Path) -> Result<(), worktree::WorktreeError> {
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(to, std::fs::read(copy)?)?;
-    Ok(())
+/// Where run records are kept.
+fn runs_dir(dir: &Path) -> PathBuf {
+    dir.join("runs")
 }
 
 fn snapshot_path(dir: &Path, run: RunId) -> PathBuf {
-    run_dir(dir, run).join("snapshot.json")
+    runs_dir(dir).join(format!("{run}.json"))
 }
 
 fn load_snapshot(dir: &Path, run: RunId) -> Option<RunSnapshot> {
@@ -1172,15 +1216,153 @@ fn load_snapshot(dir: &Path, run: RunId) -> Option<RunSnapshot> {
 /// Saves the record, 0600 in a 0700 folder.
 fn save_snapshot(dir: &Path, run: RunId, snap: &RunSnapshot) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let folder = run_dir(dir, run);
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+    for folder in [dir.to_path_buf(), runs_dir(dir)] {
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
     let text = serde_json::to_string(snap).map_err(|e| e.to_string())?;
     let path = snapshot_path(dir, run);
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())
+}
+
+/// Deletes a run's record. Its copies go at the next start, once no
+/// record points to them.
+fn forget_run(dir: &Path, run: RunId) {
+    let path = snapshot_path(dir, run);
+    if path.exists()
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        log(format!("couldn't remove {}: {e}", path.display()));
+    }
+}
+
+/// Deletes run records older than `max`, then every copy no record points
+/// to. Anything else in `dir` is from an older layout and goes too.
+pub(crate) fn gc_snapshots(dir: &Path, max: std::time::Duration) {
+    let remove = |path: &Path| {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(e) = removed {
+            log(format!("couldn't remove {}: {e}", path.display()));
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name != "blobs" && name != "runs" {
+            remove(&entry.path());
+        }
+    }
+    let mut wanted: HashSet<String> = HashSet::new();
+    for entry in std::fs::read_dir(runs_dir(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max);
+        let snap = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<RunSnapshot>(&t).ok());
+        match snap {
+            Some(snap) if !old => wanted.extend(snap.copies().map(str::to_string)),
+            _ => remove(&path),
+        }
+    }
+    for entry in std::fs::read_dir(blob_store(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !wanted.contains(&name) {
+            remove(&entry.path());
+        }
+    }
+}
+
+/// Whether the folder-relative `path`, outside every repo, leads into a
+/// repo of the folder that is reached through a link.
+fn through_link(root: &Path, repos: &[String], path: &str) -> bool {
+    let Ok(real) = root.join(path).canonicalize() else {
+        return false;
+    };
+    let Ok(real_root) = root.canonicalize() else {
+        return false;
+    };
+    repos.iter().filter(|r| !r.is_empty()).any(|r| {
+        root.join(r)
+            .canonicalize()
+            .is_ok_and(|target| target != real_root.join(r) && real.starts_with(&target))
+    })
+}
+
+/// Writes the kept copy back to `path` in the repo at `repo_dir`, with
+/// `mode` (else the file's own, else 0644). Never writes through a link:
+/// the file must not be one, and its folder must lie inside the repo. The
+/// new content is renamed into place.
+pub(crate) fn put_back(
+    repo_dir: &Path,
+    path: &str,
+    copy: &Path,
+    mode: Option<u32>,
+) -> Result<(), worktree::WorktreeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let outside = || {
+        worktree::WorktreeError::Io(std::io::Error::other(format!(
+            "{path} leads outside the repo"
+        )))
+    };
+    let target = repo_dir.join(path);
+    let real_repo = repo_dir.canonicalize()?;
+    let parent = target.parent().ok_or_else(outside)?;
+    let mut probe = parent;
+    while !probe.exists() {
+        probe = probe.parent().ok_or_else(outside)?;
+    }
+    if !probe.canonicalize()?.starts_with(&real_repo) {
+        return Err(outside());
+    }
+    std::fs::create_dir_all(parent)?;
+    if !parent.canonicalize()?.starts_with(&real_repo) {
+        return Err(outside());
+    }
+    let existing = std::fs::symlink_metadata(&target).ok();
+    if existing.as_ref().is_some_and(|m| !m.is_file()) {
+        return Err(worktree::WorktreeError::Io(std::io::Error::other(format!(
+            "{path} is no longer a plain file"
+        ))));
+    }
+    let mode = mode
+        .or_else(|| existing.map(|m| m.permissions().mode() & 0o7777))
+        .unwrap_or(0o644);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".crew-restore-{}-{nanos}", std::process::id()));
+    let written = (|| {
+        std::fs::copy(copy, &tmp)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(written?)
 }
 
 /// Drops `paths` (folder-relative) from the end records of the runs in
@@ -1198,6 +1380,10 @@ fn forget_in_snapshots(dir: &Path, edits: &[(RunId, Vec<String>)], paths: &[Stri
         };
         if let Some(end) = &mut snap.end {
             end.retain(|(p, _)| !paths.contains(p));
+            if end.is_empty() {
+                forget_run(dir, *run);
+                continue;
+            }
         }
         if let Err(e) = save_snapshot(dir, *run, &snap) {
             log(format!("couldn't update the snapshot of run {run}: {e}"));
@@ -1227,4 +1413,91 @@ pub(crate) fn in_place_counts(
     }
     total.uncommitted = total.files;
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use crate::folders::{gc_snapshots, put_back};
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn put_back_never_writes_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("api");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let copy = tmp.path().join("copy");
+        std::fs::write(&copy, "kept\n").unwrap();
+        std::fs::write(outside.join("x.txt"), "yours\n").unwrap();
+        // The file is a link now.
+        std::os::unix::fs::symlink(outside.join("x.txt"), repo.join("x.txt")).unwrap();
+        assert!(put_back(&repo, "x.txt", &copy, None).is_err());
+        // Its folder is a link now.
+        std::os::unix::fs::symlink(&outside, repo.join("sub")).unwrap();
+        assert!(put_back(&repo, "sub/x.txt", &copy, None).is_err());
+        assert!(put_back(&repo, "sub/new/y.txt", &copy, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("x.txt")).unwrap(),
+            "yours\n"
+        );
+        assert!(!outside.join("new").exists());
+
+        // A plain file comes back with the mode it had.
+        put_back(&repo, "bin/run.sh", &copy, Some(0o755)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("bin/run.sh")).unwrap(),
+            "kept\n"
+        );
+        assert_eq!(mode(&repo.join("bin/run.sh")), 0o755);
+        std::fs::write(repo.join("a.txt"), "agent\n").unwrap();
+        std::fs::set_permissions(repo.join("a.txt"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        put_back(&repo, "a.txt", &copy, None).unwrap();
+        assert_eq!(mode(&repo.join("a.txt")), 0o600);
+    }
+
+    #[test]
+    fn gc_keeps_only_copies_a_record_points_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let (runs, blobs) = (dir.join("runs"), dir.join("blobs"));
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        let (used, unused) = ("a".repeat(40), "b".repeat(40));
+        std::fs::write(blobs.join(&used), "x").unwrap();
+        std::fs::write(blobs.join(&unused), "y").unwrap();
+        std::fs::write(blobs.join(".copy-1-2"), "half").unwrap();
+        let record = serde_json::json!({"repos": [{"repo": "", "head": "h", "dirty": [
+            {"path": "a.txt", "blob": used, "copy": "kept", "mode": 420}
+        ]}]});
+        std::fs::write(runs.join("r1.json"), record.to_string()).unwrap();
+        std::fs::write(runs.join("broken.json"), "{").unwrap();
+        // An older layout's folder.
+        std::fs::create_dir_all(dir.join("0000/files")).unwrap();
+
+        gc_snapshots(&dir, Duration::from_secs(3600));
+        let mut left: Vec<String> = std::fs::read_dir(&blobs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, std::slice::from_ref(&used));
+        assert!(runs.join("r1.json").exists());
+        assert!(!runs.join("broken.json").exists());
+        assert!(!dir.join("0000").exists());
+
+        // Past the age limit the record goes, then its copies.
+        gc_snapshots(&dir, Duration::ZERO);
+        assert!(!runs.join("r1.json").exists());
+        assert!(std::fs::read_dir(&blobs).unwrap().next().is_none());
+    }
 }

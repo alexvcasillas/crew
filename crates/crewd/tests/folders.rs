@@ -252,6 +252,15 @@ impl Client {
             .expect("connection closed")
     }
 
+    /// Reads notifications until a run of `thread` reaches `want`.
+    async fn until_status_in(&mut self, thread: ThreadId, want: RunStatus) -> Vec<ServerMsg> {
+        self.until(|m| {
+            matches!(m, ServerMsg::RunStatus { thread: t, status, .. }
+                if *t == thread && *status == want)
+        })
+        .await
+    }
+
     /// Reads notifications until `done` returns true, and returns them all.
     async fn until(&mut self, mut done: impl FnMut(&ServerMsg) -> bool) -> Vec<ServerMsg> {
         let mut seen = Vec::new();
@@ -1046,19 +1055,19 @@ async fn in_place_discard_keeps_your_edits_in_files_the_run_touched() {
     // readable by you only.
     git(&root, &["gc", "-q", "--prune=now"]);
     let snaps = d.home.join("snapshots");
-    let run_dir = std::fs::read_dir(&snaps)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&run_dir), 0o700);
-    assert_eq!(mode(&run_dir.join("snapshot.json")), 0o600);
-    for copy in std::fs::read_dir(run_dir.join("files")).unwrap() {
-        assert_eq!(mode(&copy.unwrap().path()), 0o600);
+    assert_eq!(mode(&snaps), 0o700);
+    assert_eq!(mode(&snaps.join("runs")), 0o700);
+    assert_eq!(mode(&snaps.join("blobs")), 0o700);
+    let records = list(&snaps.join("runs"));
+    assert_eq!(records.len(), 1);
+    assert_eq!(mode(&records[0]), 0o600);
+    for copy in list(&snaps.join("blobs")) {
+        assert_eq!(mode(&copy), 0o600);
     }
     discard_all(&mut c, thread).await;
+    // Nothing of the run is left to undo, so its record goes.
+    assert!(list(&snaps.join("runs")).is_empty());
     // Only the run's change is undone; what you had on disk and staged
     // is back as it was.
     assert_eq!(
@@ -1099,6 +1108,118 @@ async fn a_dirty_file_too_big_to_copy_is_left_as_is() {
     assert_eq!(
         std::fs::read_to_string(root.join("a.txt")).unwrap(),
         "agent\n"
+    );
+}
+
+fn list(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|e| e.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Runs Forge over your own edit in a.txt, then hands `spoil` the copy
+/// store and discards. Returns the notes seen.
+async fn discard_with_store(spoil: impl FnOnce(&Path)) -> (Vec<String>, PathBuf) {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (root, _, thread) = in_place_api(&d, &mut c).await;
+    std::fs::write(root.join("a.txt"), "mine\n").unwrap();
+    set_edits(scripts.path(), &[("a.txt", "agent")]);
+    post(&mut c, thread, "@Forge edit").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+    spoil(&d.home.join("snapshots/blobs"));
+    discard_all(&mut c, thread).await;
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::Message { message, .. } if message.body.contains("left as is")))
+        .await;
+    let text = std::fs::read_to_string(root.join("a.txt")).unwrap();
+    assert_eq!(text, "agent\n");
+    // Keep the temp folders until the checks are done.
+    drop((d, scripts));
+    (system_notes(&seen), root)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_damaged_copy_is_never_written_back() {
+    let (notes, _) = discard_with_store(|store| {
+        for copy in list(store) {
+            std::fs::remove_file(copy).unwrap();
+        }
+    })
+    .await;
+    assert_eq!(
+        notes.last().unwrap(),
+        "a.txt's copy is missing, left as is."
+    );
+    let (notes, _) = discard_with_store(|store| {
+        for copy in list(store) {
+            std::fs::write(copy, "something else\n").unwrap();
+        }
+    })
+    .await;
+    assert_eq!(
+        notes.last().unwrap(),
+        "a.txt's copy is damaged, left as is."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_left_out_of_a_snapshot_are_named_in_the_thread() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    let (root, channel, thread) = in_place_api(&d, &mut c).await;
+    // An untracked file over 1 MB is not copied.
+    std::fs::write(root.join("dump.bin"), "z".repeat(2 * 1024 * 1024)).unwrap();
+    set_edits(scripts.path(), &[("a.txt", "agent")]);
+    post(&mut c, thread, "@Forge edit").await;
+    let seen = c.until_status_in(thread, RunStatus::Done).await;
+    assert!(
+        system_notes(&seen)
+            .contains(&"Crew couldn't keep a copy of 1 file, so it won't undo it.".to_string()),
+        "{:?}",
+        system_notes(&seen)
+    );
+    let blobs = list(&d.home.join("snapshots/blobs"));
+    assert!(blobs.is_empty(), "{blobs:?}");
+    // Archiving the thread drops its record.
+    assert_eq!(list(&d.home.join("snapshots/runs")).len(), 1);
+    c.call(Request::ArchiveThread {
+        thread,
+        archived: true,
+    })
+    .await
+    .unwrap();
+    assert!(list(&d.home.join("snapshots/runs")).is_empty());
+    let _ = channel;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_through_a_linked_repos_real_path_are_flagged() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    agents(&mut c).await;
+    let root = d.tmp.path().join("platform");
+    repo(&root.join("deep/a/b/web"));
+    std::os::unix::fs::symlink(root.join("deep/a/b/web"), root.join("web")).unwrap();
+    let (project, channel) = add_project(&mut c, &root, Some(WorkMode::InPlace)).await;
+    assert_eq!(
+        stored_project(&mut c, project).await.kind,
+        ProjectKind::MultiRepo {
+            repos: vec!["web".into()]
+        }
+    );
+    let thread = new_thread(&mut c, channel, "Through").await;
+    set_edits(scripts.path(), &[("deep/a/b/web/x.txt", "agent")]);
+    post(&mut c, thread, "@Forge edit").await;
+    let seen = c.until_status_in(thread, RunStatus::Done).await;
+    assert!(
+        system_notes(&seen)
+            .contains(&"Edits through deep/a/b/web/x.txt aren't tracked by Crew.".to_string()),
+        "{:?}",
+        system_notes(&seen)
     );
 }
 
