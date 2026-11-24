@@ -708,7 +708,9 @@ async fn watch(
             | ServerMsg::AgentChanged { .. }
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::TerminalSessionChanged { .. }
-            | ServerMsg::TerminalEvent { .. } => {}
+            | ServerMsg::TerminalEvent { .. }
+            | ServerMsg::TerminalSessionRemoved { .. }
+            | ServerMsg::TerminalSessionReset { .. } => {}
             ServerMsg::Resync => bail!("watch fell behind crewd. Run it again."),
         }
     }

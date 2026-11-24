@@ -66,6 +66,7 @@ CREATE TABLE runs (
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);
+CREATE INDEX runs_by_session ON runs(session_id);
 
 CREATE TABLE events (
     run_id TEXT NOT NULL REFERENCES runs(id),

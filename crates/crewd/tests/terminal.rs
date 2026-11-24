@@ -28,7 +28,9 @@ const WAIT: Duration = Duration::from_secs(30);
 struct Paths {
     _tmp: TempDir,
     root: PathBuf,
+    /// A link to `crew_data`, so worktree paths differ by spelling.
     crew_home: PathBuf,
+    crew_data: PathBuf,
     claude_home: PathBuf,
     other: PathBuf,
 }
@@ -41,12 +43,16 @@ impl Paths {
         let root = base.join("ws");
         let other = base.join("elsewhere");
         let claude_home = base.join("claude");
-        for dir in [&root, &other, &claude_home.join("projects")] {
+        let crew_data = root.join(".crew-data");
+        for dir in [&root, &other, &claude_home.join("projects"), &crew_data] {
             std::fs::create_dir_all(dir).unwrap();
         }
+        let crew_home = base.join("crew-link");
+        std::os::unix::fs::symlink(&crew_data, &crew_home).unwrap();
         Paths {
             _tmp: tmp,
-            crew_home: root.join(".crew"),
+            crew_home,
+            crew_data,
             root,
             claude_home,
             other,
@@ -119,6 +125,16 @@ fn write_session(path: &Path, id: &str, cwd: &Path, entry: &str, prompt: &str) {
         reply(id, cwd, 2, "On it."),
     ];
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+fn mtime_ms(path: &Path) -> i64 {
+    let t = std::fs::metadata(path).unwrap().modified().unwrap();
+    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn set_age(path: &Path, age: Duration) {
+    let f = OpenOptions::new().append(true).open(path).unwrap();
+    f.set_modified(SystemTime::now() - age).unwrap();
 }
 
 fn append(path: &Path, lines: &[String]) {
@@ -383,10 +399,10 @@ async fn a_terminal_session_shows_under_its_project() {
     let session = c.change(SHOWN, |_| true).await;
     assert_eq!(session.project, project);
     assert_eq!(session.cwd, sub.to_string_lossy());
-    assert_eq!(session.title, "Fix the login[0m bug");
-    // 2026-11-20T10:00:01Z and 10:00:02Z.
+    assert_eq!(session.title, "Fix the login bug");
+    // 2026-11-20T10:00:01Z, the first line's time.
     assert_eq!(session.started_at, 1_795_168_801_000);
-    assert_eq!(session.last_active_at, 1_795_168_802_000);
+    assert_eq!(session.last_active_at, mtime_ms(&p.transcript(&sub, SHOWN)));
     // No registry and a fresh file: live by its age.
     assert!(session.live);
 
@@ -412,7 +428,9 @@ async fn sessions_outside_projects_in_worktrees_or_of_crew_runs_are_ignored() {
         ),
         (
             "00000000-0000-4000-8000-0000000000b2",
-            p.crew_home.join("worktrees/demo/fix-login"),
+            // Where the linked crew home really is, as Claude Code
+            // writes it.
+            p.crew_data.join("worktrees/demo/fix-login"),
             "cli",
         ),
         // A name that only starts like the root's.
@@ -551,10 +569,11 @@ async fn appended_lines_stream_live_to_subscribers() {
     .await
     .unwrap();
     append(&path, &[reply(SHOWN, &p.root, 9, "Quiet.")]);
+    let written = mtime_ms(&path);
     let seen = c
         .until(|m| {
             matches!(m, ServerMsg::TerminalSessionChanged { session }
-            if session.last_active_at == 1_795_168_809_000)
+            if session.last_active_at >= written)
         })
         .await;
     assert!(terminal_items(&seen, SHOWN).is_empty(), "{seen:?}");
@@ -613,10 +632,7 @@ async fn without_a_registry_old_files_are_not_live() {
     let old = "00000000-0000-4000-8000-0000000000d1";
     let path = p.transcript(&p.root, old);
     write_session(&path, old, &p.root, "cli", "old");
-    let f = OpenOptions::new().append(true).open(&path).unwrap();
-    f.set_modified(SystemTime::now() - Duration::from_secs(600))
-        .unwrap();
-    drop(f);
+    set_age(&path, Duration::from_secs(600));
 
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
@@ -683,4 +699,78 @@ async fn sessions_are_found_by_polling_when_the_folder_comes_later() {
     write_session(&p.transcript(&p.root, SHOWN), SHOWN, &p.root, "cli", "Late");
     let session = c.change(SHOWN, |_| true).await;
     assert_eq!(session.title, "Late");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewritten_file_resets_its_backlog() {
+    let p = Paths::new();
+    let path = p.transcript(&p.root, SHOWN);
+    write_session(&path, SHOWN, &p.root, "cli", "Old ask");
+    append(&path, &[reply(SHOWN, &p.root, 3, "Old answer")]);
+    start(&p, no_claude()).await;
+    let mut c = Client::connect(&p).await;
+    create_project(&mut c, &p.root).await;
+    c.snapshot().await;
+    c.change(SHOWN, |_| true).await;
+    c.call(Request::SubscribeTerminal {
+        session: SHOWN.into(),
+    })
+    .await
+    .unwrap();
+    let old = c
+        .until(|m| matches!(m, ServerMsg::TerminalEvent { item, .. } if says(item, "Old answer")))
+        .await;
+    let last_old = terminal_items(&old, SHOWN).last().unwrap().0;
+
+    // Cut short and written anew, as a rotated file would be.
+    std::fs::write(&path, user(SHOWN, &p.root, "cli", 1, "New ask") + "\n").unwrap();
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::TerminalSessionReset { session } if session == SHOWN))
+        .await;
+    // Not sent as new items.
+    assert!(terminal_items(&seen, SHOWN).is_empty(), "{seen:?}");
+    c.call(Request::SubscribeTerminal {
+        session: SHOWN.into(),
+    })
+    .await
+    .unwrap();
+    let fresh = c
+        .until(|m| matches!(m, ServerMsg::TerminalEvent { item, .. } if says(item, "New ask")))
+        .await;
+    let fresh = terminal_items(&fresh, SHOWN);
+    assert_eq!(fresh.len(), 1, "{fresh:?}");
+    assert!(fresh[0].0 > last_old);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_and_deleted_sessions_are_not_listed() {
+    let p = Paths::new();
+    let old = "00000000-0000-4000-8000-0000000000e1";
+    let old_path = p.transcript(&p.root, old);
+    write_session(&old_path, old, &p.root, "cli", "long ago");
+    set_age(&old_path, Duration::from_secs(15 * 24 * 3600));
+    let path = p.transcript(&p.root, SHOWN);
+    write_session(&path, SHOWN, &p.root, "cli", "recent");
+
+    start(&p, no_claude()).await;
+    let mut c = Client::connect(&p).await;
+    create_project(&mut c, &p.root).await;
+    c.snapshot().await;
+    c.change(SHOWN, |_| true).await;
+    let mut other = Client::connect(&p).await;
+    let ids: Vec<String> = other.snapshot().await.into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![SHOWN.to_string()]);
+
+    std::fs::remove_file(&path).unwrap();
+    c.until(|m| matches!(m, ServerMsg::TerminalSessionRemoved { id } if id == SHOWN))
+        .await;
+    let mut other = Client::connect(&p).await;
+    assert!(other.snapshot().await.is_empty());
+    let err = c
+        .call(Request::SubscribeTerminal {
+            session: SHOWN.into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("terminal session"), "{err}");
 }

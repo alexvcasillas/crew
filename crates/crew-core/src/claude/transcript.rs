@@ -128,7 +128,22 @@ fn items(v: &Value) -> Vec<TranscriptItem> {
 }
 
 fn prompt(text: &str) -> Option<TranscriptItem> {
-    (!text.trim().is_empty()).then(|| TranscriptItem::UserPrompt(text.to_string()))
+    (!text.trim().is_empty() && !is_command_echo(text))
+        .then(|| TranscriptItem::UserPrompt(text.to_string()))
+}
+
+/// What Claude Code writes for a slash command or its output, not what
+/// the person typed.
+fn is_command_echo(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+        "<local-command-",
+    ]
+    .iter()
+    .any(|tag| text.starts_with(tag))
 }
 
 fn api_error(v: &Value) -> String {
@@ -145,14 +160,10 @@ fn api_error(v: &Value) -> String {
 /// control characters, at most 80 characters. `None` for a local command
 /// echo or a prompt with no text.
 pub fn title_from(prompt: &str) -> Option<String> {
-    let trimmed = prompt.trim_start();
-    if ["<command-", "<local-command-", "<bash-"]
-        .iter()
-        .any(|p| trimmed.starts_with(p))
-    {
+    if is_command_echo(prompt) || prompt.trim_start().starts_with("<bash-") {
         return None;
     }
-    let line = prompt
+    let line = strip_escapes(prompt)
         .split(['\n', '\r', '\u{2028}', '\u{2029}'])
         .map(clean)
         .find(|l| !l.is_empty())?;
@@ -163,6 +174,41 @@ pub fn title_from(prompt: &str) -> Option<String> {
     short.truncate(short.trim_end().len());
     short.push('…');
     Some(short)
+}
+
+/// Drops terminal escape sequences: CSI (`ESC [ ... final`), OSC
+/// (`ESC ] ... BEL` or `ESC ] ... ESC \\`) and two-character ones.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Tabs become spaces; control, bidi and zero-width characters go.

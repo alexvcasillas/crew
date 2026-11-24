@@ -1,7 +1,7 @@
 //! Chat state and run handling behind the server.
 //!
-//! Lock order: `state` before `db`. Neither lock is held across an `.await`,
-//! nor while git or a setup command runs.
+//! Lock order: `state`, then `db`, then `terminal`. No lock is held across
+//! an `.await`, nor while git, a setup command or a file read runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

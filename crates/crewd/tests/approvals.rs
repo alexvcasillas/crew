@@ -53,10 +53,30 @@ printf '{{"type":"result","subtype":"success","is_error":false,"result":"%s","du
     path
 }
 
-/// The prompt of each logged call, in order.
+/// Waits until at least `n` calls are logged in full.
+async fn until_logged(dir: &Path, n: usize) -> Vec<String> {
+    timeout(WAIT, async {
+        loop {
+            let prompts = logged_prompts(dir);
+            if prompts.len() >= n {
+                return prompts;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("calls were not logged")
+}
+
+/// The prompt of each call logged in full, in order. A call still being
+/// logged, as a busy machine may show, is left out.
 fn logged_prompts(dir: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(dir.join("args.log")).unwrap_or_default();
-    text.split_terminator('\u{1f}')
+    let mut calls: Vec<&str> = text.split('\u{1f}').collect();
+    // What follows the last call's end is a call being logged, or nothing.
+    calls.pop();
+    calls
+        .into_iter()
         .map(|call| {
             call.split_terminator('\u{1e}')
                 .next_back()
@@ -514,8 +534,10 @@ async fn approve_runs_target_with_edited_brief() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let queued = until_run(&mut c, chat.scout, RunStatus::Queued).await;
     assert_eq!(queued.thread, chat.thread);
-    // Only Forge may have started so far.
-    assert!(logged_prompts(d.dir()).iter().all(|p| p.ends_with("WAIT")));
+    // Only Forge may have started so far. Its process may still be
+    // logging its call when it counts as working.
+    let prompts = until_logged(d.dir(), 1).await;
+    assert!(prompts.iter().all(|p| p.ends_with("WAIT")), "{prompts:?}");
 
     d.go("ok");
     until_run(&mut c, chat.scout, RunStatus::Done).await;

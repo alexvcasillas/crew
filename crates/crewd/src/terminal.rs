@@ -4,14 +4,21 @@
 //! Read-only. Crew never writes under the claude home, resumes these
 //! sessions or sends them input.
 //!
-//! A watcher task tails the session files under `<claude home>/projects`.
+//! A watcher task scans the session files under `<claude home>/projects`.
 //! It is woken by file events, with a poll as backup, and reads the
 //! `<claude home>/sessions` registry for whether a session works now. It
 //! never holds the service locks while it reads files.
+//!
+//! A scan reads at most [`MAX_READ`] bytes over all files, and leaves the
+//! rest for the next one. Unless someone subscribes, a session costs only
+//! a read of its first [`HEAD_BYTES`], for its cwd and title. The last
+//! lines are read when someone subscribes, and new lines are read only
+//! while someone does.
 
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,13 +32,14 @@ use tokio::task::JoinHandle;
 
 use crate::service::{Backlog, Service, log};
 
-/// Lines read from the end of a file on first sight, and items kept for
-/// a subscriber's backlog.
+/// Lines read from the end of a file for a backlog, and items kept.
 pub const TAIL_LINES: usize = 2000;
-/// Most bytes read from one file in one go.
+/// Most bytes one scan reads over all files, and most read at once.
 pub const MAX_READ: u64 = 8 * 1024 * 1024;
 /// Most bytes read from the start of a file for its cwd and title.
-const HEAD_BYTES: u64 = 1024 * 1024;
+pub const HEAD_BYTES: u64 = 64 * 1024;
+/// Sessions not written to for this long are not listed.
+const MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Most bytes read of one registry entry.
 const REGISTRY_ENTRY_BYTES: u64 = 64 * 1024;
 /// Bytes read at a time when looking back for line starts.
@@ -53,18 +61,32 @@ pub(crate) struct TerminalState {
 
 struct Entry {
     info: TerminalSession,
-    /// Seq of the next item. Counts every item read, subscribed or not.
+    /// Seq of the next item kept.
     next_seq: u64,
     /// The last items with their seqs, kept while someone subscribes.
     buffer: Option<VecDeque<(u64, TranscriptItem)>>,
     subscribers: usize,
 }
 
+impl Entry {
+    /// Keeps the last items of `items` as the backlog, numbered on from
+    /// the last seq handed out.
+    fn fill(&mut self, items: Vec<TranscriptItem>) {
+        let skip = items.len().saturating_sub(TAIL_LINES);
+        let mut buffer = VecDeque::with_capacity(items.len() - skip);
+        for item in items.into_iter().skip(skip) {
+            buffer.push_back((self.next_seq, item));
+            self.next_seq += 1;
+        }
+        self.buffer = Some(buffer);
+    }
+}
+
 /// Requests to the watcher task.
 pub(crate) enum Cmd {
     /// Projects changed: match sessions again.
     Rescan,
-    /// Someone subscribes to a session: load its backlog if needed.
+    /// Someone subscribes to a session: read its backlog if needed.
     Load {
         session: String,
         reply: oneshot::Sender<Result<(), String>>,
@@ -106,6 +128,15 @@ impl TerminalState {
                 entry.buffer = None;
             }
         }
+    }
+
+    /// Sessions whose new lines are read.
+    fn buffered(&self) -> HashSet<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, e)| e.buffer.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 
@@ -157,12 +188,17 @@ impl Service {
     }
 
     /// Records what a scan found and tells clients.
-    fn apply(&self, updates: Vec<Update>) {
-        if updates.is_empty() {
+    fn apply(&self, updates: Vec<Update>, removed: Vec<String>) {
+        if updates.is_empty() && removed.is_empty() {
             return;
         }
         let mut db = self.db();
         let mut terminal = self.terminal();
+        for id in removed {
+            if terminal.sessions.remove(&id).is_some() {
+                self.publish_global(&mut db, ServerMsg::TerminalSessionRemoved { id });
+            }
+        }
         for u in updates {
             let id = u.info.id.clone();
             let entry = terminal
@@ -174,15 +210,22 @@ impl Service {
                     buffer: None,
                     subscribers: 0,
                 });
-            if u.backlog_only {
-                entry.next_seq += u.items.len() as u64;
-            } else {
+            if let Some(items) = u.reset
+                && entry.buffer.is_some()
+            {
+                // Subscribers ask again for the new backlog.
+                entry.fill(items);
+                self.publish_global(
+                    &mut db,
+                    ServerMsg::TerminalSessionReset {
+                        session: id.clone(),
+                    },
+                );
+            }
+            if let Some(buffer) = entry.buffer.as_mut() {
                 for item in u.items {
                     let seq = entry.next_seq;
                     entry.next_seq += 1;
-                    let Some(buffer) = entry.buffer.as_mut() else {
-                        continue;
-                    };
                     if buffer.len() == TAIL_LINES {
                         buffer.pop_front();
                     }
@@ -211,10 +254,10 @@ impl Service {
 /// What a scan found about one session.
 struct Update {
     info: TerminalSession,
+    /// New items, for subscribers.
     items: Vec<TranscriptItem>,
-    /// The items were there before anyone could subscribe: count them but
-    /// don't send them.
-    backlog_only: bool,
+    /// The file was cut short or replaced: its new backlog.
+    reset: Option<Vec<TranscriptItem>>,
     /// Seen for the first time: tell clients even if nothing changed.
     announce: bool,
 }
@@ -281,7 +324,7 @@ async fn watch(
             Ok((s, more)) => {
                 scanner = Some(s);
                 if more {
-                    // A file has more than one read's worth: go on soon.
+                    // Over this scan's read budget: go on soon.
                     ticks.reset_after(Duration::from_millis(10));
                 }
             }
@@ -309,17 +352,18 @@ struct FileState {
     kind: Kind,
     /// File length when the head was last read.
     head_len: u64,
+    /// Identity and read position since the last backlog read.
     ino: u64,
-    /// Next byte to read. Always at a line start.
+    /// Next byte to read. Always at a line start, or inside an over-long
+    /// line being skipped.
     offset: u64,
-    /// Whether the tail was read.
-    tailed: bool,
     /// Inside a line too long to read: drop bytes up to its end.
     skipping: bool,
     title: Option<String>,
     started_at: Option<i64>,
-    last_at: Option<i64>,
     mtime: SystemTime,
+    /// Clients were told about it.
+    announced: bool,
 }
 
 /// One registry entry of a running Claude Code.
@@ -328,13 +372,29 @@ struct Running {
     status: Option<String>,
 }
 
-struct Scanner {
+/// What one scan may still read.
+struct Budget {
+    left: u64,
+    /// Bytes read so far.
+    read: u64,
+}
+
+impl Budget {
+    fn spend(&mut self, n: u64) {
+        self.left = self.left.saturating_sub(n);
+        self.read += n;
+    }
+}
+
+pub(crate) struct Scanner {
     claude_home: PathBuf,
     worktrees: PathBuf,
     files: HashMap<PathBuf, FileState>,
     /// By session id. `None` if there is no registry folder.
     registry: Option<HashMap<String, Running>>,
     registry_read: Option<Instant>,
+    /// Bytes read by scans so far.
+    pub(crate) bytes_read: u64,
 }
 
 /// A project root as given and as resolved.
@@ -345,13 +405,16 @@ struct Root {
 }
 
 impl Scanner {
-    fn new(claude_home: PathBuf, worktrees: PathBuf) -> Scanner {
+    /// `worktrees` is the crew home's worktree folder, with the home
+    /// resolved.
+    pub(crate) fn new(claude_home: PathBuf, worktrees: PathBuf) -> Scanner {
         Scanner {
             claude_home,
-            worktrees: real_path(&worktrees),
+            worktrees,
             files: HashMap::new(),
             registry: None,
             registry_read: None,
+            bytes_read: 0,
         }
     }
 
@@ -381,9 +444,9 @@ impl Scanner {
             .collect()
     }
 
-    /// Reads what changed and tells clients. Returns whether a file has
-    /// more to read.
-    fn scan(&mut self, svc: &Service) -> bool {
+    /// Reads what changed, within the read budget, and tells clients.
+    /// Returns whether something was left for the next scan.
+    pub(crate) fn scan(&mut self, svc: &Service) -> bool {
         if self
             .registry_read
             .is_none_or(|at| at.elapsed() >= SLOW_POLL)
@@ -391,29 +454,54 @@ impl Scanner {
             self.read_registry();
         }
         let roots = Self::roots(svc);
+        let buffered = svc.terminal().buffered();
+        let mut budget = Budget {
+            left: MAX_READ,
+            read: 0,
+        };
         let mut updates = Vec::new();
         let mut more = false;
-        if !roots.is_empty() {
-            for path in self.session_files(&roots) {
-                match self.check(svc, &roots, &path) {
-                    Ok((update, rest)) => {
-                        updates.extend(update);
-                        more |= rest;
-                    }
-                    Err(e) => {
-                        if e.kind() != io::ErrorKind::NotFound {
-                            log(format!("can't read {}: {e}", path.display()));
-                        }
+        let mut present = HashSet::new();
+        for path in self.session_files(&roots) {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            if mtime.elapsed().is_ok_and(|age| age > MAX_AGE) {
+                continue;
+            }
+            present.insert(path.clone());
+            match self.check(svc, &roots, &path, &meta, &buffered, &mut budget) {
+                Ok((update, rest)) => {
+                    updates.extend(update);
+                    more |= rest;
+                }
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        log(format!("can't read {}: {e}", path.display()));
                     }
                 }
             }
         }
-        svc.apply(updates);
+        self.bytes_read += budget.read;
+        // Deleted, aged out or no longer in a project folder.
+        let mut removed = Vec::new();
+        self.files.retain(|path, f| {
+            let keep = present.contains(path);
+            if !keep && f.announced {
+                removed.push(f.session.clone());
+            }
+            keep
+        });
+        svc.apply(updates, removed);
         more
     }
 
     /// Session files in folders that may belong to a project.
     fn session_files(&self, roots: &[Root]) -> Vec<PathBuf> {
+        if roots.is_empty() {
+            return vec![];
+        }
         let Ok(folders) = std::fs::read_dir(self.claude_home.join("projects")) else {
             return vec![];
         };
@@ -449,9 +537,12 @@ impl Scanner {
         svc: &Service,
         roots: &[Root],
         path: &Path,
+        meta: &Metadata,
+        buffered: &HashSet<String>,
+        budget: &mut Budget,
     ) -> io::Result<(Option<Update>, bool)> {
-        let meta = std::fs::metadata(path)?;
         let len = meta.len();
+        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
         if !self.files.contains_key(path) {
             let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
                 return Ok((None, false));
@@ -468,30 +559,43 @@ impl Scanner {
                     head_len: 0,
                     ino: meta.ino(),
                     offset: 0,
-                    tailed: false,
                     skipping: false,
                     title: None,
                     started_at: None,
-                    last_at: None,
-                    mtime: meta.modified().unwrap_or(UNIX_EPOCH),
+                    mtime,
+                    announced: false,
                 },
             );
         }
         let worktrees = self.worktrees.clone();
         let file = self.files.get_mut(path).expect("just added");
-        file.mtime = meta.modified().unwrap_or(file.mtime);
+        file.mtime = mtime;
 
-        if matches!(file.kind, Kind::Unknown) && len != file.head_len {
-            read_head(path, file, len)?;
-            if let Kind::Known { .. } = file.kind
+        // The head, for the cwd and title, until it has them or is full.
+        let want_head = match file.kind {
+            Kind::Unknown => true,
+            Kind::Known { .. } => file.title.is_none() && file.head_len < HEAD_BYTES,
+            Kind::Skip => false,
+        };
+        if want_head && len != file.head_len {
+            let size = len.min(HEAD_BYTES);
+            if budget.left < size {
+                return Ok((None, true));
+            }
+            budget.spend(size);
+            let was_unknown = matches!(file.kind, Kind::Unknown);
+            read_head(path, file, len, size)?;
+            if was_unknown
+                && matches!(file.kind, Kind::Known { .. })
                 && svc.is_crew_session(&file.session)
             {
                 file.kind = Kind::Skip;
             }
             if matches!(file.kind, Kind::Unknown) && len >= HEAD_BYTES {
-                // A megabyte without a cwd: not a session we can place.
+                // A full head without a cwd: not a session we can place.
                 file.kind = Kind::Skip;
             }
+            file.started_at.get_or_insert(millis(mtime));
         }
         let Kind::Known { cwd, real } = &file.kind else {
             return Ok((None, false));
@@ -502,76 +606,59 @@ impl Scanner {
         let cwd = cwd.clone();
 
         let mut items = Vec::new();
-        let mut backlog_only = false;
-        let mut announce = false;
+        let mut reset = None;
         let mut more = false;
-        let rotated = meta.ino() != file.ino || len < file.offset;
-        if !file.tailed || rotated {
-            // First sight, or a new file in its place: the last lines only.
-            backlog_only = !file.tailed;
-            announce = !file.tailed;
-            file.ino = meta.ino();
-            let mut f = File::open(path)?;
-            let (start, end) = tail_range(&mut f, len, TAIL_LINES, MAX_READ)?;
-            let bytes = read_range(&mut f, start, end)?;
-            items = take_lines(file, &bytes);
-            file.offset = end;
-            // No line end within reach: an over-long line.
-            file.skipping = start == end && len - end >= MAX_READ;
-            if file.skipping {
-                file.offset = len;
-            }
-            file.tailed = true;
-        } else if len > file.offset {
-            let mut f = File::open(path)?;
-            let end = len.min(file.offset + MAX_READ);
-            let bytes = read_range(&mut f, file.offset, end)?;
-            let mut used = 0;
-            if file.skipping {
-                match bytes.iter().position(|b| *b == b'\n') {
-                    Some(at) => {
-                        used = at + 1;
-                        file.skipping = false;
-                    }
-                    None => used = bytes.len(),
+        if buffered.contains(&file.session) {
+            let rotated = meta.ino() != file.ino || len < file.offset;
+            if rotated {
+                // A whole read, so a short budget can't pass for an
+                // over-long line.
+                if budget.left < MAX_READ {
+                    more = true;
+                } else {
+                    let mut f = File::open(path)?;
+                    let tail = tail_range(&mut f, len, TAIL_LINES, budget.left)?;
+                    budget.spend(tail.scanned);
+                    reset = Some(take_lines(file, &tail.bytes));
+                    file.ino = meta.ino();
+                    file.offset = tail.end;
+                    file.skipping = tail.over_long;
+                }
+            } else if len > file.offset {
+                let available = len - file.offset;
+                let size = available.min(MAX_READ).min(budget.left);
+                if size == 0 {
+                    more = true;
+                } else {
+                    let mut f = File::open(path)?;
+                    let bytes = read_range(&mut f, file.offset, file.offset + size)?;
+                    budget.spend(size);
+                    let split = complete_lines(&bytes, file.skipping, MAX_READ);
+                    items = take_lines(file, &bytes[split.lines]);
+                    file.offset += split.used as u64;
+                    file.skipping = split.skipping;
+                    more = size < available;
                 }
             }
-            match bytes[used..].iter().rposition(|b| *b == b'\n') {
-                Some(last) => {
-                    let lines = &bytes[used..used + last + 1];
-                    items = take_lines(file, lines);
-                    used += last + 1;
-                }
-                None if bytes.len() as u64 == MAX_READ && !file.skipping => {
-                    // One line longer than a whole read: skip it.
-                    used = bytes.len();
-                    file.skipping = true;
-                }
-                None => {}
-            }
-            file.offset += used as u64;
-            // Cut at the read limit: go on soon.
-            more = end < len;
         }
 
-        let mtime_ms = millis(file.mtime);
-        let started_at = file.started_at.unwrap_or(mtime_ms);
         let mut info = TerminalSession {
             id: file.session.clone(),
             project,
             cwd,
             title: file.title.clone().unwrap_or_default(),
-            started_at,
-            last_active_at: file.last_at.unwrap_or(mtime_ms).max(started_at),
+            started_at: file.started_at.unwrap_or_else(|| millis(mtime)),
+            last_active_at: millis(mtime),
             live: false,
         };
-        let mtime = file.mtime;
+        let announce = !file.announced;
+        file.announced = true;
         info.live = self.is_live(&info.id, mtime);
         Ok((
             Some(Update {
                 info,
                 items,
-                backlog_only,
+                reset,
                 announce,
             }),
             more,
@@ -582,36 +669,37 @@ impl Scanner {
     /// one more subscriber.
     fn load(&mut self, svc: &Service, session: &str) -> Result<(), String> {
         let missing = || format!("There is no terminal session {session}.");
-        let next_seq = {
+        {
             let mut terminal = svc.terminal();
             let entry = terminal.sessions.get_mut(session).ok_or_else(missing)?;
             if entry.buffer.is_some() {
                 entry.subscribers += 1;
                 return Ok(());
             }
-            entry.next_seq
-        };
-        let (path, offset) = self
+        }
+        let (path, file) = self
             .files
-            .iter()
+            .iter_mut()
             .find(|(_, f)| f.session == session)
-            .map(|(p, f)| (p.clone(), f.offset))
             .ok_or_else(missing)?;
         // Read without the lock. Only this task adds items, so none come
         // in meanwhile.
-        let items = read_tail_items(&path, offset)
-            .map_err(|e| format!("Can't read the terminal session: {e}"))?;
-        let keep = items.len().min(TAIL_LINES).min(next_seq as usize);
-        let first = next_seq - keep as u64;
-        let buffer: VecDeque<(u64, TranscriptItem)> = items[items.len() - keep..]
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, item)| (first + i as u64, item))
-            .collect();
+        let read = || -> io::Result<(Tail, u64)> {
+            let mut f = File::open(path)?;
+            let meta = f.metadata()?;
+            Ok((
+                tail_range(&mut f, meta.len(), TAIL_LINES, MAX_READ)?,
+                meta.ino(),
+            ))
+        };
+        let (tail, ino) = read().map_err(|e| format!("Can't read the terminal session: {e}"))?;
+        let items = take_lines(file, &tail.bytes);
+        file.ino = ino;
+        file.offset = tail.end;
+        file.skipping = tail.over_long;
         let mut terminal = svc.terminal();
         let entry = terminal.sessions.get_mut(session).ok_or_else(missing)?;
-        entry.buffer = Some(buffer);
+        entry.fill(items);
         entry.subscribers += 1;
         Ok(())
     }
@@ -675,13 +763,12 @@ impl Scanner {
     }
 }
 
-/// Reads up to 1 MB from the start of the file for the session's cwd,
+/// Reads the first `size` bytes of the file for the session's cwd,
 /// entrypoint, start time and title.
-fn read_head(path: &Path, file: &mut FileState, len: u64) -> io::Result<()> {
+fn read_head(path: &Path, file: &mut FileState, len: u64, size: u64) -> io::Result<()> {
     file.head_len = len;
     let mut f = File::open(path)?;
-    let end = len.min(HEAD_BYTES);
-    let bytes = read_range(&mut f, 0, end)?;
+    let bytes = read_range(&mut f, 0, size)?;
     let complete = match bytes.iter().rposition(|b| *b == b'\n') {
         Some(last) => &bytes[..last + 1],
         None => return Ok(()),
@@ -701,6 +788,9 @@ fn read_head(path: &Path, file: &mut FileState, len: u64) -> io::Result<()> {
             file.title = first_title(&parsed.items);
         }
     }
+    if !matches!(file.kind, Kind::Unknown) {
+        return Ok(());
+    }
     if headless {
         file.kind = Kind::Skip;
     } else if let Some(cwd) = cwd {
@@ -710,8 +800,7 @@ fn read_head(path: &Path, file: &mut FileState, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Parses complete lines, notes their times and title, and returns their
-/// items.
+/// Parses complete lines, notes a title, and returns their items.
 fn take_lines(file: &mut FileState, bytes: &[u8]) -> Vec<TranscriptItem> {
     let mut items = Vec::new();
     for line in bytes.split(|b| *b == b'\n') {
@@ -719,10 +808,6 @@ fn take_lines(file: &mut FileState, bytes: &[u8]) -> Vec<TranscriptItem> {
             continue;
         }
         let parsed = transcript::parse(&String::from_utf8_lossy(line));
-        if let Some(at) = parsed.info.timestamp {
-            file.started_at.get_or_insert(at);
-            file.last_at = Some(file.last_at.map_or(at, |last| last.max(at)));
-        }
         if file.title.is_none() {
             file.title = first_title(&parsed.items);
         }
@@ -738,39 +823,91 @@ fn first_title(items: &[TranscriptItem]) -> Option<String> {
     })
 }
 
-/// The items of the last lines before `end`.
-fn read_tail_items(path: &Path, end: u64) -> io::Result<Vec<TranscriptItem>> {
-    let mut f = File::open(path)?;
-    let (start, end) = tail_range(&mut f, end, TAIL_LINES, MAX_READ)?;
-    let bytes = read_range(&mut f, start, end)?;
-    let mut items = Vec::new();
-    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        items.extend(transcript::parse_line(&String::from_utf8_lossy(line)));
-    }
-    Ok(items)
+/// How a read splits into whole lines.
+#[derive(Debug, PartialEq)]
+struct Split {
+    /// The whole lines, within the read.
+    lines: Range<usize>,
+    /// Bytes done with: skipped, or in whole lines.
+    used: usize,
+    /// Whether the read ends inside a line being skipped.
+    skipping: bool,
 }
 
-/// The byte range of the last `max_lines` complete lines in the first
-/// `len` bytes, at most `max_bytes` long. Reads back from `len` in chunks,
-/// so a large file is not read whole. The range is empty if no line ends
-/// within reach.
+/// Splits a read into whole lines. With `skipping`, bytes up to the first
+/// line end belong to an over-long line and are dropped. A line with no
+/// end within `max_line` bytes of its start is over-long. A part line at
+/// the end of a shorter read waits for the rest.
+fn complete_lines(bytes: &[u8], skipping: bool, max_line: u64) -> Split {
+    let mut start = 0;
+    if skipping {
+        match bytes.iter().position(|b| *b == b'\n') {
+            Some(at) => start = at + 1,
+            None => {
+                return Split {
+                    lines: 0..0,
+                    used: bytes.len(),
+                    skipping: true,
+                };
+            }
+        }
+    }
+    let rest = &bytes[start..];
+    match rest.iter().rposition(|b| *b == b'\n') {
+        Some(last) => Split {
+            lines: start..start + last + 1,
+            used: start + last + 1,
+            skipping: false,
+        },
+        // Only what is left after the skipped part counts.
+        None if rest.len() as u64 >= max_line => Split {
+            lines: start..start,
+            used: bytes.len(),
+            skipping: true,
+        },
+        None => Split {
+            lines: start..start,
+            used: start,
+            skipping: false,
+        },
+    }
+}
+
+/// The last lines of a file.
+#[derive(Debug)]
+pub(crate) struct Tail {
+    /// The whole lines that end at `end`.
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) end: u64,
+    /// Bytes read to find them.
+    pub(crate) scanned: u64,
+    /// No line ends within reach: the file ends in an over-long line.
+    pub(crate) over_long: bool,
+}
+
+/// The last `max_lines` whole lines in the first `len` bytes, at most
+/// `max_bytes` read. Reads back from `len` in chunks, so a large file is
+/// not read whole.
 pub(crate) fn tail_range(
     f: &mut File,
     len: u64,
     max_lines: usize,
     max_bytes: u64,
-) -> io::Result<(u64, u64)> {
+) -> io::Result<Tail> {
     let floor = len.saturating_sub(max_bytes);
-    let mut buf = vec![0u8; CHUNK];
+    // Chunks from the end backwards.
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut pos = len;
     let mut end = None;
     let mut lowest = None;
     let mut lines = 0;
-    while pos > floor {
+    let mut start = None;
+    'read: while pos > floor {
         let n = (pos - floor).min(CHUNK as u64) as usize;
         pos -= n as u64;
+        let mut buf = vec![0u8; n];
         f.seek(SeekFrom::Start(pos))?;
-        f.read_exact(&mut buf[..n])?;
+        f.read_exact(&mut buf)?;
         for i in (0..n).rev() {
             if buf[i] != b'\n' {
                 continue;
@@ -778,31 +915,53 @@ pub(crate) fn tail_range(
             let at = pos + i as u64;
             match end {
                 None => end = Some(at + 1),
-                Some(end) => {
+                Some(_) => {
                     lines += 1;
                     if lines == max_lines {
-                        return Ok((at + 1, end));
+                        start = Some(at + 1);
+                        chunks.push(buf);
+                        break 'read;
                     }
                 }
             }
             lowest = Some(at);
         }
+        chunks.push(buf);
     }
+    let scanned = len - pos;
     let Some(end) = end else {
-        return Ok((floor, floor));
+        // Over long if cut by the limit; else a part line to wait for.
+        let at = if floor > 0 { len } else { 0 };
+        return Ok(Tail {
+            bytes: vec![],
+            end: at,
+            scanned,
+            over_long: floor > 0,
+        });
     };
-    if floor == 0 {
-        return Ok((0, end));
+    let start = match start {
+        Some(start) => start,
+        None if floor == 0 => 0,
+        // Cut by the byte limit: start at the first whole line within it.
+        None => lowest.map_or(end, |at| at + 1),
+    };
+    let mut window = Vec::with_capacity(scanned as usize);
+    for chunk in chunks.iter().rev() {
+        window.extend_from_slice(chunk);
     }
-    // Cut by the byte limit: start at the first whole line within it.
-    let start = lowest.map_or(end, |at| at + 1);
-    Ok((start, end))
+    let bytes = window[(start - pos) as usize..(end - pos) as usize].to_vec();
+    Ok(Tail {
+        bytes,
+        end,
+        scanned,
+        over_long: false,
+    })
 }
 
 fn read_range(f: &mut File, start: u64, end: u64) -> io::Result<Vec<u8>> {
-    let mut bytes = vec![0u8; end.saturating_sub(start) as usize];
+    let mut bytes = Vec::with_capacity(end.saturating_sub(start) as usize);
     f.seek(SeekFrom::Start(start))?;
-    f.read_exact(&mut bytes)?;
+    f.take(end.saturating_sub(start)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -857,6 +1016,8 @@ fn pid_alive(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::CliBins;
+    use crew_core::store::Store;
     use std::io::Write;
 
     fn file_with(content: &[u8]) -> (tempfile::NamedTempFile, File) {
@@ -866,16 +1027,26 @@ mod tests {
         (tmp, f)
     }
 
+    /// Where the tail starts and ends.
+    fn range(t: &Tail) -> (u64, u64) {
+        (t.end - t.bytes.len() as u64, t.end)
+    }
+
     #[test]
     fn the_tail_is_the_last_whole_lines() {
         let (_tmp, mut f) = file_with(b"a\nbb\nccc\npartial");
         let len = f.metadata().unwrap().len();
-        assert_eq!(tail_range(&mut f, len, 2, MAX_READ).unwrap(), (2, 9));
-        assert_eq!(tail_range(&mut f, len, 10, MAX_READ).unwrap(), (0, 9));
+        let t = tail_range(&mut f, len, 2, MAX_READ).unwrap();
+        assert_eq!((range(&t), t.bytes.as_slice()), ((2, 9), &b"bb\nccc\n"[..]));
+        assert_eq!(
+            range(&tail_range(&mut f, len, 10, MAX_READ).unwrap()),
+            (0, 9)
+        );
         // Up to a given end.
-        assert_eq!(tail_range(&mut f, 5, 10, MAX_READ).unwrap(), (0, 5));
-        // Nothing complete yet.
-        assert_eq!(tail_range(&mut f, 1, 10, MAX_READ).unwrap(), (0, 0));
+        assert_eq!(range(&tail_range(&mut f, 5, 10, MAX_READ).unwrap()), (0, 5));
+        // Nothing whole yet.
+        let t = tail_range(&mut f, 1, 10, MAX_READ).unwrap();
+        assert!(t.bytes.is_empty() && !t.over_long);
     }
 
     #[test]
@@ -884,11 +1055,15 @@ mod tests {
         content.extend_from_slice(b"\none\ntwo\n");
         let (_tmp, mut f) = file_with(&content);
         let len = content.len() as u64;
-        let (start, end) = tail_range(&mut f, len, 100, 20).unwrap();
-        assert_eq!(&content[start as usize..end as usize], b"one\ntwo\n");
+        let t = tail_range(&mut f, len, 100, 20).unwrap();
+        assert_eq!(t.bytes, b"one\ntwo\n");
+        assert!(t.scanned <= 20);
         // One line longer than the limit gives nothing.
-        let (start, end) = tail_range(&mut f, 3 * CHUNK as u64 + 1, 100, 20).unwrap();
-        assert_eq!(start, end);
+        let t = tail_range(&mut f, 3 * CHUNK as u64 + 1, 100, 20).unwrap();
+        assert!(t.bytes.is_empty());
+        // No line end at all within reach: over long.
+        let t = tail_range(&mut f, 3 * CHUNK as u64, 100, 20).unwrap();
+        assert!(t.bytes.is_empty() && t.over_long);
     }
 
     #[test]
@@ -899,10 +1074,68 @@ mod tests {
         }
         let (_tmp, mut f) = file_with(&content);
         let len = content.len() as u64;
-        let (start, end) = tail_range(&mut f, len, 3, MAX_READ).unwrap();
+        let t = tail_range(&mut f, len, 3, MAX_READ).unwrap();
+        assert_eq!(t.bytes, b"line 49997\nline 49998\nline 49999\n");
+        assert!(t.scanned < CHUNK as u64 + 1);
+        let t = tail_range(&mut f, len, 20_000, MAX_READ).unwrap();
+        assert!(t.bytes.starts_with(b"line 30000\n"));
+    }
+
+    #[test]
+    fn reads_split_into_whole_lines() {
         assert_eq!(
-            &content[start as usize..end as usize],
-            b"line 49997\nline 49998\nline 49999\n"
+            complete_lines(b"a\nb\npart", false, 100),
+            Split {
+                lines: 0..4,
+                used: 4,
+                skipping: false
+            }
+        );
+        // A part line in a short read waits.
+        assert_eq!(
+            complete_lines(b"part", false, 100),
+            Split {
+                lines: 0..0,
+                used: 0,
+                skipping: false
+            }
+        );
+        // A line with no end in a whole read is skipped.
+        assert_eq!(
+            complete_lines(b"0123456789", false, 10),
+            Split {
+                lines: 0..0,
+                used: 10,
+                skipping: true
+            }
+        );
+        // The rest of a skipped line goes, then whole lines are kept.
+        assert_eq!(
+            complete_lines(b"tail\nnext\n", true, 10),
+            Split {
+                lines: 5..10,
+                used: 10,
+                skipping: false
+            }
+        );
+        // After a skipped part, a line cut by the read waits: only the
+        // part after the skip counts toward the limit.
+        assert_eq!(
+            complete_lines(b"end\n012345", true, 10),
+            Split {
+                lines: 4..4,
+                used: 4,
+                skipping: false
+            }
+        );
+        // Still inside the skipped line.
+        assert_eq!(
+            complete_lines(b"0123", true, 10),
+            Split {
+                lines: 0..0,
+                used: 4,
+                skipping: true
+            }
         );
     }
 
@@ -942,5 +1175,94 @@ mod tests {
             folder_name(Path::new("/work/demo/.config/my_app")),
             "-work-demo--config-my-app"
         );
+    }
+
+    /// A service with one project at `<tmp>/ws` and `n` sessions in it,
+    /// each `size` bytes and written an hour ago.
+    fn many_sessions(n: usize, size: usize) -> (tempfile::TempDir, Service, Scanner) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&base.join("crew.db")).unwrap();
+        store.create_project("demo", &root, "main").unwrap();
+        let svc = Service::new(
+            store,
+            4,
+            CliBins::default(),
+            base.join("crew/worktrees"),
+            None,
+            Duration::from_secs(60),
+            64,
+        );
+        let claude = base.join("claude");
+        let folder = claude.join("projects").join(folder_name(&root));
+        std::fs::create_dir_all(&folder).unwrap();
+        let filler = format!(
+            "{}\n",
+            serde_json::json!({"type": "attachment", "attachment": {"type": "x", "pad": "x".repeat(1000)}})
+        );
+        for i in 0..n {
+            let id = format!("00000000-0000-4000-8000-{i:012}");
+            let first = serde_json::json!({
+                "type": "user", "message": {"content": format!("ask {i}")},
+                "sessionId": id, "cwd": root, "entrypoint": "cli",
+                "timestamp": "2026-11-20T10:00:00Z",
+            });
+            let mut text = format!("{first}\n");
+            while text.len() < size {
+                text.push_str(&filler);
+            }
+            let path = folder.join(format!("{id}.jsonl"));
+            std::fs::write(&path, text).unwrap();
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
+        }
+        let scanner = Scanner::new(claude, base.join("crew/worktrees"));
+        (tmp, svc, scanner)
+    }
+
+    #[test]
+    fn old_sessions_cost_only_their_heads() {
+        let (_tmp, svc, mut scanner) = many_sessions(50, 1024 * 1024);
+        assert!(!scanner.scan(&svc));
+        assert!(
+            scanner.bytes_read <= 50 * HEAD_BYTES,
+            "read {} bytes",
+            scanner.bytes_read
+        );
+        let sessions = svc.terminal().sessions();
+        assert_eq!(sessions.len(), 50);
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.title.starts_with("ask ") && !s.live)
+        );
+        // Nothing changed: nothing read.
+        let before = scanner.bytes_read;
+        assert!(!scanner.scan(&svc));
+        assert_eq!(scanner.bytes_read, before);
+    }
+
+    #[test]
+    fn one_scan_reads_at_most_its_budget() {
+        // 200 heads of 64 KB are more than one scan may read.
+        let (_tmp, svc, mut scanner) = many_sessions(200, 100 * 1024);
+        assert!(scanner.scan(&svc), "should leave work for the next scan");
+        assert!(
+            scanner.bytes_read <= MAX_READ,
+            "read {}",
+            scanner.bytes_read
+        );
+        let first = svc.terminal().sessions().len();
+        assert!(first > 0 && first < 200, "{first}");
+        let before = scanner.bytes_read;
+        assert!(!scanner.scan(&svc));
+        assert!(scanner.bytes_read - before <= MAX_READ);
+        assert_eq!(svc.terminal().sessions().len(), 200);
     }
 }
