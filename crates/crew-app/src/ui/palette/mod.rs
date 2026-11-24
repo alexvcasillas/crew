@@ -58,6 +58,8 @@ const ROW_H: f32 = 36.;
 const LIST_MAX_H: f32 = 480.;
 /// Alpha of the match tint.
 const MATCH_ALPHA: f32 = 0.2;
+/// Under the local rows when crewd couldn't search.
+const SEARCH_DOWN: &str = "Search isn't available right now.";
 const PLACEHOLDER: &str = "Search threads, channels, agents, files…";
 /// The board's pulse mark for Running now.
 const PULSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>"#;
@@ -92,6 +94,10 @@ pub(super) struct Palette {
     seq: u64,
     /// Waits out the debounce, then asks crewd.
     search: Option<Task<()>>,
+    /// The latest search failed, so threads and files may be missing.
+    failed: bool,
+    /// Searches sent to crewd since the palette opened.
+    sent: u64,
     scroll: ScrollHandle,
     /// Scroll the highlighted row into view on the next draw.
     reveal: bool,
@@ -126,6 +132,8 @@ impl Palette {
             remote: None,
             seq: 0,
             search: None,
+            failed: false,
+            sent: 0,
             scroll: ScrollHandle::new(),
             reveal: false,
             pointer: None,
@@ -154,6 +162,7 @@ impl Palette {
     /// [`DEBOUNCE`]. A newer query drops the older one's wait and answer.
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
         self.seq += 1;
+        self.failed = false;
         let query = self.query.trim().to_string();
         if query.is_empty() {
             self.search = None;
@@ -165,6 +174,10 @@ impl Palette {
         let client = self.client.clone();
         self.search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
+            let sent = this.update(cx, |this, _| this.sent += 1);
+            if sent.is_err() {
+                return;
+            }
             let answer = client
                 .request(Request::Search {
                     query: query.clone(),
@@ -184,8 +197,11 @@ impl Palette {
                     };
                     this.update(cx, |this, cx| this.land(seq, remote, cx)).ok();
                 }
-                // The local rows stay; the next keystroke asks again.
-                Err(e) => eprintln!("crew: search failed: {e}"),
+                // The local rows stay, with a line saying search is down.
+                Err(e) => {
+                    eprintln!("crew: search failed: {e}");
+                    this.update(cx, |this, cx| this.fail(seq, cx)).ok();
+                }
             }
         }));
     }
@@ -199,6 +215,28 @@ impl Palette {
         self.remote = Some(remote);
         self.search = None;
         cx.notify();
+    }
+
+    /// Notes that search `seq` failed, unless a newer one was sent since.
+    fn fail(&mut self, seq: u64, cx: &mut Context<Self>) {
+        if seq != self.seq {
+            return;
+        }
+        self.failed = true;
+        self.search = None;
+        cx.notify();
+    }
+
+    /// Whether the search field has focus.
+    #[cfg(test)]
+    pub(super) fn field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// How many searches went to crewd.
+    #[cfg(test)]
+    pub(super) fn sent(&self) -> u64 {
+        self.sent
     }
 
     /// The number of the latest search.
@@ -270,6 +308,8 @@ impl Palette {
     fn perform(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         if let Target::ShowAll(kind) = target {
             self.expanded.insert(kind);
+            // A click may have moved focus; the keys work in the field.
+            self.input.update(cx, |input, cx| input.focus(window, cx));
             cx.notify();
             return;
         }
@@ -385,6 +425,8 @@ impl Palette {
             .overflow_hidden()
             .cursor_pointer()
             .when(selected, |r| r.bg(color("surface-300")))
+            // Clicking a row leaves the cursor in the field.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .role(Role::ListBoxOption)
             .aria_label(row.label.clone())
             .aria_description(row.sub.clone())
@@ -542,13 +584,29 @@ impl Render for Palette {
                 child += 1;
             }
         }
-        if count == 0 {
+        let searching = self.search.is_some() && !self.query.trim().is_empty();
+        let note = if self.failed {
+            Some(SEARCH_DOWN)
+        } else if searching {
+            Some("Searching…")
+        } else if count == 0 {
+            Some("No matches")
+        } else {
+            None
+        };
+        if let Some(note) = note {
+            let padding = if count == 0 { 24. } else { 8. };
             list = list.child(
                 div()
-                    .py(px(24.))
-                    .text_center()
+                    .id("palette-note")
+                    .py(px(padding))
+                    .px(px(16.))
+                    .when(count == 0, |d| d.text_center())
+                    .text_size(px(12.))
                     .text_color(color("text-tertiary"))
-                    .child("No matches"),
+                    .aria_label(note)
+                    .child(note)
+                    .test_support(),
             );
         }
         if std::mem::take(&mut self.reveal)

@@ -433,10 +433,7 @@ fn a_long_section_shows_five_then_all(cx: &mut TestAppContext) {
     assert!(shows_in_palette(cx, window, "Channels · 6"));
     let show_all = row_index(cx, window, "Show all 6", "");
     assert_eq!(show_all, 5, "after five channels");
-    for _ in 0..show_all {
-        press(cx, window, "down");
-    }
-    press(cx, window, "enter");
+    click(cx, window, ("palette-row", show_all));
     assert!(has(cx, window, "palette"), "stays open");
     let channels = rows(cx, window)
         .iter()
@@ -448,4 +445,104 @@ fn a_long_section_shows_five_then_all(cx: &mut TestAppContext) {
             .iter()
             .any(|(l, _)| l.starts_with("Show all"))
     );
+
+    // The click left the keys working in the field.
+    let focused = cx
+        .update_window(window, |_, window, cx| {
+            ws.read(cx)
+                .palette()
+                .unwrap()
+                .read(cx)
+                .field_focused(window, cx)
+        })
+        .unwrap();
+    assert!(focused, "the cursor stays in the field");
+    let count = rows(cx, window).len();
+    let selected = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, cx| ws.palette().unwrap().read(cx).selected())
+    };
+    press(cx, window, "down");
+    let before = selected(cx);
+    press(cx, window, "up");
+    assert_eq!(selected(cx), (before + count - 1) % count);
+    press(cx, window, "escape");
+    assert!(!has(cx, window, "palette"));
+}
+
+#[gpui_kit::test]
+fn a_typing_burst_sends_one_search(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    wait_for_snapshot(cx, &ws, w.thread);
+    open_palette(cx, window);
+    let palette = ws.read_with(cx, |ws, _| ws.palette().unwrap().clone());
+    for key in ["z", "z", "z"] {
+        type_text(cx, window, key);
+        cx.executor().advance_clock(Duration::from_millis(50));
+    }
+    assert_eq!(palette.read_with(cx, |p, _| p.sent()), 0, "still typing");
+    assert!(shows_in_palette(cx, window, "Searching…"));
+    assert!(!shows_in_palette(cx, window, "No matches"));
+    cx.executor().advance_clock(DEBOUNCE);
+    wait_until(cx, "the answer", |cx| {
+        palette.read_with(cx, |p, _| p.remote_query()).as_deref() == Some("zzz")
+    });
+    assert_eq!(palette.read_with(cx, |p, _| p.sent()), 1);
+    assert!(!shows_in_palette(cx, window, "Searching…"));
+    assert_eq!(
+        rows(cx, window),
+        [("New thread in #general: “zzz”".into(), String::new())],
+        "only the action matches"
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_search_says_so_until_the_next_query(cx: &mut TestAppContext) {
+    // No crewd: every search fails.
+    let home = short_home();
+    let (window, ws) = open(cx, home.path());
+    open_palette(cx, window);
+    let palette = ws.read_with(cx, |ws, _| ws.palette().unwrap().clone());
+    search(cx, window, "fix", "Search isn't available right now.");
+    assert!(!shows_in_palette(cx, window, "No matches"));
+    assert!(!shows_in_palette(cx, window, "Searching…"));
+    assert_eq!(palette.read_with(cx, |p, _| p.sent()), 1);
+    type_text(cx, window, "e");
+    assert!(!shows_in_palette(
+        cx,
+        window,
+        "Search isn't available right now."
+    ));
+    assert!(shows_in_palette(cx, window, "Searching…"));
+}
+
+#[gpui_kit::test]
+fn stop_all_shows_while_a_run_is_live(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = fake_claude(
+        tmp.path(),
+        &format!(
+            "head -n 4 '{}'\nexec sleep 60",
+            fixture("edit_and_test.jsonl").display()
+        ),
+    );
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open(cx, home.path());
+    w.post("@Forge look");
+    super::thread_tests::live_run(cx, &ws, w.thread);
+
+    open_palette(cx, window);
+    let stop = row_index(cx, window, "Stop all agents", "");
+    click(cx, window, ("palette-row", stop));
+    assert!(!has(cx, window, "palette"));
+    wait_until(cx, "every run to stop", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().running().is_empty())
+    });
+    open_palette(cx, window);
+    assert!(!rows(cx, window).iter().any(|(l, _)| l == "Stop all agents"));
 }

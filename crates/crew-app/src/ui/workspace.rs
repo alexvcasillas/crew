@@ -700,11 +700,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Writes the recents to the prefs file, off the UI thread.
+    /// Writes the recents to the prefs file, off the UI thread, after any
+    /// write still pending, so none is dropped and the latest lands last.
     fn save_recents(&mut self, cx: &mut Context<Self>) {
         let recents = self.recents.clone();
         let home = self.conn.crew_home.clone();
+        let pending = self.recents_task.take();
         self.recents_task = Some(cx.background_executor().spawn(async move {
+            if let Some(pending) = pending {
+                pending.await;
+            }
             if let Err(e) = recents.save(&home) {
                 eprintln!("crew: couldn't save recent places: {e}");
             }
