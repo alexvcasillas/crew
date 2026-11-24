@@ -3,7 +3,6 @@
 //! It takes the place of the sidebar, the main area and the inspector.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use crew_core::ids::{AgentId, ThreadId};
 use crew_core::store::Author;
@@ -115,6 +114,10 @@ pub(super) struct Review {
     busy: bool,
     /// Why the last read failed, shown in place of the diff.
     failed: Option<String>,
+    /// The file you last picked in the list, by index.
+    current_file: Option<usize>,
+    /// Why Open in editor failed, shown above the diff.
+    open_error: Option<String>,
     focus: FocusHandle,
 }
 
@@ -352,6 +355,8 @@ impl Workspace {
             _message_events: events,
             busy: false,
             failed: None,
+            current_file: None,
+            open_error: None,
             focus,
         });
         self.sync_review_comments(cx);
@@ -658,9 +663,10 @@ impl Workspace {
     }
 
     fn scroll_to_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        if let Some(review) = &self.review
+        if let Some(review) = &mut self.review
             && let Some(&row) = review.file_rows.get(file)
         {
+            review.current_file = Some(file);
             review.list.scroll_to(ListOffset {
                 item_ix: row,
                 offset_in_item: px(0.),
@@ -883,22 +889,45 @@ impl Workspace {
         }
     }
 
-    /// Opens the worktree folder in the editor app, or in Finder.
+    /// Opens the worktree in your editor, or in Finder. With a file
+    /// picked in the list, an editor gets that file too. Failing says so
+    /// under the title of the diff.
     fn open_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .review
-            .as_ref()
-            .and_then(|r| self.state().thread(r.thread))
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        let Some(worktree) = self
+            .state()
+            .thread(thread)
             .and_then(|t| t.worktree.as_ref())
             .map(|wt| wt.path.clone())
         else {
             return;
         };
-        let opened = cx
-            .background_executor()
-            .spawn(async move { open_folder(path, editor_app()) });
-        self.spawn_request(window, cx, async move |_, _| {
-            opened.await.map_err(|e| (e, None))
+        let app = self.editor_app();
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        review.open_error = None;
+        let file = review
+            .current_file
+            .and_then(|ix| review.files.get(ix))
+            .filter(|f| !matches!(f.kind, FileKind::Deleted))
+            .map(|f| worktree.join(&f.path));
+        let args = crate::editor::open_args(app.as_deref(), &worktree, file.as_deref());
+        let opener = self.opener.clone();
+        let opened = cx.background_executor().spawn(async move { opener(args) });
+        self.spawn_request(window, cx, async move |this, cx| {
+            if opened.await.is_err() {
+                this.update_in(cx, |this, _, cx| {
+                    if let Some(review) = this.review.as_mut() {
+                        review.open_error = Some(crate::editor::open_failed(app.as_deref()));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            Ok(())
         });
     }
 
@@ -1464,6 +1493,7 @@ impl Workspace {
             Some(_) => None,
             None => Some(NOTHING_TO_REVIEW.to_string()),
         };
+        let open_error = review.and_then(|r| r.open_error.clone());
         let body = match (empty, review) {
             (None, Some(review)) => div()
                 .id("review-diff")
@@ -1499,6 +1529,14 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
+            .when_some(open_error, |col, error| {
+                col.child(
+                    div()
+                        .px(px(16.))
+                        .py(px(8.))
+                        .child(super::settings::form_error("review-open-error", error)),
+                )
+            })
             .child(body)
     }
 
@@ -1813,40 +1851,6 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
                 .text_color(color("danger"))
                 .child(format!("−{removed}")),
         )
-}
-
-/// `EDITOR_APP`, in debug builds only, such as `Zed`.
-fn editor_app() -> Option<String> {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var("EDITOR_APP")
-            .ok()
-            .filter(|a| !a.trim().is_empty())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        None
-    }
-}
-
-/// Opens `path` with `open`, in `app` if given. Blocks until `open`
-/// returns, so run it off the UI thread.
-fn open_folder(path: PathBuf, app: Option<String>) -> Result<(), String> {
-    let mut open = std::process::Command::new("open");
-    if let Some(app) = &app {
-        open.arg("-a").arg(app);
-    }
-    let status = open.arg(&path).status().map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(match app {
-            Some(app) => {
-                format!("{app} couldn't open the folder. Check that the app is installed.")
-            }
-            None => "The folder couldn't be opened. Refresh to check it still exists.".into(),
-        })
-    }
 }
 
 #[cfg(test)]

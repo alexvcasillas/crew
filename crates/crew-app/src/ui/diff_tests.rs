@@ -692,3 +692,126 @@ fn the_list_keeps_its_place_when_the_rows_change(cx: &mut TestAppContext) {
         ws.read_with(cx, |ws, _| ws.review_top()) == Some(50)
     });
 }
+
+/// Launch arguments `open` would have got, in order.
+type Launches = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+/// Swaps in these editors and an opener that records its arguments, or
+/// fails when `fail` is set. Nothing is launched.
+fn fake_editors(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ws: &Entity<Workspace>,
+    detected: &[&str],
+    fail: bool,
+) -> Launches {
+    let launches = Launches::default();
+    let seen = launches.clone();
+    let opener: crate::editor::Opener = std::sync::Arc::new(move |args| {
+        seen.lock().unwrap().push(
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        );
+        if fail { Err("no".into()) } else { Ok(()) }
+    });
+    let detected = detected.iter().map(|d| d.to_string()).collect();
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.set_editor_env(detected, opener, window, cx));
+    })
+    .unwrap();
+    launches
+}
+
+fn wait_for_launches(cx: &mut TestAppContext, launches: &Launches, n: usize) -> Vec<Vec<String>> {
+    wait_until(cx, "the editor to be launched", |_| {
+        launches.lock().unwrap().len() >= n
+    });
+    launches.lock().unwrap().clone()
+}
+
+#[gpui_kit::test]
+fn open_in_editor_launches_the_chosen_editor_or_finder(cx: &mut TestAppContext) {
+    let s = setup("printf 'hello\\nthere\\n' > README.md\nprintf 'one\\ntwo\\n' > new.txt");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    let launches = fake_editors(cx, window, &ws, &["Cursor", "Zed"], false);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 2);
+    let wt = worktree(cx, &ws, s.w.thread).unwrap().display().to_string();
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "· 2 + there");
+
+    // Nothing chosen: the first detected editor, on the folder.
+    click(cx, window, "review-open-editor");
+    assert_eq!(
+        wait_for_launches(cx, &launches, 1)[0],
+        vec!["-a".to_string(), "Cursor".into(), wt.clone()]
+    );
+
+    // A picked file goes along for an editor.
+    click(cx, window, ("review-file", 1usize));
+    click(cx, window, "review-open-editor");
+    let sent = wait_for_launches(cx, &launches, 2);
+    assert_eq!(sent[1][..3], ["-a", "Cursor", &wt]);
+    assert_eq!(sent[1].len(), 4);
+    assert!(sent[1][3].starts_with(&format!("{wt}/")), "{:?}", sent[1]);
+
+    // Choosing another editor sticks, and is remembered.
+    ws.update(cx, |ws, cx| ws.choose_editor("Zed".into(), cx));
+    click(cx, window, "review-open-editor");
+    assert_eq!(wait_for_launches(cx, &launches, 3)[2][..2], ["-a", "Zed"]);
+    assert_eq!(
+        crate::editor::load_choice(s._home.path()),
+        Some("Zed".into())
+    );
+
+    // Finder opens the folder only, even with a file picked.
+    ws.update(cx, |ws, cx| ws.choose_editor("Finder".into(), cx));
+    click(cx, window, "review-open-editor");
+    assert_eq!(wait_for_launches(cx, &launches, 4)[3], vec![wt]);
+    assert!(!has(cx, window, "review-open-error"));
+}
+
+#[gpui_kit::test]
+fn a_failed_launch_says_so_under_the_review_title(cx: &mut TestAppContext) {
+    let s = setup("printf 'hello\\nthere\\n' > README.md");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    let launches = fake_editors(cx, window, &ws, &["Zed"], true);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 1);
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "· 2 + there");
+
+    click(cx, window, "review-open-editor");
+    wait_for_launches(cx, &launches, 1);
+    wait_to_show(cx, window, "Zed didn't open. Check that it is installed.");
+    assert!(has(cx, window, "review-open-error"));
+}
+
+#[gpui_kit::test]
+fn general_offers_finder_and_the_detected_editors(cx: &mut TestAppContext) {
+    let s = setup("exit 0");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    fake_editors(cx, window, &ws, &["Cursor", "Zed"], false);
+    click(cx, window, "title-settings");
+    click(cx, window, "settings-nav-general");
+    wait_until(cx, "the Editor row", |cx| has(cx, window, "general-editor"));
+    // The default is the first detected editor.
+    let shown = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, cx| {
+            ws.editor_select
+                .read(cx)
+                .selected_value()
+                .map(|v| v.to_string())
+        })
+    };
+    assert_eq!(shown(cx), Some("Cursor".to_string()));
+    ws.update(cx, |ws, cx| ws.choose_editor("Finder".into(), cx));
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.editor_app()),
+        None,
+        "Finder means no app"
+    );
+}
