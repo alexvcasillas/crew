@@ -58,6 +58,18 @@ const PERMISSIONS: [(PermissionMode, &str, &str); 3] = [
         "Read only (plan)",
     ),
 ];
+/// The longest run choices, in minutes. 0 is no limit.
+pub const RUN_LIMITS: [u32; 5] = [0, 30, 60, 120, 240];
+
+/// How a run limit reads: `No limit`, `30 min`, `1 h`.
+pub fn run_limit_label(minutes: u32) -> String {
+    match minutes {
+        0 => "No limit".into(),
+        m if m % 60 == 0 => format!("{} h", m / 60),
+        m => format!("{m} min"),
+    }
+}
+
 /// The agent's own handoff setting. `None` leaves it to the channel.
 const AGENT_POLICIES: [(Option<HandoffPolicy>, &str, &str); 3] = [
     (None, "agent-policy-channel", "Channel default"),
@@ -96,7 +108,8 @@ pub struct AgentForm {
     pub allowed_tools: Entity<InputState>,
     pub policy: Option<HandoffPolicy>,
     pub budget: Entity<InputState>,
-    pub max_minutes: Entity<InputState>,
+    /// The longest a run may take, in minutes. 0 is no limit.
+    pub max_minutes: u32,
     pub error: Option<String>,
     pub saving: bool,
     /// Saved, and nothing changed since.
@@ -140,7 +153,7 @@ pub struct Draft<'a> {
     pub allowed_tools: &'a str,
     pub policy: Option<HandoffPolicy>,
     pub budget: &'a str,
-    pub max_minutes: &'a str,
+    pub max_minutes: u32,
 }
 
 /// Checks a draft against the names `taken` by other agents, giving the
@@ -155,13 +168,7 @@ pub fn build_spec(d: &Draft<'_>, taken: &[&str]) -> Result<AgentSpec, String> {
                 .map_err(|_| "Handoffs per thread must be a whole number.".to_string())?,
         ),
     };
-    let max_run_minutes = d
-        .max_minutes
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n >= 1)
-        .ok_or_else(|| "Longest run must be a whole number of minutes, 1 or more.".to_string())?;
+    let max_run_minutes = d.max_minutes;
     let other = d.other_model.trim();
     let model = if other.is_empty() { d.model } else { other };
     if d.permission == PermissionMode::Auto && !auto_allowed(&d.runtime, model) {
@@ -297,7 +304,7 @@ struct Fields {
     allowed_tools: String,
     policy: Option<HandoffPolicy>,
     budget: String,
-    max_minutes: String,
+    max_minutes: u32,
 }
 
 impl Fields {
@@ -335,7 +342,7 @@ impl Fields {
                 .handoff_budget
                 .map(|b| b.to_string())
                 .unwrap_or_default(),
-            max_minutes: spec.max_run_minutes.to_string(),
+            max_minutes: spec.max_run_minutes,
         }
     }
 }
@@ -363,7 +370,6 @@ impl AgentForm {
             cx,
         );
         let budget = input(f.budget, "3", cx);
-        let max_minutes = input(f.max_minutes, "20", cx);
         let instructions = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(6)
@@ -378,17 +384,10 @@ impl AgentForm {
                 cx.notify();
             }
         };
-        let mut edits: Vec<Subscription> = [
-            &name,
-            &role,
-            &other_model,
-            &allowed_tools,
-            &budget,
-            &max_minutes,
-        ]
-        .into_iter()
-        .map(|input| cx.subscribe(input, move |this, _, event, cx| edited(this, event, cx)))
-        .collect();
+        let mut edits: Vec<Subscription> = [&name, &role, &other_model, &allowed_tools, &budget]
+            .into_iter()
+            .map(|input| cx.subscribe(input, move |this, _, event, cx| edited(this, event, cx)))
+            .collect();
         edits.push(cx.subscribe(&instructions, move |this, _, event, cx| {
             edited(this, event, cx)
         }));
@@ -404,7 +403,7 @@ impl AgentForm {
             allowed_tools,
             policy: f.policy,
             budget,
-            max_minutes,
+            max_minutes: f.max_minutes,
             error: None,
             saving: false,
             saved: false,
@@ -426,7 +425,7 @@ impl AgentForm {
             allowed_tools: text(&self.allowed_tools),
             policy: self.policy,
             budget: text(&self.budget),
-            max_minutes: text(&self.max_minutes),
+            max_minutes: self.max_minutes,
         }
     }
 
@@ -455,7 +454,7 @@ impl AgentForm {
                 allowed_tools: &f.allowed_tools,
                 policy: f.policy,
                 budget: &f.budget,
-                max_minutes: &f.max_minutes,
+                max_minutes: f.max_minutes,
             },
             taken,
         )
@@ -555,6 +554,14 @@ impl Workspace {
     fn set_permission(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.permission = mode;
+            form.saved = false;
+        }
+        cx.notify();
+    }
+
+    fn set_max_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        if let Some(form) = self.agent_form_mut() {
+            form.max_minutes = minutes;
             form.saved = false;
         }
         cx.notify();
@@ -868,6 +875,31 @@ impl Workspace {
                     ))
                 })
             });
+        // A limit set another way, such as from the CLI, is offered too.
+        let mut limits = RUN_LIMITS.to_vec();
+        if !limits.contains(&form.max_minutes) {
+            limits.push(form.max_minutes);
+            limits.sort_unstable();
+        }
+        let limit_label = run_limit_label(form.max_minutes);
+        let this = cx.entity().downgrade();
+        let max_minutes = Button::new("agent-max-minutes")
+            .outline()
+            .small()
+            .label(limit_label.clone())
+            .icon(IconName::ChevronDown)
+            .dropdown_menu(move |menu, _, _| {
+                limits.iter().fold(menu, |menu, minutes| {
+                    let this = this.clone();
+                    let minutes = *minutes;
+                    menu.item(PopupMenuItem::new(run_limit_label(minutes)).on_click(
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| this.set_max_minutes(minutes, cx))
+                                .ok();
+                        },
+                    ))
+                })
+            });
         let policies: Vec<AnyElement> = AGENT_POLICIES
             .iter()
             .map(|(p, id, label)| {
@@ -1052,11 +1084,15 @@ impl Workspace {
                                             .flex_col()
                                             .flex_1()
                                             .gap(px(4.))
-                                            .child(help("Longest run, in minutes"))
-                                            .child(control(
-                                                "agent-max-minutes",
-                                                Input::new(&form.max_minutes),
-                                            )),
+                                            .child(help("Longest run"))
+                                            .child(
+                                                div()
+                                                    .id("agent-max-minutes-value")
+                                                    .flex()
+                                                    .aria_label(limit_label)
+                                                    .child(max_minutes)
+                                                    .test_support(),
+                                            ),
                                     ),
                             ),
                     ))
@@ -1340,7 +1376,7 @@ mod tests {
             allowed_tools: "Bash(cargo test:*), Bash(git diff:*)",
             policy: None,
             budget: "",
-            max_minutes: "20",
+            max_minutes: 0,
         }
     }
 
@@ -1400,7 +1436,7 @@ mod tests {
             ["Bash(cargo test:*)", "Bash(git diff:*)"]
         );
         assert_eq!(spec.handoff_budget, None);
-        assert_eq!(spec.max_run_minutes, 20);
+        assert_eq!(spec.max_run_minutes, 0, "no limit");
 
         let mut other = draft("Forge");
         other.other_model = " claude-opus-4-1 ";
@@ -1408,13 +1444,9 @@ mod tests {
         assert_eq!(build_spec(&other, &[]).unwrap().model, "claude-opus-4-1");
         assert_eq!(build_spec(&other, &[]).unwrap().handoff_budget, Some(5));
 
-        let mut zero = draft("Forge");
-        zero.max_minutes = "0";
-        assert!(
-            build_spec(&zero, &[])
-                .unwrap_err()
-                .starts_with("Longest run")
-        );
+        let mut hour = draft("Forge");
+        hour.max_minutes = 60;
+        assert_eq!(build_spec(&hour, &[]).unwrap().max_run_minutes, 60);
         let mut bad = draft("Forge");
         bad.budget = "three";
         assert!(

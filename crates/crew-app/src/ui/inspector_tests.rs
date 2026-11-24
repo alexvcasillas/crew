@@ -158,6 +158,9 @@ fn handoff_card_approves_and_target_runs(cx: &mut TestAppContext) {
     let (window, ws) = open_thread(cx, home.path(), &w);
     let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
     click(cx, window, "inspector-tab-thread");
+    wait_until(cx, "the run limits", |cx| {
+        label_of(cx, window, "thread-run-limits").as_deref() == Some("Forge: No limit")
+    });
 
     assert_eq!(
         hand_off(&w, run, "Scout", "check the edit"),

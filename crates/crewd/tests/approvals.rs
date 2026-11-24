@@ -925,6 +925,29 @@ async fn run_time_limit_stops_run() {
     assert_eq!(stopped.id, run);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn no_run_limit_never_stops_a_run() {
+    // A minute lasts 1 ms, so any limit would stop the run at once.
+    let d = Daemon::start(Duration::from_millis(1)).await;
+    let mut c = d.client().await;
+    let chat = setup(&d, &mut c, 0).await;
+    let run = start_forge(&mut c, chat.thread).await;
+    until_run(&mut c, chat.forge, RunStatus::Working).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let working: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Working),
+        })
+        .await;
+    assert!(working.iter().any(|r| r.id == run), "still working");
+    c.call(Request::StopThread {
+        thread: chat.thread,
+    })
+    .await
+    .unwrap();
+    until_run(&mut c, chat.forge, RunStatus::Stopped).await;
+}
+
 async fn set_budget(c: &mut Client, thread: ThreadId, budget: u32) {
     c.call(Request::SetThreadHandoff {
         thread,

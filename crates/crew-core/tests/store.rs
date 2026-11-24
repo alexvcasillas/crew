@@ -345,7 +345,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
 
     let agents = store.agents().unwrap();
     assert_eq!(agents[0].1.name, "Ada");
-    assert_eq!(agents[0].1.max_run_minutes, 20);
+    assert_eq!(agents[0].1.max_run_minutes, 0, "no limit");
     assert_eq!(agents[0].1.handoff_policy, None);
 
     let runs = store.runs(RunFilter::default()).unwrap();
@@ -363,7 +363,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -602,7 +602,7 @@ fn agent_spec_defaults_new_fields() {
         "instructions": "", "permission_mode": "read_only", "allowed_tools": []
     });
     let spec: AgentSpec = serde_json::from_value(json).unwrap();
-    assert_eq!(spec.max_run_minutes, 20);
+    assert_eq!(spec.max_run_minutes, 0, "no limit");
     assert_eq!(spec.handoff_policy, None);
     assert_eq!(spec.handoff_budget, None);
     let mut per_agent = spec.clone();
@@ -714,7 +714,14 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let store = Store::open(&path).unwrap();
     let agents = store.agents().unwrap();
     assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0].1, spec("Ada"));
+    // The old default limit is dropped on the way to the latest version.
+    assert_eq!(
+        agents[0].1,
+        AgentSpec {
+            max_run_minutes: 0,
+            ..spec("Ada")
+        }
+    );
     let runs = store.runs(RunFilter::default()).unwrap();
     assert_eq!(runs[0].agent, agents[0].0);
     let msgs = store.messages(runs[0].thread).unwrap();
@@ -732,7 +739,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -786,7 +793,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -819,7 +826,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -832,6 +839,67 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
         .unwrap();
     let plan = plan.join(" / ");
     assert!(plan.contains("runs_by_session"), "{plan}");
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V5: &str = include_str!("../src/store/schema_v5.sql");
+
+#[test]
+fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    let spec = |name: &str, minutes: Option<u32>| {
+        let mut v = serde_json::json!({
+            "name": name, "role": "dev", "runtime": "claude_code", "model": "m",
+            "instructions": "", "permission_mode": "edit_files", "allowed_tools": []
+        });
+        if let Some(m) = minutes {
+            v["max_run_minutes"] = m.into();
+        }
+        v.to_string()
+    };
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        for (i, (name, minutes)) in [("Ada", Some(20)), ("Bo", Some(45)), ("Cy", None)]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO agents (id, name, spec, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    format!("00000000-0000-4000-8000-00000000000{}", i + 1),
+                    name,
+                    spec(name, minutes),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let store = Store::open(&path).unwrap();
+    let minutes: Vec<(String, u32)> = store
+        .agents()
+        .unwrap()
+        .into_iter()
+        .map(|(_, s)| (s.name, s.max_run_minutes))
+        .collect();
+    assert_eq!(
+        minutes,
+        [("Ada".into(), 0), ("Bo".into(), 45), ("Cy".into(), 0)]
+    );
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());

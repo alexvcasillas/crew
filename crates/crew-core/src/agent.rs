@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::HandoffPolicy;
 
-/// Run time limit for agents that do not set one.
-pub const DEFAULT_MAX_RUN_MINUTES: u32 = 20;
+/// Run time limit for agents that do not set one: none.
+pub const DEFAULT_MAX_RUN_MINUTES: u32 = 0;
 
 fn default_max_run_minutes() -> u32 {
     DEFAULT_MAX_RUN_MINUTES
@@ -88,7 +88,8 @@ pub struct AgentSpec {
     pub handoff_policy: Option<HandoffPolicy>,
     #[serde(default)]
     pub handoff_budget: Option<u32>,
-    /// A run is stopped once it takes longer than this.
+    /// A run is stopped once it takes longer than this many minutes.
+    /// 0 means no limit.
     #[serde(default = "default_max_run_minutes")]
     pub max_run_minutes: u32,
 }
