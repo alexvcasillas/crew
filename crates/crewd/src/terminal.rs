@@ -46,7 +46,7 @@ const REGISTRY_ENTRY_BYTES: u64 = 64 * 1024;
 const CHUNK: usize = 64 * 1024;
 /// Poll interval when file events work, and how often the registry is read.
 const SLOW_POLL: Duration = Duration::from_secs(5);
-/// Poll interval when file events don't work.
+/// Poll interval when file events don't work, or while a session is watched.
 const FAST_POLL: Duration = Duration::from_secs(1);
 /// Without a registry, a session written to this recently is live.
 const RECENT: Duration = Duration::from_secs(120);
@@ -268,7 +268,10 @@ async fn watch(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     mut stop: oneshot::Receiver<()>,
 ) {
+    // The real folder, as file events name real paths. Every event only
+    // asks for a scan, so its path is never compared.
     let projects_dir = claude_home.join("projects");
+    let projects_dir = std::fs::canonicalize(&projects_dir).unwrap_or(projects_dir);
     let (event_tx, mut events) = mpsc::unbounded_channel::<()>();
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_ok() {
@@ -279,6 +282,7 @@ async fn watch(
         w.watch(&projects_dir, notify::RecursiveMode::Recursive)?;
         Ok(w)
     });
+    let watching = watcher.is_ok();
     let poll = match &watcher {
         Ok(_) => SLOW_POLL,
         Err(e) => {
@@ -326,6 +330,12 @@ async fn watch(
                 if more {
                     // Over this scan's read budget: go on soon.
                     ticks.reset_after(Duration::from_millis(10));
+                } else if watching {
+                    // File events can come late or not at all, so the
+                    // check is the fallback: every second while someone
+                    // watches a session, else every few seconds.
+                    let watched = !service.terminal().buffered().is_empty();
+                    ticks.reset_after(if watched { FAST_POLL } else { SLOW_POLL });
                 }
             }
             Err(e) => {
