@@ -76,19 +76,19 @@ impl Service {
     /// Answers `ProjectOverview`. Channel stats come from the channel
     /// overviews, so they share their cached change counts.
     pub(crate) async fn project_overview(&self, project: ProjectId) -> Reply {
-        let (stored, channels, threads, runs, waiting) = {
-            let db = self.db();
-            let found = db.store.project(project).and_then(|p| {
+        // On the read-only connection, so writers don't wait for it.
+        let (stored, channels, threads, runs, waiting) = self.with_reader(|store| {
+            let found = store.project(project).and_then(|p| {
                 Ok((
                     p,
-                    db.store.channels(project)?,
-                    db.store.project_threads(project)?,
-                    db.store.project_runs(project)?,
-                    db.store.pending_approvals(None)?,
+                    store.channels(project)?,
+                    store.project_threads(project)?,
+                    store.project_runs(project)?,
+                    store.pending_approvals(None)?,
                 ))
             });
-            found.map_err(|e| e.to_string())?
-        };
+            found.map_err(|e| e.to_string())
+        })?;
         let waiting: HashSet<ThreadId> = waiting.into_iter().map(|a| a.thread).collect();
 
         let mut jobs = tokio::task::JoinSet::new();
@@ -196,22 +196,20 @@ impl Service {
 
     fn agent_profile_now(&self, agent: AgentId) -> Result<AgentProfile, String> {
         let err = |e: crew_core::store::StoreError| e.to_string();
-        let (runs, waiting, handoffs) = {
-            let db = self.db();
-            db.store.agent(agent).map_err(err)?;
-            let waiting: HashSet<RunId> = db
-                .store
+        let (runs, waiting, handoffs) = self.with_reader(|store| {
+            store.agent(agent).map_err(err)?;
+            let waiting: HashSet<RunId> = store
                 .pending_approvals(None)
                 .map_err(err)?
                 .into_iter()
                 .map(|a| a.run)
                 .collect();
-            (
-                db.store.agent_runs(agent).map_err(err)?,
+            Ok::<_, String>((
+                store.agent_runs(agent).map_err(err)?,
                 waiting,
-                db.store.handoffs_since(now_ms() - WEEK_MS).map_err(err)?,
-            )
-        };
+                store.handoffs_since(now_ms() - WEEK_MS).map_err(err)?,
+            ))
+        })?;
         let now = now_ms();
         let since = now - WEEK_MS;
         let started = |r: &StoredRun| r.status == RunStatus::Working || !r.session_id.is_empty();
@@ -249,7 +247,9 @@ impl Service {
             .collect();
         let mut edits = HashMap::new();
         for run in wanted {
-            let events = self.db().store.events(run, 0).map_err(err)?;
+            let events = self
+                .with_reader(|store| store.events(run, 0))
+                .map_err(err)?;
             edits.insert(run, run_edits(events.iter().map(|(_, e)| e)));
         }
         for r in runs.iter().filter(|r| ran_since(r, since)) {
@@ -282,18 +282,16 @@ impl Service {
         }
         let mut projects = HashSet::new();
         let mut threads = Vec::new();
-        {
-            let db = self.db();
-            let open: HashSet<ProjectId> = db
-                .store
+        self.with_reader(|store| {
+            let open: HashSet<ProjectId> = store
                 .projects()
                 .map_err(err)?
                 .into_iter()
                 .map(|p| p.id)
                 .collect();
             for (&thread, &at) in &latest {
-                let row = db.store.thread(thread).map_err(err)?;
-                let project = db.store.channel(row.channel).map_err(err)?.project;
+                let row = store.thread(thread).map_err(err)?;
+                let project = store.channel(row.channel).map_err(err)?.project;
                 // Runs in removed projects stay in the history, but the
                 // project and its threads are no longer listed.
                 if !open.contains(&project) {
@@ -304,7 +302,8 @@ impl Service {
                     threads.push((at, thread));
                 }
             }
-        }
+            Ok::<_, String>(())
+        })?;
         threads.sort_by_key(|t| std::cmp::Reverse(t.0));
         Ok(AgentProfile {
             stats,

@@ -127,6 +127,9 @@ struct Inner {
     /// Held while a worktree's slug is picked and the worktree made, so
     /// two threads can't pick the same one.
     slugs: Mutex<()>,
+    /// Held while a project is checked against the others and made, so
+    /// two can't take one folder at once.
+    adding_project: Mutex<()>,
     /// How long one minute of a run's time limit lasts.
     minute: Duration,
     /// Terminal sessions. Locked after `db` when both are.
@@ -231,6 +234,7 @@ impl Service {
             worktrees,
             crew_mcp,
             slugs: Mutex::new(()),
+            adding_project: Mutex::new(()),
             minute,
             terminal: Mutex::new(TerminalState::default()),
             terminal_cmd: OnceLock::new(),
@@ -448,6 +452,7 @@ impl Service {
     /// `Commit`, `Discard` and `ChannelOverview` run git and `Runtimes`
     /// runs the agent CLIs, so they can take a while.
     pub async fn handle(&self, req: Request) -> Reply {
+        self.refuse_removed(&req)?;
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
@@ -468,6 +473,30 @@ impl Service {
         }
     }
 
+    /// Refuses a write into a removed project. The writes that start runs
+    /// check again under the lock they write with.
+    fn refuse_removed(&self, req: &Request) -> Result<(), String> {
+        let db = self.db();
+        let open = match req {
+            Request::PostMessage { thread, .. }
+            | Request::RenameThread { thread, .. }
+            | Request::ArchiveThread { thread, .. }
+            | Request::SetThreadHandoff { thread, .. }
+            | Request::AllowMoreHandoffs { thread, .. }
+            | Request::Commit { thread, .. }
+            | Request::Discard { thread, .. } => db.store.ensure_thread_open(*thread),
+            Request::CreateThread { channel, .. }
+            | Request::UpdateChannel { channel, .. }
+            | Request::SetChannelHandoff { channel, .. } => db.store.ensure_channel_open(*channel),
+            Request::CreateChannel { project, .. }
+            | Request::UpdateProject { project, .. }
+            | Request::RenameProject { project, .. }
+            | Request::RemoveProject { project } => db.store.ensure_project_open(*project),
+            _ => Ok(()),
+        };
+        open.map_err(|e| e.to_string())
+    }
+
     /// Requests that only touch the store or the scheduler.
     fn handle_now(&self, req: Request) -> Reply {
         match req {
@@ -486,6 +515,9 @@ impl Service {
             } => json(self.create_project(&name, Path::new(&root), &main_branch)?),
             Request::CreateChannel { project, name } => {
                 let mut db = self.db();
+                db.store
+                    .ensure_project_open(project)
+                    .map_err(|e| e.to_string())?;
                 let channel = db
                     .store
                     .create_channel(project, &name)
@@ -782,6 +814,7 @@ impl Service {
     /// Saves a thread and tells `SubscribeAll` clients.
     fn create_thread(&self, channel: ChannelId, title: &str) -> Result<ThreadId, StoreError> {
         let mut db = self.db();
+        db.store.ensure_channel_open(channel)?;
         let id = db.store.create_thread(channel, title)?;
         let thread = db.store.thread(id)?;
         self.publish_global(&mut db, ServerMsg::ThreadCreated { channel, thread });
@@ -816,6 +849,11 @@ impl Service {
     /// with links resolved, which reads the disk, so not under a lock.
     fn create_project(&self, name: &str, root: &Path, main: &str) -> Result<ProjectId, String> {
         let err = |e: StoreError| e.to_string();
+        let _adding = self
+            .0
+            .adding_project
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let wanted = same_folder(root);
         let (active, removed) = {
             let db = self.db();
@@ -841,6 +879,13 @@ impl Service {
         }
         for thread in db.store.project_threads(old.id).map_err(err)? {
             self.publish_global(&mut db, ServerMsg::ThreadChanged { thread });
+        }
+        // Runs that ended lately, as a snapshot would bring them.
+        let since = now_ms() - RECENT_RUNS_MS;
+        for run in db.store.project_runs(old.id).map_err(err)? {
+            if run.ended_at.is_some_and(|e| e >= since) {
+                self.publish_status(&mut db, run.thread, run.id, run.status.clone());
+            }
         }
         Ok(old.id)
     }
@@ -1192,6 +1237,7 @@ impl Service {
         let id = {
             let mut state = self.state();
             let mut db = self.db();
+            db.store.ensure_thread_open(thread)?;
             let earlier = db.store.messages(thread)?;
             let agents = db.store.agents()?;
             let id = self.add_message(&mut db, thread, Author::You, body, None)?;
@@ -1792,6 +1838,7 @@ impl Service {
         announce: bool,
         extra_allowed: &[String],
     ) -> Result<(String, Invocation), StoreError> {
+        db.store.ensure_thread_open(job.thread)?;
         let agents = db.store.agents_with_deleted()?;
         let spec = db.store.agent(job.agent)?;
         if spec.deleted_at.is_some() {

@@ -433,6 +433,7 @@ impl Workspace {
         let mut snapshot = false;
         let mut terminal_gone = false;
         let mut run_ended = false;
+        let mut removed = Vec::new();
         let mut touched = Vec::new();
         let mut stale = Vec::new();
         for event in events {
@@ -450,6 +451,9 @@ impl Workspace {
                 && self.terminal.as_ref().is_some_and(|t| t.session == *id)
             {
                 terminal_gone = true;
+            }
+            if let ClientEvent::Msg(crew_proto::ServerMsg::ProjectRemoved { project }) = &event {
+                removed.push(*project);
             }
             if let ClientEvent::Msg(crew_proto::ServerMsg::RunStatus { status, .. }) = &event {
                 run_ended |= !matches!(status, RunStatus::Queued | RunStatus::Working);
@@ -490,6 +494,9 @@ impl Workspace {
             self.refresh_history(cx);
         }
         self.channel_touched(&touched, &stale, snapshot);
+        if !removed.is_empty() {
+            self.leave_removed(&removed, window, cx);
+        }
         self.sync_composer_mode(window, cx);
         self.sync_settings(window, cx);
         self.sync(cx);
@@ -504,6 +511,62 @@ impl Workspace {
         self.sync_terminal();
         self.sync_terminal_ticker(cx);
         cx.notify();
+    }
+
+    /// Leaves what belonged to removed projects: an open review or terminal
+    /// session closes, an open thread or channel gives way to the first
+    /// channel left (or nothing selected), and the palette searches every
+    /// project.
+    fn leave_removed(
+        &mut self,
+        removed: &[ProjectId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|t| self.state.terminal_session(&t.session).is_none())
+        {
+            self.close_terminal();
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|r| self.state.thread(r.thread).is_none())
+        {
+            self.drop_review(cx);
+        }
+        let thread_gone = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread(t).is_none());
+        let channel_gone = self
+            .nav
+            .channel
+            .is_some_and(|c| self.state.channel(c).is_none());
+        if thread_gone || channel_gone {
+            let next = self
+                .state
+                .projects()
+                .into_iter()
+                .find_map(|p| self.state.channels(p.id).first().map(|c| c.id));
+            match next {
+                Some(channel) => self.select_channel(channel, window, cx),
+                None => {
+                    self.close_thread(cx);
+                    self.nav.channel = None;
+                    self.nav.drafting = false;
+                }
+            }
+        }
+        if let Some(palette) = self.palette.clone() {
+            palette.update(cx, |palette, cx| {
+                for project in removed {
+                    palette.project_removed(*project, cx);
+                }
+            });
+        }
     }
 
     /// The name of the agent that ran last in the open thread, if it still
@@ -1460,7 +1523,7 @@ mod gpui_tests {
     use crate::test_support::{Daemon, refuse_hello, short_home};
     use crew_core::ids::{ChannelId, ProjectId, ThreadId};
     use crew_proto::Request;
-    use gpui_kit::{Entity, TestAppContext};
+    use gpui_kit::{AppContext as _, Entity, TestAppContext};
 
     use super::Workspace;
     use crate::connection::ConnectionState;
@@ -1591,6 +1654,72 @@ mod gpui_tests {
             window,
             "Crew's background service isn't running."
         ));
+    }
+
+    #[gpui_kit::test]
+    fn a_removed_project_closes_what_was_open_in_it(cx: &mut TestAppContext) {
+        let home = short_home();
+        let _daemon = Daemon::start(home.path().to_path_buf());
+        let (other, _other_events) = client::spawn(ConnectionConfig {
+            crew_home: home.path().to_path_buf(),
+        });
+        let ask = |req: Request| futures::executor::block_on(other.request(req)).unwrap();
+        let add = |name: &str, root: &str| -> (ProjectId, ChannelId) {
+            let project: ProjectId = serde_json::from_value(ask(Request::CreateProject {
+                name: name.into(),
+                root: root.into(),
+                main_branch: "main".into(),
+            }))
+            .unwrap();
+            let channel = serde_json::from_value(ask(Request::CreateChannel {
+                project,
+                name: "general".into(),
+            }))
+            .unwrap();
+            (project, channel)
+        };
+        let (gone, gone_channel) = add("gone", "/work/gone");
+        let (kept, kept_channel) = add("kept", "/work/kept");
+        let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
+            channel: gone_channel,
+            title: "fix the login".into(),
+        }))
+        .unwrap();
+
+        let (window, ws) = open(cx, home.path());
+        wait_connected(cx, &ws);
+        wait_until(cx, "the thread", |cx| {
+            ws.read_with(cx, |ws, _| ws.state().thread(thread).is_some())
+        });
+        cx.update_window(window, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.open_thread(thread, window, cx);
+                ws.open_review(thread, window, cx);
+                ws.open_palette(window, cx);
+            });
+        })
+        .unwrap();
+        ws.read_with(cx, |ws, cx| {
+            assert!(ws.review.is_some());
+            assert_eq!(ws.palette().unwrap().read(cx).scope(), Some(gone));
+        });
+
+        ask(Request::RemoveProject { project: gone });
+        wait_until(cx, "leaving the removed project", |cx| {
+            ws.read_with(cx, |ws, _| ws.nav.thread.is_none())
+        });
+        ws.read_with(cx, |ws, cx| {
+            assert_eq!(ws.nav.channel, Some(kept_channel), "the first channel left");
+            assert!(ws.review.is_none());
+            assert_eq!(ws.palette().unwrap().read(cx).scope(), None, "all projects");
+        });
+
+        // With nothing left, nothing is selected.
+        ask(Request::RemoveProject { project: kept });
+        wait_until(cx, "nothing selected", |cx| {
+            ws.read_with(cx, |ws, _| ws.nav.channel.is_none())
+        });
+        ws.read_with(cx, |ws, _| assert!(ws.nav.thread.is_none()));
     }
 
     #[gpui_kit::test]

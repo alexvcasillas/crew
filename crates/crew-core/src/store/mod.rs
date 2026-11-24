@@ -22,6 +22,8 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
+/// Why a write into a removed project is refused.
+pub const REMOVED: &str = "That project was removed.";
 const SCHEMA_VERSION: i64 = 9;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
@@ -366,6 +368,8 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.pragma_update(None, "query_only", true)?;
+        // A checkpoint can hold the file for a moment.
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
         Ok(Some(Store { conn }))
     }
 
@@ -560,6 +564,43 @@ impl Store {
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
+    }
+
+    /// Fails with [`REMOVED`] if the project was removed, so nothing is
+    /// written into it. A project that doesn't exist passes: the write
+    /// itself says so.
+    pub fn ensure_project_open(&self, p: ProjectId) -> Result<()> {
+        self.ensure_open(
+            "SELECT removed_at FROM projects WHERE id = ?1",
+            p.to_string(),
+        )
+    }
+
+    /// Like [`Self::ensure_project_open`], for the channel's project.
+    pub fn ensure_channel_open(&self, c: ChannelId) -> Result<()> {
+        self.ensure_open(
+            "SELECT p.removed_at FROM projects p JOIN channels c ON c.project_id = p.id
+             WHERE c.id = ?1",
+            c.to_string(),
+        )
+    }
+
+    /// Like [`Self::ensure_project_open`], for the thread's project.
+    pub fn ensure_thread_open(&self, t: ThreadId) -> Result<()> {
+        self.ensure_open(
+            "SELECT p.removed_at FROM projects p JOIN channels c ON c.project_id = p.id
+             JOIN threads t ON t.channel_id = c.id WHERE t.id = ?1",
+            t.to_string(),
+        )
+    }
+
+    fn ensure_open(&self, sql: &str, id: String) -> Result<()> {
+        let removed: Option<Option<i64>> =
+            self.conn.query_row(sql, [id], |r| r.get(0)).optional()?;
+        match removed {
+            Some(Some(_)) => Err(StoreError::Invalid(REMOVED.into())),
+            _ => Ok(()),
+        }
     }
 
     /// Every project, removed ones included, in the order they were made.

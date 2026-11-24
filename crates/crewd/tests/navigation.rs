@@ -753,6 +753,39 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         "the branch stays"
     );
     assert!(c.call(Request::RemoveProject { project: p }).await.is_err());
+
+    // Nothing is written into it any more, by this client or another.
+    let refused = "That project was removed.".to_string();
+    for req in [
+        Request::PostMessage {
+            thread: busy,
+            body: "@Forge again".into(),
+        },
+        Request::CreateThread {
+            channel: general,
+            title: "New".into(),
+        },
+        Request::CreateChannel {
+            project: p,
+            name: "more".into(),
+        },
+        Request::RenameThread {
+            thread: busy,
+            title: "Renamed".into(),
+        },
+        Request::Commit {
+            thread: busy,
+            message: "x".into(),
+        },
+        Request::RemoveProject { project: p },
+    ] {
+        assert_eq!(c.call(req).await, Err(refused.clone()));
+    }
+    let runs: Vec<StoredRun> = c.ok(Request::ListRuns { status: None }).await;
+    assert!(
+        runs.iter().all(|r| r.status != RunStatus::Queued),
+        "no run was queued"
+    );
 }
 
 /// A fake claude that edits like `writing_claude` and replies asking
@@ -813,11 +846,46 @@ async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back()
             .is_err()
     );
 
-    // Adding the folder again brings the project back as it was.
+    // Adding the folder again brings the project back as it was, its
+    // recent runs included.
     assert_eq!(c.project("demo again", &root).await, p);
+    c.until(|m| matches!(m, ServerMsg::RunStatus { thread, .. } if *thread == t))
+        .await;
     let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
     assert_eq!(o.channels[0].channel, general);
     assert_eq!(o.recent_threads[0].thread, t);
     let r = c.search("fix it", Some(p)).await;
     assert_eq!(r.threads[0].thread, t);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_clients_adding_one_folder_make_one_project() {
+    let d = Daemon::start(PathBuf::from("/nonexistent/claude")).await;
+    let root = d.path("demo");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..4 {
+        clients.push(d.client().await);
+    }
+    let adds = clients.into_iter().map(|mut c| {
+        let root = root.clone();
+        tokio::spawn(async move {
+            c.call(Request::CreateProject {
+                name: "demo".into(),
+                root: root.to_string_lossy().into_owned(),
+                main_branch: "main".into(),
+            })
+            .await
+        })
+    });
+    let mut made = 0;
+    for add in adds.collect::<Vec<_>>() {
+        if add.await.unwrap().is_ok() {
+            made += 1;
+        }
+    }
+    assert_eq!(made, 1);
+    let mut c = d.client().await;
+    let projects: Vec<serde_json::Value> = c.ok(Request::ListProjects).await;
+    assert_eq!(projects.len(), 1);
 }

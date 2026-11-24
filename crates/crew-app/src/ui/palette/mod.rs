@@ -146,6 +146,17 @@ impl Palette {
         if self.all_projects { None } else { self.home }
     }
 
+    /// The project searched was removed: search all of them instead.
+    pub(super) fn project_removed(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        if self.home != Some(project) {
+            return;
+        }
+        self.home = None;
+        self.all_projects = true;
+        self.schedule_search(cx);
+        cx.notify();
+    }
+
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         if query == self.query {
             return;
