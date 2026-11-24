@@ -71,6 +71,9 @@ pub(super) enum DraftKey {
     NewThread(ChannelId),
 }
 
+/// How often the sidebar redraws terminal sessions' "5m ago".
+const TERMINAL_TIMES_EVERY: Duration = Duration::from_secs(30);
+
 /// How often the status bar asks which agent CLIs are ready.
 const RUNTIMES_EVERY: Duration = Duration::from_secs(10 * 60);
 
@@ -103,6 +106,9 @@ pub struct Workspace {
     terminal_pending: Option<String>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
+    /// Redraws the sidebar's terminal session times while a project's
+    /// "In terminal" list is open.
+    terminal_ticker: Option<Task<()>>,
     /// Requests waiting for their answers, by a number of their own.
     requests: HashMap<u64, Task<()>>,
     next_request: u64,
@@ -219,6 +225,7 @@ impl Workspace {
             terminal: None,
             terminal_pending: hooks.terminal,
             ticker: None,
+            terminal_ticker: None,
             requests: HashMap::new(),
             next_request: 0,
             service_task: None,
@@ -273,9 +280,30 @@ impl Workspace {
         &mut self.state
     }
 
-    /// Whether a snapshot came since the app started.
-    pub(super) fn snapshot_seen(&self) -> bool {
-        self.snapshot_seen
+    /// Runs the sidebar's 30 s redraw only while an open "In terminal"
+    /// list has sessions to show.
+    pub(super) fn sync_terminal_ticker(&mut self, cx: &mut Context<Self>) {
+        let shown = self.nav.terminal_groups.iter().any(|p| {
+            !self.nav.collapsed.contains(p) && !self.state.terminal_sessions(*p).is_empty()
+        });
+        if !shown {
+            self.terminal_ticker = None;
+        } else if self.terminal_ticker.is_none() {
+            self.terminal_ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(TERMINAL_TIMES_EVERY).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// Whether the sidebar's terminal session times are kept fresh.
+    #[cfg(test)]
+    pub(super) fn terminal_ticking(&self) -> bool {
+        self.terminal_ticker.is_some()
     }
 
     /// Opens `thread` now if it is known, else as soon as it arrives, as
@@ -343,7 +371,15 @@ impl Workspace {
     fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let mut connected = false;
         let mut snapshot = false;
+        let mut terminal_gone = false;
         for event in events {
+            // Only crewd saying so closes the open session: a snapshot
+            // just after crewd starts may not list it yet.
+            if let ClientEvent::Msg(crew_proto::ServerMsg::TerminalSessionRemoved { id }) = &event
+                && self.terminal.as_ref().is_some_and(|t| t.session == *id)
+            {
+                terminal_gone = true;
+            }
             connected |= event == ClientEvent::Connected;
             snapshot |= matches!(
                 event,
@@ -379,7 +415,12 @@ impl Workspace {
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
         self.open_if_known(window, cx);
-        self.sync_terminal(cx);
+        let open = self.terminal.as_ref().map(|t| t.session.as_str());
+        if terminal_gone && open.is_some_and(|id| self.state.terminal_session(id).is_none()) {
+            self.close_terminal();
+        }
+        self.sync_terminal();
+        self.sync_terminal_ticker(cx);
         cx.notify();
     }
 

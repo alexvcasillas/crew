@@ -11,6 +11,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::{AnyWindowHandle, Entity, TestAppContext};
 use tempfile::TempDir;
 
+use super::terminal_view::TerminalRow;
 use super::test_ui::{click, has, label_of, open, shows, shows_within, wait_until};
 use super::thread_tests::ask;
 use super::workspace::Workspace;
@@ -20,7 +21,8 @@ use crate::test_support::{Daemon, recording_proxy, short_home};
 
 /// A crewd reading `claude_home`, and a project `demo` at `root`.
 struct Setup {
-    _daemon: Daemon,
+    daemon: Option<Daemon>,
+    home: PathBuf,
     _dirs: TempDir,
     claude_home: PathBuf,
     root: PathBuf,
@@ -45,14 +47,7 @@ impl Setup {
         ] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let daemon = Daemon::start_with_options(
-            home.to_path_buf(),
-            crewd::ServeOptions {
-                claude_bin: Some(PathBuf::from("/nonexistent/claude")),
-                claude_home: Some(claude_home.clone()),
-                ..Default::default()
-            },
-        );
+        let daemon = start(home, &claude_home);
         let (client, events) = client::spawn(ConnectionConfig {
             crew_home: home.to_path_buf(),
         });
@@ -72,7 +67,8 @@ impl Setup {
             },
         );
         Setup {
-            _daemon: daemon,
+            daemon: Some(daemon),
+            home: home.to_path_buf(),
             _dirs: dirs,
             claude_home,
             root,
@@ -81,6 +77,25 @@ impl Setup {
             _client: client,
             _events: events,
         }
+    }
+
+    /// Stops crewd, runs `meanwhile`, then starts it again on the same
+    /// homes.
+    fn restart(&mut self, meanwhile: impl FnOnce(&Self)) {
+        drop(self.daemon.take());
+        meanwhile(self);
+        self.daemon = Some(start(&self.home, &self.claude_home));
+    }
+
+    /// Writes session `id` whole: a prompt and one reply.
+    fn write(&self, id: &str, prompt: &str, answer: &str) -> PathBuf {
+        let path = self.transcript(id);
+        let lines = [user(&self.root, 1, prompt), reply(&self.root, 2, answer)];
+        // Renamed into place, so crewd never reads half a file.
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, lines.join("\n") + "\n").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path
     }
 
     /// The file Claude Code writes for session `id` started in the
@@ -122,6 +137,18 @@ impl Setup {
         std::fs::write(&tmp, entry.to_string()).unwrap();
         std::fs::rename(tmp, path).unwrap();
     }
+}
+
+/// crewd on `home`, reading `claude_home`.
+fn start(home: &Path, claude_home: &Path) -> Daemon {
+    Daemon::start_with_options(
+        home.to_path_buf(),
+        crewd::ServeOptions {
+            claude_bin: Some(PathBuf::from("/nonexistent/claude")),
+            claude_home: Some(claude_home.to_path_buf()),
+            ..Default::default()
+        },
+    )
 }
 
 fn line(root: &Path, kind: &str, second: u32, message: serde_json::Value) -> String {
@@ -212,17 +239,23 @@ fn a_terminal_session_is_listed_under_its_project(cx: &mut TestAppContext) {
     let home = short_home();
     let s = Setup::new(home.path());
     s.session("s-one", "Fix the flaky test\nIt fails on CI");
-    let (window, _ws) = open(cx, home.path());
+    let (window, ws) = open(cx, home.path());
+    let ticking = |cx: &mut TestAppContext| ws.read_with(cx, |ws, _| ws.terminal_ticking());
+    let group = format!("terminal-group-{}", s.project);
+    wait_until(cx, "the terminal row", |cx| has(cx, window, group.clone()));
+    assert!(!ticking(cx), "nothing listed, nothing to refresh");
     expand(cx, window, &s, "In terminal · 1");
     assert_eq!(
         label_of(cx, window, "terminal-session-s-one").as_deref(),
         Some("Fix the flaky test")
     );
     assert!(!has(cx, window, "terminal-live-s-one"), "not live");
+    assert!(ticking(cx), "times refresh while listed");
 
     // Collapsed again, the sessions are hidden.
-    click(cx, window, format!("terminal-group-{}", s.project));
+    click(cx, window, group);
     assert!(!has(cx, window, "terminal-session-s-one"));
+    assert!(!ticking(cx));
 }
 
 #[gpui_kit::test]
@@ -299,8 +332,13 @@ fn opening_a_terminal_session_streams_its_lines_read_only(cx: &mut TestAppContex
         !shows_within(cx, window, "terminal-list", "Maybe the timeout."),
         "thinking starts collapsed"
     );
-    // Rows: you, Claude, "On it.", the steps, thinking, "Tests pass now."
-    click(cx, window, ("terminal-thinking", 4usize));
+    let thinking = ws.read_with(cx, |ws, _| {
+        let rows = &ws.terminal.as_ref().unwrap().rows;
+        rows.iter()
+            .position(|r| matches!(r, TerminalRow::Thinking { .. }))
+            .unwrap()
+    });
+    click(cx, window, ("terminal-thinking", thinking));
     assert!(shows_within(
         cx,
         window,
@@ -326,25 +364,52 @@ fn opening_a_terminal_session_streams_its_lines_read_only(cx: &mut TestAppContex
 fn a_replaced_terminal_session_fills_again(cx: &mut TestAppContext) {
     let home = short_home();
     let s = Setup::new(home.path());
-    let path = s.session("s-one", "Fix the flaky test");
+    s.write("s-one", "Fix the flaky test", "**Old** reply.");
     let (window, _ws) = open_session(cx, home.path(), &s, "s-one");
     wait_until(cx, "the backlog", |cx| {
-        shows_within(cx, window, "terminal-list", "On it.")
+        shows_within(cx, window, "terminal-list", "bold Old")
     });
 
     // A new file in its place: crewd resets the session, the app asks
     // for its backlog again.
-    let tmp = path.with_extension("new");
-    std::fs::write(
-        &tmp,
-        user(&s.root, 1, "Fix the flaky test") + "\n" + &reply(&s.root, 2, "Started over.") + "\n",
-    )
-    .unwrap();
-    std::fs::rename(&tmp, &path).unwrap();
+    s.write("s-one", "Fix the flaky test", "**New** reply.");
     wait_until(cx, "the new backlog", |cx| {
-        shows_within(cx, window, "terminal-list", "Started over.")
+        shows_within(cx, window, "terminal-list", "bold New")
     });
-    assert!(!shows_within(cx, window, "terminal-list", "On it."));
+    assert!(!shows_within(cx, window, "terminal-list", "bold Old"));
+}
+
+/// crewd numbers a session's items from 0 again after a restart, so the
+/// same seq can hold other text than before.
+#[gpui_kit::test]
+fn a_session_changed_while_crewd_was_away_shows_its_new_text(cx: &mut TestAppContext) {
+    let home = short_home();
+    let mut s = Setup::new(home.path());
+    s.write("s-one", "Fix the flaky test", "**Old** reply.");
+    let (window, ws) = open_session(cx, home.path(), &s, "s-one");
+    let said_row = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.terminal.as_ref().and_then(|t| {
+                t.rows
+                    .iter()
+                    .position(|r| matches!(r, TerminalRow::Said { .. }))
+            })
+        })
+    };
+    wait_until(cx, "the backlog", |cx| {
+        shows_within(cx, window, "terminal-list", "bold Old")
+    });
+    let said = said_row(cx).unwrap();
+
+    s.restart(|s| {
+        s.write("s-one", "Fix the flaky test", "**New** reply.");
+    });
+    wait_until(cx, "the new text", |cx| {
+        shows_within(cx, window, "terminal-list", "bold New")
+    });
+    assert!(!shows_within(cx, window, "terminal-list", "bold Old"));
+    assert_eq!(said_row(cx), Some(said), "the same row");
+    assert!(has(cx, window, "terminal-view"), "still open");
 }
 
 #[gpui_kit::test]

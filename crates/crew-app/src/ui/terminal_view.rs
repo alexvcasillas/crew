@@ -24,6 +24,8 @@ const CWD_MAX: usize = 60;
 const AGENT: &str = "Claude";
 /// The left edge of a turn's content, past the avatar.
 const INDENT: f32 = 24. + 32. + 12.;
+/// Most characters of one prompt, message or thought drawn.
+pub const TEXT_MAX: usize = 20_000;
 
 /// One row of a terminal session's list.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,7 +65,7 @@ pub fn terminal_rows<'a>(
             TranscriptItem::UserPrompt(text) => {
                 rows.push(TerminalRow::You {
                     seq,
-                    text: clean_lines(text),
+                    text: shown(text),
                 });
                 continue;
             }
@@ -72,11 +74,11 @@ pub fn terminal_rows<'a>(
         let row = match event {
             Event::Message { text } if !text.trim().is_empty() => TerminalRow::Said {
                 seq,
-                text: clean_lines(text),
+                text: shown(text),
             },
             Event::Thinking { text } if !text.trim().is_empty() => TerminalRow::Thinking {
                 seq,
-                text: clean_lines(text),
+                text: shown(text),
             },
             Event::ToolCall {
                 id,
@@ -126,7 +128,7 @@ pub fn terminal_rows<'a>(
                 }
                 continue;
             }
-            Event::Error { message } => TerminalRow::Error(clean_lines(message)),
+            Event::Error { message } => TerminalRow::Error(shown(message)),
             Event::PermissionDenied { tool, .. } => {
                 TerminalRow::Error(format!("Not allowed: {}", clean_line(tool)))
             }
@@ -136,6 +138,15 @@ pub fn terminal_rows<'a>(
         rows.push(row);
     }
     rows
+}
+
+/// Text as drawn: cleaned, and cut to [`TEXT_MAX`] characters with `…`.
+fn shown(text: &str) -> String {
+    let text = clean_lines(text);
+    match text.char_indices().nth(TEXT_MAX) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
 }
 
 /// Puts Claude's name over its output, once per turn.
@@ -174,6 +185,8 @@ pub(super) struct TerminalView {
     pub(super) rows: Vec<TerminalRow>,
     /// The log version `rows` were made from.
     version: Option<u64>,
+    /// The log generation `docs` and `open_thinking` belong to.
+    generation: u64,
     /// Thinking rows you opened, by seq.
     open_thinking: HashSet<u64>,
     /// Its messages read as Markdown.
@@ -189,6 +202,7 @@ impl TerminalView {
             list,
             rows: Vec::new(),
             version: None,
+            generation: 0,
             open_thinking: HashSet::new(),
             docs: DocCache::default(),
         }
@@ -214,7 +228,7 @@ impl Workspace {
         self.state_mut().watch_terminal(&session);
         self.client.watch_terminal(session.clone());
         self.terminal = Some(TerminalView::new(session));
-        self.sync_terminal(cx);
+        self.sync_terminal();
         self.focus_workspace(window, cx);
         cx.notify();
     }
@@ -227,28 +241,33 @@ impl Workspace {
         }
     }
 
-    /// Brings the open session's rows in line with its items, and closes
-    /// it once crewd no longer lists it.
-    pub(super) fn sync_terminal(&mut self, cx: &mut Context<Self>) {
+    /// Brings the open session's rows in line with its items. Called once
+    /// per batch of what crewd sent; does nothing unless the items moved.
+    pub(super) fn sync_terminal(&mut self) {
         let Some(open) = &self.terminal else {
             return;
         };
         let state = self.state();
-        let Some(session) = state.terminal_session(&open.session) else {
-            if self.connected() && self.snapshot_seen() {
-                self.close_terminal();
-                cx.notify();
-            }
-            return;
-        };
         let version = state.terminal_version(&open.session);
+        let generation = state.terminal_generation(&open.session);
         if open.version == Some(version) {
             return;
         }
-        let rows = terminal_rows(state.terminal_items(&open.session), &session.cwd);
+        let cwd = state
+            .terminal_session(&open.session)
+            .map_or("", |s| s.cwd.as_str());
+        let rows = terminal_rows(state.terminal_items(&open.session), cwd);
         let Some(open) = self.terminal.as_mut() else {
             return;
         };
+        if open.generation != generation {
+            // A seq may now name another item: forget what was read
+            // and opened by seq.
+            open.generation = generation;
+            open.docs = DocCache::default();
+            open.open_thinking.clear();
+            open.rows.clear();
+        }
         let old = std::mem::replace(&mut open.rows, rows);
         let same = old
             .iter()
@@ -550,7 +569,7 @@ fn you_avatar() -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalRow, terminal_rows};
+    use super::{TEXT_MAX, TerminalRow, terminal_rows};
     use crate::ui::run_card::StepState;
     use crew_core::claude::transcript::TranscriptItem;
     use crew_core::event::{Event, ToolKind};
@@ -669,6 +688,25 @@ mod tests {
         let failed = steps(&[edit, result("e1", true)]);
         assert_eq!(failed[0].state, StepState::Failed);
         assert_eq!(failed[0].lines, None);
+    }
+
+    #[test]
+    fn long_text_is_cut_for_drawing() {
+        let long = "x".repeat(TEXT_MAX + 10);
+        let items = [said(&long), said("short")];
+        let rows = terminal_rows(items.iter().enumerate().map(|(i, it)| (i as u64, it)), "");
+        let TerminalRow::Said { text, .. } = &rows[1] else {
+            panic!("{rows:?}");
+        };
+        assert_eq!(text.chars().count(), TEXT_MAX + 1);
+        assert!(text.ends_with('…'));
+        assert_eq!(
+            rows[2],
+            TerminalRow::Said {
+                seq: 1,
+                text: "short".into()
+            }
+        );
     }
 
     #[test]
