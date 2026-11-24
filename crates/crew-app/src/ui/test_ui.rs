@@ -48,7 +48,7 @@ pub fn open_sized_tall(
     };
     let (window, ws) = cx.update(|cx| {
         gpui_kit::init(cx);
-        crate::app::init(cx);
+        crate::app::init(home, cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::default(),

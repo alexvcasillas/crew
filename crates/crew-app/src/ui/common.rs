@@ -419,3 +419,47 @@ mod tests {
         assert!((pulse_opacity(0.25) - 0.7).abs() < 1e-6);
     }
 }
+
+/// Adds a probe that records the text size `el` draws at under `key`, in
+/// tests only, so they can check what the appearance settings did.
+pub fn with_font_probe<E: ParentElement>(el: E, key: impl FnOnce() -> String) -> E {
+    #[cfg(test)]
+    {
+        let key = key();
+        let mut el = el;
+        el.extend([canvas(
+            move |_, window, _| font_probe::record(key, window),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .into_any_element()]);
+        el
+    }
+    #[cfg(not(test))]
+    {
+        let _ = key;
+        el
+    }
+}
+
+#[cfg(test)]
+pub mod font_probe {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use gpui_kit::{Pixels, Window};
+
+    thread_local! {
+        static SIZES: RefCell<HashMap<String, Pixels>> = RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn record(key: String, window: &Window) {
+        let size = window.text_style().font_size.to_pixels(window.rem_size());
+        SIZES.with(|s| s.borrow_mut().insert(key, size));
+    }
+
+    /// The text size the element probed as `key` last drew at.
+    pub fn size_of(key: &str) -> Option<Pixels> {
+        SIZES.with(|s| s.borrow().get(key).copied())
+    }
+}

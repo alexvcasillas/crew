@@ -23,6 +23,8 @@ use crate::prefs::{self, Appearance, DEFAULT_CODE_FONT, DEFAULT_UI_FONT};
 const BASE_UI: f32 = 13.;
 /// The code text size the app was drawn at, which `mono` scales from.
 const BASE_CODE: f32 = 12.;
+/// How much the window's frame grows per px of interface text over 13.
+const CHROME_PER_PX: f32 = 0.045;
 /// The Kit's base size at the original look: its rem.
 const KIT_BASE: f32 = 13.;
 
@@ -36,6 +38,7 @@ struct Scale {
     code: f32,
     line: f32,
     row: f32,
+    chrome: f32,
     bolder: bool,
     ui_family: Option<SharedString>,
     code_family: Option<SharedString>,
@@ -64,6 +67,7 @@ impl Scale {
             // Rows grow with bigger text so the text still fits, and never
             // shrink below their original height for smaller text.
             row: a.density.factor() * text.max(1.),
+            chrome: 1. + (f32::from(a.ui_size) - BASE_UI) * CHROME_PER_PX,
             bolder: a.bolder,
             ui_family,
             code_family,
@@ -114,6 +118,14 @@ pub fn mono_line(n: f32) -> Pixels {
 /// density, text size and zoom. Whole pixels, so row borders stay sharp.
 pub fn row(n: f32) -> Pixels {
     px((n * with(|s| s.row * s.zoom)).round())
+}
+
+/// A length of the window's frame (title bar height, sidebar, inspector
+/// and settings nav widths, the main area's side padding): `n` px at the
+/// default text size and zoom, a little bigger with bigger text. Whole
+/// pixels.
+pub fn chrome(n: f32) -> Pixels {
+    px((n * with(|s| s.chrome * s.zoom)).round())
 }
 
 /// `w`, one step heavier with Bolder text, up to Black.
@@ -179,16 +191,50 @@ struct Store {
 
 impl Global for Store {}
 
+/// The installed font families, listed once at startup.
+struct Fonts {
+    names: Option<Arc<Vec<String>>>,
+    _listing: Option<Task<()>>,
+}
+
+impl Global for Fonts {}
+
 /// Reads the settings saved in `crew_home` and applies them. Later
 /// changes are saved there.
 pub fn load(crew_home: PathBuf, cx: &mut App) {
-    let appearance = Appearance::load(&crew_home);
+    let saved = Appearance::load(&crew_home);
     cx.set_global(Store {
         home: crew_home,
         seq: Arc::new(AtomicU64::new(0)),
         _save: None,
     });
-    apply(appearance, cx);
+    cx.set_global(Fonts {
+        names: None,
+        _listing: None,
+    });
+    apply(saved, cx);
+    // Listing the installed fonts is slow, so it runs off the UI thread. A
+    // font of your own shows once the list is in.
+    let text_system = cx.text_system().clone();
+    let list = cx
+        .background_executor()
+        .spawn(async move { text_system.all_font_names() });
+    let listing = cx.spawn(async move |cx| {
+        let names = list.await;
+        cx.update(|cx| {
+            cx.global_mut::<Fonts>().names = Some(Arc::new(names));
+            let a = appearance(cx);
+            if a.ui_font != DEFAULT_UI_FONT || a.code_font != DEFAULT_CODE_FONT {
+                apply(a, cx);
+            }
+        });
+    });
+    cx.global_mut::<Fonts>()._listing = Some(listing);
+}
+
+/// The installed font families, once listed.
+pub fn installed_fonts(cx: &App) -> Option<Arc<Vec<String>>> {
+    cx.try_global::<Fonts>().and_then(|f| f.names.clone())
 }
 
 /// The settings in use.
@@ -228,16 +274,14 @@ pub fn step_zoom(direction: i8, cx: &mut App) {
 
 /// Makes `appearance` the one the helpers and the Kit read, and redraws.
 fn apply(appearance: Appearance, cx: &mut App) {
-    // Listing the installed fonts is slow, so only for a font of your own.
-    let mut names: Option<Vec<String>> = None;
-    let mut installed = |family: &str| {
+    let names = installed_fonts(cx);
+    let installed = |family: &str| {
         names
-            .get_or_insert_with(|| cx.text_system().all_font_names())
-            .iter()
-            .any(|f| f == family)
+            .as_ref()
+            .is_some_and(|n| n.iter().any(|f| f == family))
     };
-    let ui = resolve_family(&appearance.ui_font, DEFAULT_UI_FONT, &mut installed);
-    let code = resolve_family(&appearance.code_font, DEFAULT_CODE_FONT, &mut installed);
+    let ui = resolve_family(&appearance.ui_font, DEFAULT_UI_FONT, installed);
+    let code = resolve_family(&appearance.code_font, DEFAULT_CODE_FONT, installed);
     set_scale(Scale::of(&appearance, ui, code));
     cx.set_global(appearance);
     apply_kit_theme(cx);
@@ -263,8 +307,8 @@ mod tests {
     use gpui_kit::{FontWeight, SharedString, px};
 
     use super::{
-        Scale, code_family, line, mono, mono_line, relative_line, resolve_family, row, set_scale,
-        text, ui_family, ui_px, weight,
+        Scale, chrome, code_family, line, mono, mono_line, relative_line, resolve_family, row,
+        set_scale, text, ui_family, ui_px, weight,
     };
     use crate::prefs::{Appearance, Density, LineHeight};
 
@@ -288,6 +332,7 @@ mod tests {
         }
         for n in [1., 4., 28., 44.] {
             assert_eq!(row(n), px(n));
+            assert_eq!(chrome(n), px(n));
         }
         assert_eq!(weight(FontWeight::MEDIUM), FontWeight::MEDIUM);
         assert_eq!(relative_line(), gpui_kit::phi());
@@ -307,6 +352,10 @@ mod tests {
         assert!(near(line(20.), 20. * 16. / 13.));
         assert!(near(mono_line(20.), 25.));
         assert_eq!(row(28.), px(34.));
+        // The board at 16: sidebar 300, title bar 52, side padding 28.
+        assert_eq!(chrome(264.), px(300.));
+        assert_eq!(chrome(48.), px(54.));
+        assert_eq!(chrome(24.), px(27.));
     }
 
     #[test]

@@ -325,7 +325,8 @@ fn bold_markers(text: &str, runs: &[TextRun], id: &str) -> Vec<AnyElement> {
     let mut at = 0;
     let mut markers = Vec::new();
     for run in runs {
-        if run.font.weight == FontWeight::BOLD {
+        // Bold as drawn with the settings in use, Bolder text or not.
+        if run.font.weight == scale::weight(FontWeight::BOLD) {
             markers.push(
                 div()
                     .id(SharedString::from(format!("{id}-bold-{at}")))

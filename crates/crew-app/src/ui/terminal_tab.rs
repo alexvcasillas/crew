@@ -248,10 +248,13 @@ impl Workspace {
                     .child("Read only.")
                     .when_some(cwd, |footer, cwd| {
                         footer.child("Commands ran in").child(
-                            div()
-                                .flex()
-                                .min_w_0()
-                                .child(div().truncate().font_family(code_family()).child(cwd)),
+                            div().flex().min_w_0().child(
+                                div()
+                                    .truncate()
+                                    .font_family(code_family())
+                                    .text_size(scale::mono(12.))
+                                    .child(cwd),
+                            ),
                         )
                     })
                     .test_support(),

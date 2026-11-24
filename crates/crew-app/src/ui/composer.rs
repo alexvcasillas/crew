@@ -572,6 +572,7 @@ impl Composer {
         let mono = |text: String| {
             div()
                 .font_family(code_family())
+                .text_size(scale::mono(12.))
                 .text_color(color("text-secondary"))
                 .child(text)
         };
@@ -649,7 +650,12 @@ impl Composer {
                     .text_color(color("text-tertiary"))
                     .aria_label(line)
                     .child("Starts in a new worktree off")
-                    .child(div().font_family(code_family()).child(self.base.clone()))
+                    .child(
+                        div()
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
+                            .child(self.base.clone()),
+                    )
                     .test_support(),
             )
             .child(

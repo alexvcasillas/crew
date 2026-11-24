@@ -14,7 +14,9 @@ use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip};
+use super::common::{
+    clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip, with_font_probe,
+};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
@@ -102,8 +104,8 @@ impl Workspace {
                     .items_center()
                     .gap(ui_px(12.))
                     .h(scale::row(44.))
-                    .pl(ui_px(24.))
-                    .pr(ui_px(16.))
+                    .pl(scale::chrome(24.))
+                    .pr(scale::chrome(16.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .child(
@@ -192,7 +194,7 @@ impl Workspace {
     fn render_composer_area(&self) -> impl IntoElement + use<> {
         div()
             .flex_none()
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .pb(scale::row(16.))
             .pt(scale::row(4.))
             .child(self.composer.clone())
@@ -217,8 +219,8 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap(ui_px(8.))
-                .px(ui_px(24.))
-                .pl(ui_px(24. + 32. + 12.))
+                .px(scale::chrome(24.))
+                .pl(scale::chrome(24.) + ui_px(32. + 12.))
                 .text_size(scale::text(12.))
                 .text_color(color("text-tertiary"))
                 .child(
@@ -251,7 +253,7 @@ impl Workspace {
             .id(format!("message-{id}"))
             .flex()
             .gap(ui_px(12.))
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .py(scale::row(8.))
             .child(avatar)
             .child(
@@ -295,6 +297,7 @@ impl Workspace {
                                     body.child(styled_body(&message.body, names))
                                 }
                             })
+                            .map(|body| with_font_probe(body, || format!("message-body-{id}")))
                             .test_support(),
                     ),
             )
@@ -316,7 +319,7 @@ impl Workspace {
             .id(format!("live-{id}"))
             .flex()
             .gap(ui_px(12.))
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .py(scale::row(8.))
             .bg(color("surface-100"))
             .child(live_avatar(
@@ -422,7 +425,10 @@ fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
 
 /// Lines up with a message's text, past the avatar.
 pub(super) fn indented(child: impl IntoElement) -> Div {
-    div().pl(ui_px(24. + 32. + 12.)).pr(ui_px(24.)).child(child)
+    div()
+        .pl(scale::chrome(24.) + ui_px(32. + 12.))
+        .pr(scale::chrome(24.))
+        .child(child)
 }
 
 fn you_avatar() -> Div {

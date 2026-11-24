@@ -60,3 +60,8 @@ mod test_ui;
 mod thread_tests;
 
 pub use crate::app::run;
+
+/// The title bar's height with the appearance settings in use.
+pub fn title_bar_height() -> gpui_kit::Pixels {
+    crate::theme::scale::chrome(title_bar::TITLE_BAR_HEIGHT)
+}

@@ -447,7 +447,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(INSPECTOR_WIDTH))
+            .w(scale::chrome(INSPECTOR_WIDTH))
             .h_full()
             .border_l_1()
             .border_color(color("border-100"))

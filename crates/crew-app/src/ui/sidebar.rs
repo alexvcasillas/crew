@@ -9,10 +9,10 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{ago, dot, monogram, now_ms, status_word};
+use super::common::{ago, dot, monogram, now_ms, status_word, with_font_probe};
 use super::settings::Page;
 use super::settings::projects::FolderFor;
-use super::workspace::{SIDEBAR_WIDTH, Workspace};
+use super::workspace::Workspace;
 use crate::model::ThreadStatus;
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
@@ -55,7 +55,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .border_r_1()
             .border_color(color("border-100"))
@@ -169,6 +169,7 @@ impl Workspace {
             .child(
                 div()
                     .font_family(code_family())
+                    .text_size(scale::mono(13.))
                     .text_color(color("text-tertiary"))
                     .child("#"),
             )
@@ -177,7 +178,8 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(channel.name.clone()),
+                    .child(channel.name.clone())
+                    .map(|label| with_font_probe(label, || format!("channel-label-{id}"))),
             )
             .child(render_badge(id, &badge))
             .on_click(cx.listener(move |this, _, window, cx| {

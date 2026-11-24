@@ -5,6 +5,7 @@ use crew_core::ids::MessageId;
 use crew_core::store::Author;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Bounds, Entity, Pixels, TestAppContext};
 
+use super::common::font_probe;
 use super::test_ui::{bounds_of, press, wait_until};
 use super::thread_tests::{World, open_thread, world};
 use super::workspace::Workspace;
@@ -67,6 +68,12 @@ fn defaults_keep_the_original_look(cx: &mut TestAppContext) {
     assert_eq!(body.size.height, gpui_kit::px(20.), "a message line");
     let add = bounds(cx, window, "sidebar-projects-add".into());
     assert_eq!(add.size.height, gpui_kit::px(16.), "a kit button");
+    let text = |key: String| font_probe::size_of(&key).unwrap();
+    assert_eq!(text(format!("message-body-{message}")), gpui_kit::px(13.));
+    assert_eq!(
+        text(format!("channel-label-{}", w.channel)),
+        gpui_kit::px(13.)
+    );
 
     // Nothing is written until you change a setting.
     assert_eq!(crate::prefs::read(home.path(), APPEARANCE_KEY), None);
@@ -80,10 +87,8 @@ fn bigger_text_reaches_messages_the_sidebar_and_kit_buttons(cx: &mut TestAppCont
     let (w, window, _ws, message) = thread_with_message(cx, home.path(), &tmp.path().join("repo"));
     let channel_id = format!("channel-{}", w.channel);
     let body_id = format!("message-body-{message}");
-    let kit_before = bounds(cx, window, "sidebar-projects-add".into())
-        .size
-        .height;
-
+    let label_id = format!("channel-label-{}", w.channel);
+    let send_before = bounds(cx, window, "composer-send".into()).size;
     cx.update(|cx| {
         scale::set_appearance(
             Appearance {
@@ -95,25 +100,39 @@ fn bigger_text_reaches_messages_the_sidebar_and_kit_buttons(cx: &mut TestAppCont
     });
     cx.run_until_parked();
 
+    let grown = 18. / 13.;
+    assert_eq!(
+        font_probe::size_of(&body_id),
+        Some(gpui_kit::px(18.)),
+        "message text"
+    );
+    assert_eq!(
+        font_probe::size_of(&label_id),
+        Some(gpui_kit::px(18.)),
+        "sidebar row label"
+    );
     let body = bounds(cx, window, body_id);
     assert!(
-        near(body.size.height, 20. * 18. / 13.),
+        near(body.size.height, 20. * grown),
         "message line: {:?}",
         body.size.height
     );
     let channel = bounds(cx, window, channel_id);
     assert_eq!(channel.size.height, gpui_kit::px(39.), "sidebar row");
-    let kit = bounds(cx, window, "sidebar-projects-add".into())
-        .size
-        .height;
-    // Kit sizes are in rems, drawn on whole pixels.
-    assert!(
-        (f32::from(kit) - f32::from(kit_before) * 18. / 13.).abs() <= 1.,
-        "kit button: {kit:?} from {kit_before:?}"
-    );
-    // Layout lengths follow the zoom only.
+    // A Kit button's label and padding are in rems, drawn on device pixels.
+    let send = bounds(cx, window, "composer-send".into()).size;
+    for (after, before) in [
+        (send.width, send_before.width),
+        (send.height, send_before.height),
+    ] {
+        assert!(
+            (f32::from(after) - f32::from(before) * grown).abs() <= 1.5,
+            "kit button: {send:?} from {send_before:?}"
+        );
+    }
+    // The frame grows a little: 264 × (1 + 5 × 0.045).
     let sidebar = bounds(cx, window, "sidebar".into());
-    assert_eq!(sidebar.size.width, gpui_kit::px(264.));
+    assert_eq!(sidebar.size.width, gpui_kit::px(323.));
 
     wait_until(cx, "the settings saved", |_| {
         Appearance::load(home.path()).ui_size == 18
@@ -147,7 +166,9 @@ fn zoom_shortcuts_work_outside_text_fields(cx: &mut TestAppContext) {
     assert_eq!(zoom(cx), 110);
     let sidebar = bounds(cx, window, "sidebar".into());
     assert!(near(sidebar.size.width, 264. * 1.1), "{sidebar:?}");
-    press(cx, window, "cmd-- cmd-- cmd--");
+    press(cx, window, "cmd-+");
+    assert_eq!(zoom(cx), 120, "⌘+ zooms in like ⌘=");
+    press(cx, window, "cmd-- cmd-- cmd-- cmd--");
     assert_eq!(zoom(cx), 80);
     press(cx, window, "cmd-0");
     assert_eq!(zoom(cx), 100);
@@ -208,17 +229,26 @@ fn big_text_and_zoom_fit_the_smallest_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let width = gpui_kit::px(crate::app::WINDOW_MIN_WIDTH);
-    let title: Vec<Bounds<Pixels>> = ["title-search", "title-running", "title-settings"]
-        .into_iter()
-        .map(|id| bounds(cx, window, id.into()))
-        .collect();
+    let title: Vec<Bounds<Pixels>> = [
+        "title-app",
+        "title-search",
+        "title-running",
+        "title-settings",
+    ]
+    .into_iter()
+    .map(|id| bounds(cx, window, id.into()))
+    .collect();
     for pair in title.windows(2) {
         assert!(
             pair[0].right() <= pair[1].left(),
             "title bar items overlap: {title:?}"
         );
     }
-    assert!(title[2].right() <= width, "settings off screen: {title:?}");
+    assert!(title[3].right() <= width, "settings off screen: {title:?}");
+    assert!(
+        title[0].size.width > gpui_kit::px(0.),
+        "Crew shows: {title:?}"
+    );
 
     let header: Vec<Bounds<Pixels>> = ["toggle-activity", "thread-handoffs"]
         .into_iter()

@@ -215,14 +215,11 @@ impl Appearance {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
         };
-        let clamp = |n: u64, sizes: &[u8]| {
-            n.clamp(u64::from(sizes[0]), u64::from(sizes[sizes.len() - 1])) as u8
-        };
         if let Some(n) = int("ui_size") {
-            a.ui_size = clamp(n, &UI_SIZES);
+            a.ui_size = nearest(n, &UI_SIZES);
         }
         if let Some(n) = int("code_size") {
-            a.code_size = clamp(n, &CODE_SIZES);
+            a.code_size = nearest(n, &CODE_SIZES);
         }
         if let Some(f) = text("ui_font") {
             a.ui_font = f.to_string();
@@ -240,7 +237,9 @@ impl Appearance {
             a.density = d;
         }
         if let Some(z) = int("zoom") {
-            a.zoom = z.clamp(u64::from(ZOOM_MIN), u64::from(ZOOM_MAX)) as u16;
+            let step = u64::from(ZOOM_STEP);
+            let on_grid = (z + step / 2) / step * step;
+            a.zoom = on_grid.clamp(u64::from(ZOOM_MIN), u64::from(ZOOM_MAX)) as u16;
         }
         if let Some(m) = text("sidebar_mode").and_then(SidebarMode::parse) {
             a.sidebar_mode = m;
@@ -266,6 +265,15 @@ impl Appearance {
         map.insert("sidebar_mode".into(), self.sidebar_mode.name().into());
         Value::Object(map)
     }
+}
+
+/// The offered size closest to `n`, the smaller on a tie.
+fn nearest(n: u64, sizes: &[u8]) -> u8 {
+    sizes
+        .iter()
+        .copied()
+        .min_by_key(|&s| n.abs_diff(u64::from(s)))
+        .unwrap_or(sizes[0])
 }
 
 /// `zoom` one step bigger (`direction` 1) or smaller (-1), on the 10%
@@ -375,6 +383,16 @@ mod tests {
         assert!(!a.bolder);
         assert_eq!(a.zoom, ZOOM_MIN);
         assert_eq!(a.density, Density::Compact);
+
+        // Only the offered sizes, and zoom on its 10% grid.
+        write(
+            home.path(),
+            APPEARANCE_KEY,
+            serde_json::json!({"ui_size": 17, "code_size": 3, "zoom": 105}),
+        )
+        .unwrap();
+        let a = Appearance::load(home.path());
+        assert_eq!((a.ui_size, a.code_size, a.zoom), (16, 11, 110));
     }
 
     #[test]

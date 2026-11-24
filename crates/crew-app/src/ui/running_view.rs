@@ -24,7 +24,7 @@ use super::common::{
 };
 use super::inspector::run_state;
 use super::run_card::summarize;
-use super::workspace::{SIDEBAR_WIDTH, Workspace};
+use super::workspace::Workspace;
 use crate::model::{RunningNow, ThreadStatus};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
@@ -635,7 +635,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .px(ui_px(8.))
             .py(scale::row(12.))

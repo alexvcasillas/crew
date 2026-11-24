@@ -20,7 +20,7 @@ use super::{control, field, form_error, help, segment, segmented};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 use crate::ui::common::{monogram, provider_icon, runtime_badge, runtime_chip};
-use crate::ui::workspace::{SIDEBAR_WIDTH, Workspace};
+use crate::ui::workspace::Workspace;
 
 /// The models the segmented control offers, by the names `claude` takes.
 pub const MODELS: [(&str, &str); 3] = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
@@ -787,7 +787,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .px(ui_px(8.))
             .py(scale::row(12.))

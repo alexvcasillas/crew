@@ -33,7 +33,8 @@ pub fn menu_height(rows: usize, any_agents: bool) -> f32 {
 /// px): when above it would run under the title bar. `height` is in
 /// window px too.
 pub fn opens_below(top: f32, height: f32) -> bool {
-    top - f32::from(ui_px(MENU_GAP)) - height < f32::from(ui_px(super::title_bar::TITLE_BAR_HEIGHT))
+    top - f32::from(ui_px(MENU_GAP)) - height
+        < f32::from(scale::chrome(super::title_bar::TITLE_BAR_HEIGHT))
 }
 
 /// An agent as the menu shows it.

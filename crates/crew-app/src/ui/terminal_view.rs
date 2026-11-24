@@ -318,7 +318,7 @@ impl Workspace {
                     .items_center()
                     .gap(ui_px(12.))
                     .h(scale::row(44.))
-                    .px(ui_px(24.))
+                    .px(scale::chrome(24.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .child(
@@ -426,8 +426,8 @@ impl Workspace {
                 return author_row(ix, you_avatar(), "You", None)
                     .child(
                         div()
-                            .pl(ui_px(INDENT))
-                            .pr(ui_px(24.))
+                            .pl(scale::chrome(24.) + ui_px(INDENT - 24.))
+                            .pr(scale::chrome(24.))
                             .line_height(scale::line(20.))
                             .child(
                                 div()
@@ -529,8 +529,8 @@ impl Workspace {
                 .into_any_element(),
         };
         div()
-            .pl(ui_px(INDENT))
-            .pr(ui_px(24.))
+            .pl(scale::chrome(24.) + ui_px(INDENT - 24.))
+            .pr(scale::chrome(24.))
             .pb(scale::row(8.))
             .child(content)
             .into_any_element()
@@ -550,7 +550,7 @@ fn author_row(ix: usize, avatar: Div, name: &str, runtime: Option<&str>) -> Stat
                 .flex()
                 .items_center()
                 .gap(ui_px(12.))
-                .px(ui_px(24.))
+                .px(scale::chrome(24.))
                 .child(avatar)
                 .child(
                     div()

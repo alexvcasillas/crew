@@ -90,7 +90,7 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_center()
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .py(ui_px(32.))
             .child(
                 div()

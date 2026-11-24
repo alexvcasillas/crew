@@ -41,7 +41,7 @@ impl Workspace {
             .flex_none()
             .items_start()
             .gap(ui_px(12.))
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .pt(ui_px(20.))
             .pb(scale::row(16.))
             .when(ruled, |header| {
@@ -312,7 +312,7 @@ impl Workspace {
             .flex_wrap()
             .items_center()
             .gap(ui_px(8.))
-            .px(ui_px(24.))
+            .px(scale::chrome(24.))
             .pt(scale::row(16.))
             .pb(scale::row(12.))
             .child(

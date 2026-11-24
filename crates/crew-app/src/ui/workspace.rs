@@ -39,9 +39,12 @@ use crate::model::{Handoff, State};
 use crate::prefs::Appearance;
 use crate::recents::Recents;
 use crate::theme::color;
-use crate::theme::scale::{self, ui_family, ui_px, weight};
+use crate::theme::scale::{self, ui_family, weight};
 
 pub const SIDEBAR_WIDTH: f32 = 264.;
+/// The most of the window's width the sidebar takes, for big text and zoom
+/// in a small window.
+const SIDEBAR_MAX_SHARE: f32 = 0.4;
 /// Narrower windows hide the inspector until you show it.
 pub const INSPECTOR_MIN_WINDOW: f32 = 1200.;
 /// Longest thread title taken from a first message.
@@ -198,6 +201,10 @@ pub struct Workspace {
     recents_task: Option<Task<()>>,
     /// Lays out again when the appearance settings change.
     _appearance: Subscription,
+    /// The window's width as last drawn.
+    window_width: Pixels,
+    /// Where the traffic lights were put, to move them only on a change.
+    traffic_lights: Option<Point<Pixels>>,
 }
 
 /// A place the palette, and the sidebar, can take you to.
@@ -215,7 +222,6 @@ pub(super) type EditorSelect = SelectState<Vec<SharedString>>;
 
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        crate::theme::scale::load(conn.crew_home.clone(), cx);
         let appearance = cx.observe_global_in::<Appearance>(window, |this, _, cx| {
             this.remeasure_lists();
             cx.notify();
@@ -326,7 +332,15 @@ impl Workspace {
             recents,
             recents_task: None,
             _appearance: appearance,
+            traffic_lights: None,
+            window_width: px(f32::MAX),
         }
+    }
+
+    /// The sidebar's width: it grows with bigger text, but never takes more
+    /// than [`SIDEBAR_MAX_SHARE`] of the window.
+    pub(super) fn sidebar_width(&self) -> Pixels {
+        scale::chrome(SIDEBAR_WIDTH).min((self.window_width * SIDEBAR_MAX_SHARE).floor())
     }
 
     /// Text sizes changed: the virtual lists measure their rows again.
@@ -1290,7 +1304,13 @@ fn working_hint(names: &[String]) -> Option<String> {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let wide = window.viewport_size().width >= ui_px(INSPECTOR_MIN_WINDOW);
+        self.window_width = window.viewport_size().width;
+        let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
+        let lights = crate::app::traffic_lights();
+        if self.traffic_lights != Some(lights) {
+            self.traffic_lights = Some(lights);
+            window.set_traffic_light_position(lights);
+        }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
         div()

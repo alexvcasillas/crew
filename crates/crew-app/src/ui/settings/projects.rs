@@ -22,7 +22,7 @@ use crate::theme::scale::{self, code_family, ui_px, weight};
 use crate::ui::common::chip;
 use crate::ui::thread_settings::policy_name;
 use crate::ui::title_bar::home_relative;
-use crate::ui::workspace::{SIDEBAR_WIDTH, Workspace};
+use crate::ui::workspace::Workspace;
 
 pub const NOT_GIT: &str = "Crew needs a git repository. Run `git init` there first.";
 const NO_BRANCH: &str = "Crew couldn't tell the main branch. Check out a branch there first.";
@@ -564,7 +564,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .px(ui_px(8.))
             .py(scale::row(12.))

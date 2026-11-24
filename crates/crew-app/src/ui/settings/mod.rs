@@ -251,7 +251,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(NAV_WIDTH))
+            .w(scale::chrome(NAV_WIDTH))
             .h_full()
             .px(ui_px(8.))
             .py(scale::row(12.))

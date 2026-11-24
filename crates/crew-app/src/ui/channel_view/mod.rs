@@ -959,7 +959,7 @@ impl Workspace {
                         div()
                             .id("channel-error")
                             .flex_none()
-                            .px(ui_px(24.))
+                            .px(scale::chrome(24.))
                             .pb(scale::row(8.))
                             .text_size(scale::text(12.))
                             .text_color(color("danger"))
@@ -1044,7 +1044,7 @@ impl Workspace {
                     .into_any_element()
             }
         };
-        div().px(ui_px(24.)).child(body).into_any_element()
+        div().px(scale::chrome(24.)).child(body).into_any_element()
     }
 
     fn render_section(

@@ -21,7 +21,7 @@ use gpui_kit::*;
 use super::common::{dot, spinner};
 use super::inspector::INSPECTOR_WIDTH;
 use super::markdown_view::render_doc;
-use super::workspace::{SIDEBAR_WIDTH, Workspace};
+use super::workspace::Workspace;
 use crate::checks::{Check, CheckState, checks};
 use crate::comments::{Comment, comments, place, reviewer_replies};
 use crate::diff_parse::{FileDiff, FileKind, Line, LineKind, parse, split_pairs};
@@ -1424,7 +1424,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(ui_px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .border_r_1()
             .border_color(color("border-100"))
@@ -1666,6 +1666,7 @@ impl Workspace {
                         .min_w_0()
                         .truncate()
                         .font_family(code_family())
+                        .text_size(scale::mono(12.))
                         .aria_label(value.clone())
                         .child(value)
                         .test_support(),
@@ -1677,7 +1678,7 @@ impl Workspace {
             .flex_col()
             .flex_none()
             .gap(ui_px(12.))
-            .w(ui_px(INSPECTOR_WIDTH))
+            .w(scale::chrome(INSPECTOR_WIDTH))
             .h_full()
             .p(ui_px(16.))
             .border_l_1()

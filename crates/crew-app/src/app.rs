@@ -1,5 +1,7 @@
 //! App setup: fonts, theme, the shortcut table, menus and the window.
 
+use std::path::Path;
+
 use gpui_kit::*;
 
 use crate::connection::ConnectionConfig;
@@ -38,6 +40,17 @@ actions!(
         ResetZoom,
     ]
 );
+
+/// The traffic lights' left inset and their buttons' height.
+const TRAFFIC_LIGHTS_X: f32 = 16.;
+const TRAFFIC_LIGHT_SIZE: f32 = 14.;
+
+/// Where the traffic lights go: centred in the title bar, which grows
+/// with text size and zoom. They themselves don't scale.
+pub fn traffic_lights() -> Point<Pixels> {
+    let title = crate::ui::title_bar_height();
+    point(px(TRAFFIC_LIGHTS_X), (title - px(TRAFFIC_LIGHT_SIZE)) / 2.)
+}
 
 pub const WINDOW_MIN_WIDTH: f32 = 960.;
 pub const WINDOW_MIN_HEIGHT: f32 = 600.;
@@ -79,7 +92,6 @@ pub fn bindings() -> Vec<Shortcut> {
         outside_text("cmd-r", RenameThread, "Rename thread"),
         outside_text("cmd-backspace", ArchiveThread, "Archive thread"),
         outside_text("cmd-=", ZoomIn, "Bigger"),
-        outside_text("cmd-+", ZoomIn, "Bigger"),
         outside_text("cmd--", ZoomOut, "Smaller"),
         outside_text("cmd-0", ResetZoom, "Reset zoom"),
     ]
@@ -103,11 +115,14 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
-/// Fonts, theme, key bindings, menus and Quit. Call after `gpui_kit::init`.
-pub fn init(cx: &mut App) {
+/// Fonts, the appearance saved in `crew_home`, theme, key bindings, menus
+/// and Quit. Call after `gpui_kit::init`.
+pub fn init(crew_home: &Path, cx: &mut App) {
     fonts::load(cx);
-    scale::apply_kit_theme(cx);
+    scale::load(crew_home.to_path_buf(), cx);
     cx.bind_keys(bindings().into_iter().map(|s| s.binding));
+    // ⌘+ too, which the shortcuts list shows as one row with ⌘=.
+    cx.bind_keys([KeyBinding::new("cmd-+", ZoomIn, Some("!Input"))]);
     cx.bind_keys(crate::ui::composer::bindings());
     cx.bind_keys(crate::ui::diff_view::bindings());
     cx.bind_keys(crate::ui::running_view::bindings());
@@ -123,22 +138,21 @@ pub fn init(cx: &mut App) {
 pub fn run() {
     let app = application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
+        let conn = ConnectionConfig::from_env();
         gpui_kit::init(cx);
-        init(cx);
+        init(&conn.crew_home, cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
                 title: Some("Crew".into()),
                 appears_transparent: true,
-                // Centres the traffic lights in the 48px title bar.
-                traffic_light_position: Some(point(px(16.), px(17.))),
+                traffic_light_position: Some(traffic_lights()),
             }),
             app_owns_titlebar_drag: true,
             window_min_size: Some(size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT))),
             ..Default::default()
         };
-        let conn = ConnectionConfig::from_env();
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| Workspace::new(conn, window, cx))
         })
@@ -185,7 +199,6 @@ mod tests {
                 "cmd-r",
                 "cmd-backspace",
                 "cmd-=",
-                "cmd-+",
                 "cmd--",
                 "cmd-0",
             ]

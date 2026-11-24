@@ -13,7 +13,7 @@ use super::settings::Page;
 use super::workspace::Workspace;
 use crate::app;
 use crate::theme::color;
-use crate::theme::scale::{self, code_family, ui_px, weight};
+use crate::theme::scale::{self, code_family, ui_family, ui_px, weight};
 
 pub const TITLE_BAR_HEIGHT: f32 = 48.;
 /// The Kit title bar's left padding for the traffic lights on macOS.
@@ -43,7 +43,7 @@ impl Workspace {
             .or_else(|| self.render_review_title(cx));
         if let Some((left, right)) = special {
             return TitleBar::new()
-                .h(ui_px(TITLE_BAR_HEIGHT))
+                .h(scale::chrome(TITLE_BAR_HEIGHT))
                 .bg(color("bg-100"))
                 .border_color(color("border-100"))
                 .child(
@@ -58,20 +58,23 @@ impl Workspace {
                 )
                 .child(div().flex_none().pr(ui_px(12.)).child(right));
         }
+        let search = search_width(width);
+        let crowded = search < ui_px(SEARCH_WIDTH);
         TitleBar::new()
-            .h(ui_px(TITLE_BAR_HEIGHT))
+            .h(scale::chrome(TITLE_BAR_HEIGHT))
             .bg(color("bg-100"))
             .border_color(color("border-100"))
             .child(
                 // Equal flexible sides keep the search button centred.
+                // "Crew" always shows; the breadcrumb after it is cut, and
+                // never reaches under the search button.
                 div()
                     .flex()
                     .items_center()
                     .gap(ui_px(8.))
                     .flex_1()
                     .flex_basis(ui_px(0.))
-                    .min_w_0()
-                    // Never reaches under the search button.
+                    .min_w(app_name_width(cx) + ui_px(16.))
                     .overflow_hidden()
                     .mr(ui_px(12.))
                     .px(ui_px(8.))
@@ -84,20 +87,32 @@ impl Workspace {
                             .child("Crew")
                             .test_support(),
                     )
-                    .children(self.render_breadcrumb(cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(ui_px(8.))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .children(self.render_breadcrumb(cx)),
+                    ),
             )
-            .child(render_search_button(search_width(width), cx))
+            .child(render_search_button(search, cx))
             .child(
                 div()
                     .flex_1()
                     .flex_basis(ui_px(0.))
                     .flex()
                     .justify_end()
-                    // Mirrors the traffic-light inset on the left. The
-                    // traffic lights don't zoom, so neither does this.
+                    // Mirrors the traffic-light inset on the left, which
+                    // doesn't zoom, unless the bar is too crowded for it.
                     .items_center()
                     .gap(ui_px(8.))
-                    .pl(px(TRAFFIC_LIGHTS_INSET))
+                    .pl(if crowded {
+                        ui_px(12.)
+                    } else {
+                        px(TRAFFIC_LIGHTS_INSET)
+                    })
                     .pr(ui_px(12.))
                     .children(self.render_title_actions(cx)),
             )
@@ -190,7 +205,8 @@ impl Workspace {
             slash().into_any_element(),
             div()
                 .id("title-project")
-                .flex_none()
+                .min_w_0()
+                .truncate()
                 .font_weight(weight(FontWeight::MEDIUM))
                 .aria_label(project.name.clone())
                 .child(project.name.clone())
@@ -200,13 +216,16 @@ impl Workspace {
             div()
                 .id("title-channel")
                 .flex()
-                .flex_none()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
                 .gap(ui_px(2.))
                 .font_weight(weight(FontWeight::MEDIUM))
                 .aria_label(format!("#{}", channel.name))
                 .child(
                     div()
                         .font_family(code_family())
+                        .text_size(scale::mono(13.))
                         .text_color(color("text-tertiary"))
                         .child("#"),
                 )
@@ -254,6 +273,21 @@ pub(super) fn home_relative(path: &Path) -> String {
         },
         _ => path.display().to_string(),
     }
+}
+
+/// How wide "Crew" is drawn in the title bar.
+fn app_name_width(cx: &App) -> Pixels {
+    let text = cx.text_system();
+    let mut name = font(ui_family());
+    name.weight = weight(FontWeight::SEMIBOLD);
+    let id = text.resolve_font(&name);
+    let size = scale::text(13.);
+    "Crew"
+        .chars()
+        .filter_map(|c| text.advance(id, size, c).ok())
+        .map(|a| a.width)
+        .fold(px(0.), |sum, w| sum + w)
+        .ceil()
 }
 
 /// The search button's width in a window `window` wide: its full width
