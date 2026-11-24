@@ -415,7 +415,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -791,7 +791,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -845,7 +845,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -878,7 +878,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -951,7 +951,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -990,7 +990,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1184,4 +1184,152 @@ fn usage_follows_the_runtime_the_run_used() {
     let usage = store.usage_since(0, i64::MAX / 2).unwrap();
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
+}
+
+const SCHEMA_V7: &str = include_str!("../src/store/schema_v7.sql");
+
+#[test]
+fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V7).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, main_branch, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000001', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000002',
+                        '00000000-0000-4000-8000-000000000001', 'general', 2);
+             INSERT INTO threads (id, channel_id, title, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000003',
+                        '00000000-0000-4000-8000-000000000002', 'Fix login', 3);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let project = store.projects().unwrap()[0].id;
+    let channel = &store.channels(project).unwrap()[0];
+    assert_eq!(channel.name, "general");
+    assert_eq!(channel.description, "");
+    let thread = &store.threads(channel.id).unwrap()[0];
+    assert_eq!(thread.title, "Fix login");
+    assert_eq!(thread.archived_at, None);
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn archiving_a_thread_round_trips() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "first").unwrap();
+    assert_eq!(store.thread(t).unwrap().archived_at, None);
+    store.set_thread_archived(t, true).unwrap();
+    assert!(store.thread(t).unwrap().archived_at.is_some());
+    store.set_thread_archived(t, false).unwrap();
+    assert_eq!(store.thread(t).unwrap().archived_at, None);
+    let missing = crew_core::ids::ThreadId::new();
+    assert!(matches!(
+        store.set_thread_archived(missing, true),
+        Err(StoreError::NotFound("thread"))
+    ));
+}
+
+#[test]
+fn a_channel_takes_a_new_name_and_description() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    store
+        .update_channel(c, "bugs", "Things that broke")
+        .unwrap();
+    let channel = store.channel(c).unwrap();
+    assert_eq!(
+        (channel.name.as_str(), channel.description.as_str()),
+        ("bugs", "Things that broke")
+    );
+}
+
+#[test]
+fn thread_activity_counts_messages_and_finds_excerpts() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let quiet = store.create_thread(c, "quiet").unwrap();
+    let busy = store.create_thread(c, "busy").unwrap();
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    store
+        .add_message(busy, Author::You, "first ask", None)
+        .unwrap();
+    store
+        .add_message(busy, Author::Agent(a), "one", None)
+        .unwrap();
+    store
+        .add_message(busy, Author::You, "second ask", None)
+        .unwrap();
+    store
+        .add_message(busy, Author::Agent(a), "two", None)
+        .unwrap();
+    store
+        .add_message(busy, Author::System, "note", None)
+        .unwrap();
+
+    let activity = store.thread_activity(c).unwrap();
+    assert_eq!(activity.len(), 2);
+    let q = activity.iter().find(|x| x.thread == quiet).unwrap();
+    assert_eq!(q.messages, 0);
+    assert_eq!(q.last_message_at, None);
+    assert_eq!(
+        (q.latest_agent.as_deref(), q.first_you.as_deref()),
+        (None, None)
+    );
+    let b = activity.iter().find(|x| x.thread == busy).unwrap();
+    assert_eq!(b.messages, 4);
+    assert!(b.last_message_at.is_some());
+    assert_eq!(b.latest_agent.as_deref(), Some("two"));
+    assert_eq!(b.first_you.as_deref(), Some("first ask"));
+    assert_eq!(b.pending_ask, None);
+
+    // A pending ask's note is the excerpt; once decided it is not.
+    let r = store.create_run(busy, a).unwrap();
+    let kind = ApprovalKind::Permission {
+        tool: "Bash".into(),
+        input: serde_json::json!({ "command": "ls" }),
+        tool_use_id: None,
+    };
+    let ask = store.create_approval(busy, r, &kind).unwrap();
+    store
+        .add_approval_message(busy, "Ada wants to run Bash: ls", r, ask)
+        .unwrap();
+    let activity = store.thread_activity(c).unwrap();
+    let b = activity.iter().find(|x| x.thread == busy).unwrap();
+    assert_eq!(b.pending_ask.as_deref(), Some("Ada wants to run Bash: ls"));
+    assert!(b.needs_you);
+    store
+        .decide_approval(ask, ApprovalStatus::Approved, None)
+        .unwrap();
+    let activity = store.thread_activity(c).unwrap();
+    let b = activity.iter().find(|x| x.thread == busy).unwrap();
+    assert_eq!(b.pending_ask, None);
+    assert!(!b.needs_you);
+    assert_eq!(store.channel_runs(c).unwrap().len(), 1);
 }

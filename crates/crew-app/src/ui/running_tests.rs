@@ -227,7 +227,7 @@ fn stop_all_shortcut_stops_everything(cx: &mut TestAppContext) {
     press(cx, window, "cmd-shift-.");
     run_in(cx, &ws, w.thread, forge, RunStatus::Stopped);
     run_in(cx, &ws, shop.thread, scout, RunStatus::Stopped);
-    wait_gone(cx, window, "title-running".into());
+    wait_label(cx, window, "title-running".into(), "Nothing running");
     wait_gone(cx, window, "status-working".into());
 
     press(cx, window, "cmd-2");

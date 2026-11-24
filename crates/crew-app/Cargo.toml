@@ -23,6 +23,7 @@ nix = { workspace = true, features = ["socket"] }
 
 [dev-dependencies]
 crewd = { path = "../crewd" }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

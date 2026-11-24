@@ -1319,6 +1319,7 @@ async fn handoffs_used_and_worktree_changes_are_broadcast() {
         while c
             .call(Request::Discard {
                 thread: chat.thread,
+                delete_branch: false,
             })
             .await
             .is_err()

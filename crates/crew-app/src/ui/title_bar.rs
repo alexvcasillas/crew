@@ -3,6 +3,7 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{IconName, Sizable as _, TitleBar};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use std::path::{Path, PathBuf};
@@ -93,41 +94,51 @@ impl Workspace {
             )
     }
 
-    /// "● N running · ● M need you", when anything runs or waits, and
-    /// the settings button. Every view's title bar ends with them.
+    /// "● N running · ● M need you", or "Nothing running", and the
+    /// settings button. Every view's title bar ends with them. The first
+    /// opens Running now.
     pub(super) fn render_title_actions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let (running, needs) = self.run_counts();
-        let mut actions = Vec::new();
-        if running + needs > 0 {
-            let label = format!("{running} running · {needs} need you");
-            actions.push(
-                div()
-                    .id("title-running")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(6.))
-                    .h(px(28.))
-                    .px(px(10.))
-                    .border_1()
-                    .border_color(color("border-200"))
-                    .rounded(px(6.))
-                    .text_size(px(12.))
-                    .text_color(color("text-secondary"))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(color("surface-100")))
-                    .role(Role::Button)
-                    .aria_label(label)
-                    .child(dot("accent-blue"))
-                    .child(format!("{running} running"))
-                    .child(div().text_color(color("text-tertiary")).child("·"))
-                    .child(dot("warning"))
-                    .child(format!("{needs} need you"))
-                    .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx)))
-                    .test_support()
-                    .into_any_element(),
-            );
-        }
+        let live = running + needs > 0;
+        let label = if live {
+            format!("{running} running · {needs} need you")
+        } else {
+            "Nothing running".to_string()
+        };
+        let mut actions = vec![
+            div()
+                .id("title-running")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.))
+                .h(px(28.))
+                .px(px(10.))
+                .border_1()
+                .border_color(color("border-200"))
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .text_color(color("text-secondary"))
+                .cursor_pointer()
+                .hover(|s| s.bg(color("surface-100")))
+                .role(Role::Button)
+                .aria_label(label)
+                .map(|button| {
+                    if live {
+                        button
+                            .child(dot("accent-blue"))
+                            .child(format!("{running} running"))
+                            .child(div().text_color(color("text-tertiary")).child("·"))
+                            .child(dot("warning"))
+                            .child(format!("{needs} need you"))
+                    } else {
+                        button.child("Nothing running")
+                    }
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx)))
+                .test_support()
+                .into_any_element(),
+        ];
         actions.push(
             Button::new("title-settings")
                 .ghost()

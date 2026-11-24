@@ -28,6 +28,10 @@ actions!(
         ShowRunning,
         /// Approve the newest request in the open thread (⌘↵).
         ApproveLatest,
+        /// Rename the selected thread card (⌘R).
+        RenameThread,
+        /// Archive the selected thread card (⌘⌫).
+        ArchiveThread,
     ]
 );
 
@@ -58,6 +62,8 @@ pub fn bindings() -> Vec<Shortcut> {
         shortcut("cmd-1", ShowThreads, "Threads"),
         shortcut("cmd-2", ShowRunning, "Running now"),
         shortcut("cmd-enter", ApproveLatest, "Approve the newest request"),
+        shortcut("cmd-r", RenameThread, "Rename thread"),
+        shortcut("cmd-backspace", ArchiveThread, "Archive thread"),
     ]
 }
 
@@ -155,7 +161,9 @@ mod tests {
                 "cmd-,",
                 "cmd-1",
                 "cmd-2",
-                "cmd-enter"
+                "cmd-enter",
+                "cmd-r",
+                "cmd-backspace",
             ]
         );
         let labels: Vec<&str> = bindings().iter().map(|s| s.label).collect();

@@ -58,6 +58,9 @@ pub struct ServeOptions {
     /// sessions. `None` turns them off. The `crewd` binary uses
     /// [`claude_home_from`].
     pub claude_home: Option<PathBuf>,
+    /// For tests only: extra time each change count of a channel overview
+    /// takes, to make counts slow. Leave it at zero.
+    pub count_delay: Duration,
 }
 
 /// Claude Code's home: `CREW_CLAUDE_HOME`, else `CLAUDE_CONFIG_DIR` (where
@@ -85,6 +88,7 @@ impl Default for ServeOptions {
             minute: Duration::from_secs(60),
             notice_buffer: 4096,
             runtimes_wait: None,
+            count_delay: Duration::ZERO,
             claude_home: None,
         }
     }
@@ -190,6 +194,7 @@ pub async fn serve_until(
         opts.minute,
         opts.notice_buffer,
     );
+    service.set_count_delay(opts.count_delay);
     let sweeper = service.sweep_blocked();
     let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
     let terminal = opts
@@ -622,6 +627,7 @@ async fn requests_and_notices(
                     req @ (Request::ThreadDiff { .. }
                     | Request::Commit { .. }
                     | Request::Discard { .. }
+                    | Request::ChannelOverview { .. }
                     | Request::Runtimes) => {
                         let (svc, tx) = (service.clone(), answer_tx.clone());
                         tokio::spawn(async move {

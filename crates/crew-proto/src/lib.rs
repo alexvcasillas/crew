@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 9;
+pub const PROTO_VERSION: u32 = 10;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -66,6 +66,26 @@ pub enum Request {
     RenameThread {
         thread: ThreadId,
         title: String,
+    },
+    /// Archives the thread or brings it back. Its worktree and any live
+    /// run are left alone. Answered with null; every client gets a
+    /// [`ServerMsg::ThreadChanged`].
+    ArchiveThread {
+        thread: ThreadId,
+        archived: bool,
+    },
+    /// Renames the channel and sets its description. The name is
+    /// lowercase letters, numbers and dashes, and new in its project.
+    /// Answered with null; every client gets a [`ServerMsg::ChannelChanged`].
+    UpdateChannel {
+        channel: ChannelId,
+        name: String,
+        description: String,
+    },
+    /// Answered with a [`ChannelOverview`]: stats and one summary per
+    /// thread, archived ones included.
+    ChannelOverview {
+        channel: ChannelId,
     },
     PostMessage {
         thread: ThreadId,
@@ -140,9 +160,13 @@ pub enum Request {
         message: String,
     },
     /// Removes the thread's worktree, changes included, and its branch
-    /// unless the branch has commits beyond the worktree's base.
+    /// unless the branch has commits beyond the worktree's base. With
+    /// `delete_branch`, the branch goes even then. Refused while a run in
+    /// the thread is live.
     Discard {
         thread: ThreadId,
+        #[serde(default)]
+        delete_branch: bool,
     },
     /// From crew-mcp: the agent of `run` hands work to `agent`. Answered
     /// with a text for the agent.
@@ -228,6 +252,105 @@ pub struct TerminalSession {
     pub last_active_at: i64,
     /// Whether Claude Code is working in it now.
     pub live: bool,
+}
+
+/// The answer to [`Request::ChannelOverview`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelOverview {
+    pub stats: ChannelStats,
+    /// One per thread of the channel, archived ones included, oldest first.
+    pub threads: Vec<ThreadSummary>,
+}
+
+/// Numbers for a channel's header. Archived threads don't count. "Week"
+/// means the last 7 days.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelStats {
+    pub threads: u32,
+    /// Threads created this week.
+    pub threads_week: u32,
+    /// Threads with a queued or working run.
+    pub active: u32,
+    /// Threads with an approval waiting for you.
+    pub needs_you: u32,
+    /// Time of runs that ended this week or are working, in ms.
+    pub agent_ms_week: i64,
+    pub runs_week: u32,
+    /// Changes of threads active this week.
+    pub files_week: u32,
+    pub added_week: u32,
+    pub removed_week: u32,
+}
+
+/// What a thread card shows.
+///
+/// `files`, `added` and `removed` are the thread's whole work: its
+/// worktree against the base it started from, commits included. Review
+/// changes (`ThreadDiff`) shows only what isn't committed yet, so after a
+/// commit the card still counts files that Review changes no longer lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub thread: ThreadId,
+    /// Messages from you and agents. System notes don't count.
+    #[serde(default)]
+    pub messages: u32,
+    /// One per run, oldest first.
+    #[serde(default)]
+    pub runs: Vec<RunBar>,
+    #[serde(default)]
+    pub handoffs: u32,
+    /// Agents with runs here, in the order they first ran.
+    #[serde(default)]
+    pub participants: Vec<AgentId>,
+    /// Plain text, at most 240 characters: the pending ask, else the
+    /// latest agent reply, else your first message.
+    #[serde(default)]
+    pub excerpt: String,
+    /// Unix milliseconds.
+    #[serde(default)]
+    pub last_activity_at: i64,
+    #[serde(default)]
+    pub worktree: WorktreeState,
+    /// Files changed against the worktree's base, commits included.
+    #[serde(default)]
+    pub files: u32,
+    #[serde(default)]
+    pub added: u32,
+    #[serde(default)]
+    pub removed: u32,
+    /// Time of all its runs, live ones so far, in ms.
+    #[serde(default)]
+    pub agent_ms: i64,
+    /// The counts are still being worked out: `files`, `added` and
+    /// `removed` are their last known values, or zeros.
+    #[serde(default)]
+    pub counting: bool,
+}
+
+/// One run in a thread card's strip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunBar {
+    pub status: RunStatus,
+    /// How long it ran, or has run so far. 0 if it never started.
+    pub ms: i64,
+}
+
+/// Where a thread's worktree stands. A worktree whose folder is gone, or
+/// that git can't read, is `Clean`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorktreeState {
+    /// The thread has no worktree.
+    #[default]
+    None,
+    Clean,
+    /// Everything is committed on the branch.
+    Committed,
+    Uncommitted {
+        files: u32,
+    },
 }
 
 /// One agent CLI crewd can find. The answer to [`Request::Runtimes`] is a
@@ -356,6 +479,9 @@ pub enum ServerMsg {
     },
     /// A thread was renamed or its settings changed.
     ThreadChanged { thread: StoredThread },
+    /// Change counts in the channel's overview were worked out or may
+    /// have changed: ask for it again if it is shown.
+    ChannelOverviewStale { channel: ChannelId },
     /// An agent was created, changed or deleted. Deleted agents have
     /// `deleted_at` set.
     AgentChanged { agent: StoredAgent },
@@ -471,6 +597,87 @@ mod tests {
         write_frame(&mut buf, &reply).await.unwrap();
         let got: ServerMsg = read_frame(&mut buf.as_slice()).await.unwrap().unwrap();
         assert_eq!(got, reply);
+    }
+
+    #[test]
+    fn channel_messages_round_trip() {
+        let msgs = vec![
+            ClientMsg::Request {
+                id: 1,
+                req: Request::ArchiveThread {
+                    thread: ThreadId::new(),
+                    archived: true,
+                },
+            },
+            ClientMsg::Request {
+                id: 2,
+                req: Request::UpdateChannel {
+                    channel: ChannelId::new(),
+                    name: "bugs".into(),
+                    description: "Things that broke".into(),
+                },
+            },
+            ClientMsg::Request {
+                id: 3,
+                req: Request::ChannelOverview {
+                    channel: ChannelId::new(),
+                },
+            },
+            ClientMsg::Request {
+                id: 4,
+                req: Request::Discard {
+                    thread: ThreadId::new(),
+                    delete_branch: true,
+                },
+            },
+        ];
+        for msg in msgs {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+        }
+        // An older client's discard keeps the branch rule it knew.
+        let thread = ThreadId::new();
+        let json = format!(r#"{{"type":"discard","thread":"{thread}"}}"#);
+        assert_eq!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::Discard {
+                thread,
+                delete_branch: false
+            }
+        );
+        let overview = ChannelOverview {
+            stats: ChannelStats {
+                threads: 2,
+                ..ChannelStats::default()
+            },
+            threads: vec![ThreadSummary {
+                thread,
+                messages: 3,
+                runs: vec![RunBar {
+                    status: RunStatus::Done,
+                    ms: 1200,
+                }],
+                handoffs: 1,
+                participants: vec![AgentId::new()],
+                excerpt: "Done.".into(),
+                last_activity_at: 5,
+                worktree: WorktreeState::Uncommitted { files: 2 },
+                files: 2,
+                added: 3,
+                removed: 1,
+                agent_ms: 1200,
+                counting: true,
+            }],
+        };
+        let json = serde_json::to_value(&overview).unwrap();
+        assert_eq!(
+            json["threads"][0]["worktree"],
+            serde_json::json!({ "state": "uncommitted", "files": 2 })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChannelOverview>(json).unwrap(),
+            overview
+        );
     }
 
     #[test]

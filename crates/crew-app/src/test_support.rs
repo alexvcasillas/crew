@@ -244,3 +244,68 @@ pub fn recording_proxy(
     });
     seen
 }
+
+/// Forwards every client on `front` to crewd on `back`, except that while
+/// `failing` is set, `ChannelOverview` is answered with an error here.
+/// Counts the `ChannelOverview` requests clients send.
+pub fn failing_overview_proxy(
+    front: &Path,
+    back: PathBuf,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let failing = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (fail, count) = (failing.clone(), asked.clone());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::UnixStream::connect(&back).await else {
+                    continue;
+                };
+                let (mut client_rd, client_wr) = client.into_split();
+                let (mut server_rd, mut server_wr) = server.into_split();
+                let client_wr = Arc::new(tokio::sync::Mutex::new(client_wr));
+                let (fail, count, to_client) = (fail.clone(), count.clone(), client_wr.clone());
+                tokio::spawn(async move {
+                    while let Ok(Some(msg)) = read_frame::<_, ClientMsg>(&mut client_rd).await {
+                        let ClientMsg::Request { id, req } = &msg;
+                        if matches!(req, crew_proto::Request::ChannelOverview { .. }) {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            if fail.load(Ordering::SeqCst) {
+                                let refused = ServerMsg::Response {
+                                    id: *id,
+                                    result: Err("crewd is having a bad day.".into()),
+                                };
+                                let mut out = to_client.lock().await;
+                                if write_frame(&mut *out, &refused).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                        if write_frame(&mut server_wr, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Ok(Some(msg)) = read_frame::<_, ServerMsg>(&mut server_rd).await {
+                        let mut out = client_wr.lock().await;
+                        if write_frame(&mut *out, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    });
+    (failing, asked)
+}

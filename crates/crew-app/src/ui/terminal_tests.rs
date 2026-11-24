@@ -438,7 +438,10 @@ fn the_live_dot_clears_when_the_session_goes_idle(cx: &mut TestAppContext) {
             "terminal sessions aren't Crew runs"
         );
     });
-    assert!(!has(cx, window, "title-running"));
+    assert_eq!(
+        label_of(cx, window, "title-running").as_deref(),
+        Some("Nothing running")
+    );
 
     s.register("s-one", "idle");
     wait_until(cx, "the dot to clear", |cx| {

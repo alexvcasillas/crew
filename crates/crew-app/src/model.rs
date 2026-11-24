@@ -331,8 +331,11 @@ impl State {
                 }
             }
             ServerMsg::LimitsChanged { limits } => self.limits_changed(limits),
-            // The workspace keeps the runtimes.
-            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
+            // The workspace keeps the runtimes and refetches overviews.
+            ServerMsg::Response { .. }
+            | ServerMsg::Resync
+            | ServerMsg::RuntimesChanged { .. }
+            | ServerMsg::ChannelOverviewStale { .. } => {}
         }
     }
 
@@ -490,12 +493,27 @@ impl State {
         )
     }
 
-    /// The channel's threads, oldest first.
+    /// The channel's threads that aren't archived, oldest first.
     pub fn threads(&self, channel: ChannelId) -> Vec<&StoredThread> {
+        sorted(
+            self.threads
+                .values()
+                .filter(|t| t.channel == channel && t.archived_at.is_none()),
+            |t| (t.created_at, t.id.0),
+        )
+    }
+
+    /// The channel's threads, archived ones included, oldest first.
+    pub fn threads_with_archived(&self, channel: ChannelId) -> Vec<&StoredThread> {
         sorted(
             self.threads.values().filter(|t| t.channel == channel),
             |t| (t.created_at, t.id.0),
         )
+    }
+
+    /// Every known run, in no order.
+    pub fn all_runs(&self) -> impl Iterator<Item = &StoredRun> {
+        self.runs.values()
     }
 
     pub fn run(&self, run: RunId) -> Option<&StoredRun> {
@@ -661,11 +679,12 @@ impl State {
     }
 
     /// Messages in the channel's threads after `since` (Unix ms) that you
-    /// didn't write.
+    /// didn't write. Archived threads don't count.
     pub fn unread(&self, channel: ChannelId, since: i64) -> usize {
         let threads = self.thread_ids(|c| c == channel);
         threads
             .iter()
+            .filter(|t| self.threads.get(t).is_some_and(|t| t.archived_at.is_none()))
             .flat_map(|t| self.messages(*t))
             .filter(|m| m.created_at > since && m.author != Author::You)
             .count()
@@ -914,6 +933,7 @@ mod tests {
             created_at: 1,
             handoff_policy: None,
             handoff_budget: None,
+            description: String::new(),
         }
     }
 
@@ -927,6 +947,7 @@ mod tests {
             handoff_policy: None,
             handoff_budget: None,
             handoffs_used: 0,
+            archived_at: None,
         }
     }
 
@@ -1259,6 +1280,27 @@ mod tests {
             .map(|t| t.title.as_str())
             .collect();
         assert_eq!(titles, ["fix the login page", "newer"]);
+    }
+
+    #[test]
+    fn archived_threads_leave_the_list_and_the_unread_count() {
+        let (mut state, _, c, t) = one_thread();
+        let mut reply = message(t.id, "done", 10);
+        reply.author = Author::System;
+        state.apply(ServerMsg::Message {
+            thread: t.id,
+            message: reply,
+        });
+        assert_eq!(state.unread(c.id, 0), 1);
+        let mut archived = t.clone();
+        archived.archived_at = Some(20);
+        state.apply(ServerMsg::ThreadChanged { thread: archived });
+        assert!(state.threads(c.id).is_empty());
+        assert_eq!(state.threads_with_archived(c.id).len(), 1);
+        assert_eq!(state.unread(c.id, 0), 0);
+        state.apply(ServerMsg::ThreadChanged { thread: t.clone() });
+        assert_eq!(state.threads(c.id).len(), 1, "unarchived");
+        assert_eq!(state.unread(c.id, 0), 1);
     }
 
     #[test]

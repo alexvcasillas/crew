@@ -8,7 +8,10 @@ use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{Author, StoredChannel, StoredProject, StoredThread};
 use crew_core::worktree::Diff;
-use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
+use crew_proto::{
+    ChannelOverview, ClientMsg, PROTO_VERSION, Request, RunBar, ServerMsg, ThreadSummary,
+    WorktreeState, read_frame, write_frame,
+};
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
@@ -734,7 +737,10 @@ async fn discard_removes_worktree() {
     let s = setup(&d, &mut c).await;
 
     let err = c
-        .call(Request::Discard { thread: s.thread })
+        .call(Request::Discard {
+            thread: s.thread,
+            delete_branch: false,
+        })
         .await
         .unwrap_err();
     assert_eq!(err, "This thread has no worktree.");
@@ -744,7 +750,12 @@ async fn discard_removes_worktree() {
     let wt_path = d.home.join("worktrees/demo/fix-login");
     assert!(wt_path.is_dir());
 
-    c.call(Request::Discard { thread: s.thread }).await.unwrap();
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: false,
+    })
+    .await
+    .unwrap();
     assert!(!wt_path.exists());
     assert_eq!(git(&d.root(), &["branch", "--list", "crew/fix-login"]), "");
     assert!(thread_of(&mut c, &s).await.worktree.is_none());
@@ -777,7 +788,6 @@ async fn commit_refused_while_running() {
     })
     .await;
 
-    let wait = "Wait for Forge to finish, or stop it.";
     let err = c
         .call(Request::Commit {
             thread: s.thread,
@@ -785,14 +795,23 @@ async fn commit_refused_while_running() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err, wait);
-    let err = c
-        .call(Request::Discard { thread: s.thread })
-        .await
-        .unwrap_err();
-    assert_eq!(err, wait);
-    // Discard was refused, so the worktree stays.
+    assert_eq!(err, "Wait for Forge to finish, or stop it.");
+    for delete_branch in [false, true] {
+        let err = c
+            .call(Request::Discard {
+                thread: s.thread,
+                delete_branch,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Stop Forge first.");
+    }
+    // Discard was refused, so the worktree and its branch stay.
     assert!(d.home.join("worktrees/demo/fix-login").is_dir());
+    git(
+        &d.root(),
+        &["rev-parse", "--verify", "refs/heads/crew/fix-login"],
+    );
 
     c.call(Request::StopThread { thread: s.thread })
         .await
@@ -815,7 +834,12 @@ async fn discard_keeps_a_branch_with_commits() {
         })
         .await;
 
-    c.call(Request::Discard { thread: s.thread }).await.unwrap();
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: false,
+    })
+    .await
+    .unwrap();
     let wt_path = d.home.join("worktrees/demo/fix-login");
     assert!(!wt_path.exists());
     assert!(thread_of(&mut c, &s).await.worktree.is_none());
@@ -1023,4 +1047,586 @@ async fn setup_starts_the_run_clock() {
     );
     c.call(Request::StopRun { run: run.id }).await.unwrap();
     c.until_status(RunStatus::Stopped).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_can_delete_a_branch_with_commits() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: true,
+    })
+    .await
+    .unwrap();
+    assert!(!d.home.join("worktrees/demo/fix-login").exists());
+    assert_eq!(git(&d.root(), &["branch", "--list", "crew/fix-login"]), "");
+    assert!(thread_of(&mut c, &s).await.worktree.is_none());
+    let msgs = c.pending.clone();
+    assert!(
+        !system_messages(&msgs)
+            .iter()
+            .any(|m| m.starts_with("Kept branch")),
+        "the branch was deleted, not kept"
+    );
+}
+
+/// A fake claude that edits `a.txt` ("one" becomes "ONE" plus "two"),
+/// writes `file.txt`, then replays `edit_and_test.jsonl`.
+fn editing_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-edits.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf 'ONE\\ntwo\\n' > a.txt\nexec '{}' '{}'\n",
+            fake("claude_writes.sh").display(),
+            fixture("edit_and_test.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+async fn overview(c: &mut Client, channel: ChannelId) -> ChannelOverview {
+    c.ok(Request::ChannelOverview { channel }).await
+}
+
+fn summary(o: &ChannelOverview, thread: ThreadId) -> &ThreadSummary {
+    o.threads.iter().find(|t| t.thread == thread).unwrap()
+}
+
+/// An app connection: subscribed to everything, snapshot read.
+async fn app_client(d: &Daemon) -> Client {
+    let mut app = d.client().await;
+    app.call(Request::SubscribeAll).await.unwrap();
+    app.until(|m| matches!(m, ServerMsg::Snapshot { .. })).await;
+    app
+}
+
+/// The first `ThreadChanged` for `thread` where it is (or isn't) archived.
+async fn archive_change(app: &mut Client, thread: ThreadId, archived: bool) -> StoredThread {
+    let seen = app
+        .until(|m| {
+            matches!(m, ServerMsg::ThreadChanged { thread: t }
+                if t.id == thread && t.archived_at.is_some() == archived)
+        })
+        .await;
+    match seen.last() {
+        Some(ServerMsg::ThreadChanged { thread }) => thread.clone(),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archiving_keeps_the_worktree_and_a_live_run() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(session_then_sleep_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    let mut app = app_client(&d).await;
+
+    post(&mut c, s.thread, "@Forge wait").await;
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::Event {
+                event: Event::SessionStarted { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let live = overview(&mut c, s.channel).await;
+    assert_eq!((live.stats.threads, live.stats.active), (1, 1));
+    let bars = &summary(&live, s.thread).runs;
+    assert_eq!(bars.len(), 1);
+    assert_eq!(bars[0].status, RunStatus::Working);
+
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: true,
+    })
+    .await
+    .unwrap();
+    let archived = archive_change(&mut app, s.thread, true).await;
+    assert!(archived.worktree.is_some());
+    assert!(thread_of(&mut c, &s).await.archived_at.is_some());
+    // The run goes on and the worktree stays.
+    let working: Vec<crew_core::store::StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Working),
+        })
+        .await;
+    assert_eq!(working.len(), 1);
+    assert!(d.home.join("worktrees/demo/fix-login").is_dir());
+    // Archived threads leave the stats but keep their summary.
+    let o = overview(&mut c, s.channel).await;
+    assert_eq!((o.stats.threads, o.stats.active), (0, 0));
+    assert_eq!(o.threads.len(), 1);
+
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: false,
+    })
+    .await
+    .unwrap();
+    archive_change(&mut app, s.thread, false).await;
+    assert_eq!(overview(&mut c, s.channel).await.stats.threads, 1);
+
+    let err = c
+        .call(Request::ArchiveThread {
+            thread: ThreadId::new(),
+            archived: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "thread not found");
+
+    c.call(Request::StopThread { thread: s.thread })
+        .await
+        .unwrap();
+    c.until_status(RunStatus::Stopped).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_settings_check_the_name() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    let _: ChannelId = c
+        .ok(Request::CreateChannel {
+            project: s.project,
+            name: "random".into(),
+        })
+        .await;
+    let mut app = app_client(&d).await;
+
+    let update = |name: &str, description: &str| Request::UpdateChannel {
+        channel: s.channel,
+        name: name.into(),
+        description: description.into(),
+    };
+    for bad in ["", "#", "two words", "Bugs", "bugs_2", "bugs!"] {
+        let err = c.call(update(bad, "")).await.unwrap_err();
+        assert_eq!(err, "Use lowercase letters, numbers and dashes.", "{bad:?}");
+    }
+    for taken in ["random", "#random"] {
+        let err = c.call(update(taken, "")).await.unwrap_err();
+        assert_eq!(err, "#random already exists in Demo.");
+    }
+    let channels: Vec<StoredChannel> = c.ok(Request::ListChannels { project: s.project }).await;
+    assert!(channels.iter().any(|ch| ch.name == "general"));
+
+    // Keeping its own name is fine.
+    c.call(update("general", "")).await.unwrap();
+    c.call(update(" #bugs-2 ", "  Things that broke.  "))
+        .await
+        .unwrap();
+    let seen = app
+        .until(|m| matches!(m, ServerMsg::ChannelChanged { channel } if channel.name == "bugs-2"))
+        .await;
+    let Some(ServerMsg::ChannelChanged { channel }) = seen.last() else {
+        unreachable!()
+    };
+    assert_eq!(channel.description, "Things that broke.");
+    let err = c
+        .call(Request::UpdateChannel {
+            channel: ChannelId::new(),
+            name: "x".into(),
+            description: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "channel not found");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_overview_sums_up_each_thread() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(editing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    let forge = agent_id(&mut c, "Forge").await;
+    let scout = agent_id(&mut c, "Scout").await;
+    let empty: ThreadId = c
+        .ok(Request::CreateThread {
+            channel: s.channel,
+            title: "Nothing yet".into(),
+        })
+        .await;
+    let noted: ThreadId = c
+        .ok(Request::CreateThread {
+            channel: s.channel,
+            title: "Just a note".into(),
+        })
+        .await;
+    post(
+        &mut c,
+        noted,
+        "Remember the **login** page\nand the `logout` one",
+    )
+    .await;
+
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    post(&mut c, s.thread, "@Scout check it").await;
+    c.until_status(RunStatus::Done).await;
+
+    let o = overview(&mut c, s.channel).await;
+    assert_eq!(o.threads.len(), 3);
+    let fix = summary(&o, s.thread);
+    assert_eq!(fix.messages, 4);
+    assert_eq!(fix.handoffs, 0);
+    assert_eq!(fix.participants, vec![forge, scout]);
+    assert_eq!(
+        fix.runs
+            .iter()
+            .map(|r| r.status.clone())
+            .collect::<Vec<_>>(),
+        vec![RunStatus::Done, RunStatus::Done]
+    );
+    assert!(fix.runs.iter().all(|r| r.ms >= 0));
+    assert_eq!(fix.agent_ms, fix.runs.iter().map(|r| r.ms).sum::<i64>());
+    assert_eq!(fix.excerpt, "Fixed.");
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 2 });
+    assert_eq!((fix.files, fix.added, fix.removed), (2, 3, 1));
+    let thread = thread_of(&mut c, &s).await;
+    assert!(fix.last_activity_at >= thread.created_at);
+
+    let none = summary(&o, empty);
+    assert_eq!(none.worktree, WorktreeState::None);
+    assert_eq!((none.messages, none.files, none.agent_ms), (0, 0, 0));
+    assert_eq!(none.excerpt, "");
+    assert!(none.runs.is_empty() && none.participants.is_empty());
+
+    let note = summary(&o, noted);
+    assert_eq!(note.excerpt, "Remember the login page and the logout one");
+    assert_eq!(note.messages, 1);
+
+    assert_eq!(o.stats.threads, 3);
+    assert_eq!(o.stats.threads_week, 3);
+    assert_eq!((o.stats.active, o.stats.needs_you), (0, 0));
+    assert_eq!(o.stats.runs_week, 2);
+    assert_eq!(o.stats.agent_ms_week, fix.agent_ms);
+    assert_eq!(
+        (o.stats.files_week, o.stats.added_week, o.stats.removed_week),
+        (2, 3, 1)
+    );
+
+    // Committed work still counts against the base.
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Fix login".into(),
+        })
+        .await;
+    let o = overview(&mut c, s.channel).await;
+    let fix = summary(&o, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Committed);
+    assert_eq!((fix.files, fix.added, fix.removed), (2, 3, 1));
+
+    // A worktree folder deleted outside Crew reads as clean, not an error.
+    std::fs::remove_dir_all(d.home.join("worktrees/demo/fix-login")).unwrap();
+    let o = overview(&mut c, s.channel).await;
+    let fix = summary(&o, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Clean);
+    assert_eq!((fix.files, fix.added, fix.removed), (0, 0, 0));
+    assert_eq!(o.threads.len(), 3);
+
+    // Discarding leaves no worktree at all.
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: false,
+    })
+    .await
+    .unwrap();
+    let o = overview(&mut c, s.channel).await;
+    assert_eq!(summary(&o, s.thread).worktree, WorktreeState::None);
+
+    let err = c
+        .call(Request::ChannelOverview {
+            channel: ChannelId::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "channel not found");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_overview_counts_are_cached_until_a_run_ends() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(editing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let first = overview(&mut c, s.channel).await;
+    assert_eq!(summary(&first, s.thread).files, 2);
+
+    // An edit made outside a run isn't seen until something invalidates.
+    let wt = d.home.join("worktrees/demo/fix-login");
+    std::fs::write(wt.join("extra.txt"), "x\n").unwrap();
+    let cached = overview(&mut c, s.channel).await;
+    assert_eq!(summary(&cached, s.thread).files, 2);
+
+    post(&mut c, s.thread, "@Forge again").await;
+    c.until_status(RunStatus::Done).await;
+    let fresh = overview(&mut c, s.channel).await;
+    let fix = summary(&fresh, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 3 });
+    assert_eq!((fix.files, fix.added, fix.removed), (3, 4, 1));
+    assert_eq!(
+        fix.runs
+            .iter()
+            .map(|r: &RunBar| r.status.clone())
+            .collect::<Vec<_>>(),
+        vec![RunStatus::Done, RunStatus::Done]
+    );
+}
+
+async fn agent_id(c: &mut Client, name: &str) -> AgentId {
+    let agents: Vec<crew_core::store::StoredAgent> = c
+        .ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
+    agents.into_iter().find(|a| a.spec.name == name).unwrap().id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_settings_keep_an_old_name_and_cap_the_description() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    // Made before names were checked.
+    let old: ChannelId = c
+        .ok(Request::CreateChannel {
+            project: s.project,
+            name: "Old Name".into(),
+        })
+        .await;
+    c.call(Request::UpdateChannel {
+        channel: old,
+        name: "Old Name".into(),
+        description: "Still here".into(),
+    })
+    .await
+    .unwrap();
+    let channels: Vec<StoredChannel> = c.ok(Request::ListChannels { project: s.project }).await;
+    let ch = channels.iter().find(|ch| ch.id == old).unwrap();
+    assert_eq!(
+        (ch.name.as_str(), ch.description.as_str()),
+        ("Old Name", "Still here")
+    );
+    // A new name still has to follow the rules.
+    let err = c
+        .call(Request::UpdateChannel {
+            channel: old,
+            name: "Newer Name".into(),
+            description: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Use lowercase letters, numbers and dashes.");
+
+    let update = |description: String| Request::UpdateChannel {
+        channel: s.channel,
+        name: "general".into(),
+        description,
+    };
+    c.call(update("é".repeat(280))).await.unwrap();
+    let err = c.call(update("x".repeat(281))).await.unwrap_err();
+    assert_eq!(err, "Keep the description under 280 characters.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_count_comes_later_and_archived_threads_skip_git() {
+    let scripts = tempfile::tempdir().unwrap();
+    let opts = ServeOptions {
+        count_delay: Duration::from_secs(3),
+        ..ServeOptions::default()
+    };
+    let d = Daemon::start_with(editing_script(scripts.path()), opts, false).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+
+    // Archived: no git, no waiting, nothing to count.
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: true,
+    })
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let o = overview(&mut c, s.channel).await;
+    assert!(started.elapsed() < Duration::from_millis(1000));
+    let fix = summary(&o, s.thread);
+    assert!(!fix.counting);
+    assert_eq!((fix.files, fix.worktree), (0, WorktreeState::Clean));
+
+    // Back again: two overviews at once both answer at their deadline,
+    // still counting, and share one count.
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: false,
+    })
+    .await
+    .unwrap();
+    let mut app = app_client(&d).await;
+    let mut other = d.client().await;
+    let started = std::time::Instant::now();
+    let (o, o2) = tokio::join!(overview(&mut c, s.channel), overview(&mut other, s.channel));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(1400), "{waited:?}");
+    assert!(waited < Duration::from_millis(2900), "{waited:?}");
+    for o in [&o, &o2] {
+        let fix = summary(o, s.thread);
+        assert!(fix.counting);
+        assert_eq!(fix.files, 0);
+    }
+
+    // The count goes on in the background, and the app is told once.
+    let is_stale = |m: &ServerMsg| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel);
+    app.until(is_stale).await;
+    let fresh = overview(&mut c, s.channel).await;
+    let more = timeout(Duration::from_millis(500), app.until(is_stale)).await;
+    assert!(more.is_err(), "told twice");
+    let fix = summary(&fresh, s.thread);
+    assert!(!fix.counting);
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 2 });
+    assert_eq!((fix.files, fix.added, fix.removed), (2, 3, 1));
+}
+
+/// First run: edits `a.txt` and writes `file.txt` without reporting an
+/// edit. Once `file.txt` exists, it writes `extra.txt`, reports one
+/// finished edit and keeps working.
+fn edits_then_works_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-edits-then-works.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ -f file.txt ]; then\n  printf 'x\\n' > extra.txt\n  head -n 3 '{fixture}'\n  sleep 60\n  exit 0\nfi\nprintf 'ONE\\ntwo\\n' > a.txt\nexec '{writes}' '{quiet}'\n",
+            fixture = fixture("edit_and_test.jsonl").display(),
+            writes = fake("claude_writes.sh").display(),
+            quiet = fixture("read_file.jsonl").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_edit_refreshes_the_counts() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(edits_then_works_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    assert_eq!(
+        summary(&overview(&mut c, s.channel).await, s.thread).files,
+        2
+    );
+    let mut app = app_client(&d).await;
+
+    post(&mut c, s.thread, "@Forge more").await;
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::Event {
+                event: Event::ToolResult { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let o = overview(&mut c, s.channel).await;
+    let fix = summary(&o, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 3 });
+    assert_eq!(fix.files, 3);
+    // The app was told the channel's counts changed.
+    app.until(
+        |m| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel),
+    )
+    .await;
+    assert_eq!(
+        fix.runs.last().map(|r| r.status.clone()),
+        Some(RunStatus::Working)
+    );
+
+    c.call(Request::StopThread { thread: s.thread })
+        .await
+        .unwrap();
+    c.until_status(RunStatus::Stopped).await;
+}
+
+/// A fake claude that writes `file.txt` and reports no edit.
+fn quiet_writing_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-writes-quietly.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}'\n",
+            fake("claude_writes.sh").display(),
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_or_a_discard_tells_the_app_the_counts_changed() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(quiet_writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let fix = summary(&overview(&mut c, s.channel).await, s.thread).clone();
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 1 });
+    let mut app = app_client(&d).await;
+    let is_stale = |m: &ServerMsg| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel);
+    let early = timeout(Duration::from_millis(300), app.until(is_stale)).await;
+    assert!(early.is_err(), "nothing changed yet");
+
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+    timeout(Duration::from_millis(2000), app.until(is_stale))
+        .await
+        .expect("told after the commit");
+    let fix = summary(&overview(&mut c, s.channel).await, s.thread).clone();
+    assert_eq!(fix.worktree, WorktreeState::Committed);
+
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: true,
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_millis(2000), app.until(is_stale))
+        .await
+        .expect("told after the discard");
 }

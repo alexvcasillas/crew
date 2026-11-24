@@ -22,7 +22,7 @@ const DISCARD_ASK: &str =
     "Discard Forge's changes? The worktree is removed. A branch with commits is kept.";
 
 /// A git repo at `root` whose first commit holds `README.md`.
-fn repo_with_readme(root: &Path) {
+pub(super) fn repo_with_readme(root: &Path) {
     git_repo(root);
     std::fs::write(root.join("README.md"), "hello\nworld\n").unwrap();
     for args in [

@@ -135,7 +135,10 @@ fn first_launch_creates_project_agent_and_lands_in_general(cx: &mut TestAppConte
         assert_eq!(ws.state().channels(project).len(), 1);
     });
     assert!(!has(cx, window, "first-launch"));
-    assert!(shows(cx, window, "New thread"), "the new thread's composer");
+    assert!(
+        shows(cx, window, "No threads yet"),
+        "the empty channel's composer"
+    );
     assert!(composer_focused(cx, window, &ws));
 }
 

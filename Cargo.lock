@@ -1289,6 +1289,7 @@ dependencies = [
  "gpui-pre",
  "nix",
  "pulldown-cmark",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
