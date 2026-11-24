@@ -26,7 +26,9 @@ use crate::theme::color;
 use crate::theme::scale::{self, ui_px, weight};
 #[cfg(test)]
 pub(crate) use add_project::NOT_A_FOLDER;
+pub(crate) use add_project::{repos_line, setup_file_in, short_remote, size_label};
 use discard::discard_label;
+pub(crate) use project::REMOVE_BODY;
 
 /// The dialogs' width.
 const WIDTH: f32 = 420.;

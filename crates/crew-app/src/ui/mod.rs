@@ -1,6 +1,7 @@
 //! The Crew window, built with GPUI-kit.
 
 mod activity;
+mod agent_view;
 mod approval_card;
 mod channel_view;
 mod common;
@@ -16,6 +17,7 @@ mod inspector;
 mod markdown_view;
 mod mention_menu;
 pub mod palette;
+mod project_view;
 mod run_card;
 pub mod running_view;
 mod service_control;
@@ -49,6 +51,8 @@ mod folder_tests;
 mod inspector_tests;
 #[cfg(test)]
 mod motion_tests;
+#[cfg(test)]
+mod pages_tests;
 #[cfg(test)]
 mod palette_tests;
 #[cfg(test)]

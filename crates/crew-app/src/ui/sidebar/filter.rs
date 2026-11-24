@@ -161,7 +161,12 @@ impl Workspace {
             return;
         };
         let place = match hit {
-            Hit::Project(project) => Place::Project(project),
+            // As a click on its row: a project's one channel, or its
+            // overview.
+            Hit::Project(project) => match self.single_channel(project) {
+                Some(channel) => Place::Channel(channel),
+                None => Place::Project(project),
+            },
             Hit::Channel(channel) => Place::Channel(channel),
         };
         self.open_place(place, window, cx);

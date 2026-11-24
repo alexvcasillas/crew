@@ -15,7 +15,6 @@ use gpui_kit::*;
 
 use super::super::common::with_font_probe;
 use super::super::palette::highlighted;
-use super::super::settings::Page;
 use super::super::workspace::{Place, Workspace};
 use super::{ChannelBadge, render_badge, sidebar_row, status_dot};
 use crate::prefs::{ShowProjects, SortProjects};
@@ -231,7 +230,8 @@ impl Workspace {
         let selected = match look.single {
             Some(channel) => self.nav.channel == Some(channel),
             None => false,
-        } || look.hit.is_some_and(|hit| hit == self.sidebar.selected);
+        } || self.page_project() == Some(id)
+            || look.hit.is_some_and(|hit| hit == self.sidebar.selected);
         let badge = match look.single {
             Some(channel) => self.channel_badge(channel),
             // Open, its channels carry their own dots.
@@ -244,14 +244,34 @@ impl Workspace {
         let lead = if look.single.is_some() {
             div().flex_none().w(ui_px(12.)).into_any_element()
         } else {
-            Icon::new(if look.open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            })
-            .size(ui_px(12.))
-            .text_color(color("text-secondary"))
-            .into_any_element()
+            // The chevron only opens and closes; the rest of the row
+            // opens the overview.
+            div()
+                .id(SharedString::from(format!("project-chevron-{id}")))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(ui_px(16.))
+                .mx(ui_px(-2.))
+                .rounded(ui_px(4.))
+                .hover(|c| c.bg(color("border-200")))
+                .aria_label(if look.open { "Close" } else { "Open" })
+                .child(
+                    Icon::new(if look.open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(ui_px(12.))
+                    .text_color(color("text-secondary")),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_project(id, cx);
+                }))
+                .test_support()
+                .into_any_element()
         };
         let this = cx.entity().downgrade();
         let pinned = project.pinned_at.is_some();
@@ -308,7 +328,7 @@ impl Workspace {
             .child(render_badge(format!("project-status-{id}"), &badge))
             .on_click(cx.listener(move |this, _, window, cx| match look.single {
                 Some(channel) => this.select_channel(channel, window, cx),
-                None => this.toggle_project(id, cx),
+                None => this.click_project(id, window, cx),
             }))
             .test_support()
             .context_menu(move |menu, _, _| project_menu(menu, this.clone(), id, pinned, &first))
@@ -343,7 +363,7 @@ impl Workspace {
 
     /// Runs `open` with `args` off the UI thread, showing `failed` if it
     /// doesn't work.
-    fn run_open(
+    pub(crate) fn run_open(
         &mut self,
         args: Vec<OsString>,
         failed: String,
@@ -360,7 +380,12 @@ impl Workspace {
         });
     }
 
-    fn reveal_project(&mut self, project: ProjectId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reveal_project(
+        &mut self,
+        project: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(root) = self.state().project(project).map(|p| p.root.clone()) else {
             return;
         };
@@ -383,15 +408,14 @@ impl Workspace {
         self.run_open(args, failed, window, cx);
     }
 
-    /// Settings › Projects on this project, where its setup files are.
+    /// The project's overview, at its setup files.
     fn open_setup_files(
         &mut self,
         project: ProjectId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings(Page::Projects, window, cx);
-        self.select_project(project, window, cx);
+        self.open_project_page(project, true, window, cx);
     }
 }
 

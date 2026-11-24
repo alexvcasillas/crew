@@ -372,6 +372,20 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The threads sidebar, narrowed to `project`'s threads in all its
+    /// channels.
+    pub(crate) fn show_project_threads(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        let t = &mut self.sidebar.threads;
+        t.project = Some(project);
+        t.channel = None;
+        t.cursor = None;
+        t.list.scroll_to(ListOffset::default());
+        if sidebar_mode(cx) != SidebarMode::Threads {
+            self.switch_sidebar(cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn threads_now(&self) -> i64 {
         #[cfg(test)]
         if let Some(now) = self.sidebar.threads.now {

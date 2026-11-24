@@ -27,7 +27,7 @@ use gpui_kit::*;
 use super::common::{ago, dot, monogram, now_ms, status_word, with_font_probe};
 use super::palette::{highlighted, match_range};
 
-use super::workspace::Workspace;
+use super::workspace::{Place, Workspace};
 use crate::model::ThreadStatus;
 use crate::prefs::{SidebarMode, SidebarPrefs};
 use crate::theme::color;
@@ -438,16 +438,23 @@ impl Workspace {
         (rows, Vec::new())
     }
 
+    /// The one channel a project's row stands for: its only channel,
+    /// when it has no terminal sessions either.
+    pub(super) fn single_channel(&self, project: ProjectId) -> Option<ChannelId> {
+        let state = self.state();
+        match state.channels(project).as_slice() {
+            [only] if state.terminal_sessions(project).is_empty() => Some(only.id),
+            _ => None,
+        }
+    }
+
     /// A project's row and, while it is open, its channels and terminal
     /// sessions. A project with one channel and no sessions is one row.
     fn push_project(&self, rows: &mut Vec<Row>, project: ProjectId, hit: Option<usize>) {
+        let single = self.single_channel(project);
         let state = self.state();
         let channels = state.channels(project);
         let sessions = state.terminal_sessions(project);
-        let single = match channels.as_slice() {
-            [only] if sessions.is_empty() => Some(only.id),
-            _ => None,
-        };
         let open = single.is_none() && !self.nav.collapsed.contains(&project);
         rows.push(Row::Project(ProjectLook {
             project,
@@ -551,7 +558,7 @@ impl Workspace {
                 .into_any_element(),
             Row::AgentsHeading => self.render_agents_heading(cx).into_any_element(),
             Row::Agent(agent) => match self.state().agent(agent) {
-                Some(agent) => self.render_agent(agent).into_any_element(),
+                Some(agent) => self.render_agent(agent, cx).into_any_element(),
                 None => div().into_any_element(),
             },
         };
@@ -742,24 +749,30 @@ impl Workspace {
             .test_support()
     }
 
-    fn render_agent(&self, agent: &StoredAgent) -> impl IntoElement {
+    fn render_agent(&self, agent: &StoredAgent, cx: &mut Context<Self>) -> impl IntoElement {
         let id = agent.id;
         let status = self.state().agent_status(id);
         let (word, token) = status_word(status);
+        let selected = self.page_agent() == Some(id);
         sidebar_row(format!("agent-{id}"))
             .gap(ui_px(8.))
+            .when(selected, |row| row.bg(color("surface-300")))
             .aria_label(agent.spec.name.clone())
+            .aria_selected(selected)
             .child(monogram(&agent.spec.name, 20.))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(color(if status == ThreadStatus::Idle {
+                    .text_color(color(if status == ThreadStatus::Idle && !selected {
                         "text-secondary"
                     } else {
                         "text-primary"
                     }))
+                    .when(selected, |name| {
+                        name.font_weight(weight(FontWeight::MEDIUM))
+                    })
                     .child(agent.spec.name.clone()),
             )
             .child(
@@ -771,6 +784,11 @@ impl Workspace {
                     .aria_label(word)
                     .child(word)
                     .test_support(),
+            )
+            .on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.open_place(Place::Agent(id), window, cx)
+                }),
             )
             .test_support()
     }

@@ -350,10 +350,11 @@ fn discard_with_delete_branch_removes_the_worktree_and_branch(cx: &mut TestAppCo
     })
     .unwrap();
     click(cx, window, format!("thread-more-{}", w.thread));
-    // Rename, Copy branch name, Archive, a separator, Discard worktree.
+    // Rename, Copy branch name, Open worktree in terminal, Archive, a
+    // separator, Discard worktree.
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        window.within("popup-menu").click(4usize, cx);
+        window.within("popup-menu").click(5usize, cx);
     })
     .unwrap();
     wait_label(

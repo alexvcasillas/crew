@@ -11,8 +11,8 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalStatus, Author, Limits, StoredRun};
 use crew_proto::{
-    AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, SearchResults,
-    ServerMsg, SetupFileSize, ThreadState, ThreadSummary, read_frame, write_frame,
+    AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, RunPlace,
+    SearchResults, ServerMsg, SetupFileSize, ThreadState, ThreadSummary, read_frame, write_frame,
 };
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
@@ -591,6 +591,34 @@ async fn agent_profile_counts_runs_edits_and_threads() {
     assert_eq!(row.run.status, RunStatus::Done);
     assert!(!row.waiting);
     assert_eq!(profile.threads, [second, first]);
+    assert!(
+        profile
+            .recent_runs
+            .iter()
+            .all(|r| r.removed_project.is_none())
+    );
+
+    // A run in a removed project says where it ran.
+    c.call(Request::RemoveProject { project: q }).await.unwrap();
+    let profile: AgentProfile = c.ok(Request::AgentProfile { agent: forge }).await;
+    let places: Vec<_> = profile
+        .recent_runs
+        .iter()
+        .map(|r| r.removed_project.clone())
+        .collect();
+    assert_eq!(
+        places,
+        [
+            None,
+            Some(RunPlace {
+                project: "other".into(),
+                channel: "general".into(),
+                thread_title: "Second".into(),
+            }),
+            None,
+        ]
+    );
+    assert_eq!(profile.projects, 1);
 
     // Once deleted, it still has a profile, history and all.
     c.call(Request::DeleteAgent { agent: forge }).await.unwrap();

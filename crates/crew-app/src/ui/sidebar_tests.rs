@@ -240,7 +240,7 @@ fn a_single_channel_project_is_one_row_that_opens_it(cx: &mut TestAppContext) {
         label_of(cx, window, format!("project-status-{}", w.project)).as_deref(),
         Some("")
     );
-    click(cx, window, project_row(w.project));
+    click(cx, window, format!("project-chevron-{}", w.project));
     assert!(!has(cx, window, format!("channel-{bugs}")), "it closes");
 }
 
@@ -487,12 +487,11 @@ fn the_project_menu_reveals_opens_copies_renames_and_removes(cx: &mut TestAppCon
         Some(root.to_string_lossy().into_owned())
     );
 
-    // Project overview opens its first channel for now.
+    // Project overview.
     right_click(cx, window, project_row(w.project));
     menu_click(cx, window, 0);
-    wait_until(cx, "general", |cx| {
-        shown_channel(cx, &ws) == Some(w.channel)
-    });
+    wait_until(cx, "the overview", |cx| has(cx, window, "overview-page"));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.page_project()), Some(w.project));
 
     // New thread in #general.
     right_click(cx, window, project_row(w.project));
@@ -502,18 +501,13 @@ fn the_project_menu_reveals_opens_copies_renames_and_removes(cx: &mut TestAppCon
         assert!(ws.nav.drafting);
     });
 
-    // Setup files: Settings › Projects on this project.
+    // Setup files: the overview, at its setup files.
     right_click(cx, window, project_row(w.project));
     menu_click(cx, window, 8);
-    ws.read_with(cx, |ws, _| {
-        let settings = ws.settings.as_ref().expect("settings");
-        assert_eq!(settings.page, super::settings::Page::Projects);
-        assert_eq!(settings.projects.selected, Some(w.project));
+    wait_until(cx, "the setup files", |cx| {
+        has(cx, window, "overview-setup")
     });
-    cx.update_window(window, |_, window, cx| {
-        ws.update(cx, |ws, cx| ws.close_settings(window, cx));
-    })
-    .unwrap();
+    assert!(ws.read_with(cx, |ws, _| ws.settings.is_none()));
 
     // Rename.
     right_click(cx, window, project_row(w.project));
@@ -539,11 +533,10 @@ fn the_project_menu_reveals_opens_copies_renames_and_removes(cx: &mut TestAppCon
     wait_until(cx, "the remove dialog", |cx| {
         shows(cx, window, "Remove Demo app from Crew?")
     });
-    assert!(shows(
-        cx,
-        window,
-        "Removes it from Crew. Your folder, branches and worktrees stay on disk."
-    ));
+    assert_eq!(
+        label_of(cx, window, "remove-project-body").as_deref(),
+        Some("Removes it from Crew. Your folder, branches and worktrees stay on disk.")
+    );
     click(cx, window, "dialog-confirm");
     wait_until(cx, "the project to go", |cx| {
         !has(cx, window, project_row(w.project))

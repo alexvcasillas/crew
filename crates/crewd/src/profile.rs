@@ -10,8 +10,8 @@ use crew_core::project_kind::{looks_secret, repo_of};
 use crew_core::store::StoredRun;
 use crew_core::worktree;
 use crew_proto::{
-    AgentProfile, AgentStats, AgentUse, ChannelRow, ProjectOverview, RecentThread, RunRow,
-    SetupFile, SetupFileSize, ThreadState,
+    AgentProfile, AgentStats, AgentUse, ChannelRow, ProjectOverview, RecentThread, RunPlace,
+    RunRow, SetupFile, SetupFileSize, ThreadState,
 };
 
 use crate::overview::{WEEK_MS, ran_since, run_ms};
@@ -265,7 +265,7 @@ impl Service {
             stats.added_week = stats.added_week.saturating_add(e.added);
             stats.removed_week = stats.removed_week.saturating_add(e.removed);
         }
-        let recent_runs = recent
+        let mut recent_runs: Vec<RunRow> = recent
             .into_iter()
             .map(|r| {
                 let e = edits.get(&r.id).copied().unwrap_or_default();
@@ -276,6 +276,7 @@ impl Service {
                     added: e.added,
                     removed: e.removed,
                     waiting: waiting.contains(&r.id),
+                    removed_project: None,
                 }
             })
             .collect();
@@ -307,6 +308,27 @@ impl Service {
                 projects.insert(project);
                 if row.archived_at.is_none() {
                     threads.push((at, thread));
+                }
+            }
+            // Clients no longer know a removed project's threads: say
+            // where its runs ran.
+            let removed: HashMap<ProjectId, String> = store
+                .removed_projects()
+                .map_err(err)?
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect();
+            if !removed.is_empty() {
+                for row in &mut recent_runs {
+                    let thread = store.thread(row.run.thread).map_err(err)?;
+                    let channel = store.channel(thread.channel).map_err(err)?;
+                    if let Some(project) = removed.get(&channel.project) {
+                        row.removed_project = Some(RunPlace {
+                            project: project.clone(),
+                            channel: channel.name,
+                            thread_title: thread.title,
+                        });
+                    }
                 }
             }
             Ok::<_, String>(())

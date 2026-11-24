@@ -589,6 +589,19 @@ pub struct RunRow {
     /// An approval of this run waits for you.
     #[serde(default)]
     pub waiting: bool,
+    /// For a run in a removed project, where it ran, which clients no
+    /// longer know. `None` otherwise.
+    #[serde(default)]
+    pub removed_project: Option<RunPlace>,
+}
+
+/// Where a run in a removed project ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunPlace {
+    pub project: String,
+    pub channel: String,
+    pub thread_title: String,
 }
 
 /// A Claude Code session someone runs in their own terminal, inside one of

@@ -81,7 +81,11 @@ fn cmd_k_opens_with_recent_and_actions(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
-    assert!(ws.read_with(cx, |ws, _| ws.settings.is_some()), "for now");
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.page_agent()),
+        Some(w.agents[0]),
+        "its profile"
+    );
     press(cx, window, "cmd-1");
     go_to(cx, window, &ws, w.channel, w.thread);
 
@@ -594,7 +598,7 @@ fn typing_finds_projects_first_and_enter_opens_one(cx: &mut TestAppContext) {
     repo_with_readme(&root);
     let w = world(home.path(), &root, &[]);
     let added = more_projects(&w, tmp.path(), &["supapick", "supameter"]);
-    let (pick, pick_general) = added[0];
+    let (pick, _) = added[0];
     let (window, ws) = open(cx, home.path());
     wait_until(cx, "the projects", |cx| {
         ws.read_with(cx, |ws, _| ws.state().channel(added[1].1).is_some())
@@ -619,7 +623,7 @@ fn typing_finds_projects_first_and_enter_opens_one(cx: &mut TestAppContext) {
     }
     press(cx, window, "enter");
     ws.read_with(cx, |ws, _| {
-        assert_eq!(ws.nav.channel, Some(pick_general), "its first channel");
+        assert_eq!(ws.page_project(), Some(pick), "its overview");
         assert_eq!(ws.recents.project, Some(pick));
     });
 
