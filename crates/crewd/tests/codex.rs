@@ -1094,3 +1094,72 @@ async fn stop_cancels_a_pending_approval_then_interrupts() {
     let interrupt = order.iter().position(|m| *m == "turn/interrupt").unwrap();
     assert!(cancel < interrupt, "{order:?}");
 }
+
+/// Codex asks for more than its sandbox: you see what, and only what is
+/// inside the thread's folder can be granted.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let d_tmp = tempfile::tempdir().unwrap();
+    // As crewd stores it, so paths compare as they would for real.
+    let root = std::fs::canonicalize(d_tmp.path()).unwrap().join("repo");
+    let inside = format!("{}/gen", root.display());
+    let ask = |id: i64, permissions: Value, reply: Value| {
+        json!({"request": "item/permissions/requestApproval", "id": id,
+               "params": {"threadId": TID, "turnId": "turn-1", "itemId": format!("p{id}"),
+                          "cwd": root, "reason": "build output", "permissions": permissions},
+               "reply": reply})
+    };
+    let mut steps = start();
+    steps.extend([
+        ask(
+            0,
+            json!({"network": {"enabled": true}, "fileSystem": {"read": null, "write": [inside, "/"]}}),
+            json!({"permissions": {"network": {"enabled": true}, "fileSystem": {"write": [inside]}}, "scope": "turn"}),
+        ),
+        ask(
+            1,
+            json!({"network": null, "fileSystem": {"read": null, "write": ["/etc"]}}),
+            json!({"permissions": {}, "scope": "turn"}),
+        ),
+    ]);
+    steps.extend(finish("Built."));
+    scenario(dir, 1, steps);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let thread = setup(&mut c, &root, PermissionMode::ReadOnly).await;
+    let run = ask_forge(&mut c, thread, "@Forge build").await;
+
+    let asked = c.until_asked().await;
+    let ApprovalKind::Permission { tool, .. } = &asked.kind else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(tool, "Permissions");
+    c.decide(asked.id, true).await;
+    let seen = c.until_ended(run).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+    let texts = system_texts(&seen);
+    assert!(
+        texts
+            .contains(&"Forge wants more access: write gen, /, network · build output".to_string()),
+        "{texts:?}"
+    );
+    assert!(
+        texts.contains(&"Declined access outside the worktree.".to_string()),
+        "{texts:?}"
+    );
+    // The /etc ask never reached you.
+    let pending: Vec<StoredApproval> = c
+        .ok(Request::ListApprovals {
+            thread: Some(thread),
+        })
+        .await;
+    assert!(pending.is_empty(), "{pending:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|m| matches!(m, ServerMsg::Approval { approval, .. } if approval.id != asked.id)),
+        "{seen:#?}"
+    );
+}

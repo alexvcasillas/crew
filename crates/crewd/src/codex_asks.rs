@@ -3,6 +3,7 @@
 //! Pure, so the mapping is tested on its own.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use crew_core::codex::proto::{
     ApprovalDecision, ApprovalResponse, ElicitationParams, ElicitationResponse, FileChange,
@@ -22,6 +23,8 @@ pub(crate) enum Mapped {
     Refuse(String),
     /// Ask you first.
     Ask(AskFor),
+    /// Answer at once with this result and tell the thread `note`.
+    Declined { reply: Value, note: String },
 }
 
 /// A request that becomes a Crew permission approval.
@@ -41,7 +44,8 @@ pub(crate) enum ReplyKind {
     Approval,
     /// `{"action": ...}` for an MCP elicitation.
     Elicitation,
-    /// A grant of the asked permissions, or of none. Holds what was asked.
+    /// A grant of the permissions, or of none. Holds what may be granted:
+    /// what was asked, cut down to the thread's folder.
     Permissions(Value),
 }
 
@@ -68,9 +72,9 @@ impl ReplyKind {
             }),
             // There is no "cancel" here: granting nothing is the refusal.
             // The grant lasts for the turn only.
-            ReplyKind::Permissions(asked) => {
+            ReplyKind::Permissions(grant) => {
                 let granted = match answer {
-                    Answer::Yes => without_nulls(asked),
+                    Answer::Yes => grant.clone(),
                     Answer::No | Answer::Cancel => json!({}),
                 };
                 Ok(json!({"permissions": granted, "scope": "turn"}))
@@ -81,12 +85,14 @@ impl ReplyKind {
 }
 
 /// Maps a request. `files` holds the changes of started file change
-/// items; `crew_wired` says whether the `crew` MCP server is Crew's own.
+/// items; `crew_wired` says whether the `crew` MCP server is Crew's own;
+/// `cwd` is the thread's folder, the only place access can be granted.
 pub(crate) fn map_request(
     method: &str,
     params: &Value,
     files: &HashMap<String, Vec<FileChange>>,
     crew_wired: bool,
+    cwd: &Path,
 ) -> Mapped {
     match ServerRequest::parse(method, params) {
         ServerRequest::CommandApproval(p) => {
@@ -115,17 +121,29 @@ pub(crate) fn map_request(
             ask(ReplyKind::Approval, "Edit", input, Some(p.item_id))
         }
         ServerRequest::PermissionsApproval(p) => {
-            let label = p
-                .reason
-                .filter(|r| !r.trim().is_empty())
-                .unwrap_or_else(|| "more access than its sandbox gives".into());
+            let granted = clamp(&p.permissions, cwd);
+            if granted.as_object().is_none_or(|g| g.is_empty()) {
+                return Mapped::Declined {
+                    reply: ReplyKind::Permissions(granted).reply(Answer::No),
+                    note: OUTSIDE_WORKTREE.into(),
+                };
+            }
+            // What is really asked, never the model's reason alone.
+            let mut label = describe(&p.permissions, cwd);
+            if let Some(reason) = p.reason.filter(|r| !r.trim().is_empty()) {
+                label = format!("{label} · {}", reason.trim());
+            }
             let input = json!({
                 "label": label,
                 "cwd": p.cwd.unwrap_or_default(),
                 "permissions": p.permissions,
             });
-            let kind = ReplyKind::Permissions(p.permissions);
-            ask(kind, "Permissions", input, Some(p.item_id))
+            ask(
+                ReplyKind::Permissions(granted),
+                "Permissions",
+                input,
+                Some(p.item_id),
+            )
         }
         ServerRequest::McpElicitation(p) if crew_wired && p.server_name == CREW_SERVER => {
             Mapped::Reply(ReplyKind::Elicitation.reply(Answer::Yes))
@@ -169,18 +187,150 @@ fn elicited_tool(p: &ElicitationParams) -> String {
     }
 }
 
-/// The object without its null fields, as a grant leaves out what wasn't
-/// asked for.
-fn without_nulls(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ),
-        _ => json!({}),
+/// Said in the thread when an access ask is declined without asking you.
+const OUTSIDE_WORKTREE: &str = "Declined access outside the worktree.";
+/// Paths shown in an access ask before "+N more".
+const SHOWN_PATHS: usize = 3;
+
+/// `path` against `cwd` if relative, with `.` and `..` worked out.
+fn absolute(path: &str, cwd: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in cwd.join(path).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
     }
+    out
+}
+
+fn inside(path: &str, cwd: &Path) -> bool {
+    absolute(path, cwd).starts_with(absolute("", cwd))
+}
+
+/// A path as shown: relative to `cwd` when inside it.
+fn shown(path: &str, cwd: &Path) -> String {
+    let abs = absolute(path, cwd);
+    match abs.strip_prefix(absolute("", cwd)) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".into(),
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => abs.to_string_lossy().into_owned(),
+    }
+}
+
+fn strings(v: &Value) -> Vec<&str> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// A sandbox entry's path as shown: a path, a glob or a special place.
+fn entry_shown(entry: &Value, cwd: &Path) -> String {
+    let path = &entry["path"];
+    match path["type"].as_str() {
+        Some("path") => shown(path["path"].as_str().unwrap_or_default(), cwd),
+        Some("glob_pattern") => path["pattern"].as_str().unwrap_or_default().to_string(),
+        Some("special") => match path["value"]["kind"].as_str() {
+            Some("root") => "/".into(),
+            Some(kind) => kind.to_string(),
+            None => "?".into(),
+        },
+        _ => path.to_string(),
+    }
+}
+
+fn network_asked(asked: &Value) -> bool {
+    asked["network"]["enabled"] == json!(true)
+}
+
+/// What an access ask wants, such as `write gen, /, network`.
+fn describe(asked: &Value, cwd: &Path) -> String {
+    let fs = &asked["fileSystem"];
+    let mut write: Vec<String> = strings(&fs["write"])
+        .iter()
+        .map(|p| shown(p, cwd))
+        .collect();
+    let mut read: Vec<String> = strings(&fs["read"]).iter().map(|p| shown(p, cwd)).collect();
+    for entry in fs["entries"].as_array().into_iter().flatten() {
+        match entry["access"].as_str() {
+            Some("write") => write.push(entry_shown(entry, cwd)),
+            Some("read") => read.push(entry_shown(entry, cwd)),
+            _ => {}
+        }
+    }
+    let list = |verb: &str, paths: Vec<String>| {
+        if paths.is_empty() {
+            return None;
+        }
+        let more = paths.len().saturating_sub(SHOWN_PATHS);
+        let mut text = format!(
+            "{verb} {}",
+            paths[..paths.len().min(SHOWN_PATHS)].join(", ")
+        );
+        if more > 0 {
+            text.push_str(&format!(" +{more} more"));
+        }
+        Some(text)
+    };
+    let parts: Vec<String> = [
+        list("write", write),
+        list("read", read),
+        network_asked(asked).then(|| "network".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "more access".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// What may be granted of `asked`: file access only inside `cwd`, as
+/// absolute paths, and network only if asked for. Globs and special
+/// places can't be checked, so they are never granted. Empty if nothing.
+fn clamp(asked: &Value, cwd: &Path) -> Value {
+    let fs = &asked["fileSystem"];
+    let keep = |list: &Value| -> Vec<String> {
+        strings(list)
+            .into_iter()
+            .filter(|p| inside(p, cwd))
+            .map(|p| absolute(p, cwd).to_string_lossy().into_owned())
+            .collect()
+    };
+    let mut granted_fs = serde_json::Map::new();
+    for key in ["read", "write"] {
+        let paths = keep(&fs[key]);
+        if !paths.is_empty() {
+            granted_fs.insert(key.into(), json!(paths));
+        }
+    }
+    let entries: Vec<Value> = fs["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| matches!(e["access"].as_str(), Some("read" | "write")))
+        .filter(|e| {
+            e["path"]["type"] == "path"
+                && e["path"]["path"].as_str().is_some_and(|p| inside(p, cwd))
+        })
+        .cloned()
+        .collect();
+    if !entries.is_empty() {
+        granted_fs.insert("entries".into(), json!(entries));
+    }
+    let mut granted = serde_json::Map::new();
+    if network_asked(asked) {
+        granted.insert("network".into(), json!({"enabled": true}));
+    }
+    if !granted_fs.is_empty() {
+        granted.insert("fileSystem".into(), Value::Object(granted_fs));
+    }
+    Value::Object(granted)
 }
 
 #[cfg(test)]
@@ -188,7 +338,13 @@ mod tests {
     use super::*;
 
     fn map(method: &str, params: Value, wired: bool) -> Mapped {
-        map_request(method, &params, &HashMap::new(), wired)
+        map_request(
+            method,
+            &params,
+            &HashMap::new(),
+            wired,
+            Path::new("/work/demo"),
+        )
     }
 
     fn asked(m: Mapped) -> AskFor {
@@ -240,6 +396,7 @@ mod tests {
             &json!({"itemId": "exec-9"}),
             &files,
             true,
+            Path::new("/work/demo"),
         );
         let a = asked(m);
         assert_eq!(a.tool, "Edit");
@@ -285,19 +442,31 @@ mod tests {
         assert_eq!(elicited_tool(&p("docs", "Pick a file")), "mcp__docs");
     }
 
-    #[test]
-    fn permission_asks_grant_what_was_asked_or_nothing() {
-        let asked_for = json!({"network": {"enabled": true}, "fileSystem": null});
-        let a = asked(map(
+    fn permissions(permissions: Value, reason: Option<&str>) -> Mapped {
+        map(
             "item/permissions/requestApproval",
-            json!({"itemId": "i1", "cwd": "/work/demo", "reason": "fetch the docs", "permissions": asked_for}),
+            json!({"itemId": "i1", "cwd": "/work/demo", "reason": reason, "permissions": permissions}),
             true,
+        )
+    }
+
+    #[test]
+    fn permission_asks_show_what_is_asked_and_grant_only_the_worktree() {
+        let a = asked(permissions(
+            json!({"network": {"enabled": true},
+                   "fileSystem": {"read": null, "write": ["/work/demo/gen", "/", "/work/demo/../etc"]}}),
+            Some("build output"),
         ));
         assert_eq!(a.tool, "Permissions");
-        assert_eq!(a.input["label"], "fetch the docs");
+        assert_eq!(
+            a.input["label"],
+            "write gen, /, /work/etc, network · build output"
+        );
         assert_eq!(
             a.kind.reply(Answer::Yes),
-            json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"})
+            json!({"permissions": {"network": {"enabled": true},
+                                   "fileSystem": {"write": ["/work/demo/gen"]}},
+                   "scope": "turn"})
         );
         for no in [Answer::No, Answer::Cancel] {
             assert_eq!(
@@ -305,6 +474,62 @@ mod tests {
                 json!({"permissions": {}, "scope": "turn"})
             );
         }
+    }
+
+    #[test]
+    fn long_path_lists_are_cut_and_relative_paths_are_in_the_worktree() {
+        let a = asked(permissions(
+            json!({"fileSystem": {"write": ["a", "b", "/work/demo/c", "d", "e"]}}),
+            None,
+        ));
+        assert_eq!(a.input["label"], "write a, b, c +2 more");
+        let granted = a.kind.reply(Answer::Yes);
+        assert_eq!(
+            granted["permissions"]["fileSystem"]["write"],
+            json!([
+                "/work/demo/a",
+                "/work/demo/b",
+                "/work/demo/c",
+                "/work/demo/d",
+                "/work/demo/e"
+            ])
+        );
+    }
+
+    #[test]
+    fn asks_for_nothing_inside_the_worktree_are_declined_at_once() {
+        for asked_for in [
+            json!({"fileSystem": {"write": ["/etc"]}, "network": null}),
+            json!({"fileSystem": {"entries": [{"path": {"type": "special", "value": {"kind": "root"}}, "access": "write"}]}}),
+            json!({"network": {"enabled": false}}),
+        ] {
+            assert_eq!(
+                permissions(asked_for, Some("please")),
+                Mapped::Declined {
+                    reply: json!({"permissions": {}, "scope": "turn"}),
+                    note: "Declined access outside the worktree.".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_entries_inside_the_worktree_are_kept() {
+        let a = asked(permissions(
+            json!({"fileSystem": {"entries": [
+                {"path": {"type": "path", "path": "/work/demo/out"}, "access": "write"},
+                {"path": {"type": "glob_pattern", "pattern": "**/*.rs"}, "access": "write"},
+                {"path": {"type": "special", "value": {"kind": "tmpdir"}}, "access": "read"}
+            ]}}),
+            None,
+        ));
+        assert_eq!(a.input["label"], "write out, **/*.rs, read tmpdir");
+        assert_eq!(
+            a.kind.reply(Answer::Yes)["permissions"],
+            json!({"fileSystem": {"entries": [
+                {"path": {"type": "path", "path": "/work/demo/out"}, "access": "write"}
+            ]}})
+        );
     }
 
     #[test]

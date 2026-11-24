@@ -91,9 +91,13 @@ pub fn short_input(input: &serde_json::Value) -> String {
 }
 
 /// The thread note for a permission ask of `agent`.
-/// MCP tools, named `mcp__<server>__<tool>`, read as `server/tool`.
+/// MCP tools, named `mcp__<server>__<tool>`, read as `server/tool`. A
+/// Codex `Permissions` ask reads as wanting more access.
 pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
     let shown = short_input(input);
+    if tool == "Permissions" {
+        return format!("{agent} wants more access: {shown}");
+    }
     let (verb, what) = match tool.strip_prefix("mcp__") {
         Some(rest) => ("use", rest.replacen("__", "/", 1)),
         None => ("run", tool.to_string()),
@@ -300,6 +304,14 @@ mod tests {
         assert_eq!(
             permission_text("Ada", "mcp__github", &json!({})),
             "Ada wants to use github."
+        );
+        assert_eq!(
+            permission_text(
+                "Ada",
+                "Permissions",
+                &json!({"label": "write gen, network"})
+            ),
+            "Ada wants more access: write gen, network"
         );
     }
 }
