@@ -1212,6 +1212,17 @@ mod tests {
         };
         assert_eq!(bash.state, StepState::Blocked);
 
+        // Output that only quotes the refusal is a plain failure.
+        let quoted = format!("notes: {refusal}");
+        let rows = activity_rows(
+            &[events[0].clone(), at(run, 2, result("t1", true, &quoted))],
+            run,
+        );
+        let ActivityRow::Tool(bash) = &rows[0] else {
+            panic!("a run row")
+        };
+        assert_eq!(bash.state, StepState::Failed);
+
         // A denial without its call gets a row of its own.
         let rows = activity_rows(&[events[1].clone()], run);
         assert_eq!(

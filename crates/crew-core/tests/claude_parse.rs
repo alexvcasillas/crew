@@ -378,3 +378,48 @@ fn an_ordinary_error_result_is_no_denial() {
     let events = parser.parse(&result);
     assert!(matches!(events.as_slice(), [Event::ToolResult { .. }]));
 }
+
+/// A run that `cat`s a file quoting the safety check's refusal, then
+/// fails. `denials` is its result's list of denied calls.
+fn quoting_run(denials: serde_json::Value) -> Vec<Event> {
+    let mut parser = StreamParser::new();
+    let lines = [
+        json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat notes.txt; false"}}]}}),
+        json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t1","is_error":true,
+             "content":"notes: Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions]"}]}}),
+        json!({"type":"result","subtype":"success","is_error":false,"result":"ok",
+               "duration_ms":1,"num_turns":1,"permission_denials":denials}),
+    ];
+    lines
+        .iter()
+        .flat_map(|line| parser.parse(&line.to_string()))
+        .filter(|e| matches!(e, Event::PermissionDenied { .. }))
+        .collect()
+}
+
+#[test]
+fn output_that_quotes_a_refusal_is_no_denial() {
+    assert_eq!(quoting_run(json!([])), vec![]);
+}
+
+#[test]
+fn a_quoted_refusal_counts_when_the_result_lists_the_call() {
+    let input = json!({"command": "cat notes.txt; false"});
+    assert_eq!(
+        quoting_run(json!([{"tool_name":"Bash","tool_input":input,"tool_use_id":"t1"}])),
+        vec![blocked("Bash", input, "Destructive or unwanted actions")]
+    );
+}
+
+#[test]
+fn a_plain_denial_has_no_reason() {
+    let mut parser = StreamParser::new();
+    let line = json!({"type":"result","subtype":"success","is_error":false,"result":"ok",
+        "duration_ms":1,"num_turns":1,"permission_denials":[
+            {"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t9"}]})
+    .to_string();
+    let events = parser.parse(&line);
+    assert_eq!(events[0], denied("Bash", json!({"command": "ls"})));
+}
