@@ -55,6 +55,29 @@ pub fn short_model(model: &str) -> &str {
     }
 }
 
+/// One line of text an agent or CLI wrote, safe to draw: tabs and
+/// carriage returns become spaces, and other control and bidi characters
+/// are dropped, so they can't hide or reorder what you read.
+pub fn clean_line(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\t' | '\r' => Some(' '),
+            c if c.is_control() => None,
+            '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Like [`clean_line`] for each line of `text`.
+pub fn clean_lines(text: &str) -> String {
+    text.lines().map(clean_line).collect::<Vec<_>>().join("\n")
+}
+
 /// `4m 12s`, `12s` or `1h 3m`.
 pub fn elapsed(ms: i64) -> String {
     let secs = ms.max(0) / 1000;

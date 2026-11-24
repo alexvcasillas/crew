@@ -269,7 +269,7 @@ fn coming_soon_runtimes_are_disabled(cx: &mut TestAppContext) {
         label_of(cx, window, "agent-form-title").as_deref(),
         Some("New agent")
     );
-    assert!(shows(cx, window, "Claude Code Not installed"));
+    assert!(shows(cx, window, "Claude Code Not installed (selected)"));
     assert!(shows(cx, window, INSTALL_CLAUDE));
     for (key, name) in COMING_RUNTIMES {
         let id = format!("runtime-{key}");

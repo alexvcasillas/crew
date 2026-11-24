@@ -207,6 +207,15 @@ pub struct ModelInfo {
     pub label: String,
 }
 
+/// The model a new Codex agent starts on: the first Luna model, the
+/// cheapest, else the first listed.
+pub fn default_codex_model(models: &[ModelInfo]) -> Option<&ModelInfo> {
+    models
+        .iter()
+        .find(|m| m.id.contains("luna"))
+        .or(models.first())
+}
+
 /// The answer to [`Request::PermissionAsk`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionAnswer {

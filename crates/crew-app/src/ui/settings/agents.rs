@@ -155,7 +155,11 @@ pub fn build_spec(d: &Draft<'_>, taken: &[&str]) -> Result<AgentSpec, String> {
         model: if other.is_empty() { d.model } else { other }.to_string(),
         instructions: d.instructions.trim().to_string(),
         permission_mode: d.permission.clone(),
-        allowed_tools: split_tools(d.allowed_tools),
+        // Only `claude` takes a list of tools to allow.
+        allowed_tools: match d.runtime {
+            Runtime::ClaudeCode => split_tools(d.allowed_tools),
+            Runtime::Codex => Vec::new(),
+        },
         handoff_policy: d.policy,
         handoff_budget: budget,
         max_run_minutes,
@@ -211,12 +215,7 @@ pub fn split_tools(text: &str) -> Vec<String> {
 /// The Codex model a new agent starts on: the first Luna model, else the
 /// first listed. Empty if none is listed, which leaves it to Codex.
 pub fn default_codex_model(models: &[ModelInfo]) -> String {
-    models
-        .iter()
-        .find(|m| m.id.contains("luna"))
-        .or(models.first())
-        .map(|m| m.id.clone())
-        .unwrap_or_default()
+    crew_proto::default_codex_model(models).map_or_else(String::new, |m| m.id.clone())
 }
 
 /// The models crewd listed for `runtime`.
@@ -966,11 +965,14 @@ impl Workspace {
                         Some("Edits stay in the thread's own worktree."),
                         div().flex().child(permission),
                     ))
-                    .child(field(
-                        "Always allow these tools",
-                        Some("A comma list, passed as --allowedTools."),
-                        control("agent-tools", Input::new(&form.allowed_tools)),
-                    ))
+                    // Codex has no such list; it asks through its sandbox.
+                    .when(form.runtime == Runtime::ClaudeCode, |col| {
+                        col.child(field(
+                            "Always allow these tools",
+                            Some("A comma list, passed as --allowedTools."),
+                            control("agent-tools", Input::new(&form.allowed_tools)),
+                        ))
+                    })
                     .child(field(
                         "Bringing in other agents",
                         Some("When this agent mentions another one."),
@@ -1184,7 +1186,11 @@ impl Workspace {
             selected,
             enabled,
         )
-        .aria_label(format!("{name} {status}"))
+        .aria_label(if selected {
+            format!("{name} {status} (selected)")
+        } else {
+            format!("{name} {status}")
+        })
         .when(enabled, |card| {
             card.cursor_pointer()
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -1401,6 +1407,11 @@ mod tests {
         let spec = build_spec(&d, &[]).unwrap();
         assert_eq!(spec.runtime, Runtime::Codex);
         assert_eq!(spec.model, "gpt-6-luna");
+        assert!(
+            spec.allowed_tools.is_empty(),
+            "Codex takes no tool list: {:?}",
+            spec.allowed_tools
+        );
     }
 
     #[test]

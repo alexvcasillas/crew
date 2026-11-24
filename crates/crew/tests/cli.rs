@@ -29,6 +29,11 @@ fn replay_script(dir: &Path) -> PathBuf {
 
 /// Runs crewd on its own runtime in a background thread until the test ends.
 fn start_crewd(home: &Path, claude_bin: PathBuf) {
+    start_crewd_with(home, claude_bin, None);
+}
+
+/// Like [`start_crewd`], with `codex_bin` as `codex`.
+fn start_crewd_with(home: &Path, claude_bin: PathBuf, codex_bin: Option<PathBuf>) {
     let serve_home = home.to_path_buf();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -36,6 +41,8 @@ fn start_crewd(home: &Path, claude_bin: PathBuf) {
             let opts = ServeOptions {
                 max_runs: 4,
                 claude_bin: Some(claude_bin),
+                // Never the real codex.
+                codex_bin: Some(codex_bin.unwrap_or_else(|| PathBuf::from("/nonexistent/codex"))),
                 crew_mcp_bin: None,
                 ..Default::default()
             };
@@ -660,4 +667,92 @@ fn agent_add_checks_budget_and_minutes() {
         "--max-minutes",
         "1",
     ]));
+}
+
+/// A signed-in `codex` whose app-server lists two models, Luna second.
+fn fake_codex(dir: &Path) -> PathBuf {
+    let fake = manifest_dir().join("../crew-core/tests/fake/codex_app_server.py");
+    let models = dir.join("models.json");
+    let steps = serde_json::json!({"steps": [
+        {"expect": "initialize", "as": "init"},
+        {"respond": "init", "result": {}},
+        {"expect": "initialized"},
+        {"expect": "model/list", "as": "list"},
+        {"respond": "list", "result": {"data": [
+            {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol", "hidden": false},
+            {"id": "gpt-6-luna", "model": "gpt-6-luna", "displayName": "GPT-6-Luna", "hidden": false}
+        ], "nextCursor": null}}
+    ]});
+    std::fs::write(&models, steps.to_string()).unwrap();
+    let path = dir.join("codex");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'codex-cli 0.165.0' ;;\nlogin) exit 0 ;;\napp-server) exec python3 '{}' '{}' ;;\n*) exit 2 ;;\nesac\n",
+            fake.display(),
+            models.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn agent_add_makes_codex_agents_on_the_default_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    start_crewd_with(
+        &home,
+        replay_script(tmp.path()),
+        Some(fake_codex(tmp.path())),
+    );
+    let add = |args: &[&str]| {
+        let mut cmd = crew(&home, tmp.path());
+        cmd.args(["agent", "add"]).args(args);
+        cmd
+    };
+    let out = stdout_of(&mut add(&[
+        "Nova",
+        "--runtime",
+        "codex",
+        "--role",
+        "Builds",
+    ]));
+    assert!(out.contains("Nova uses gpt-6-luna (GPT-6-Luna)."), "{out}");
+    stdout_of(&mut add(&[
+        "Kit",
+        "--runtime",
+        "codex",
+        "--model",
+        "gpt-6.1-sol",
+        "--role",
+        "Builds",
+        "--edit",
+    ]));
+    let err = add(&["Quill", "--role", "Writes"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("--model"), "{err}");
+
+    let agents: Vec<crew_core::store::StoredAgent> = ask(
+        &home,
+        crew_proto::Request::ListAgents {
+            include_deleted: false,
+        },
+    );
+    use crew_core::agent::{PermissionMode, Runtime};
+    let spec = |name: &str| &agents.iter().find(|a| a.spec.name == name).unwrap().spec;
+    assert_eq!(spec("Nova").runtime, Runtime::Codex);
+    assert_eq!(spec("Nova").model, "gpt-6-luna");
+    assert_eq!(spec("Nova").permission_mode, PermissionMode::ReadOnly);
+    assert_eq!(spec("Kit").runtime, Runtime::Codex);
+    assert_eq!(spec("Kit").model, "gpt-6.1-sol");
+    assert_eq!(spec("Kit").permission_mode, PermissionMode::EditFiles);
+    assert!(agents.iter().all(|a| a.spec.name != "Quill"));
 }
