@@ -477,7 +477,8 @@ async fn a_codex_run_streams_events_and_ends_done() {
     assert!(
         instructions.starts_with(
             "You are Forge, Builds things, working in Crew with other agents in project demo.\n\
-             You are read-only: review and report, don't change files."
+             You are read-only: review and report, don't change files.\n\
+             When you review changes, list each finding on its own line as `path:line: comment`."
         ),
         "{instructions}"
     );

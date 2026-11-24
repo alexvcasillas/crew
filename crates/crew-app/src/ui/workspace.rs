@@ -426,6 +426,7 @@ impl Workspace {
         self.sync(cx);
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
+        self.sync_review_comments(cx);
         self.open_if_known(window, cx);
         let open = self.terminal.as_ref().map(|t| t.session.as_str());
         if terminal_gone && open.is_some_and(|id| self.state.terminal_session(id).is_none()) {

@@ -532,3 +532,90 @@ fn a_running_check_shows_running_then_passes(cx: &mut TestAppContext) {
     wait_to_show(cx, window, "Passed npm test");
     assert!(!shows(cx, window, "Running npm test"));
 }
+
+/// A fake claude: read-only runs reply with `reply` (JSON-escaped, and
+/// `%s` stands for the run's folder), others edit as `script` says.
+fn reviewer_script(script: &str, reply: &str) -> String {
+    let sid = r#""session_id":"00000000-0000-4000-8000-000000000001""#;
+    let text = format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{reply}"}}]}},{sid}}}"#
+    );
+    let result = format!(
+        r#"{{"type":"result","subtype":"success","is_error":false,"result":"{reply}","duration_ms":5,"num_turns":1,"permission_denials":[],{sid}}}"#
+    );
+    // printf reads backslashes, so JSON's `\n` goes in as `\\n`.
+    let (text, result) = (text.replace('\\', "\\\\"), result.replace('\\', "\\\\"));
+    format!(
+        "case \"$*\" in *'--permission-mode plan'*) d=$(pwd); printf '%s\\n' '{init}'; printf '{text}\\n' \"$d\"; printf '{result}\\n' \"$d\"; exit 0;; esac\n{script}",
+        init = r#"{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-haiku-4-5","tools":["Read"]}"#,
+    )
+}
+
+#[gpui_kit::test]
+fn a_reviewer_reply_pins_its_comments_to_the_diff(cx: &mut TestAppContext) {
+    let reply = "Two notes.\\n\\n- ./README.md:2: Say who.\\n- `%s/new.txt:1` - Check it.\\nnowhere.rs:4: Gone.";
+    let s = setup(&reviewer_script(
+        "printf 'hello\\nthere\\n' > README.md\nprintf 'one\\ntwo\\n' > new.txt",
+        reply,
+    ));
+    let scout: AgentId = ask(
+        &s.w.client,
+        Request::CreateAgent {
+            spec: crew_core::agent::AgentSpec {
+                permission_mode: PermissionMode::ReadOnly,
+                ..agent("Scout", "Reviews")
+            },
+        },
+    );
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 2);
+    review_from_inspector(cx, window);
+    // No reviewer yet: no comments, no callout.
+    wait_to_show(cx, window, "· 2 + there");
+    assert!(!has(cx, window, "review-callout"));
+    assert!(!shows(cx, window, "Comments outside the diff"));
+
+    // Scout replies while the review is open.
+    s.w.post("@Scout look it over");
+    run_of(cx, &ws, s.w.thread, scout, RunStatus::Done);
+    wait_to_show(cx, window, "Scout left 3 comments.");
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.pinned_comments()),
+        [
+            (
+                "README.md".to_string(),
+                Some(2),
+                "Scout · README.md:2".to_string()
+            ),
+            (
+                "new.txt".to_string(),
+                Some(1),
+                "Scout · new.txt:1".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.outside_comments()),
+        ["Scout · nowhere.rs:4"]
+    );
+    assert!(shows(cx, window, "Comments outside the diff"));
+    assert!(shows(cx, window, "Scout · README.md:2"));
+    assert!(shows(cx, window, "Say who."));
+    assert!(shows(cx, window, "Scout · nowhere.rs:4"));
+
+    // Forge changes things again: Scout's comments were about older work.
+    s.w.post("@Forge once more");
+    wait_until(cx, "Forge's second run", |cx| {
+        ws.read_with(cx, |ws, _| {
+            let runs = ws.state().thread_runs(s.w.thread);
+            runs.len() == 3 && runs[2].status == RunStatus::Done
+        })
+    });
+    wait_until(cx, "the comments to go", |cx| {
+        !shows(cx, window, "Comments outside the diff")
+    });
+    assert!(ws.read_with(cx, |ws, _| ws.pinned_comments()).is_empty());
+    assert!(!has(cx, window, "review-callout"));
+}

@@ -993,6 +993,7 @@ async fn runs_hear_their_crew_context_in_one_system_prompt() {
         prompts[0][1],
         "You are Scout, Reviews code, working in Crew with other agents in project demo.\n\
          You are read-only: review and report, don't change files.\n\
+         When you review changes, list each finding on its own line as `path:line: comment`.\n\
          Other agents here:\n\
          - Forge (Builds things, edits files)\n\
          To bring in another agent, call the mcp__crew_run__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\

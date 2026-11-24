@@ -21,8 +21,10 @@ use gpui_kit::*;
 
 use super::common::{dot, spinner};
 use super::inspector::INSPECTOR_WIDTH;
+use super::markdown_view::render_doc;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
 use crate::checks::{Check, CheckState, checks};
+use crate::comments::{Comment, comments, place, reviewer_replies};
 use crate::diff_parse::{FileDiff, FileKind, LineKind, parse};
 use crate::fonts::mono_font;
 use crate::theme::color;
@@ -48,6 +50,7 @@ const BODY_MAX_LINES: usize = 20;
 const GUTTER: f32 = 44.;
 const LINE_HEIGHT: f32 = 20.;
 const NOTHING_TO_REVIEW: &str = "No changes to review.";
+const OUTSIDE_TITLE: &str = "Comments outside the diff";
 const NOTE: &str = "Nothing is pushed. Committing stays on your machine, and the branch is yours to merge or open a PR from.";
 
 /// Esc leaves the commit message first, then the review.
@@ -76,6 +79,10 @@ enum Row {
     Note(usize),
     /// A large file waiting for "Show diff".
     Folded(usize),
+    /// The title above comments that aren't on a shown line.
+    OutsideTitle,
+    /// A review comment, by its index, under the row before it.
+    Comment(usize),
 }
 
 /// The open review of a thread's changes.
@@ -91,6 +98,10 @@ pub(super) struct Review {
     list: ListState,
     /// Large files you asked to see, by path.
     shown: HashSet<String>,
+    /// Findings from the reviewers' latest replies.
+    comments: Vec<Comment>,
+    /// The latest reviewer and how many comments its reply left.
+    left: Option<(String, usize)>,
     message: Entity<TextareaState>,
     /// The draft from the agent's latest reply, empty if none.
     draft: String,
@@ -130,21 +141,42 @@ pub fn draft_commit_message(reply: &str) -> String {
     }
 }
 
-/// The diff list's rows, and where each file starts.
-fn diff_rows(files: &[FileDiff], shown: &HashSet<String>) -> (Vec<Row>, Vec<usize>) {
+/// Whether a file's lines are drawn: it has no note and is small or
+/// asked for.
+fn lines_drawn(file: &FileDiff, shown: &HashSet<String>) -> bool {
+    file.note.is_none() && (file.line_count() <= LARGE_FILE_LINES || shown.contains(&file.path))
+}
+
+/// The diff list's rows, and where each file starts. Comments go under
+/// their line, or above the first file when their line isn't drawn.
+fn diff_rows(
+    files: &[FileDiff],
+    shown: &HashSet<String>,
+    comments: &[Comment],
+) -> (Vec<Row>, Vec<usize>) {
+    let placement = place(files, |f| lines_drawn(&files[f], shown), comments);
     let mut rows = Vec::new();
+    if !placement.outside.is_empty() {
+        rows.push(Row::OutsideTitle);
+        rows.extend(placement.outside.iter().map(|&c| Row::Comment(c)));
+    }
     let mut starts = Vec::new();
     for (f, file) in files.iter().enumerate() {
         starts.push(rows.len());
         rows.push(Row::File(f));
         if file.note.is_some() {
             rows.push(Row::Note(f));
-        } else if file.line_count() > LARGE_FILE_LINES && !shown.contains(&file.path) {
+        } else if !lines_drawn(file, shown) {
             rows.push(Row::Folded(f));
         } else {
             for (h, hunk) in file.hunks.iter().enumerate() {
                 rows.push(Row::Hunk(f, h));
-                rows.extend((0..hunk.lines.len()).map(|l| Row::Line(f, h, l)));
+                for l in 0..hunk.lines.len() {
+                    rows.push(Row::Line(f, h, l));
+                    if let Some(under) = placement.under.get(&(f, h, l)) {
+                        rows.extend(under.iter().map(|&c| Row::Comment(c)));
+                    }
+                }
             }
         }
     }
@@ -203,6 +235,8 @@ impl Workspace {
             file_rows: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             shown: HashSet::new(),
+            comments: Vec::new(),
+            left: None,
             message,
             draft,
             _message_events: events,
@@ -210,6 +244,7 @@ impl Workspace {
             failed: None,
             focus,
         });
+        self.sync_review_comments(cx);
         self.load_thread_diff(thread, cx);
         cx.notify();
     }
@@ -279,6 +314,79 @@ impl Workspace {
         }
         review.draft = draft;
         cx.notify();
+    }
+
+    /// Reads the reviewers' comments afresh, and redraws the rows when
+    /// they changed.
+    pub(super) fn sync_review_comments(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        let state = self.state();
+        let root = state
+            .thread(thread)
+            .and_then(|t| t.worktree.as_ref())
+            .map(|wt| wt.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let replies = reviewer_replies(state, thread);
+        let found = comments(state, &replies, &root);
+        let left = replies.last().and_then(|last| {
+            let n = comments(state, std::slice::from_ref(last), &root).len();
+            let name = state.agent(last.0)?.spec.name.clone();
+            (n > 0).then_some((name, n))
+        });
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        review.left = left;
+        if found != review.comments {
+            review.comments = found;
+            rebuild_rows(review);
+            cx.notify();
+        }
+    }
+
+    /// Each comment pinned under a line: the file, the line's new
+    /// number and the card's header.
+    #[cfg(test)]
+    pub(super) fn pinned_comments(&self) -> Vec<(String, Option<u32>, String)> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let mut under = None;
+        let mut pinned = Vec::new();
+        for row in &review.rows {
+            match *row {
+                Row::Line(f, h, l) => {
+                    let file = &review.files[f];
+                    under = Some((file.path.clone(), file.hunks[h].lines[l].new));
+                }
+                Row::Comment(c) => {
+                    if let Some((path, line)) = under.clone() {
+                        pinned.push((path, line, comment_header(&review.comments[c])));
+                    }
+                }
+                _ => under = None,
+            }
+        }
+        pinned
+    }
+
+    /// The headers of the comments listed outside the diff.
+    #[cfg(test)]
+    pub(super) fn outside_comments(&self) -> Vec<String> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let mut rows = review.rows.iter();
+        if rows.next() != Some(&Row::OutsideTitle) {
+            return Vec::new();
+        }
+        rows.map_while(|row| match row {
+            Row::Comment(c) => Some(comment_header(&review.comments[*c])),
+            _ => None,
+        })
+        .collect()
     }
 
     /// The agent whose changes these are: the one of the latest run that
@@ -792,6 +900,62 @@ impl Workspace {
                     .test_support()
                     .into_any_element()
             }
+            Row::OutsideTitle => div()
+                .id(("diff-row", ix))
+                .w_full()
+                .flex()
+                .items_center()
+                .h(px(40.))
+                .px(px(16.))
+                .text_size(px(12.))
+                .text_color(color("text-secondary"))
+                .aria_label(OUTSIDE_TITLE)
+                .child(OUTSIDE_TITLE)
+                .test_support()
+                .into_any_element(),
+            Row::Comment(c) => {
+                let comment = &review.comments[c];
+                let header = comment_header(comment);
+                let doc = crate::markdown::parse(&comment.body);
+                div()
+                    .id(("diff-row", ix))
+                    .w_full()
+                    .py(px(6.))
+                    .pl(px(GUTTER * 2. + 16.))
+                    .pr(px(16.))
+                    .child(
+                        div()
+                            .id(("review-comment", c))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .max_w(px(720.))
+                            .px(px(12.))
+                            .py(px(10.))
+                            .bg(color("surface-raised"))
+                            .border_1()
+                            .border_color(color("border-200"))
+                            .rounded(px(8.))
+                            .aria_label(header.clone())
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(color("text-secondary"))
+                                    .child(header),
+                            )
+                            .child(
+                                div()
+                                    .id(("review-comment-body", c))
+                                    .aria_label(comment.body.clone())
+                                    .child(render_doc(&doc, &[], &format!("review-comment-{c}")))
+                                    .test_support(),
+                            )
+                            .test_support(),
+                    )
+                    .test_support()
+                    .into_any_element()
+            }
             Row::Folded(f) => {
                 let file = &review.files[f];
                 let note = format!("{} changes {} lines.", file.path, file.line_count());
@@ -1231,6 +1395,27 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("What next"),
             )
+            .when_some(review.left.clone(), |col, (agent, n)| {
+                let text = format!(
+                    "{agent} left {n} {}.",
+                    if n == 1 { "comment" } else { "comments" }
+                );
+                col.child(
+                    div()
+                        .id("review-callout")
+                        .px(px(12.))
+                        .py(px(10.))
+                        .bg(color("surface-100"))
+                        .border_1()
+                        .border_color(color("border-200"))
+                        .rounded(px(8.))
+                        .text_size(px(13.))
+                        .text_color(color("text-primary"))
+                        .aria_label(text.clone())
+                        .child(text)
+                        .test_support(),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1321,12 +1506,17 @@ impl Workspace {
 }
 
 fn rebuild_rows(review: &mut Review) {
-    let (rows, starts) = diff_rows(&review.files, &review.shown);
+    let (rows, starts) = diff_rows(&review.files, &review.shown, &review.comments);
     if rows != review.rows {
         review.list.reset(rows.len());
     }
     review.rows = rows;
     review.file_rows = starts;
+}
+
+/// "{Agent} · {path}:{line}".
+fn comment_header(comment: &Comment) -> String {
+    format!("{} · {}:{}", comment.agent, comment.path, comment.line)
 }
 
 fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
@@ -1415,7 +1605,7 @@ mod tests {
             LARGE_FILE_LINES + 1
         );
         let files = parse(&patch);
-        let (rows, starts) = diff_rows(&files, &HashSet::new());
+        let (rows, starts) = diff_rows(&files, &HashSet::new(), &[]);
         assert_eq!(
             rows,
             [
@@ -1429,7 +1619,7 @@ mod tests {
         );
         assert_eq!(starts, [0, 4]);
         let shown = HashSet::from(["big".to_string()]);
-        let (rows, _) = diff_rows(&files, &shown);
+        let (rows, _) = diff_rows(&files, &shown, &[]);
         assert_eq!(rows.len(), 4 + 2 + LARGE_FILE_LINES + 1);
     }
 }

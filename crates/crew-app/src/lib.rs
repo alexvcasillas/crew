@@ -2,6 +2,7 @@
 
 pub mod checks;
 pub mod client;
+pub mod comments;
 pub mod connection;
 pub mod diff_parse;
 pub mod markdown;
