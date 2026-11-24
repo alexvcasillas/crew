@@ -1334,7 +1334,6 @@ fn working_hint(names: &[String]) -> Option<String> {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_width = window.viewport_size().width;
-        self.ensure_repo_messages(window, cx);
         let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
         let lights = crate::app::traffic_lights();
         if self.traffic_lights != Some(lights) {

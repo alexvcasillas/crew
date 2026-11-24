@@ -9,10 +9,12 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ThreadId};
 use crew_core::project_kind::WorkMode;
 use crew_proto::Request;
-use gpui_kit::{AnyWindowHandle, Entity, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::inspector_tests::run_of;
-use super::test_ui::{click, has, label_of, notifications, press, shows, wait_to_show, wait_until};
+use super::test_ui::{
+    bounds_of, click, has, label_of, notifications, press, shows, wait_to_show, wait_until,
+};
 use super::thread_tests::{World, agent, ask, go_to, open_thread, world_named};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
@@ -211,6 +213,20 @@ fn a_folder_of_repos_shows_a_worktree_per_repo_and_commits_one_repo(cx: &mut Tes
         "Plain files at the top of platform/ stay out of the thread folder: README.md, docker-compose.yml. Agents can read them from the original folder but not change them.",
     );
 
+    // Discarding from the thread names the thread folder and each repo.
+    let thread = f.w.thread;
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_discard_dialog(thread, window, cx));
+    })
+    .unwrap();
+    wait_label(
+        cx,
+        window,
+        "discard-heading",
+        "Discard the worktree? This deletes the thread folder and the worktrees for crew/fix-the-login in api, infra and web. Uncommitted changes can't be recovered.",
+    );
+    click(cx, window, "dialog-cancel");
+
     // Review groups the files by repo, with a commit per repo.
     click(cx, window, "inspector-tab-changes");
     click(cx, window, "changes-review");
@@ -245,6 +261,37 @@ fn a_folder_of_repos_shows_a_worktree_per_repo_and_commits_one_repo(cx: &mut Tes
         Some("Discard changes in api and web")
     );
     assert!(!has(cx, window, "review-mode-chip"), "not in place");
+
+    // The bar over the diff names the file at the top and marks it viewed.
+    assert_eq!(
+        label_of(cx, window, "review-file-bar").as_deref(),
+        Some("api · a.txt")
+    );
+    click(cx, window, ("review-file", 2usize));
+    wait_label(cx, window, "review-file-bar", "web · b.txt");
+    click(cx, window, "review-top-viewed");
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.viewed_files(f.w.thread)),
+        ["web/b.txt"]
+    );
+    click(cx, window, ("review-file", 0usize));
+    wait_label(cx, window, "review-file-bar", "api · a.txt");
+
+    // Every file's header row is whole, above its first hunk.
+    for file in 0..3usize {
+        let row = ws.read_with(cx, |ws, _| ws.review_file_row(file));
+        let header = bounds_of(cx, window, ("diff-file", file)).unwrap();
+        let hunk = bounds_of(cx, window, ("diff-row", row + 1)).unwrap();
+        assert!(
+            header.size.height >= gpui_kit::px(39.),
+            "file {file}'s header is {:?} tall",
+            header.size.height
+        );
+        assert!(
+            header.bottom() <= hunk.top() + gpui_kit::px(0.5),
+            "file {file}'s header {header:?} overlaps its hunk {hunk:?}"
+        );
+    }
 
     // Committing web leaves api to review.
     click(cx, window, ("review-commit-repo", 1usize));

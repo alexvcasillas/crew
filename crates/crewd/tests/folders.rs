@@ -1365,6 +1365,48 @@ async fn a_repo_gone_from_the_folder_still_lets_a_thread_be_discarded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_repo_replaced_by_another_clone_still_lets_a_thread_be_discarded() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(fake_claude(scripts.path())).await;
+    let mut c = d.client().await;
+    agents(&mut c).await;
+    let root = platform(d.tmp.path());
+    let (_, channel) = add_project(&mut c, &root, None).await;
+    let thread = new_thread(&mut c, channel, "Old").await;
+    set_edits(scripts.path(), &[("web/a.txt", "web change")]);
+    post(&mut c, thread, "@Forge go").await;
+    until_run(&mut c, thread, RunStatus::Done).await;
+    let folder = real(&d.home).join("worktrees/platform/old");
+    assert!(folder.join("web").exists());
+
+    // `web` is now a different clone at the same path.
+    std::fs::remove_dir_all(root.join("web")).unwrap();
+    repo(&root.join("web"));
+    std::fs::write(root.join("web/mine.txt"), "mine\n").unwrap();
+
+    discard_all(&mut c, thread).await;
+    assert!(!folder.exists(), "Crew's own copy goes");
+    assert!(
+        stored_thread(&mut c, channel, thread)
+            .await
+            .worktree
+            .is_none()
+    );
+    // The new clone is untouched and knows no stale worktree.
+    assert_eq!(
+        std::fs::read_to_string(root.join("web/mine.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(
+        git(&root.join("web"), &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_missing_folder_is_refused() {
     let scripts = tempfile::tempdir().unwrap();
     let d = Daemon::start(fake_claude(scripts.path())).await;
@@ -1395,12 +1437,18 @@ async fn existing_projects_learn_their_kind_on_start() {
     let scripts = tempfile::tempdir().unwrap();
     let d = Daemon::start_in(tmp, home, fake_claude(scripts.path())).await;
     let mut c = d.client().await;
-    let projects: Vec<StoredProject> = c.ok(Request::ListProjects).await;
-    assert_eq!(
-        projects[0].kind,
-        ProjectKind::MultiRepo {
-            repos: vec!["api".into(), "web".into()]
+    // crewd answers while it looks, and learns the kind soon after.
+    let want = ProjectKind::MultiRepo {
+        repos: vec!["api".into(), "web".into()],
+    };
+    let started = std::time::Instant::now();
+    let project = loop {
+        let projects: Vec<StoredProject> = c.ok(Request::ListProjects).await;
+        if projects[0].kind == want {
+            break projects[0].clone();
         }
-    );
-    assert_eq!(projects[0].work_mode, WorkMode::OwnCopy);
+        assert!(started.elapsed() < WAIT, "the kind wasn't learnt");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(project.work_mode, WorkMode::OwnCopy);
 }

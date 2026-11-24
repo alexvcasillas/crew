@@ -93,6 +93,10 @@ enum Command {
         thread: String,
         #[arg(short, long)]
         message: String,
+        /// The repo to commit in, for a project that holds several, such
+        /// as `api`.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Remove a thread's worktree, changes included. Its branch goes too,
     /// unless it has commits.
@@ -844,12 +848,16 @@ async fn run(cli: Cli) -> Result<()> {
             print_diff(&diff, stat);
             Ok(())
         }
-        Command::Commit { thread, message } => {
+        Command::Commit {
+            thread,
+            message,
+            repo,
+        } => {
             let thread = resolve_thread(&mut c, &thread).await?;
             let sha: String = c
                 .ask(Request::Commit {
                     thread,
-                    repo: None,
+                    repo,
                     message,
                 })
                 .await?;

@@ -6,6 +6,7 @@ use crew_proto::{Request, WorktreeState};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::*;
 
+use super::super::folder::and_list;
 use super::super::workspace::Workspace;
 use super::{DialogKind, heading};
 use crate::theme::color;
@@ -110,17 +111,28 @@ impl Workspace {
         delete_branch: bool,
         this: WeakEntity<Self>,
     ) -> AnyElement {
-        let branch = self
+        let worktree = self
             .state()
             .thread(thread)
-            .and_then(|t| t.worktree.as_ref())
-            .map(|wt| wt.branch.clone())
+            .and_then(|t| t.worktree.as_ref());
+        let branch = worktree.map(|wt| wt.branch.clone()).unwrap_or_default();
+        // A folder of repos has a worktree of each inside the thread folder.
+        let repos: Vec<String> = worktree
+            .map(|wt| wt.repos.iter().map(|r| r.repo.clone()).collect())
             .unwrap_or_default();
+        let (lead, tail) = if repos.is_empty() {
+            ("This deletes the folder for ".to_string(), String::new())
+        } else {
+            (
+                "This deletes the thread folder and the worktrees for ".to_string(),
+                format!(" in {}", and_list(&repos)),
+            )
+        };
         let label = format!(
-            "Discard the worktree? This deletes the folder for {branch}. Uncommitted changes can't be recovered."
+            "Discard the worktree? {lead}{branch}{tail}. Uncommitted changes can't be recovered."
         );
         let body = div()
-            .child("This deletes the folder for ")
+            .child(lead)
             .child(
                 div()
                     .font_family(code_family())
@@ -128,7 +140,7 @@ impl Workspace {
                     .text_color(color("text-primary"))
                     .child(branch),
             )
-            .child(". Uncommitted changes can't be recovered.")
+            .child(format!("{tail}. Uncommitted changes can't be recovered."))
             .flex()
             .flex_wrap()
             .gap(ui_px(3.));

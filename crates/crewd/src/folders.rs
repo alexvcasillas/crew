@@ -205,6 +205,29 @@ fn remove_repo_worktrees(
             removed.push(repo.clone());
             continue;
         }
+        // Another clone now sits at the repo's path: it doesn't know the
+        // worktree, so Crew's own copy goes and the clone forgets any
+        // stale worktree entry.
+        if dest.exists() && !same_repo(&src, &dest) {
+            if dest.starts_with(own)
+                && let Err(e) = std::fs::remove_dir_all(&dest)
+            {
+                return (removed, kept, Some(format!("{repo}: {e}")));
+            }
+            let pruned = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&src)
+                .args(["worktree", "prune"])
+                .output();
+            if let Err(e) = pruned {
+                log(format!(
+                    "couldn't prune worktrees of {}: {e}",
+                    src.display()
+                ));
+            }
+            removed.push(repo.clone());
+            continue;
+        }
         let done = (|| {
             let keep = !delete_branch && worktree::has_commits_beyond(&src, &wt.branch, &r.base)?;
             worktree::remove(&src, &dest, &wt.branch, !keep)?;
@@ -221,6 +244,28 @@ fn remove_repo_worktrees(
         }
     }
     (removed, kept, None)
+}
+
+/// Whether the worktree at `dest` belongs to the repo at `src`: both
+/// share one git folder.
+fn same_repo(src: &Path, dest: &Path) -> bool {
+    let common = |dir: &Path| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        path.canonicalize().ok()
+    };
+    match (common(src), common(dest)) {
+        (Some(a), Some(b)) => a == b,
+        // A copy git can't read any more is not the repo's.
+        (Some(_), None) => false,
+        _ => true,
+    }
 }
 
 /// Makes a thread folder at `path` with a worktree of each of `repos` on
@@ -1277,12 +1322,17 @@ pub(crate) fn gc_snapshots(dir: &Path, max: std::time::Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // Only what Crew made goes: an older layout's run folder holds its
+    // `snapshot.json`. Anything else here is left alone.
     for entry in entries.flatten() {
+        let path = entry.path();
         let name = entry.file_name();
-        if name != "blobs" && name != "runs" {
-            remove(&entry.path());
+        let plain_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if name != "blobs" && name != "runs" && plain_dir && path.join("snapshot.json").is_file() {
+            remove(&path);
         }
     }
+    let is_file = |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|t| t.is_file());
     let mut wanted: HashSet<String> = HashSet::new();
     for entry in std::fs::read_dir(runs_dir(dir))
         .into_iter()
@@ -1290,6 +1340,10 @@ pub(crate) fn gc_snapshots(dir: &Path, max: std::time::Duration) {
         .flatten()
     {
         let path = entry.path();
+        // Records are `<run>.json`; nothing else in `runs` is Crew's.
+        if !is_file(&entry) || path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -1310,7 +1364,9 @@ pub(crate) fn gc_snapshots(dir: &Path, max: std::time::Duration) {
         .flatten()
     {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !wanted.contains(&name) {
+        // Copies are named by their id, half-made ones `.copy-…`.
+        let crews = crew_core::snapshot::valid_id(&name) || name.starts_with(".copy-");
+        if is_file(&entry) && crews && !wanted.contains(&name) {
             remove(&entry.path());
         }
     }
@@ -1504,6 +1560,14 @@ mod tests {
         std::fs::write(runs.join("broken.json"), "{").unwrap();
         // An older layout's folder.
         std::fs::create_dir_all(dir.join("0000/files")).unwrap();
+        std::fs::write(dir.join("0000/snapshot.json"), "{}").unwrap();
+        // Things Crew never makes stay, wherever they are.
+        std::fs::create_dir_all(dir.join("photos")).unwrap();
+        std::fs::write(dir.join("photos/cat.jpg"), "cat").unwrap();
+        std::fs::write(dir.join("notes.txt"), "mine").unwrap();
+        std::fs::write(runs.join("notes.txt"), "mine").unwrap();
+        std::fs::create_dir_all(runs.join("keep")).unwrap();
+        std::fs::write(blobs.join("readme.md"), "mine").unwrap();
 
         gc_snapshots(&dir, Duration::from_secs(3600));
         let mut left: Vec<String> = std::fs::read_dir(&blobs)
@@ -1512,14 +1576,18 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, std::slice::from_ref(&used));
+        assert_eq!(left, [used.clone(), "readme.md".to_string()]);
         assert!(runs.join("r1.json").exists());
         assert!(!runs.join("broken.json").exists());
         assert!(!dir.join("0000").exists());
+        assert!(dir.join("photos/cat.jpg").exists());
+        assert!(dir.join("notes.txt").exists());
+        assert!(runs.join("notes.txt").exists() && runs.join("keep").is_dir());
 
         // Past the age limit the record goes, then its copies.
         gc_snapshots(&dir, Duration::ZERO);
         assert!(!runs.join("r1.json").exists());
-        assert!(std::fs::read_dir(&blobs).unwrap().next().is_none());
+        assert!(!blobs.join(&used).exists());
+        assert!(blobs.join("readme.md").exists());
     }
 }
