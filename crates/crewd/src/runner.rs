@@ -224,6 +224,7 @@ pub fn spawn_run(
 
     let spawned = Command::new(&inv.bin)
         .args(&inv.args)
+        .envs(inv.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&inv.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

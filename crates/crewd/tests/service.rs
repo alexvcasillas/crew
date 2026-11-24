@@ -409,6 +409,56 @@ async fn mention_starts_run_and_agent_replies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_cli_gets_the_run_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("run-id.txt");
+    let script = dir.path().join("claude-env.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$CREW_RUN_ID\" > '{}'\nexec '{}' '{}'\n",
+            out.display(),
+            fake("claude_ok.sh").display(),
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let d = Daemon::start(4, script).await;
+    let mut c = d.client().await;
+    let (_agent, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    let _: serde_json::Value = c.ok(Request::Subscribe { thread }).await;
+    let _: crew_core::ids::MessageId = c
+        .ok(Request::PostMessage {
+            thread,
+            body: "@Forge go".into(),
+        })
+        .await;
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::RunStatus {
+                status: RunStatus::Done,
+                ..
+            }
+        )
+    })
+    .await;
+
+    let runs: Vec<StoredRun> = c
+        .ok(Request::ListRuns {
+            status: Some(RunStatus::Done),
+        })
+        .await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        runs[0].id.to_string()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_mention_posts_system_message() {
     let dir = tempfile::tempdir().unwrap();
     let d = Daemon::start(4, fake("claude_sleeps.sh")).await;

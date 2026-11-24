@@ -1059,8 +1059,14 @@ impl Service {
         let extra = state.retry_rules.remove(&job.run).unwrap_or_default();
         let mut db = self.db();
         match self.prepare(&mut db, &job, pending, announce, &extra) {
-            Ok((name, inv)) => {
+            Ok((name, mut inv)) => {
                 drop(db);
+                // So the user's hooks can tell a Crew run apart.
+                let env = match &mut inv {
+                    Invocation::Claude(inv) => &mut inv.env,
+                    Invocation::Codex(inv) => &mut inv.env,
+                };
+                env.push(("CREW_RUN_ID".to_string(), job.run.to_string()));
                 let (handle, rx, join) = match inv {
                     Invocation::Claude(inv) => spawn_run(inv),
                     Invocation::Codex(inv) => {
@@ -1439,6 +1445,7 @@ impl Service {
                     prompt: fresh,
                     resume: resume.map(|(thread, prompt)| Resume { thread, prompt }),
                     mcp: wiring,
+                    env: Vec::new(),
                 })
             }
         };
