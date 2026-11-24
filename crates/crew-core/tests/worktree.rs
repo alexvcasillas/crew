@@ -248,3 +248,54 @@ fn excluded_paths_stay_out_of_diff_and_commit() {
     // The repo's own exclude file is never touched.
     assert_eq!(fs::read(&root_exclude).ok(), before);
 }
+
+#[test]
+fn change_counts_cover_commits_and_uncommitted_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_root, dest, base) = setup(tmp.path());
+    let none: &[String] = &[];
+    assert_eq!(
+        worktree::change_counts(&dest, &base, none).unwrap(),
+        worktree::ChangeCounts::default()
+    );
+
+    // Uncommitted: one edit and one new file.
+    fs::write(dest.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    fs::write(dest.join("new.txt"), "n\n").unwrap();
+    let counts = worktree::change_counts(&dest, &base, none).unwrap();
+    assert_eq!(
+        counts,
+        worktree::ChangeCounts {
+            uncommitted: 2,
+            committed: false,
+            files: 2,
+            added: 3,
+            removed: 1,
+        }
+    );
+
+    // Committed, then one more edit on top: totals are against the base.
+    worktree::commit(&dest, "Edit", none).unwrap();
+    let counts = worktree::change_counts(&dest, &base, none).unwrap();
+    assert_eq!((counts.uncommitted, counts.committed), (0, true));
+    assert_eq!((counts.files, counts.added, counts.removed), (2, 3, 1));
+    fs::write(dest.join("b.txt"), "").unwrap();
+    let counts = worktree::change_counts(&dest, &base, none).unwrap();
+    assert_eq!((counts.uncommitted, counts.committed), (1, true));
+    assert_eq!((counts.files, counts.added, counts.removed), (3, 3, 2));
+
+    // Copied files stay out.
+    let copied = vec!["b.txt".to_string()];
+    let counts = worktree::change_counts(&dest, &base, &copied).unwrap();
+    assert_eq!((counts.uncommitted, counts.files), (0, 2));
+}
+
+#[test]
+fn channel_names_are_lowercase_numbers_and_dashes() {
+    use crew_core::slug::{BAD_CHANNEL_NAME, channel_name};
+    assert_eq!(channel_name(" #bugs-2 ").unwrap(), "bugs-2");
+    assert_eq!(channel_name("general").unwrap(), "general");
+    for bad in ["", "#", "##x", "two words", "Bugs", "a_b", "é"] {
+        assert_eq!(channel_name(bad), Err(BAD_CHANNEL_NAME), "{bad:?}");
+    }
+}

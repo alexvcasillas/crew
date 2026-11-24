@@ -838,7 +838,11 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("Discard removes the worktree, changes included. Add --yes to confirm.");
             }
             let thread = resolve_thread(&mut c, &thread).await?;
-            c.call(Request::Discard { thread }).await?;
+            c.call(Request::Discard {
+                thread,
+                delete_branch: false,
+            })
+            .await?;
             Ok(())
         }
         Command::Thread(ThreadCommand::Handoff { thread, setting }) => {

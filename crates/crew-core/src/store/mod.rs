@@ -22,7 +22,7 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v5.sql"),
     include_str!("migrate_v6.sql"),
     include_str!("migrate_v7.sql"),
+    include_str!("migrate_v8.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -167,6 +168,9 @@ pub struct StoredChannel {
     pub created_at: i64,
     pub handoff_policy: Option<HandoffPolicy>,
     pub handoff_budget: Option<u32>,
+    /// What the channel is for. Empty if not set.
+    #[serde(default)]
+    pub description: String,
 }
 
 /// The git worktree a thread works in.
@@ -194,6 +198,27 @@ pub struct StoredThread {
     pub handoff_budget: Option<u32>,
     /// Agent-initiated handoffs that ran in this thread.
     pub handoffs_used: u32,
+    /// Unix milliseconds, set while the thread is archived.
+    #[serde(default)]
+    pub archived_at: Option<i64>,
+}
+
+/// What a channel overview needs from one thread's messages and asks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadActivity {
+    pub thread: ThreadId,
+    /// Messages from you and from agents. System notes don't count.
+    pub messages: u32,
+    /// Unix milliseconds of the newest message of any kind.
+    pub last_message_at: Option<i64>,
+    /// The newest agent reply.
+    pub latest_agent: Option<String>,
+    /// Your first message.
+    pub first_you: Option<String>,
+    /// Whether an approval waits for a decision.
+    pub needs_you: bool,
+    /// The note of the newest pending approval.
+    pub pending_ask: Option<String>,
 }
 
 /// A run as saved in the store.
@@ -654,6 +679,64 @@ impl Store {
         Ok(())
     }
 
+    /// Archives the thread now, or brings it back.
+    pub fn set_thread_archived(&self, t: ThreadId, archived: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET archived_at = ?2 WHERE id = ?1",
+            params![t.to_string(), archived.then(now_ms)],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("thread"));
+        }
+        Ok(())
+    }
+
+    /// Message counts, excerpts and pending asks of every thread in the
+    /// channel.
+    pub fn thread_activity(&self, c: ChannelId) -> Result<Vec<ThreadActivity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id,
+               (SELECT COUNT(*) FROM messages m
+                 WHERE m.thread_id = t.id AND m.author_kind <> 'system'),
+               (SELECT MAX(m.created_at) FROM messages m WHERE m.thread_id = t.id),
+               (SELECT m.body FROM messages m
+                 WHERE m.thread_id = t.id AND m.author_kind = 'agent'
+                 ORDER BY m.ord DESC LIMIT 1),
+               (SELECT m.body FROM messages m
+                 WHERE m.thread_id = t.id AND m.author_kind = 'you'
+                 ORDER BY m.ord LIMIT 1),
+               EXISTS(SELECT 1 FROM approvals a
+                 WHERE a.thread_id = t.id AND a.status = ?2),
+               (SELECT m.body FROM messages m JOIN approvals a ON a.id = m.approval_id
+                 WHERE m.thread_id = t.id AND a.status = ?2
+                 ORDER BY m.ord DESC LIMIT 1)
+             FROM threads t WHERE t.channel_id = ?1 ORDER BY t.created_at, t.rowid",
+        )?;
+        let pending = enum_text(&ApprovalStatus::Pending)?;
+        let rows = stmt.query_map(params![c.to_string(), pending], |r| {
+            Ok(ThreadActivity {
+                thread: ThreadId(uuid_col(r, 0)?),
+                messages: r.get(1)?,
+                last_message_at: r.get(2)?,
+                latest_agent: r.get(3)?,
+                first_you: r.get(4)?,
+                needs_you: r.get(5)?,
+                pending_ask: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every run of every thread in the channel, in order.
+    pub fn channel_runs(&self, c: ChannelId) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE thread_id IN (SELECT id FROM threads WHERE channel_id = ?1)
+             ORDER BY ord"
+        ))?;
+        let rows = stmt.query_map([c.to_string()], read_run)?;
+        rows.map(|r| r?).collect()
+    }
+
     /// Sets or clears the thread's worktree.
     pub fn set_thread_worktree(&self, t: ThreadId, wt: Option<&ThreadWorktree>) -> Result<()> {
         let changed = self.conn.execute(
@@ -669,6 +752,19 @@ impl Store {
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound("thread"));
+        }
+        Ok(())
+    }
+
+    /// Renames the channel and sets its description. The caller checks
+    /// the name first.
+    pub fn update_channel(&self, c: ChannelId, name: &str, description: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE channels SET name = ?2, description = ?3 WHERE id = ?1",
+            params![c.to_string(), name, description],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("channel"));
         }
         Ok(())
     }
@@ -1101,8 +1197,8 @@ fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
         .map_err(StoreError::from))
 }
 
-const CHANNEL_COLUMNS: &str =
-    "SELECT id, project_id, name, created_at, handoff_policy, handoff_budget FROM channels";
+const CHANNEL_COLUMNS: &str = "SELECT id, project_id, name, created_at, handoff_policy,
+     handoff_budget, description FROM channels";
 
 fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
     let channel = StoredChannel {
@@ -1112,6 +1208,7 @@ fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
         created_at: r.get(3)?,
         handoff_policy: None,
         handoff_budget: r.get(5)?,
+        description: r.get(6)?,
     };
     let policy: Option<String> = r.get(4)?;
     Ok(parse_policy(policy).map(|handoff_policy| StoredChannel {
@@ -1122,7 +1219,7 @@ fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
 
 const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,
      worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used,
-     worktree_ready FROM threads";
+     worktree_ready, archived_at FROM threads";
 
 fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
     let path: Option<String> = r.get(4)?;
@@ -1146,6 +1243,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
         handoff_policy: None,
         handoff_budget: r.get(8)?,
         handoffs_used: r.get(9)?,
+        archived_at: r.get(11)?,
     };
     let policy: Option<String> = r.get(7)?;
     Ok(parse_policy(policy).map(|handoff_policy| StoredThread {

@@ -14,7 +14,8 @@ CREATE TABLE channels (
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     handoff_policy TEXT,
-    handoff_budget INTEGER
+    handoff_budget INTEGER,
+    description TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE agents (
@@ -37,7 +38,8 @@ CREATE TABLE threads (
     worktree_ready INTEGER NOT NULL DEFAULT 0,
     handoff_policy TEXT,
     handoff_budget INTEGER,
-    handoffs_used INTEGER NOT NULL DEFAULT 0
+    handoffs_used INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER
 );
 
 CREATE TABLE messages (

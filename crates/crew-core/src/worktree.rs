@@ -135,6 +135,63 @@ pub fn diff(dest: &Path, base: &str, exclude: &[String]) -> Result<Diff> {
     Ok(Diff { files, patch })
 }
 
+/// How much a worktree changed, for a summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCounts {
+    /// Files that differ from `HEAD`: uncommitted edits and new files.
+    pub uncommitted: u32,
+    /// Whether the branch has commits beyond the base.
+    pub committed: bool,
+    /// Files that differ from the base, commits and uncommitted edits
+    /// together.
+    pub files: u32,
+    /// Lines added against the base. Binary files count 0.
+    pub added: u32,
+    /// Lines removed against the base. Binary files count 0.
+    pub removed: u32,
+}
+
+/// Counts what changed in `dest` since `base`, the way [`diff`] sees it,
+/// without building a patch. Paths in `exclude` are left out.
+pub fn change_counts(dest: &Path, base: &str, exclude: &[String]) -> Result<ChangeCounts> {
+    let index = TempIndex::new(dest)?;
+    index.git(["add", "-A"])?;
+    let mut paths = vec![".".to_string()];
+    paths.extend(exclude.iter().map(|p| format!(":(exclude,literal){p}")));
+    let numstat = |against: &str| {
+        let mut args = vec![
+            "diff",
+            "--cached",
+            "--no-renames",
+            "-z",
+            "--numstat",
+            against,
+        ];
+        args.push("--");
+        args.extend(paths.iter().map(String::as_str));
+        index.git(args)
+    };
+    let mut counts = ChangeCounts::default();
+    for entry in numstat(base)?.split('\0').filter(|s| !s.is_empty()) {
+        let mut parts = entry.splitn(3, '\t');
+        let (Some(added), Some(removed)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        counts.files += 1;
+        counts.added += added.parse().unwrap_or(0);
+        counts.removed += removed.parse().unwrap_or(0);
+    }
+    let head = head(dest)?;
+    counts.committed = head != base;
+    counts.uncommitted = if counts.committed {
+        let changed = numstat("HEAD")?;
+        changed.split('\0').filter(|s| !s.is_empty()).count() as u32
+    } else {
+        counts.files
+    };
+    Ok(counts)
+}
+
 /// Stages everything in `dest` except the paths in `exclude` (relative to
 /// `dest`) and commits it. Uses the repo's git identity, or
 /// `Crew <crew@localhost>` for any part that is not set. Returns the sha.

@@ -914,6 +914,7 @@ mod tests {
             created_at: 1,
             handoff_policy: None,
             handoff_budget: None,
+            description: String::new(),
         }
     }
 
@@ -927,6 +928,7 @@ mod tests {
             handoff_policy: None,
             handoff_budget: None,
             handoffs_used: 0,
+            archived_at: None,
         }
     }
 

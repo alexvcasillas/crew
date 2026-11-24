@@ -1,7 +1,8 @@
 //! Chat state and run handling behind the server.
 //!
-//! Lock order: `state`, then `db`, then `terminal`. No lock is held across
-//! an `.await`, nor while git, a setup command or a file read runs.
+//! Lock order: `state`, then `db`, then `terminal`. The change count cache
+//! is locked on its own, never while taking another lock. No lock is held
+//! across an `.await`, nor while git, a setup command or a file read runs.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
+use crate::overview::ChangeCache;
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 use crate::terminal::{Cmd, TerminalState};
 
@@ -121,6 +123,8 @@ struct Inner {
     terminal: Mutex<TerminalState>,
     /// Requests to the terminal session watcher, once it runs.
     terminal_cmd: OnceLock<mpsc::UnboundedSender<Cmd>>,
+    /// Change counts of thread worktrees, for channel overviews.
+    changes: Mutex<ChangeCache>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -207,6 +211,7 @@ impl Service {
             minute,
             terminal: Mutex::new(TerminalState::default()),
             terminal_cmd: OnceLock::new(),
+            changes: Mutex::new(ChangeCache::default()),
         }))
     }
 
@@ -255,6 +260,18 @@ impl Service {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    pub(crate) fn changes(&self) -> MutexGuard<'_, ChangeCache> {
+        self.0
+            .changes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets the thread's cached change counts.
+    fn changes_may_differ(&self, thread: ThreadId) {
+        self.changes().invalidate(thread);
+    }
+
     pub(crate) fn terminal(&self) -> MutexGuard<'_, TerminalState> {
         self.0
             .terminal
@@ -296,13 +313,17 @@ impl Service {
 
     /// Handles every request except `Hello`, `Subscribe`, `SubscribeAll`
     /// and `PermissionAsk`, which belong to the connection. `ThreadDiff`,
-    /// `Commit` and `Discard` run git and `Runtimes` runs the agent CLIs,
-    /// so they can take a while.
+    /// `Commit`, `Discard` and `ChannelOverview` run git and `Runtimes`
+    /// runs the agent CLIs, so they can take a while.
     pub async fn handle(&self, req: Request) -> Reply {
         match req {
             Request::ThreadDiff { thread } => self.thread_diff(thread).await,
             Request::Commit { thread, message } => self.commit(thread, &message).await,
-            Request::Discard { thread } => self.discard(thread).await,
+            Request::Discard {
+                thread,
+                delete_branch,
+            } => self.discard(thread, delete_branch).await,
+            Request::ChannelOverview { channel } => self.channel_overview(channel).await,
             Request::Runtimes => self.runtimes().await,
             other => self.handle_now(other),
         }
@@ -373,6 +394,22 @@ impl Service {
                     .rename_thread(thread, title)
                     .map_err(|e| e.to_string())?;
                 self.thread_changed(&mut db, thread)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::ArchiveThread { thread, archived } => {
+                let mut db = self.db();
+                db.store
+                    .set_thread_archived(thread, archived)
+                    .map_err(|e| e.to_string())?;
+                self.thread_changed(&mut db, thread)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::UpdateChannel {
+                channel,
+                name,
+                description,
+            } => {
+                self.update_channel(channel, &name, description.trim())?;
                 Ok(serde_json::Value::Null)
             }
             Request::PostMessage { thread, body } => json(
@@ -451,6 +488,7 @@ impl Service {
             Request::ThreadDiff { .. }
             | Request::Commit { .. }
             | Request::Discard { .. }
+            | Request::ChannelOverview { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
@@ -536,6 +574,36 @@ impl Service {
         Ok(())
     }
 
+    /// Renames the channel and sets its description, once the name is
+    /// valid and no other channel of its project has it.
+    fn update_channel(
+        &self,
+        channel: ChannelId,
+        name: &str,
+        description: &str,
+    ) -> Result<(), String> {
+        let mut db = self.db();
+        let stored = db.store.channel(channel).map_err(|e| e.to_string())?;
+        let name = crew_core::slug::channel_name(name)?;
+        let project = db
+            .store
+            .project(stored.project)
+            .map_err(|e| e.to_string())?;
+        let taken = db
+            .store
+            .channels(stored.project)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|c| c.id != channel && c.name.eq_ignore_ascii_case(&name));
+        if taken {
+            return Err(format!("#{name} already exists in {}.", project.name));
+        }
+        db.store
+            .update_channel(channel, &name, description)
+            .map_err(|e| e.to_string())?;
+        self.channel_changed(&mut db, channel)
+    }
+
     /// Tells `SubscribeAll` clients the agent as it is now.
     fn agent_changed(&self, db: &mut Db, agent: AgentId) -> Result<(), String> {
         let agent = db.store.agent(agent).map_err(|e| e.to_string())?;
@@ -615,7 +683,9 @@ impl Service {
             return Err("Write a commit message.".into());
         }
         let copied = self.copied_files(thread)?;
-        let wt = self.claim_for_change(thread)?;
+        let wt = self.claim_for_change(thread, |name| {
+            format!("Wait for {name} to finish, or stop it.")
+        })?;
         let result = blocking(move || {
             if worktree::diff(&wt.path, "HEAD", &copied)?.files.is_empty() {
                 return Ok(None);
@@ -623,6 +693,7 @@ impl Service {
             worktree::commit(&wt.path, &message, &copied).map(Some)
         })
         .await;
+        self.changes_may_differ(thread);
         self.release_change(thread);
         match result? {
             Some(sha) => json(sha),
@@ -631,23 +702,24 @@ impl Service {
     }
 
     /// Removes the thread's worktree, uncommitted changes included. Its
-    /// branch goes too, unless it has commits beyond the worktree's base:
-    /// then it is kept and the thread is told.
-    async fn discard(&self, thread: ThreadId) -> Reply {
+    /// branch goes too, unless it has commits beyond the worktree's base
+    /// and `delete_branch` is off: then it is kept and the thread is told.
+    async fn discard(&self, thread: ThreadId, delete_branch: bool) -> Reply {
         let root = self
             .db()
             .store
             .project_of_thread(thread)
             .map_err(|e| e.to_string())?
             .root;
-        let wt = self.claim_for_change(thread)?;
+        let wt = self.claim_for_change(thread, |name| format!("Stop {name} first."))?;
         let (path, branch) = (wt.path.clone(), wt.branch.clone());
         let result = blocking(move || {
-            let keep = worktree::has_commits_beyond(&root, &wt.branch, &wt.base)?;
+            let keep = !delete_branch && worktree::has_commits_beyond(&root, &wt.branch, &wt.base)?;
             worktree::remove(&root, &wt.path, &wt.branch, !keep)?;
             Ok::<_, worktree::WorktreeError>(keep)
         })
         .await;
+        self.changes_may_differ(thread);
         // A worktree that is gone is cleared even if deleting the branch failed.
         let cleared = if result.is_ok() || !path.exists() {
             let mut db = self.db();
@@ -673,8 +745,13 @@ impl Service {
     }
 
     /// Holds the thread so no run starts there while its worktree changes.
-    /// Refuses while a run in the thread is live.
-    fn claim_for_change(&self, thread: ThreadId) -> Result<ThreadWorktree, String> {
+    /// Refuses while a run in the thread is live, saying `busy` of its
+    /// agent's name.
+    fn claim_for_change(
+        &self,
+        thread: ThreadId,
+        busy: impl FnOnce(&str) -> String,
+    ) -> Result<ThreadWorktree, String> {
         let mut state = self.state();
         let db = self.db();
         let live = state
@@ -689,7 +766,7 @@ impl Service {
                 .iter()
                 .find(|(id, _)| *id == agent)
                 .map_or("the agent", |(_, spec)| spec.name.as_str());
-            return Err(format!("Wait for {name} to finish, or stop it."));
+            return Err(busy(name));
         }
         let wt = db
             .store
@@ -1329,6 +1406,7 @@ impl Service {
 
     /// Saves the thread's worktree and tells `SubscribeAll` clients.
     fn save_worktree(&self, thread: ThreadId, wt: &ThreadWorktree) -> Result<(), StoreError> {
+        self.changes_may_differ(thread);
         let mut db = self.db();
         db.store.set_thread_worktree(thread, Some(wt))?;
         self.thread_changed_or_log(&mut db, thread);
@@ -1646,6 +1724,8 @@ impl Service {
         outcome: RunOutcome,
         reply: String,
     ) -> Result<(), StoreError> {
+        // The run may have changed files.
+        self.changes_may_differ(thread);
         let mut state = self.state();
         // The process is gone, so dropping the handle does nothing more.
         Self::end_live(&mut state, run);
