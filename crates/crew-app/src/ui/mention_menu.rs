@@ -1,9 +1,10 @@
 //! The `@` menu above the composer: agents matching what follows the `@`.
 
+use crew_core::agent::Runtime;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{chip, monogram, status_word};
+use super::common::{monogram, runtime_badge_for, status_word};
 use super::composer::{Composer, ComposerEvent};
 use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
@@ -19,6 +20,8 @@ pub struct MentionAgent {
     pub role: String,
     /// `claude · haiku`.
     pub chip: String,
+    /// The runtime behind `chip`, for its provider mark.
+    pub runtime: Runtime,
     pub status: ThreadStatus,
 }
 
@@ -165,7 +168,7 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
                         .child(agent.role.clone()),
                 ),
         )
-        .child(chip(agent.chip.clone()))
+        .child(runtime_badge_for(&agent.runtime, agent.chip.clone()))
         .child(
             div()
                 .id(("mention-status", ix))
@@ -220,12 +223,14 @@ fn hint(keys: &'static str, what: &'static str) -> impl IntoElement {
 mod tests {
     use super::{MentionAgent, matching, mention_at};
     use crate::model::ThreadStatus;
+    use crew_core::agent::Runtime;
 
     fn agent(name: &str) -> MentionAgent {
         MentionAgent {
             name: name.into(),
             role: String::new(),
             chip: "claude · haiku".into(),
+            runtime: Runtime::ClaudeCode,
             status: ThreadStatus::Idle,
         }
     }

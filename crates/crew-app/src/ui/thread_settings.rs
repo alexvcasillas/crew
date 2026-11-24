@@ -1,6 +1,7 @@
 //! The inspector's Thread tab: who is in the thread, how handoffs run,
 //! the working copy and a way to stop it all.
 
+use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ThreadId};
 use crew_core::policy::{self, HandoffPolicy, PolicyInputs};
@@ -11,7 +12,7 @@ use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{chip, elapsed, monogram, now_ms, runtime_chip};
+use super::common::{elapsed, monogram, now_ms, runtime_badge_for, runtime_chip};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -62,7 +63,7 @@ pub fn used_up(policy: HandoffPolicy, used: u32, budget: u32) -> bool {
 struct Participant {
     agent: AgentId,
     name: String,
-    chip: Option<String>,
+    chip: Option<(Runtime, String)>,
     status: String,
     token: &'static str,
 }
@@ -105,7 +106,7 @@ impl Workspace {
                 Participant {
                     agent,
                     name: spec.map_or_else(|| "Deleted agent".to_string(), |s| s.name.clone()),
-                    chip: spec.map(runtime_chip),
+                    chip: spec.map(|s| (s.runtime.clone(), runtime_chip(s))),
                     status,
                     token,
                 }
@@ -290,7 +291,9 @@ impl Workspace {
                                         .text_size(px(13.))
                                         .child(p.name),
                                 )
-                                .children(p.chip.map(chip))
+                                .children(
+                                    p.chip.map(|(runtime, text)| runtime_badge_for(&runtime, text)),
+                                )
                                 .child(div().flex_1())
                                 .child(div().text_color(color(p.token)).child(p.status))
                                 .test_support()

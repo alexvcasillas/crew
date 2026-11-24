@@ -442,6 +442,7 @@ impl Workspace {
                 name: a.spec.name.clone(),
                 role: a.spec.role.clone(),
                 chip: runtime_chip(&a.spec),
+                runtime: a.spec.runtime.clone(),
                 status: self.state.agent_status(a.id),
             })
             .collect();
