@@ -501,17 +501,26 @@ async fn update_agent_changes_next_run_args() {
         .await
         .unwrap_err();
     assert_eq!(err, "an agent named \"Forge\" already exists");
-    let err = c
-        .call(Request::UpdateAgent {
-            agent: other,
+    // Codex agents are taken, made or changed.
+    c.call(Request::UpdateAgent {
+        agent: other,
+        spec: AgentSpec {
+            name: "Sentinel".into(),
+            runtime: Runtime::Codex,
+            ..forge()
+        },
+    })
+    .await
+    .unwrap();
+    let _: AgentId = c
+        .ok(Request::CreateAgent {
             spec: AgentSpec {
+                name: "Coder".into(),
                 runtime: Runtime::Codex,
                 ..forge()
             },
         })
-        .await
-        .unwrap_err();
-    assert_eq!(err, "Codex agents aren't supported yet. Pick Claude Code.");
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -631,7 +640,11 @@ async fn runtimes_reports_fake_claude_version() {
         .expect("codex in the list");
     assert!(codex_info.installed);
     assert_eq!(codex_info.version.as_deref(), Some("0.9.1"));
-    assert_eq!(codex_info.signed_in, None);
+    // `codex login status` fails here, so it reads as signed out.
+    assert_eq!(codex_info.signed_in, Some(false));
+    assert!(codex_info.models.is_empty());
+    let ids: Vec<&str> = claude.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["opus", "sonnet", "haiku"]);
     assert_eq!(codex_info.path.as_deref(), Some(codex.to_str().unwrap()));
 
     // Signed out: the status command fails and says so.

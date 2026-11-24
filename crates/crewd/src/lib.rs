@@ -1,6 +1,7 @@
 //! The Crew daemon: runs agent processes and serves clients.
 
 mod approvals;
+pub mod codex_runner;
 pub mod runner;
 mod runtimes;
 pub mod server;

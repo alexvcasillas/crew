@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -173,9 +173,9 @@ pub enum Request {
         budget: Option<u32>,
     },
     /// Answered with `Vec<RuntimeInfo>`. Runs each CLI's `--version` and
-    /// sign-in status command. If they take over a second, the answer says
-    /// only which CLIs were found, and `ServerMsg::RuntimesChanged` follows
-    /// with the rest.
+    /// sign-in status command, and asks Codex for its models. If they take
+    /// over a second, the answer says only which CLIs were found, and
+    /// `ServerMsg::RuntimesChanged` follows with the rest.
     Runtimes,
 }
 
@@ -192,6 +192,19 @@ pub struct RuntimeInfo {
     pub signed_in: Option<bool>,
     /// Where the binary is.
     pub path: Option<String>,
+    /// Models an agent of this runtime can use. Fixed for Claude Code,
+    /// asked of the CLI for Codex. Empty if unknown.
+    #[serde(default)]
+    pub models: Vec<ModelInfo>,
+}
+
+/// A model an agent can be set to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// What the agent's `model` is set to.
+    pub id: String,
+    /// The name to show.
+    pub label: String,
 }
 
 /// The answer to [`Request::PermissionAsk`].

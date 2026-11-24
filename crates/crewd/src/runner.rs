@@ -28,12 +28,12 @@ const TERM_AFTER: Duration = Duration::from_secs(3);
 /// Time between SIGTERM and SIGKILL when stopping.
 const KILL_AFTER: Duration = Duration::from_secs(5);
 /// How many output lines a failure keeps.
-const STDERR_TAIL: usize = 20;
+pub(crate) const STDERR_TAIL: usize = 20;
 /// Capacity of the event channel.
-const EVENT_BUFFER: usize = 1024;
+pub(crate) const EVENT_BUFFER: usize = 1024;
 /// How long the output readers may run on after the process is gone. A
 /// leftover child that holds the pipes would otherwise keep them open.
-const READERS_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const READERS_GRACE: Duration = Duration::from_secs(2);
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -271,7 +271,7 @@ async fn read_events(
 }
 
 /// Keeps the last stderr lines in `tail`, updated per line.
-async fn read_tail(stderr: impl AsyncRead + Unpin, tail: Arc<Mutex<VecDeque<String>>>) {
+pub(crate) async fn read_tail(stderr: impl AsyncRead + Unpin, tail: Arc<Mutex<VecDeque<String>>>) {
     let mut reader = BufReader::new(stderr);
     while let Some(line) = next_line(&mut reader).await {
         let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
@@ -350,7 +350,7 @@ async fn finish_readers(readers: Readers) -> (bool, VecDeque<String>) {
 }
 
 /// Waits for `task` until `deadline`, then aborts it.
-async fn join_until(mut task: JoinHandle<()>, deadline: tokio::time::Instant) {
+pub(crate) async fn join_until(mut task: JoinHandle<()>, deadline: tokio::time::Instant) {
     if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
         task.abort();
         // Wait for the abort so the task is gone, and with it the sender.
@@ -359,7 +359,7 @@ async fn join_until(mut task: JoinHandle<()>, deadline: tokio::time::Instant) {
 }
 
 /// Sends SIGINT, then SIGTERM, then SIGKILL until the process exits.
-async fn escalate(child: &mut Child, pgid: Option<Pid>) {
+pub(crate) async fn escalate(child: &mut Child, pgid: Option<Pid>) {
     signal_group(pgid, Signal::SIGINT);
     if tokio::time::timeout(TERM_AFTER, child.wait()).await.is_ok() {
         return;
@@ -372,7 +372,7 @@ async fn escalate(child: &mut Child, pgid: Option<Pid>) {
     let _ = child.wait().await;
 }
 
-fn signal_group(pgid: Option<Pid>, signal: Signal) {
+pub(crate) fn signal_group(pgid: Option<Pid>, signal: Signal) {
     if let Some(pgid) = pgid {
         // The group may already be gone; that is fine.
         let _ = killpg(pgid, signal);

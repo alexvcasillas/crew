@@ -172,6 +172,7 @@ mod tests {
             version: Some("2.1.0".into()),
             signed_in: Some(true),
             path: Some("/usr/local/bin/claude".into()),
+            models: vec![],
         };
         assert_eq!(runtime_state(&info), ("Signed in", "success"));
         info.signed_in = None;

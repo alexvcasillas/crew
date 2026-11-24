@@ -105,6 +105,24 @@ pub struct CrewContext {
 impl CrewContext {
     /// The plain text block for `agent`. `wired` adds how to hand off.
     pub fn render(&self, agent: &AgentSpec, wired: bool) -> String {
+        let handoff = wired.then(|| {
+            format!(
+                "To bring in another agent, call the {HANDOFF_TOOL} tool with the agent's name and a short brief. Writing @Name in your final reply also works."
+            )
+        });
+        self.render_with(agent, handoff)
+    }
+
+    /// [`CrewContext::render`] for a Codex agent, which sees crew-mcp's
+    /// tools by server and tool name.
+    pub fn render_codex(&self, agent: &AgentSpec, wired: bool) -> String {
+        let handoff = wired.then(|| {
+            "To bring in another agent, call the handoff tool of the crew MCP server with the agent's name and a short brief. Writing @Name in your final reply also works.".to_string()
+        });
+        self.render_with(agent, handoff)
+    }
+
+    fn render_with(&self, agent: &AgentSpec, handoff: Option<String>) -> String {
         let who = if agent.role.trim().is_empty() {
             agent.name.clone()
         } else {
@@ -135,11 +153,7 @@ impl CrewContext {
                 });
             }
         }
-        if wired {
-            lines.push(format!(
-                "To bring in another agent, call the {HANDOFF_TOOL} tool with the agent's name and a short brief. Writing @Name in your final reply also works."
-            ));
-        }
+        lines.extend(handoff);
         lines.join("\n")
     }
 }
@@ -589,6 +603,23 @@ mod tests {
                  You can edit files in this thread's worktree."
             ]
         );
+    }
+
+    #[test]
+    fn codex_context_names_the_handoff_tool_of_the_crew_server() {
+        let a = agent(PermissionMode::EditFiles);
+        assert_eq!(
+            context().render_codex(&a, true),
+            "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
+             You can edit files in this thread's worktree.\n\
+             Other agents here:\n\
+             - Forge (Builds features, edits files)\n\
+             - Scout (read-only)\n\
+             To bring in another agent, call the handoff tool of the crew MCP server with the agent's name and a short brief. Writing @Name in your final reply also works."
+        );
+        let plain = context().render_codex(&a, false);
+        assert!(!plain.contains("handoff"));
+        assert_eq!(plain, context().render(&a, false));
     }
 
     #[test]

@@ -126,6 +126,17 @@ fn runs_start_queued_then_get_a_session() {
         store.start_run(crew_core::ids::RunId::new(), "x"),
         Err(StoreError::NotFound("run"))
     ));
+
+    // A session the CLI names itself is saved once it is known.
+    store.set_run_session(r, "thr-1").unwrap();
+    let named = store.run(r).unwrap();
+    assert_eq!(named.session_id, "thr-1");
+    assert_eq!(named.status, RunStatus::Working);
+    assert_eq!(named.started_at, started.started_at);
+    assert!(matches!(
+        store.set_run_session(crew_core::ids::RunId::new(), "x"),
+        Err(StoreError::NotFound("run"))
+    ));
 }
 
 #[test]

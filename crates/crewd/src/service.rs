@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
+use crate::codex_runner::{Ask, CodexInvocation, spawn_codex_run};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 
 /// Told once per run when permission prompts can't reach crewd.
@@ -129,9 +130,9 @@ pub(crate) fn log(msg: impl std::fmt::Display) {
 /// default: `CREW_CLAUDE_BIN` or `claude`, and `codex`.
 #[derive(Debug, Clone, Default)]
 pub struct CliBins {
-    /// Used for every run.
+    /// Used for every Claude Code run.
     pub claude: Option<PathBuf>,
-    /// Only looked for, by `Runtimes`.
+    /// Used for every Codex run.
     pub codex: Option<PathBuf>,
     /// How long `Runtimes` waits for the CLIs before it answers with
     /// less. `None` is [`QUICK_ANSWER`].
@@ -239,14 +240,12 @@ impl Service {
                 json(channel)
             }
             Request::CreateAgent { spec } => {
-                supported(&spec)?;
                 let mut db = self.db();
                 let agent = db.store.create_agent(&spec).map_err(|e| e.to_string())?;
                 self.agent_changed(&mut db, agent)?;
                 json(agent)
             }
             Request::UpdateAgent { agent, spec } => {
-                supported(&spec)?;
                 let mut db = self.db();
                 db.store
                     .update_agent(agent, &spec)
@@ -925,7 +924,17 @@ impl Service {
             .spawn(svc.set_up_then_run(job, pending, stop_rx));
     }
 
-    /// Spawns `claude` for a job. Returns the task that watches it, or
+    /// Puts a Codex run's approval requests to you, like a Claude run's
+    /// permission asks.
+    fn asker(&self, run: RunId) -> Ask {
+        let svc = self.clone();
+        Box::new(move |tool, input, item| {
+            svc.ask_permission(run, tool, input, item)
+                .map(|wait| wait.answer)
+        })
+    }
+
+    /// Spawns the agent's CLI for a job. Returns the task that watches it, or
     /// `None` if it couldn't start, in which case the run is marked failed.
     /// `announce` publishes `Working`, which a run that was set up did already.
     fn launch(
@@ -939,7 +948,10 @@ impl Service {
         match self.prepare(&mut db, &job, pending, announce) {
             Ok((name, inv)) => {
                 drop(db);
-                let (handle, rx, join) = spawn_run(inv);
+                let (handle, rx, join) = match inv {
+                    Invocation::Claude(inv) => spawn_run(inv),
+                    Invocation::Codex(inv) => spawn_codex_run(inv, self.asker(job.run)),
+                };
                 state.live.insert(job.run, (job.thread, handle));
                 self.start_timer(state, &job);
                 Some(
@@ -1177,14 +1189,14 @@ impl Service {
     }
 
     /// Picks the session and prompt for a job, marks its run `Working` and
-    /// builds the command line.
+    /// builds what starts the agent's CLI.
     fn prepare(
         &self,
         db: &mut Db,
         job: &Job,
         pending: Option<Pending>,
         announce: bool,
-    ) -> Result<(String, ClaudeInvocation), StoreError> {
+    ) -> Result<(String, Invocation), StoreError> {
         let agents = db.store.agents_with_deleted()?;
         let spec = db.store.agent(job.agent)?;
         if spec.deleted_at.is_some() {
@@ -1213,7 +1225,7 @@ impl Service {
                 break;
             }
         }
-        let (session_id, session, prompt) = match previous {
+        let (resume, prompt) = match previous {
             Some(run) => {
                 let messages = db.store.messages(job.thread)?;
                 let missed = missed_messages(
@@ -1223,27 +1235,34 @@ impl Service {
                     job.agent,
                 );
                 let prompt = with_context(&missed, &agents, &job.prompt);
-                (
-                    run.session_id.clone(),
-                    SessionArg::Resume(run.session_id),
-                    prompt,
-                )
+                (Some(run.session_id), prompt)
             }
             None => {
-                let id = Uuid::new_v4();
                 let prompt = match pending {
                     Some(p) => p.fresh,
                     // A handoff: the whole thread so far, then the brief.
                     None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
                 };
-                (id.to_string(), SessionArg::New(id), prompt)
+                (None, prompt)
             }
+        };
+        // Crew names a new Claude session. Codex names its threads, so a
+        // new Codex run gets its session once the thread has started.
+        let new_session = Uuid::new_v4();
+        let session_id = match (&resume, &spec.runtime) {
+            (Some(id), _) => id.clone(),
+            (None, Runtime::ClaudeCode) => new_session.to_string(),
+            (None, Runtime::Codex) => String::new(),
         };
         db.store.start_run(job.run, &session_id)?;
         if announce {
             self.publish_status(db, job.thread, job.run, RunStatus::Working);
         }
-        if self.0.crew_mcp.is_none() && spec.permission_mode == PermissionMode::EditFiles {
+        // Codex asks through its app-server, so it needs no crew-mcp for that.
+        if self.0.crew_mcp.is_none()
+            && spec.permission_mode == PermissionMode::EditFiles
+            && spec.runtime == Runtime::ClaudeCode
+        {
             self.add_message(db, job.thread, Author::System, NO_CREW_MCP, Some(job.run))?;
         }
         let wiring = self.0.crew_mcp.as_ref().map(|(bin, home)| McpWiring {
@@ -1265,10 +1284,39 @@ impl Service {
                 })
                 .collect(),
         };
-        let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring, Some(&context));
-        if let Some(bin) = &self.0.bins.claude {
-            inv.bin = bin.clone();
-        }
+        let inv = match spec.runtime {
+            Runtime::ClaudeCode => {
+                let session = match resume {
+                    Some(id) => SessionArg::Resume(id),
+                    None => SessionArg::New(new_session),
+                };
+                let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring, Some(&context));
+                if let Some(bin) = &self.0.bins.claude {
+                    inv.bin = bin.clone();
+                }
+                Invocation::Claude(inv)
+            }
+            Runtime::Codex => {
+                let developer_instructions = [
+                    context.render_codex(&spec, wiring.is_some()),
+                    spec.instructions.clone(),
+                ]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+                Invocation::Codex(CodexInvocation {
+                    bin: crate::runtimes::codex_bin(&self.0.bins),
+                    cwd,
+                    model: spec.model.clone(),
+                    permission_mode: spec.permission_mode.clone(),
+                    developer_instructions,
+                    prompt,
+                    resume,
+                    mcp: wiring,
+                })
+            }
+        };
         Ok((spec.name, inv))
     }
 
@@ -1288,6 +1336,7 @@ impl Service {
             match &event {
                 Event::TurnEnd { summary: s, .. } => summary = s.clone(),
                 Event::Message { text } => texts.push(text.clone()),
+                Event::SessionStarted { session_id, .. } => self.name_session(run, session_id),
                 _ => {}
             }
             self.record_event(thread, run, event);
@@ -1304,6 +1353,19 @@ impl Service {
             log(format!("couldn't record the end of run {run}: {e}"));
         }
         self.start_ready();
+    }
+
+    /// Saves the session a run started if it had none yet, as a new Codex
+    /// run doesn't: Codex names its thread itself. A later run resumes it.
+    fn name_session(&self, run: RunId, session_id: &str) {
+        let db = self.db();
+        let unnamed = db.store.run(run).is_ok_and(|r| r.session_id.is_empty());
+        if unnamed
+            && !session_id.is_empty()
+            && let Err(e) = db.store.set_run_session(run, session_id)
+        {
+            log(format!("couldn't save the session of run {run}: {e}"));
+        }
     }
 
     fn finish(
@@ -1472,12 +1534,10 @@ impl Service {
     }
 }
 
-/// Refuses runtimes that have no adapter yet.
-fn supported(spec: &AgentSpec) -> Result<(), String> {
-    match spec.runtime {
-        Runtime::ClaudeCode => Ok(()),
-        Runtime::Codex => Err("Codex agents aren't supported yet. Pick Claude Code.".into()),
-    }
+/// What starts a run: the agent's CLI and how it is called.
+enum Invocation {
+    Claude(ClaudeInvocation),
+    Codex(CodexInvocation),
 }
 
 /// Runs blocking work, such as git, off the async threads.

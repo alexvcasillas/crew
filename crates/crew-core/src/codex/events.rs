@@ -37,6 +37,8 @@ pub struct CodexTranslator {
     open: Vec<(String, Vec<String>)>,
     /// Text of the last `final_answer` message of the current turn.
     final_answer: Option<String>,
+    /// Set once `SessionStarted` was given, so a resume doesn't repeat it.
+    session: bool,
 }
 
 impl CodexTranslator {
@@ -58,8 +60,22 @@ impl CodexTranslator {
             ServerNotification::AgentMessageDelta(_) | ServerNotification::TurnDiffUpdated(_) => {
                 vec![]
             }
-            ServerNotification::Raw(v) => raw_notification(v),
+            ServerNotification::Raw(v) => self.raw_notification(v),
         }
+    }
+
+    /// `SessionStarted` for the thread, the first time only. For a driver
+    /// that learns the thread from the `thread/start` or `thread/resume`
+    /// reply before the notification arrives.
+    pub fn session_started(&mut self, id: &str, model: &str, cwd: &str) -> Vec<Event> {
+        if std::mem::replace(&mut self.session, true) {
+            return vec![];
+        }
+        vec![Event::SessionStarted {
+            session_id: id.to_string(),
+            model: model.to_string(),
+            cwd: cwd.to_string(),
+        }]
     }
 
     /// Ends every item that was started but never completed, for example
@@ -182,6 +198,21 @@ impl CodexTranslator {
         events
     }
 
+    fn raw_notification(&mut self, v: &Value) -> Vec<Event> {
+        let method = v.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "thread/started" {
+            let thread = &v["params"]["thread"];
+            let text = |k: &str| thread.get(k).and_then(Value::as_str).unwrap_or("");
+            return self.session_started(text("id"), text("model"), text("cwd"));
+        }
+        if QUIET.contains(&method) {
+            return vec![];
+        }
+        vec![Event::Raw {
+            line: v.to_string(),
+        }]
+    }
+
     /// Records a started item and returns its calls. A repeated start is
     /// ignored.
     fn open_item(&mut self, id: &str, calls: Vec<Event>) -> Vec<Event> {
@@ -276,6 +307,10 @@ fn mcp_call(m: &McpToolCallItem) -> Event {
 }
 
 fn mcp_output(m: &McpToolCallItem) -> String {
+    let refused = matches!(m.status, ItemStatus::Failed | ItemStatus::Declined);
+    if refused && m.error.is_none() && m.result.as_ref().is_none_or(Value::is_null) {
+        return "Declined".into();
+    }
     if let Some(e) = &m.error {
         return match e.get("message").and_then(Value::as_str) {
             Some(msg) => msg.to_string(),
@@ -294,29 +329,4 @@ fn mcp_output(m: &McpToolCallItem) -> String {
             .join("\n"),
         None => r.to_string(),
     }
-}
-
-fn raw_notification(v: &Value) -> Vec<Event> {
-    let method = v.get("method").and_then(Value::as_str).unwrap_or("");
-    if method == "thread/started" {
-        let thread = &v["params"]["thread"];
-        let text = |k: &str| {
-            thread
-                .get(k)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        return vec![Event::SessionStarted {
-            session_id: text("id"),
-            model: text("model"),
-            cwd: text("cwd"),
-        }];
-    }
-    if QUIET.contains(&method) {
-        return vec![];
-    }
-    vec![Event::Raw {
-        line: v.to_string(),
-    }]
 }
