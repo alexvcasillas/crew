@@ -58,8 +58,8 @@ pub struct ServeOptions {
     /// sessions. `None` turns them off. The `crewd` binary uses
     /// [`claude_home_from`].
     pub claude_home: Option<PathBuf>,
-    /// Extra time each change count of a channel overview takes. Tests
-    /// make counts slow with it; zero otherwise.
+    /// For tests only: extra time each change count of a channel overview
+    /// takes, to make counts slow. Leave it at zero.
     pub count_delay: Duration,
 }
 
