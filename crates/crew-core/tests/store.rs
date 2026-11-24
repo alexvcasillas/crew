@@ -1113,3 +1113,26 @@ fn set_limits_refuses_a_per_agent_policy() {
     assert!(matches!(err, StoreError::Invalid(_)));
     assert_eq!(store.limits().unwrap(), Limits::default());
 }
+
+#[test]
+fn runs_that_never_started_are_not_history_or_usage() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let queued = store.create_run(t, a).unwrap();
+    store.set_run_status(queued, RunStatus::Stopped).unwrap();
+    assert!(store.run_history(None, 10).unwrap().is_empty());
+    assert!(store.usage_since(0, i64::MAX / 2).unwrap().is_empty());
+}
+
+#[test]
+fn usage_follows_the_runtime_the_run_used() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    let mut changed = spec("Ada");
+    changed.runtime = Runtime::Codex;
+    store.update_agent(a, &changed).unwrap();
+    let usage = store.usage_since(0, i64::MAX / 2).unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
+}

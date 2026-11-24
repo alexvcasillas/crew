@@ -908,11 +908,13 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    /// Ended runs (any final status), newest `ended_at` first. `before` is an
-    /// exclusive `ended_at` in Unix ms; `limit` is clamped to 1..=200.
+    /// Ended runs that started (any final status), newest `ended_at` first.
+    /// `before` is an exclusive `ended_at` in Unix ms; `limit` is clamped to
+    /// 1..=200. A run stopped while still queued never started and is left out.
     pub fn run_history(&self, before: Option<i64>, limit: u32) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{RUN_COLUMNS} WHERE ended_at IS NOT NULL AND (?1 IS NULL OR ended_at < ?1)
+            "{RUN_COLUMNS} WHERE ended_at IS NOT NULL AND session_id <> ''
+             AND (?1 IS NULL OR ended_at < ?1)
              ORDER BY ended_at DESC, ord DESC LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![before, limit.clamp(1, 200)], read_run)?;
@@ -921,32 +923,26 @@ impl Store {
 
     /// Runs per runtime that ended at or after `since_ms`, counted by their
     /// full duration, plus live runs counted by their time so far at `now_ms`.
-    /// Queued runs don't count. A runtime with no runs is left out.
+    /// The runtime is the one the run used. Queued runs and runs that never
+    /// started don't count. A runtime with no runs is left out.
     pub fn usage_since(&self, since_ms: i64, now_ms: i64) -> Result<Vec<RuntimeUsage>> {
-        let runtimes: std::collections::HashMap<AgentId, Runtime> = self
-            .all_agents()?
-            .into_iter()
-            .map(|a| (a.id, a.spec.runtime))
-            .collect();
         let mut stmt = self.conn.prepare(&format!(
-            "{RUN_COLUMNS} WHERE status = ?1 OR ended_at >= ?2 ORDER BY ord"
+            "{RUN_COLUMNS} WHERE status = ?1 OR (ended_at >= ?2 AND session_id <> '') ORDER BY ord"
         ))?;
         let working = status_text(&RunStatus::Working)?;
         let runs = stmt.query_map(params![working, since_ms], read_run)?;
         let mut usage: Vec<RuntimeUsage> = Vec::new();
         for run in runs {
             let run = run??;
-            let Some(runtime) = runtimes.get(&run.agent) else {
-                continue;
-            };
+            let runtime = run.runtime;
             let ms = (run.ended_at.unwrap_or(now_ms) - run.started_at).max(0);
-            match usage.iter_mut().find(|u| u.runtime == *runtime) {
+            match usage.iter_mut().find(|u| u.runtime == runtime) {
                 Some(u) => {
                     u.runs += 1;
                     u.total_ms += ms;
                 }
                 None => usage.push(RuntimeUsage {
-                    runtime: runtime.clone(),
+                    runtime,
                     runs: 1,
                     total_ms: ms,
                 }),
