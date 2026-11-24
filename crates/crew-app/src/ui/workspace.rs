@@ -159,6 +159,8 @@ pub struct Workspace {
     pub(super) runtimes_refresh: Option<Task<()>>,
     /// Settings, shown in place of the body.
     pub(super) settings: Option<SettingsView>,
+    /// Why the last change of limits failed, shown on their page.
+    pub(super) limits_error: Option<String>,
     /// The first launch, shown in place of the body until it is done.
     pub(super) first_launch: Option<FirstLaunch>,
     /// Whether the first snapshot was seen, which decides the first
@@ -251,6 +253,7 @@ impl Workspace {
             runtimes_checking: false,
             runtimes_refresh: None,
             settings,
+            limits_error: None,
             first_launch: None,
             snapshot_seen: false,
             pick_folder: native_picker(),

@@ -9,7 +9,7 @@ use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
+    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
     StoredProject, StoredRun, StoredThread,
 };
 use crew_proto::{ServerMsg, TerminalSession};
@@ -236,6 +236,10 @@ pub struct State {
     terminal: HashMap<String, TerminalSession>,
     /// One log per watched terminal session.
     terminal_logs: HashMap<String, TerminalLog>,
+    /// crewd's global limits, as last reported.
+    limits: Limits,
+    /// Limits sent to crewd and not yet reported back.
+    sent_limits: Option<Limits>,
 }
 
 /// A handoff policy and budget, `None` for "fall back".
@@ -262,9 +266,10 @@ impl State {
                 runs,
                 approvals,
                 terminal_sessions,
-                limits: _,
+                limits,
             } => {
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
+                self.limits_changed(limits);
                 self.terminal = terminal_sessions
                     .into_iter()
                     .map(|s| (s.id.clone(), s))
@@ -325,11 +330,9 @@ impl State {
                     log.events.push(LoggedEvent::new(run, seq, event));
                 }
             }
+            ServerMsg::LimitsChanged { limits } => self.limits_changed(limits),
             // The workspace keeps the runtimes.
-            ServerMsg::Response { .. }
-            | ServerMsg::Resync
-            | ServerMsg::RuntimesChanged { .. }
-            | ServerMsg::LimitsChanged { .. } => {}
+            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
         }
     }
 
@@ -367,6 +370,14 @@ impl State {
                 .get(id)
                 .is_some_and(|t| (t.handoff_policy, t.handoff_budget) != *sent)
         });
+    }
+
+    /// Takes crewd's limits. Once they match what was sent, they show.
+    fn limits_changed(&mut self, limits: Limits) {
+        if self.sent_limits == Some(limits) {
+            self.sent_limits = None;
+        }
+        self.limits = limits;
     }
 
     /// Keeps the run as sent, unless a further-along copy is known.
@@ -547,6 +558,22 @@ impl State {
     /// Goes back to crewd's thread setting, as when sending failed.
     pub fn drop_thread_handoff(&mut self, thread: ThreadId) {
         self.sent_thread_handoffs.remove(&thread);
+    }
+
+    /// The global limits: the last ones sent, until crewd reports them,
+    /// else crewd's.
+    pub fn limits(&self) -> &Limits {
+        self.sent_limits.as_ref().unwrap_or(&self.limits)
+    }
+
+    /// Notes limits just sent to crewd.
+    pub fn expect_limits(&mut self, limits: Limits) {
+        self.sent_limits = Some(limits);
+    }
+
+    /// Goes back to crewd's limits, as when sending failed.
+    pub fn drop_limits(&mut self) {
+        self.sent_limits = None;
     }
 
     /// Any agent, deleted ones included, so old messages can name them.
@@ -1563,6 +1590,60 @@ mod tests {
         later.handoff_budget = Some(9);
         state.apply(ServerMsg::ThreadChanged { thread: later });
         assert_eq!(state.thread_handoff(t.id), (None, Some(9)));
+    }
+
+    #[test]
+    fn limits_come_from_the_snapshot_and_follow_crewd() {
+        use crew_core::policy::HandoffPolicy;
+        use crew_core::store::Limits;
+        let mut state = State::default();
+        assert_eq!(*state.limits(), Limits::default());
+        let stored = Limits {
+            max_runs: 2,
+            paused: true,
+            handoff_policy: HandoffPolicy::Budget,
+            handoff_budget: 5,
+        };
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+            limits: stored,
+        });
+        assert_eq!(*state.limits(), stored);
+
+        // A change just sent shows at once, and an older report doesn't
+        // undo it.
+        let sent = Limits {
+            max_runs: 6,
+            ..stored
+        };
+        state.expect_limits(sent);
+        assert_eq!(*state.limits(), sent);
+        state.apply(ServerMsg::LimitsChanged {
+            limits: Limits {
+                max_runs: 3,
+                ..stored
+            },
+        });
+        assert_eq!(*state.limits(), sent);
+        state.apply(ServerMsg::LimitsChanged { limits: sent });
+        assert_eq!(*state.limits(), sent);
+        // Once reported, a change from another app shows.
+        let other = Limits {
+            paused: false,
+            ..sent
+        };
+        state.apply(ServerMsg::LimitsChanged { limits: other });
+        assert_eq!(*state.limits(), other);
+        // A failed request goes back to crewd's copy.
+        state.expect_limits(Limits::default());
+        state.drop_limits();
+        assert_eq!(*state.limits(), other);
     }
 
     #[test]
