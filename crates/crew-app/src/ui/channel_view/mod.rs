@@ -2,6 +2,8 @@
 //! search, and one card per thread, grouped in sections.
 
 mod card;
+mod empty;
+mod new_thread;
 mod stats;
 
 use std::collections::{HashMap, HashSet};
@@ -13,6 +15,7 @@ use crew_proto::{ChannelOverview, Request, ThreadSummary, WorktreeState};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
+use super::composer::ComposerMode;
 use super::run_card::{Step, StepState};
 use super::workspace::Workspace;
 use crate::theme::color;
@@ -503,6 +506,8 @@ pub struct ChannelView {
     pub(super) sort: Sort,
     pub(super) folded: HashSet<Section>,
     pub(super) hovered: Option<ThreadId>,
+    /// The card whose overflow menu is open.
+    pub(super) menu_open: Option<ThreadId>,
     /// The thread you had open last, highlighted when you come back.
     pub(super) selected: Option<ThreadId>,
     pub(super) search: Entity<InputState>,
@@ -543,6 +548,7 @@ impl ChannelView {
             sort: Sort::Latest,
             folded: HashSet::from([Section::Older]),
             hovered: None,
+            menu_open: None,
             selected: None,
             search,
             _search_events: events,
@@ -572,7 +578,13 @@ impl ChannelView {
         self.sort = Sort::Latest;
         self.folded = HashSet::from([Section::Older]);
         self.hovered = None;
+        self.menu_open = None;
         self.to_top = true;
+    }
+
+    /// Where the worktree of `thread`'s card stands, as last counted.
+    pub(super) fn card_worktree(&self, thread: ThreadId) -> Option<WorktreeState> {
+        self.cards.get(&thread).map(|c| c.summary.worktree)
     }
 
     pub(super) fn stats(&self) -> crew_proto::ChannelStats {
@@ -588,7 +600,6 @@ impl Workspace {
     pub(super) fn shown_channel(&self) -> Option<ChannelId> {
         let channel = self.nav.channel?;
         let shown = self.nav.thread.is_none()
-            && !self.nav.drafting
             && self.terminal.is_none()
             && self.state().channel(channel).is_some();
         shown.then_some(channel)
@@ -905,51 +916,61 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The channel view: header, stats, toolbar and the card list.
+    /// The channel view: header, stats, toolbar and the card list. An
+    /// empty channel shows how to start instead, and a new thread is
+    /// written above the cards.
     pub(super) fn render_channel_view(
         &self,
         channel: ChannelId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let empty = self.channel_view.counts.iter().all(|n| *n == 0);
+        use gpui_kit::prelude::FluentBuilder as _;
+        let mode = self.composer_mode();
+        let empty = mode == ComposerMode::Empty;
+        let drafting = mode == ComposerMode::NewThread;
+        let plain = !empty && !drafting;
         div()
             .id("channel-view")
             .size_full()
             .flex()
             .flex_col()
-            .child(self.render_channel_header(channel, cx))
-            .child(self.render_channel_stats())
-            .child(self.render_channel_toolbar(cx))
-            .children(self.channel_view.error.as_ref().map(|error| {
-                let text = format!("Couldn't load this channel. {error}");
-                div()
-                    .id("channel-error")
-                    .flex_none()
-                    .px(px(24.))
-                    .pb(px(8.))
-                    .text_size(px(12.))
-                    .text_color(color("danger"))
-                    .aria_label(text.clone())
-                    .child(text)
-                    .test_support()
-            }))
+            .child(self.render_channel_header(channel, empty, cx))
+            .when(plain, |view| {
+                view.child(self.render_channel_stats())
+                    .child(self.render_channel_toolbar(cx))
+            })
+            .children(
+                self.channel_view
+                    .error
+                    .as_ref()
+                    .filter(|_| !empty)
+                    .map(|error| {
+                        let text = format!("Couldn't load this channel. {error}");
+                        div()
+                            .id("channel-error")
+                            .flex_none()
+                            .px(px(24.))
+                            .pb(px(8.))
+                            .text_size(px(12.))
+                            .text_color(color("danger"))
+                            .aria_label(text.clone())
+                            .child(text)
+                            .test_support()
+                    }),
+            )
+            .when(drafting, |view| {
+                view.child(self.render_new_thread_composer())
+            })
             .child(if empty {
-                div()
-                    .id("channel-empty")
-                    .flex_1()
-                    .px(px(24.))
-                    .py(px(16.))
-                    .text_color(color("text-tertiary"))
-                    .aria_label("No threads yet")
-                    .child("No threads yet")
-                    .test_support()
-                    .into_any_element()
+                self.render_channel_empty(cx).into_any_element()
             } else {
                 div()
                     .id("channel-cards")
                     .flex_1()
                     .min_h_0()
                     .w_full()
+                    // Written above, the cards step back.
+                    .when(drafting, |cards| cards.pt(px(20.)).opacity(0.45))
                     .child(
                         list(
                             self.channel_view.list.clone(),

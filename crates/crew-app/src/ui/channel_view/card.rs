@@ -211,36 +211,6 @@ impl Workspace {
         );
     }
 
-    /// Asks for a new title for `thread`.
-    pub(super) fn open_rename_dialog(
-        &mut self,
-        _thread: ThreadId,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO(task 3): the Rename thread dialog.
-    }
-
-    /// Asks before archiving `thread`.
-    pub(super) fn open_archive_dialog(
-        &mut self,
-        _thread: ThreadId,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO(task 3): the Archive dialog.
-    }
-
-    /// Asks before discarding `thread`'s worktree.
-    pub(super) fn open_discard_dialog(
-        &mut self,
-        _thread: ThreadId,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO(task 3): the Discard worktree dialog.
-    }
-
     pub(super) fn render_card(&self, thread: ThreadId, cx: &mut Context<Self>) -> AnyElement {
         let Some(card) = self.channel_view.cards.get(&thread) else {
             return div().into_any_element();
@@ -248,7 +218,10 @@ impl Workspace {
         let state = self.state();
         let now = now_ms();
         let id = card.thread;
-        let hovered = self.channel_view.hovered == Some(id);
+        // A card keeps its actions while its overflow menu is open, which
+        // the pointer leaves the card for.
+        let hovered =
+            self.channel_view.hovered == Some(id) || self.channel_view.menu_open == Some(id);
         let selected = self.channel_view.selected == Some(id);
         let working_runs: Vec<_> = state
             .live_runs(id)
@@ -421,6 +394,7 @@ impl Workspace {
             stop: None,
         };
         let this = cx.entity().downgrade();
+        let opened = this.clone();
         div()
             .id(SharedString::from(format!("thread-actions-{id}")))
             .flex()
@@ -474,6 +448,19 @@ impl Workspace {
                     .accessibility_label("More actions")
                     .dropdown_menu(move |popup, _, _| {
                         thread_menu(popup, this.clone(), &menu, false)
+                    })
+                    .on_open_change(move |open, _, cx| {
+                        opened
+                            .update(cx, |this, cx| {
+                                let view = &mut this.channel_view;
+                                if *open {
+                                    view.menu_open = Some(id);
+                                } else if view.menu_open == Some(id) {
+                                    view.menu_open = None;
+                                }
+                                cx.notify();
+                            })
+                            .ok();
                     }),
             )
     }

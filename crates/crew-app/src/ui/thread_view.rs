@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{AgentId, ApprovalId, ChannelId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun,
@@ -178,56 +178,6 @@ impl Workspace {
     }
 
     /// The main area while you write the first message of a new thread.
-    pub(super) fn render_new_thread(&self, channel: ChannelId) -> impl IntoElement + use<> {
-        let name = self
-            .state()
-            .channel(channel)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
-        div()
-            .id("new-thread-view")
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .flex_col()
-                    .justify_center()
-                    .h(px(44.))
-                    .px(px(24.))
-                    .border_b_1()
-                    .border_color(color("border-100"))
-                    .child(
-                        div()
-                            .id("new-thread-title")
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .aria_label("New thread")
-                            .child("New thread")
-                            .test_support(),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(color("text-tertiary"))
-                            .child(format!("In #{name}")),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color("text-tertiary"))
-                    .child("Say what you need. Mention an agent with @ to start it."),
-            )
-            .child(self.render_composer_area())
-            .test_support()
-    }
-
     fn render_composer_area(&self) -> impl IntoElement + use<> {
         div()
             .flex_none()

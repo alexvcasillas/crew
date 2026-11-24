@@ -18,20 +18,11 @@ use crate::theme::color;
 const SEARCH_WIDTH: f32 = 240.;
 
 impl Workspace {
-    /// Asks for the channel's name and description.
-    pub(super) fn open_channel_settings_dialog(
-        &mut self,
-        _channel: ChannelId,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO(task 3): the Channel settings dialog.
-    }
-
     /// `# name` in its project, its description, and Channel settings.
     pub(super) fn render_channel_header(
         &self,
         channel: ChannelId,
+        ruled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let state = self.state();
@@ -53,6 +44,9 @@ impl Workspace {
             .px(px(24.))
             .pt(px(20.))
             .pb(px(16.))
+            .when(ruled, |header| {
+                header.border_b_1().border_color(color("border-100"))
+            })
             .child(
                 div()
                     .flex()

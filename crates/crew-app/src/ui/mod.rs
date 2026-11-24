@@ -8,6 +8,7 @@ pub mod composer;
 mod connect;
 #[cfg(debug_assertions)]
 mod dev_hooks;
+mod dialogs;
 pub mod diff_view;
 mod first_launch;
 mod inspector;
@@ -32,6 +33,8 @@ mod auto_tests;
 mod channel_tests;
 #[cfg(test)]
 mod codex_tests;
+#[cfg(test)]
+mod dialog_tests;
 #[cfg(test)]
 mod diff_tests;
 #[cfg(test)]

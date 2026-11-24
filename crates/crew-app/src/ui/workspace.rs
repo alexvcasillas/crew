@@ -18,7 +18,7 @@ use gpui_kit::*;
 use super::approval_card::BriefEditor;
 use super::channel_view::ChannelView;
 use super::common::runtime_chip;
-use super::composer::{Composer, ComposerEvent};
+use super::composer::{Composer, ComposerEvent, ComposerMode};
 use super::diff_view::{Review, SavedMessage};
 use super::first_launch::FirstLaunch;
 use super::inspector::Inspector;
@@ -30,7 +30,8 @@ use super::settings::projects::{PickFolder, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
-    ApproveLatest, NewThread, OpenSettings, Search, ShowRunning, ShowThreads, StopAll,
+    ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search, ShowRunning,
+    ShowThreads, StopAll,
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
@@ -185,6 +186,8 @@ pub struct Workspace {
     _editor_events: Subscription,
     /// The selected channel's cards and toolbar.
     pub(super) channel_view: ChannelView,
+    /// The thread or channel dialog on screen, if any.
+    pub(super) dialog: Option<super::dialogs::OpenDialog>,
 }
 
 /// The Editor select of General.
@@ -200,6 +203,7 @@ impl Workspace {
                 window,
                 |this, _, event, window, cx| match event {
                     ComposerEvent::Send(text) => this.send(text.clone(), window, cx),
+                    ComposerEvent::Cancel => this.cancel_new_thread(window, cx),
                     ComposerEvent::OpenAgentSettings => {
                         this.open_settings(Page::Agents, window, cx);
                         this.new_agent(window, cx);
@@ -291,6 +295,7 @@ impl Workspace {
             editor_select,
             _editor_events: editor_events,
             channel_view,
+            dialog: None,
         }
     }
 
@@ -466,6 +471,7 @@ impl Workspace {
             self.refresh_history(cx);
         }
         self.channel_touched(&touched, &stale, snapshot);
+        self.sync_composer_mode(window, cx);
         self.sync_settings(window, cx);
         self.sync(cx);
         self.sync_inspector(window, cx);
@@ -531,11 +537,19 @@ impl Workspace {
         } else {
             working_hint(&working)
         };
-        let busy =
-            self.nav.drafting && self.creating.is_some() && self.creating == self.nav.channel;
+        let busy = self.creating.is_some()
+            && matches!(self.draft_key(), Some(DraftKey::NewThread(c)) if self.creating == Some(c));
+        let base = self
+            .nav
+            .channel
+            .and_then(|c| self.state.channel(c))
+            .and_then(|c| self.state.project(c.project))
+            .map(|p| p.main_branch.clone())
+            .unwrap_or_default();
         self.composer.update(cx, |composer, cx| {
             composer.set_context(agents, project, hint, cx);
             composer.set_busy(busy, cx);
+            composer.set_base(base, cx);
         });
 
         let running_ticks = self.running.is_some()
@@ -596,9 +610,11 @@ impl Workspace {
         self.nav.drafting = false;
         self.look_at(Some(channel));
         self.reset_channel_view(channel, window, cx);
-        self.composer.update(cx, |composer, cx| {
-            composer.set_first_message(false, window, cx)
-        });
+        self.sync_composer_mode(window, cx);
+        if self.composer_mode() != ComposerMode::Empty {
+            // The composer isn't shown, so its shortcuts go to the view.
+            self.focus.focus(window, cx);
+        }
         self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
@@ -624,10 +640,9 @@ impl Workspace {
         self.nav.drafting = false;
         let channel = self.state.thread(thread).map(|t| t.channel);
         self.look_at(channel.or(self.nav.channel));
-        self.composer.update(cx, |composer, cx| {
-            composer.set_first_message(false, window, cx);
-            composer.focus(window, cx);
-        });
+        self.sync_composer_mode(window, cx);
+        self.composer
+            .update(cx, |composer, cx| composer.focus(window, cx));
         self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
@@ -642,20 +657,77 @@ impl Workspace {
         self.stash_draft(cx);
         self.close_thread(cx);
         self.nav.drafting = true;
-        self.composer.update(cx, |composer, cx| {
-            composer.set_first_message(true, window, cx);
-            composer.focus(window, cx);
-        });
+        self.sync_composer_mode(window, cx);
+        self.composer
+            .update(cx, |composer, cx| composer.focus(window, cx));
         self.load_draft(window, cx);
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Closes the new thread composer, dropping what you wrote in it.
+    pub(super) fn cancel_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.nav.drafting || self.creating.is_some() {
+            return;
+        }
+        if let Some(channel) = self.nav.channel {
+            self.drafts.remove(&DraftKey::NewThread(channel));
+        }
+        self.composer
+            .update(cx, |composer, cx| composer.set_text("", window, cx));
+        self.nav.drafting = false;
+        self.sync_composer_mode(window, cx);
+        self.focus.focus(window, cx);
+        self.sync(cx);
+        cx.notify();
+    }
+
+    /// What the composer is for, given what is open: a reply, a new
+    /// thread, or the first thread of an empty channel.
+    pub(super) fn composer_mode(&self) -> ComposerMode {
+        match (self.nav.thread, self.nav.channel) {
+            (Some(_), _) => ComposerMode::Reply,
+            (None, Some(channel)) if self.channel_is_empty(channel) => ComposerMode::Empty,
+            (None, Some(_)) if self.nav.drafting => ComposerMode::NewThread,
+            _ => ComposerMode::Reply,
+        }
+    }
+
+    /// Whether `channel` is known and has no threads, archived or not.
+    pub(super) fn channel_is_empty(&self, channel: ChannelId) -> bool {
+        self.state.channel(channel).is_some()
+            && self.state.threads_with_archived(channel).is_empty()
+    }
+
+    /// Puts the composer in the mode for what is open. A first message
+    /// you were writing in an empty channel that gets a thread meanwhile
+    /// stays, in the new thread composer.
+    fn sync_composer_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was = self.composer.read(cx).mode();
+        let mut mode = self.composer_mode();
+        if was == ComposerMode::Empty
+            && mode == ComposerMode::Reply
+            && self.nav.thread.is_none()
+            && self.terminal.is_none()
+            && !self.composer.read(cx).text(cx).trim().is_empty()
+        {
+            self.nav.drafting = true;
+            mode = ComposerMode::NewThread;
+        }
+        self.composer
+            .update(cx, |composer, cx| composer.set_mode(mode, window, cx));
     }
 
     /// Whose text the composer holds now.
     fn draft_key(&self) -> Option<DraftKey> {
         match (self.nav.thread, self.nav.channel) {
             (Some(thread), _) => Some(DraftKey::Thread(thread)),
-            (None, Some(channel)) if self.nav.drafting => Some(DraftKey::NewThread(channel)),
+            (None, Some(channel))
+                if self.nav.drafting
+                    || (self.terminal.is_none() && self.channel_is_empty(channel)) =>
+            {
+                Some(DraftKey::NewThread(channel))
+            }
             _ => None,
         }
     }
@@ -746,6 +818,9 @@ impl Workspace {
                     return;
                 }
                 self.creating = Some(channel);
+                // The thread may land before its answer: stay on its draft.
+                self.nav.drafting = true;
+                self.sync_composer_mode(window, cx);
                 self.sync(cx);
                 let title = thread_title(&text);
                 self.spawn_request(window, cx, async move |this, cx| {
@@ -1057,6 +1132,14 @@ impl Render for Workspace {
             .on_action(
                 cx.listener(|this, _: &ApproveLatest, window, cx| this.approve_latest(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &RenameThread, window, cx| this.rename_selected(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ArchiveThread, window, cx| {
+                    this.archive_selected(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &StopAll, window, cx| this.stop_all(window, cx)))
             .on_action(
                 cx.listener(|this, _: &ShowRunning, window, cx| this.show_running(window, cx)),
@@ -1163,9 +1246,6 @@ impl Workspace {
                 match (self.nav.thread, self.nav.channel) {
                     (Some(thread), _) if self.state.thread(thread).is_some() => {
                         self.render_thread(thread, cx).into_any_element()
-                    }
-                    (_, Some(channel)) if self.nav.drafting => {
-                        self.render_new_thread(channel).into_any_element()
                     }
                     (_, Some(channel)) if self.state.channel(channel).is_some() => {
                         self.render_channel_view(channel, cx)

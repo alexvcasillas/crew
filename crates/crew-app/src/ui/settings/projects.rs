@@ -107,21 +107,14 @@ pub fn copy_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A channel name: what you typed without a leading `#`.
-pub fn channel_name(text: &str, taken: &[&str]) -> Result<String, String> {
-    let name = text.trim().trim_start_matches('#').trim();
-    if name.is_empty() {
-        return Err("Give the channel a name.".into());
+/// A channel name: what you typed without a leading `#`, by the rules
+/// crewd checks a renamed channel with, and new in `project`.
+pub fn channel_name(text: &str, taken: &[&str], project: &str) -> Result<String, String> {
+    let name = crew_core::slug::channel_name(text).map_err(str::to_string)?;
+    if taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
+        return Err(format!("#{name} already exists in {project}."));
     }
-    if name.chars().any(char::is_whitespace) {
-        return Err("Use - instead of spaces in a channel name.".into());
-    }
-    if taken.iter().any(|t| t.eq_ignore_ascii_case(name)) {
-        return Err(format!(
-            "This project already has #{name}. Pick another name."
-        ));
-    }
-    Ok(name.to_string())
+    Ok(name)
 }
 
 /// The general channel every new project starts with.
@@ -466,7 +459,12 @@ impl Workspace {
             .into_iter()
             .map(|c| c.name.as_str())
             .collect();
-        let checked = channel_name(&text, &taken);
+        let project_name = self
+            .state()
+            .project(project)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let checked = channel_name(&text, &taken, &project_name);
         let input = form.new_channel.clone();
         let name = match checked {
             Ok(name) => name,
@@ -948,12 +946,14 @@ mod tests {
 
     #[test]
     fn channel_names_drop_the_hash_and_must_be_new() {
-        assert_eq!(channel_name(" #bugs ", &[]).unwrap(), "bugs");
-        assert!(channel_name("", &[]).is_err());
-        assert!(channel_name("two words", &[]).is_err());
+        let bad = "Use lowercase letters, numbers and dashes.";
+        assert_eq!(channel_name(" #bugs ", &[], "demo").unwrap(), "bugs");
+        assert_eq!(channel_name("", &[], "demo").unwrap_err(), bad);
+        assert_eq!(channel_name("two words", &[], "demo").unwrap_err(), bad);
+        assert_eq!(channel_name("General", &[], "demo").unwrap_err(), bad);
         assert_eq!(
-            channel_name("General", &["general"]).unwrap_err(),
-            "This project already has #General. Pick another name."
+            channel_name("bugs-2", &["Bugs-2"], "demo").unwrap_err(),
+            "#bugs-2 already exists in demo."
         );
     }
 }
