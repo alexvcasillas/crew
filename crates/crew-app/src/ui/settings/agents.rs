@@ -17,7 +17,7 @@ use super::runtimes::runtime_state;
 use super::{control, field, form_error, help, segment, segmented};
 use crate::fonts::mono_font;
 use crate::theme::color;
-use crate::ui::common::{chip, monogram, runtime_chip};
+use crate::ui::common::{monogram, provider_icon, runtime_badge, runtime_chip};
 use crate::ui::workspace::{SIDEBAR_WIDTH, Workspace};
 
 /// The models the segmented control offers, by the names `claude` takes.
@@ -744,7 +744,7 @@ impl Workspace {
                     )
                     .child({
                         let text = runtime_chip(&a.spec);
-                        chip(text.clone())
+                        runtime_badge(&a.spec)
                             .id(SharedString::from(format!("settings-agent-chip-{id}")))
                             .aria_label(text)
                             .test_support()
@@ -808,8 +808,15 @@ impl Workspace {
         let usable = runtime_usable(&form.runtime, &self.runtimes);
         let other_set = !form.other_model.read(cx).value().trim().is_empty();
         let sub = match form.editing.and_then(|a| self.state().agent(a)) {
-            Some(a) => runtime_chip(&a.spec),
-            None => "Not saved yet".to_string(),
+            Some(a) => {
+                let text = runtime_chip(&a.spec);
+                runtime_badge(&a.spec)
+                    .id("agent-form-chip")
+                    .aria_label(text)
+                    .test_support()
+                    .into_any_element()
+            }
+            None => help("Not saved yet").into_any_element(),
         };
         let models = self.render_model_picker(form, other_set, cx);
         let permission_label = PERMISSIONS
@@ -882,7 +889,7 @@ impl Workspace {
                                             .child(title.clone())
                                             .test_support(),
                                     )
-                                    .child(help(sub)),
+                                    .child(div().flex().child(sub)),
                             )
                             .when(form.saved, |row| {
                                 row.child(
@@ -1181,6 +1188,7 @@ impl Workspace {
             Runtime::Codex => info.is_some_and(|i| i.installed),
         };
         let selected = *picked == runtime;
+        let icon = provider_icon(&runtime, 16.);
         runtime_card(
             SharedString::from(format!("runtime-{key}")),
             selected,
@@ -1197,6 +1205,7 @@ impl Workspace {
                     this.set_runtime(runtime.clone(), window, cx);
                 }))
         })
+        .child(icon)
         .child(
             div()
                 .flex()

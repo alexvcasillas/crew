@@ -9,6 +9,7 @@ use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::common::provider_icon;
 use super::settings::Page;
 use super::settings::agents::{INSTALL_CLAUDE, blank_spec, default_codex_model, models_of};
 use super::settings::projects::{FIRST_CHANNEL, FolderFor, Repo, create_project, folder_name};
@@ -274,8 +275,10 @@ impl Workspace {
                     div()
                         .id(SharedString::from(format!("first-launch-runtime-{name}")))
                         .flex()
+                        .items_center()
                         .gap(px(6.))
                         .aria_label(format!("{name}{version} {word}"))
+                        .child(provider_icon(&info.runtime, 16.))
                         .child(div().child(format!("{name}{version}")))
                         .child(div().text_color(color(token)).child(word))
                         .test_support()

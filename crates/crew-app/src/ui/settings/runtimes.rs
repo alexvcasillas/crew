@@ -10,6 +10,7 @@ use gpui_kit::*;
 use super::{help, page_scroll, page_title};
 use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::ui::common::provider_icon;
 use crate::ui::workspace::Workspace;
 
 pub fn runtime_name(runtime: &Runtime) -> &'static str {
@@ -83,6 +84,7 @@ impl Workspace {
                     .border_b_1()
                     .border_color(color("border-100"))
                     .aria_label(format!("{name} {word}"))
+                    .child(provider_icon(&info.runtime, 16.))
                     .child(
                         div()
                             .flex()
