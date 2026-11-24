@@ -226,6 +226,7 @@ pub struct Turn {
     pub status: TurnStatus,
     pub error: Option<TurnError>,
     pub items: Vec<ThreadItem>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -326,6 +327,7 @@ pub struct McpToolCallItem {
     pub tool: String,
     pub status: ItemStatus,
     pub arguments: Value,
+    pub result: Option<Value>,
     pub error: Option<Value>,
 }
 

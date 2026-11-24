@@ -140,7 +140,7 @@ fn tool_result(b: &Value) -> Option<Event> {
     })
 }
 
-fn truncate(mut s: String) -> String {
+pub(crate) fn truncate(mut s: String) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {
         return s;
     }

@@ -5,6 +5,8 @@
 //! messages Crew uses; [`client`] runs the connection.
 
 pub mod client;
+pub mod events;
 pub mod proto;
 
 pub use client::{CodexConn, CodexError, Incoming, RequestId};
+pub use events::CodexTranslator;
