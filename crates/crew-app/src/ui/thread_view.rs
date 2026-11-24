@@ -102,18 +102,25 @@ impl Workspace {
                     .items_center()
                     .gap(px(12.))
                     .h(px(44.))
-                    .px(px(24.))
+                    .pl(px(24.))
+                    .pr(px(16.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .child(
+                        // Title and channel share one line, as on the board.
+                        // A long title is cut with an ellipsis; the channel
+                        // label always shows in full.
                         div()
                             .flex()
-                            .flex_col()
+                            .items_baseline()
+                            .gap(px(10.))
                             .flex_1()
                             .min_w_0()
                             .child(
                                 div()
                                     .id("thread-title")
+                                    .flex_shrink(1.)
+                                    .min_w_0()
                                     .truncate()
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -123,6 +130,8 @@ impl Workspace {
                             )
                             .child(
                                 div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
                                     .text_size(px(12.))
                                     .text_color(color("text-tertiary"))
                                     .child(format!("Thread in #{channel_name}")),

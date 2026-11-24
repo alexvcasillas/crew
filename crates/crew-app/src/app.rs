@@ -51,6 +51,15 @@ fn shortcut<A: Action>(keys: &'static str, action: A, label: &'static str) -> Sh
     }
 }
 
+/// A shortcut that stays out of the way while you type: text fields keep
+/// their own meaning for the keys (⌘⌫ deletes to the start of the line).
+fn outside_text<A: Action>(keys: &'static str, action: A, label: &'static str) -> Shortcut {
+    Shortcut {
+        binding: KeyBinding::new(keys, action, Some("!Input")),
+        label,
+    }
+}
+
 /// Every shortcut, the one list the keymap and any shortcuts page read.
 pub fn bindings() -> Vec<Shortcut> {
     vec![
@@ -63,8 +72,8 @@ pub fn bindings() -> Vec<Shortcut> {
         shortcut("cmd-2", ShowRunning, "Running now"),
         shortcut("cmd-shift-r", ShowRunning, "Running now"),
         shortcut("cmd-enter", ApproveLatest, "Approve the newest request"),
-        shortcut("cmd-r", RenameThread, "Rename thread"),
-        shortcut("cmd-backspace", ArchiveThread, "Archive thread"),
+        outside_text("cmd-r", RenameThread, "Rename thread"),
+        outside_text("cmd-backspace", ArchiveThread, "Archive thread"),
     ]
 }
 

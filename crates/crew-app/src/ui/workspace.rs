@@ -1120,14 +1120,18 @@ fn touched_thread(msg: &crew_proto::ServerMsg) -> Option<ThreadId> {
 }
 
 /// A thread's title from its first message: the first line, at most
-/// [`TITLE_MAX`] characters.
+/// [`TITLE_MAX`] characters, ending in "…" when cut.
 pub fn thread_title(text: &str) -> String {
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or_default()
         .trim();
-    line.chars().take(TITLE_MAX).collect()
+    if line.chars().count() <= TITLE_MAX {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(TITLE_MAX - 1).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Whether a scroll `offset` (negative as content moves up) is within
@@ -1409,7 +1413,10 @@ mod tests {
             "Fix the login"
         );
         assert_eq!(thread_title("\n  @Forge look  \nmore"), "@Forge look");
-        assert_eq!(thread_title(&"x".repeat(100)).chars().count(), 80);
+        let long = thread_title(&"x".repeat(100));
+        assert_eq!(long.chars().count(), 80);
+        assert!(long.ends_with('…'));
+        assert_eq!(thread_title(&"y".repeat(80)), "y".repeat(80));
     }
 
     #[test]
