@@ -1466,7 +1466,11 @@ impl Service {
         let mut texts: Vec<String> = Vec::new();
         while let Some(event) = rx.recv().await {
             match &event {
-                Event::TurnEnd { summary: s, .. } => summary = s.clone(),
+                // A resumed session can print an empty result before the
+                // one for its prompt. The last result that counts wins.
+                Event::TurnEnd { summary: s, .. } if !event.is_empty_turn_end() => {
+                    summary = s.clone()
+                }
                 Event::Message { text } => texts.push(text.clone()),
                 Event::SessionStarted { session_id, .. } => self.name_session(run, session_id),
                 _ => {}

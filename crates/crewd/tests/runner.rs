@@ -411,3 +411,24 @@ async fn env_reaches_the_process() {
     assert_eq!(join.await.unwrap(), RunOutcome::Done);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "run-42");
 }
+
+#[tokio::test]
+async fn empty_result_on_resume_does_not_end_the_turn() {
+    let inv = invocation(fake("claude_resume_leftover.sh"), vec![]);
+    let (_handle, mut rx, join) = spawn_run(inv);
+    let mut summaries = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        if let Event::TurnEnd { ok, summary, .. } = ev {
+            summaries.push((ok, summary));
+        }
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(15), join)
+        .await
+        .expect("outcome within 15 s")
+        .unwrap();
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(
+        summaries,
+        vec![(true, String::new()), (true, "It is merged.".to_string())]
+    );
+}

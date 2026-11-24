@@ -107,6 +107,15 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Whether this is a `TurnEnd` for no turn at all: no turns and no
+    /// summary. A resumed Claude session prints one for something left
+    /// over from before, ahead of the result for its prompt.
+    pub fn is_empty_turn_end(&self) -> bool {
+        matches!(self, Event::TurnEnd { num_turns: 0, summary, .. } if summary.trim().is_empty())
+    }
+}
+
 /// A safety check category as a short sentence: `[destructive_action]`
 /// or `DestructiveAction` reads `Destructive action`.
 pub fn humanize_reason(raw: &str) -> String {
@@ -151,6 +160,25 @@ pub enum RunStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_turn_end_has_no_turns_and_no_summary() {
+        let end = |summary: &str, num_turns| Event::TurnEnd {
+            ok: true,
+            summary: summary.into(),
+            duration_ms: 29,
+            num_turns,
+        };
+        assert!(end("", 0).is_empty_turn_end());
+        assert!(!end("", 2).is_empty_turn_end());
+        assert!(!end("Done.", 0).is_empty_turn_end());
+        assert!(
+            !Event::Message {
+                text: String::new()
+            }
+            .is_empty_turn_end()
+        );
+    }
 
     #[test]
     fn event_round_trips_through_json() {

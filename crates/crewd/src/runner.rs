@@ -273,7 +273,7 @@ pub fn spawn_run(
 /// The output readers and what they found so far. The findings live
 /// outside the tasks, so they survive when a reader is aborted.
 struct Readers {
-    /// Whether the last `TurnEnd` seen was good.
+    /// Whether the last `TurnEnd` that counts was good.
     turn_ok: Arc<AtomicBool>,
     /// Notified once a `TurnEnd` has been read.
     turn_ended: Arc<Notify>,
@@ -284,7 +284,8 @@ struct Readers {
 }
 
 /// Parses stdout into events, records each `TurnEnd` in `turn_ok` and
-/// notifies `turn_ended`.
+/// notifies `turn_ended`. An empty `TurnEnd` with no turns is skipped,
+/// see [`counts_turns`].
 ///
 /// Keeps reading to the end even if the receiver is gone, so the child
 /// never blocks on a full pipe.
@@ -299,7 +300,9 @@ async fn read_events(
     let mut receiver_alive = true;
     while let Some(line) = next_line(&mut reader).await {
         for event in parser.parse(&line) {
-            if let Event::TurnEnd { ok, .. } = &event {
+            if let Event::TurnEnd { ok, .. } = &event
+                && !(event.is_empty_turn_end() && counts_turns(&line))
+            {
                 turn_ok.store(*ok, Ordering::SeqCst);
                 turn_ended.notify_one();
             }
@@ -308,6 +311,15 @@ async fn read_events(
             }
         }
     }
+}
+
+/// Whether a `result` line says how many turns it took. A resumed session
+/// first prints a result with no turns for something left over from
+/// before; that one isn't the end of this run's turn. Without the field
+/// there is no telling them apart, so every result counts.
+fn counts_turns(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|v| v.get("num_turns").is_some_and(serde_json::Value::is_u64))
 }
 
 /// Keeps the last stderr lines in `tail`, updated per line.
