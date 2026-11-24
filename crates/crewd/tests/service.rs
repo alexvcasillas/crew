@@ -115,18 +115,22 @@ impl Daemon {
         claude_bin: PathBuf,
         crew_mcp_bin: Option<PathBuf>,
     ) -> Daemon {
+        Daemon::start_opts(ServeOptions {
+            max_runs,
+            claude_bin: Some(claude_bin),
+            crew_mcp_bin,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn start_opts(opts: ServeOptions) -> Daemon {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("crew");
         std::fs::create_dir(&home).unwrap();
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = home.clone();
         tokio::spawn(async move {
-            let opts = ServeOptions {
-                max_runs,
-                claude_bin: Some(claude_bin),
-                crew_mcp_bin,
-                ..Default::default()
-            };
             if let Err(e) = serve(&path, opts).await {
                 panic!("serve failed: {e:#}");
             }
@@ -1308,4 +1312,137 @@ for line in open({frames:?}):
         })
         .await;
     assert_eq!(agents.len(), 1);
+}
+
+/// Writes a script that prints `fixture` and then waits, like a CLI kept
+/// alive by a background task after it answered.
+fn answer_then_wait_script(dir: &Path, fixture_name: &str) -> PathBuf {
+    let path = dir.join("claude-answer-wait.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncat '{}'\nexec sleep 600\n",
+            fixture(fixture_name).display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The bodies of the messages in `seen` not written by you, with who
+/// wrote them.
+fn messages(seen: &[ServerMsg]) -> Vec<(Author, String)> {
+    seen.iter()
+        .filter_map(|m| match m {
+            ServerMsg::Message { message, .. } if message.author != Author::You => {
+                Some((message.author.clone(), message.body.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopped_run_still_posts_its_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = answer_then_wait_script(dir.path(), "read_file.jsonl");
+    let d = Daemon::start(4, script).await;
+    let mut c = d.client().await;
+    let (agent, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge look at it".into(),
+    })
+    .await
+    .unwrap();
+    let seen = c
+        .until(|m| {
+            matches!(
+                m,
+                ServerMsg::Event {
+                    event: Event::TurnEnd { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+    let Some(ServerMsg::Event { run, .. }) = seen.last().cloned() else {
+        unreachable!()
+    };
+    // Stop it before it would be ended for lingering.
+    c.call(Request::StopRun { run }).await.unwrap();
+    let seen = c.until(|m| is_status(m, RunStatus::Stopped)).await;
+    assert_eq!(
+        messages(&seen),
+        vec![
+            (Author::Agent(agent), fixture_summary("read_file.jsonl")),
+            (Author::System, "Forge stopped.".to_string()),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_stopped_by_its_limit_still_posts_its_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = answer_then_wait_script(dir.path(), "read_file.jsonl");
+    // Forge's 20 min limit lasts 1 s, well before a lingering run ends.
+    let d = Daemon::start_opts(ServeOptions {
+        max_runs: 4,
+        claude_bin: Some(script),
+        minute: Duration::from_millis(50),
+        ..Default::default()
+    })
+    .await;
+    let mut c = d.client().await;
+    let (agent, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge look at it".into(),
+    })
+    .await
+    .unwrap();
+    let seen = c.until(|m| is_status(m, RunStatus::Stopped)).await;
+    let posted = messages(&seen);
+    // Before them is the note that permission prompts are off.
+    assert_eq!(
+        posted[posted.len() - 2..],
+        [
+            (Author::Agent(agent), fixture_summary("read_file.jsonl")),
+            (
+                Author::System,
+                "Forge hit its 20 min limit and was stopped. Its changes are kept.".to_string()
+            ),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_stopped_before_it_answered_posts_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = Daemon::start(4, fake("claude_sleeps.sh")).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, dir.path(), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge wait".into(),
+    })
+    .await
+    .unwrap();
+    let seen = c.until(|m| is_status(m, RunStatus::Working)).await;
+    let Some(ServerMsg::RunStatus { run, .. }) = seen.last().cloned() else {
+        unreachable!()
+    };
+    c.call(Request::StopRun { run }).await.unwrap();
+    let seen = c.until(|m| is_status(m, RunStatus::Stopped)).await;
+    assert_eq!(
+        messages(&seen),
+        vec![(Author::System, "Forge stopped.".to_string())]
+    );
 }
