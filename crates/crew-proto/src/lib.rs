@@ -479,6 +479,9 @@ pub enum ServerMsg {
     },
     /// A thread was renamed or its settings changed.
     ThreadChanged { thread: StoredThread },
+    /// Change counts in the channel's overview were worked out or may
+    /// have changed: ask for it again if it is shown.
+    ChannelOverviewStale { channel: ChannelId },
     /// An agent was created, changed or deleted. Deleted agents have
     /// `deleted_at` set.
     AgentChanged { agent: StoredAgent },

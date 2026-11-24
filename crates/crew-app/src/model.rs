@@ -331,8 +331,11 @@ impl State {
                 }
             }
             ServerMsg::LimitsChanged { limits } => self.limits_changed(limits),
-            // The workspace keeps the runtimes.
-            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
+            // The workspace keeps the runtimes and refetches overviews.
+            ServerMsg::Response { .. }
+            | ServerMsg::Resync
+            | ServerMsg::RuntimesChanged { .. }
+            | ServerMsg::ChannelOverviewStale { .. } => {}
         }
     }
 

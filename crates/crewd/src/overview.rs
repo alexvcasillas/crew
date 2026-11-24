@@ -48,6 +48,19 @@ pub(crate) struct ChangeCache {
     live_pending: HashSet<ThreadId>,
     /// Edit and write calls of live runs that haven't finished, by thread.
     edits: HashSet<(ThreadId, String)>,
+    /// Channels with a waiter that tells clients once the counts an
+    /// overview left out are worked out.
+    waiting: HashSet<ChannelId>,
+}
+
+/// What a live run's edit did to its thread's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveEdit {
+    /// They are no longer current.
+    Dropped,
+    /// Too soon after the last drop: they drop after `wait`. `first` is
+    /// set for the first edit held back since then.
+    Held { wait: Duration, first: bool },
 }
 
 impl ChangeCache {
@@ -103,26 +116,27 @@ impl ChangeCache {
     /// Drops the thread's counts for a live run's edit, at most once per
     /// [`LIVE_EVERY`]. An edit that comes sooner is kept for
     /// [`Self::apply_due`]. Returns whether it dropped them.
-    pub(crate) fn invalidate_live(&mut self, thread: ThreadId, now: Instant) -> bool {
-        if self
-            .live
-            .get(&thread)
-            .is_some_and(|at| now.duration_since(*at) < LIVE_EVERY)
-        {
-            self.live_pending.insert(thread);
-            return false;
+    pub(crate) fn invalidate_live(&mut self, thread: ThreadId, now: Instant) -> LiveEdit {
+        if let Some(at) = self.live.get(&thread) {
+            let since = now.saturating_duration_since(*at);
+            if since < LIVE_EVERY {
+                let first = self.live_pending.insert(thread);
+                return LiveEdit::Held {
+                    wait: LIVE_EVERY - since,
+                    first,
+                };
+            }
         }
         self.live.insert(thread, now);
         self.invalidate(thread);
-        true
+        LiveEdit::Dropped
     }
 
     /// Drops the thread's counts for a held back live edit once
-    /// [`LIVE_EVERY`] has passed.
-    pub(crate) fn apply_due(&mut self, thread: ThreadId, now: Instant) {
-        if self.live_pending.contains(&thread) {
-            self.invalidate_live(thread, now);
-        }
+    /// [`LIVE_EVERY`] has passed. Returns whether it did.
+    pub(crate) fn apply_due(&mut self, thread: ThreadId, now: Instant) -> bool {
+        self.live_pending.contains(&thread)
+            && self.invalidate_live(thread, now) == LiveEdit::Dropped
     }
 
     /// Notes an edit or write call of a live run.
@@ -201,6 +215,17 @@ impl Service {
             }
         }
 
+        let late: Vec<ThreadId> = {
+            let cache = self.changes();
+            wanted
+                .into_iter()
+                .filter(|t| cache.fresh(*t).is_none())
+                .collect()
+        };
+        if !late.is_empty() {
+            self.tell_when_counted(channel, late);
+        }
+
         let mut counts = HashMap::new();
         let mut counting = HashSet::new();
         {
@@ -235,6 +260,36 @@ impl Service {
             &counting,
             now_ms(),
         ))
+    }
+
+    /// Sends `ChannelOverviewStale` once none of `threads` is being
+    /// counted any more. One waiter per channel: a second overview that
+    /// leaves counts out while one waits adds nothing.
+    fn tell_when_counted(&self, channel: ChannelId, threads: Vec<ThreadId>) {
+        if !self.changes().waiting.insert(channel) {
+            return;
+        }
+        let svc = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let counted = svc.counted();
+                tokio::pin!(counted);
+                counted.as_mut().enable();
+                let done = {
+                    let mut cache = svc.changes();
+                    let done = threads.iter().all(|t| !cache.computing.contains(t));
+                    if done {
+                        cache.waiting.remove(&channel);
+                    }
+                    done
+                };
+                if done {
+                    break;
+                }
+                counted.await;
+            }
+            svc.overview_stale(channel);
+        });
     }
 
     /// Works out the thread's counts off the async threads, waiting for
@@ -519,7 +574,7 @@ mod tests {
     use crew_core::ids::ThreadId;
     use crew_core::worktree::ChangeCounts;
 
-    use crate::overview::{ChangeCache, EXCERPT_LEN, pick_excerpt, plain_excerpt};
+    use crate::overview::{ChangeCache, EXCERPT_LEN, LiveEdit, pick_excerpt, plain_excerpt};
 
     fn files(n: u32) -> ChangeCounts {
         ChangeCounts {
@@ -570,26 +625,45 @@ mod tests {
         let generation = cache.claim(t).unwrap();
         cache.finish(t, generation, files(1), true);
         let start = Instant::now();
-        assert!(cache.invalidate_live(t, start));
+        assert_eq!(cache.invalidate_live(t, start), LiveEdit::Dropped);
         assert_eq!(cache.fresh(t), None);
         let generation = cache.claim(t).unwrap();
         cache.finish(t, generation, files(2), true);
-        assert!(!cache.invalidate_live(t, start + Duration::from_secs(4)));
+        assert_eq!(
+            cache.invalidate_live(t, start + Duration::from_secs(4)),
+            LiveEdit::Held {
+                wait: Duration::from_secs(1),
+                first: true
+            }
+        );
+        assert_eq!(
+            cache.invalidate_live(t, start + Duration::from_millis(4500)),
+            LiveEdit::Held {
+                wait: Duration::from_millis(500),
+                first: false
+            }
+        );
         assert_eq!(cache.fresh(t), Some(files(2)));
         // The held back edit drops them once its time comes.
-        cache.apply_due(t, start + Duration::from_millis(4900));
+        assert!(!cache.apply_due(t, start + Duration::from_millis(4900)));
         assert_eq!(cache.fresh(t), Some(files(2)));
-        cache.apply_due(t, start + Duration::from_secs(5));
+        assert!(cache.apply_due(t, start + Duration::from_secs(5)));
         assert_eq!(cache.fresh(t), None);
         let generation = cache.claim(t).unwrap();
         cache.finish(t, generation, files(3), true);
         // Nothing held back: nothing to do.
-        cache.apply_due(t, start + Duration::from_secs(20));
+        assert!(!cache.apply_due(t, start + Duration::from_secs(20)));
         assert_eq!(cache.fresh(t), Some(files(3)));
-        assert!(cache.invalidate_live(t, start + Duration::from_secs(20)));
+        assert_eq!(
+            cache.invalidate_live(t, start + Duration::from_secs(20)),
+            LiveEdit::Dropped
+        );
         assert_eq!(cache.fresh(t), None);
         // Each thread on its own.
-        assert!(cache.invalidate_live(ThreadId::new(), start));
+        assert_eq!(
+            cache.invalidate_live(ThreadId::new(), start),
+            LiveEdit::Dropped
+        );
     }
 
     #[test]

@@ -410,9 +410,15 @@ impl Workspace {
         let mut terminal_gone = false;
         let mut run_ended = false;
         let mut touched = Vec::new();
+        let mut stale = Vec::new();
         for event in events {
             if let ClientEvent::Msg(msg) = &event {
                 touched.extend(touched_thread(msg));
+            }
+            if let ClientEvent::Msg(crew_proto::ServerMsg::ChannelOverviewStale { channel }) =
+                &event
+            {
+                stale.push(*channel);
             }
             // Only crewd saying so closes the open session: a snapshot
             // just after crewd starts may not list it yet.
@@ -459,7 +465,7 @@ impl Workspace {
             self.refresh_usage(cx);
             self.refresh_history(cx);
         }
-        self.channel_touched(&touched, snapshot);
+        self.channel_touched(&touched, &stale, snapshot);
         self.sync_settings(window, cx);
         self.sync(cx);
         self.sync_inspector(window, cx);

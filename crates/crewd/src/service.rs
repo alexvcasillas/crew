@@ -29,7 +29,7 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
-use crate::overview::ChangeCache;
+use crate::overview::{ChangeCache, LiveEdit};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 use crate::terminal::{Cmd, TerminalState};
 
@@ -326,13 +326,50 @@ impl Service {
                 self.changes().edit_started(thread, id.clone());
             }
             Event::ToolResult { id, .. } => {
-                let mut cache = self.changes();
-                if cache.edit_finished(thread, id) {
-                    cache.invalidate_live(thread, std::time::Instant::now());
+                let live = {
+                    let mut cache = self.changes();
+                    if !cache.edit_finished(thread, id) {
+                        return;
+                    }
+                    cache.invalidate_live(thread, std::time::Instant::now())
+                };
+                match live {
+                    LiveEdit::Dropped => self.thread_overview_stale(thread),
+                    LiveEdit::Held { wait, first: true } => {
+                        let svc = self.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            let dropped =
+                                svc.changes().apply_due(thread, std::time::Instant::now());
+                            if dropped {
+                                svc.thread_overview_stale(thread);
+                            }
+                        });
+                    }
+                    LiveEdit::Held { first: false, .. } => {}
                 }
             }
             _ => {}
         }
+    }
+
+    /// Tells `SubscribeAll` clients that the overview of `thread`'s
+    /// channel changed.
+    fn thread_overview_stale(&self, thread: ThreadId) {
+        let channel = match self.db().store.thread(thread) {
+            Ok(t) => t.channel,
+            Err(e) => {
+                log(format!("couldn't read thread {thread}: {e}"));
+                return;
+            }
+        };
+        self.overview_stale(channel);
+    }
+
+    /// Tells `SubscribeAll` clients that the channel's overview changed.
+    pub(crate) fn overview_stale(&self, channel: ChannelId) {
+        let mut db = self.db();
+        self.publish_global(&mut db, ServerMsg::ChannelOverviewStale { channel });
     }
 
     pub(crate) fn terminal(&self) -> MutexGuard<'_, TerminalState> {

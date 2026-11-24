@@ -711,6 +711,7 @@ async fn watch(
             | ServerMsg::ChannelChanged { .. }
             | ServerMsg::ThreadCreated { .. }
             | ServerMsg::ThreadChanged { .. }
+            | ServerMsg::ChannelOverviewStale { .. }
             | ServerMsg::AgentChanged { .. }
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::LimitsChanged { .. }

@@ -527,3 +527,68 @@ fn archived_threads_show_only_under_archived(cx: &mut TestAppContext) {
     click(cx, window, "channel-filter-all");
     assert!(has(cx, window, card(w.thread)));
 }
+
+#[gpui_kit::test]
+fn counts_crewd_finishes_later_land_on_the_card(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    let claude = fake_claude(
+        tmp.path(),
+        &format!(
+            "printf 'hello\\nthere\\n' > README.md\nprintf 'one\\ntwo\\n' > new.txt\ncat '{}'",
+            fixture("edit_and_test.jsonl").display()
+        ),
+    );
+    let home = short_home();
+    // Each count takes 2 s, past the 1.5 s crewd waits before answering.
+    let _daemon = Daemon::start_with_options(
+        home.path().to_path_buf(),
+        crewd::ServeOptions {
+            claude_bin: Some(claude),
+            count_delay: Duration::from_secs(2),
+            ..Default::default()
+        },
+    );
+    let w = world(home.path(), &root, &[]);
+    let forge: AgentId = ask(
+        &w.client,
+        Request::CreateAgent {
+            spec: crew_core::agent::AgentSpec {
+                permission_mode: PermissionMode::EditFiles,
+                ..agent("Forge", "Builds")
+            },
+        },
+    );
+    let (window, ws) = open(cx, home.path());
+    w.post("@Forge fix it");
+    run_of(cx, &ws, w.thread, forge, RunStatus::Done);
+    let started = std::time::Instant::now();
+    go_to_channel(cx, window, w.channel);
+
+    let counts = format!("thread-counts-{}", w.thread);
+    let has_counts = |cx: &mut TestAppContext| {
+        label_of(cx, window, counts.clone()).is_some_and(|l| l.contains(" · 2 files +3 −1 · "))
+    };
+    // The first answer comes while crewd is still counting.
+    wait_until(cx, "the first overview", |cx| {
+        label_of(cx, window, counts.clone()).is_some()
+    });
+    assert!(!has_counts(cx));
+    // Time in the view stands still until crewd had real time to finish
+    // and say so. Then one refetch delay is enough: the 3 s fallback
+    // never comes into it.
+    let mut stepped = Duration::ZERO;
+    wait_until(cx, "the counts crewd worked out", |cx| {
+        if started.elapsed() > Duration::from_millis(3000) {
+            cx.executor().advance_clock(Duration::from_millis(600));
+            stepped += Duration::from_millis(600);
+        }
+        has_counts(cx)
+    });
+    assert!(stepped < Duration::from_secs(3), "{stepped:?}");
+    assert_eq!(
+        label_of(cx, window, format!("thread-worktree-{}", w.thread)).as_deref(),
+        Some("2 uncommitted")
+    );
+}

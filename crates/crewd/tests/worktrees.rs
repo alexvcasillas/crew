@@ -1480,34 +1480,35 @@ async fn a_slow_count_comes_later_and_archived_threads_skip_git() {
     assert!(!fix.counting);
     assert_eq!((fix.files, fix.worktree), (0, WorktreeState::Clean));
 
-    // Back again: the overview answers at its deadline, still counting.
+    // Back again: two overviews at once both answer at their deadline,
+    // still counting, and share one count.
     c.call(Request::ArchiveThread {
         thread: s.thread,
         archived: false,
     })
     .await
     .unwrap();
+    let mut app = app_client(&d).await;
+    let mut other = d.client().await;
     let started = std::time::Instant::now();
-    let o = overview(&mut c, s.channel).await;
+    let (o, o2) = tokio::join!(overview(&mut c, s.channel), overview(&mut other, s.channel));
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(1400), "{waited:?}");
     assert!(waited < Duration::from_millis(2900), "{waited:?}");
-    let fix = summary(&o, s.thread);
-    assert!(fix.counting);
-    assert_eq!(fix.files, 0);
+    for o in [&o, &o2] {
+        let fix = summary(o, s.thread);
+        assert!(fix.counting);
+        assert_eq!(fix.files, 0);
+    }
 
-    // The count goes on in the background and lands in the cache.
-    let fresh = timeout(WAIT, async {
-        loop {
-            let o = overview(&mut c, s.channel).await;
-            if !summary(&o, s.thread).counting {
-                return o;
-            }
-        }
-    })
-    .await
-    .expect("the count never finished");
+    // The count goes on in the background, and the app is told once.
+    let is_stale = |m: &ServerMsg| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel);
+    app.until(is_stale).await;
+    let fresh = overview(&mut c, s.channel).await;
+    let more = timeout(Duration::from_millis(500), app.until(is_stale)).await;
+    assert!(more.is_err(), "told twice");
     let fix = summary(&fresh, s.thread);
+    assert!(!fix.counting);
     assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 2 });
     assert_eq!((fix.files, fix.added, fix.removed), (2, 3, 1));
 }
@@ -1543,6 +1544,7 @@ async fn a_live_edit_refreshes_the_counts() {
         summary(&overview(&mut c, s.channel).await, s.thread).files,
         2
     );
+    let mut app = app_client(&d).await;
 
     post(&mut c, s.thread, "@Forge more").await;
     c.until(|m| {
@@ -1559,6 +1561,11 @@ async fn a_live_edit_refreshes_the_counts() {
     let fix = summary(&o, s.thread);
     assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 3 });
     assert_eq!(fix.files, 3);
+    // The app was told the channel's counts changed.
+    app.until(
+        |m| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel),
+    )
+    .await;
     assert_eq!(
         fix.runs.last().map(|r| r.status.clone()),
         Some(RunStatus::Working)

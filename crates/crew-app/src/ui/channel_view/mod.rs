@@ -19,6 +19,9 @@ use crate::theme::color;
 
 /// How long the view waits after a change before asking crewd again.
 const REFETCH_AFTER: Duration = Duration::from_millis(500);
+/// While crewd is still counting changes, how long the view waits for it
+/// to say they are done before asking again anyway.
+const COUNTING_FALLBACK: Duration = Duration::from_secs(3);
 /// "This week" and "Recent": the last 7 days.
 pub const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -416,6 +419,8 @@ pub struct ChannelView {
     overview: Option<ChannelOverview>,
     fetch: Option<Task<()>>,
     refetch: Option<Task<()>>,
+    /// Asks again if crewd never says counts it was working out are done.
+    fallback: Option<Task<()>>,
     /// Something changed in the channel since the last overview.
     dirty: bool,
     /// Whether the view was shown when last synced.
@@ -452,6 +457,7 @@ impl ChannelView {
             overview: None,
             fetch: None,
             refetch: None,
+            fallback: None,
             dirty: false,
             shown: false,
             filter: Filter::All,
@@ -477,6 +483,7 @@ impl ChannelView {
         self.overview = None;
         self.fetch = None;
         self.refetch = None;
+        self.fallback = None;
         self.dirty = false;
         self.filter = Filter::All;
         self.sort = Sort::Latest;
@@ -520,14 +527,21 @@ impl Workspace {
             .update(cx, |search, cx| search.set_value("", window, cx));
     }
 
-    /// Notes changes crewd reported in `threads`, so the overview of the
-    /// shown channel is asked for again.
-    pub(super) fn channel_touched(&mut self, threads: &[ThreadId], snapshot: bool) {
+    /// Notes changes crewd reported in `threads`, or in the overviews of
+    /// `stale` channels, so the overview of the shown channel is asked for
+    /// again.
+    pub(super) fn channel_touched(
+        &mut self,
+        threads: &[ThreadId],
+        stale: &[ChannelId],
+        snapshot: bool,
+    ) {
         let Some(channel) = self.channel_view.channel else {
             return;
         };
         let state = self.state();
         let touched = snapshot
+            || stale.contains(&channel)
             || threads
                 .iter()
                 .any(|t| state.thread(*t).is_some_and(|t| t.channel == channel));
@@ -571,6 +585,7 @@ impl Workspace {
         let view = &mut self.channel_view;
         view.dirty = false;
         view.refetch = None;
+        view.fallback = None;
         let answer = self.client.request(Request::ChannelOverview { channel });
         self.channel_view.fetch = Some(cx.spawn(async move |this, cx| {
             let overview = answer.await.and_then(|v| {
@@ -580,9 +595,11 @@ impl Workspace {
                 this.channel_view.fetch = None;
                 match overview {
                     Ok(overview) if this.channel_view.channel == Some(channel) => {
-                        // Counts crewd is still working out come in a
-                        // later answer.
-                        this.channel_view.dirty |= overview.threads.iter().any(|t| t.counting);
+                        // crewd says when counts it is still working out
+                        // are done; ask again later in case it never does.
+                        if overview.threads.iter().any(|t| t.counting) {
+                            this.channel_view.fallback = Some(this.counting_fallback(channel, cx));
+                        }
                         this.channel_view.overview = Some(overview);
                     }
                     Ok(_) => {}
@@ -594,6 +611,23 @@ impl Workspace {
             })
             .ok();
         }));
+    }
+
+    /// Marks the overview of `channel` for asking again after
+    /// [`COUNTING_FALLBACK`].
+    fn counting_fallback(&self, channel: ChannelId, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COUNTING_FALLBACK).await;
+            this.update(cx, |this, cx| {
+                this.channel_view.fallback = None;
+                if this.channel_view.channel == Some(channel) {
+                    this.channel_view.dirty = true;
+                    this.sync_channel(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
     }
 
     /// Whether the shown channel has a working run, so its cards' timers
