@@ -242,7 +242,7 @@ impl Workspace {
                     .text_size(px(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(match &cwd {
-                        Some(cwd) => format!("Read only. Commands ran in {cwd}."),
+                        Some(cwd) => format!("Read only. Commands ran in {cwd}"),
                         None => "Read only.".to_string(),
                     })
                     .child("Read only.")
@@ -251,8 +251,7 @@ impl Workspace {
                             div()
                                 .flex()
                                 .min_w_0()
-                                .child(div().truncate().font_family(mono_font()).child(cwd))
-                                .child("."),
+                                .child(div().truncate().font_family(mono_font()).child(cwd)),
                         )
                     })
                     .test_support(),
@@ -279,7 +278,7 @@ impl Workspace {
         let (word, token) = match cmd.state {
             CommandState::Running if unfinished => ("Didn't finish", "text-tertiary"),
             CommandState::Running => ("Running", "accent-blue"),
-            CommandState::Passed => ("Passed", "success"),
+            CommandState::Passed => ("Done", "success"),
             CommandState::Failed => ("Failed", "danger"),
         };
         let icon = match cmd.state {

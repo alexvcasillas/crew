@@ -117,13 +117,13 @@ fn the_terminal_tab_lists_the_commands_with_their_output(cx: &mut TestAppContext
     );
     assert_eq!(
         label_of(cx, window, ("terminal-state", 0usize)).as_deref(),
-        Some("Passed")
+        Some("Done")
     );
     assert_eq!(
         label_of(cx, window, ("terminal-state", 1usize)).as_deref(),
         Some("Failed")
     );
-    assert!(shows(cx, window, "Read only. Commands ran in /work/demo."));
+    assert!(shows(cx, window, "Read only. Commands ran in /work/demo"));
 
     click(cx, window, ("terminal-show-all", 0usize));
     let out = label_of(cx, window, ("terminal-output", 0usize)).unwrap();
@@ -252,7 +252,7 @@ fn the_tab_catches_up_and_follows_a_live_run(cx: &mut TestAppContext) {
     assert!(!has(cx, window, ("terminal-command", 1usize)));
     assert_eq!(
         label_of(cx, window, ("terminal-state", 0usize)).as_deref(),
-        Some("Passed")
+        Some("Done")
     );
 
     std::fs::write(&go, "").unwrap();
@@ -289,7 +289,7 @@ fn the_tab_is_complete_after_leaving_the_thread_and_coming_back(cx: &mut TestApp
     click(cx, window, "inspector-tab-terminal");
     wait_until(cx, "the first command", |cx| {
         has(cx, window, ("terminal-state", 0usize))
-            && label_of(cx, window, ("terminal-state", 0usize)).as_deref() == Some("Passed")
+            && label_of(cx, window, ("terminal-state", 0usize)).as_deref() == Some("Done")
     });
 
     go_to(cx, window, &ws, w.channel, other);

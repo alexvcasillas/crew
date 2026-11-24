@@ -279,21 +279,12 @@ impl Workspace {
             .child(field(
                 "Editor",
                 Some("Open in editor uses this app."),
-                control(
+                div().w(px(280.)).child(control(
                     "general-editor",
                     Select::new(&self.editor_select)
                         .small()
                         .accessibility_label("Editor"),
-                ),
-            ))
-            .child(field(
-                "Max agents at once",
-                Some("More runs wait in a queue until one finishes."),
-                value_text(
-                    "general-max-runs",
-                    self.state().limits().max_runs.to_string(),
-                    false,
-                ),
+                )),
             ))
     }
 }
