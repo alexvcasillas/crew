@@ -1142,7 +1142,7 @@ async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
     let texts = system_texts(&seen);
     assert!(
         texts
-            .contains(&"Forge wants more access: write gen, /, network · build output".to_string()),
+            .contains(&"Forge wants more access: network, write gen, / · build output".to_string()),
         "{texts:?}"
     );
     assert!(
@@ -1162,4 +1162,78 @@ async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
             .any(|m| matches!(m, ServerMsg::Approval { approval, .. } if approval.id != asked.id)),
         "{seen:#?}"
     );
+}
+
+/// A link inside the folder that points out of it grants nothing, and an
+/// ask whose network part would be cut off still shows it first.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_through_links_is_refused_and_network_shows_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let d_tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(d_tmp.path()).unwrap().join("repo");
+    let long = format!("{}/{}", root.display(), "d".repeat(90));
+    let ask = |id: i64, permissions: Value, reply: Value| {
+        json!({"request": "item/permissions/requestApproval", "id": id,
+               "params": {"threadId": TID, "turnId": "turn-1", "itemId": format!("p{id}"),
+                          "cwd": root, "reason": null, "permissions": permissions},
+               "reply": reply})
+    };
+    let mut steps = start();
+    steps.extend([
+        // `escape` links to `/`.
+        ask(
+            0,
+            json!({"fileSystem": {"write": ["escape", "escape/etc"]}}),
+            json!({"permissions": {}, "scope": "turn"}),
+        ),
+        ask(
+            1,
+            json!({"network": {"enabled": true}, "fileSystem": {"write": ["gen\n", long]}}),
+            json!({"permissions": {}, "scope": "turn"}),
+        ),
+    ]);
+    steps.extend(finish("Done."));
+    scenario(dir, 1, steps);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let thread = setup(&mut c, &root, PermissionMode::ReadOnly).await;
+    std::os::unix::fs::symlink("/", root.join("escape")).unwrap();
+    let run = ask_forge(&mut c, thread, "@Forge build").await;
+
+    // The declined ask comes first, before the one you see.
+    let mut seen = c
+        .until(|m| {
+            matches!(m, ServerMsg::Approval { approval, .. }
+                if approval.status == ApprovalStatus::Pending)
+        })
+        .await;
+    let Some(ServerMsg::Approval {
+        approval: asked, ..
+    }) = seen.last().cloned()
+    else {
+        unreachable!()
+    };
+    c.decide(asked.id, false).await;
+    seen.extend(c.until_ended(run).await);
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+    let texts = system_texts(&seen);
+    assert!(
+        texts.contains(&"Declined access outside the worktree.".to_string()),
+        "{texts:?}"
+    );
+    let shown = texts
+        .iter()
+        .find(|t| t.starts_with("Forge wants more access: "))
+        .unwrap();
+    assert!(
+        shown.starts_with("Forge wants more access: network, write gen, "),
+        "{shown}"
+    );
+    assert!(!shown.contains('\n'), "{shown}");
+    assert!(
+        shown.contains("..."),
+        "the long path is cut in the middle: {shown}"
+    );
+    assert!(!shown.ends_with("..."), "the line is never cut: {shown}");
 }
