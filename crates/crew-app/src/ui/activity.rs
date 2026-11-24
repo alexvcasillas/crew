@@ -11,9 +11,10 @@ use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::approval_card::outside_sandbox;
 use super::common::{clean_line, spinner};
 use super::markdown_view::{DocKey, render_doc};
-use super::run_card::{Answer, DecidedAsk, StepState, match_asks, relative};
+use super::run_card::{Answer, DecidedAsk, OUTSIDE_TAG, StepState, match_asks, relative};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
 use crate::model::{LoggedEvent, PatchMark, patch_marks};
@@ -67,6 +68,8 @@ pub struct ToolRow {
     pub reason: Option<String>,
     /// How you answered the ask to run it, if it asked.
     pub answer: Option<Answer>,
+    /// It asked to run outside Claude Code's sandbox.
+    pub outside: bool,
 }
 
 /// One row of the Activity tab.
@@ -173,6 +176,7 @@ fn rows_of(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     output: None,
                     reason: None,
                     answer: None,
+                    outside: outside_sandbox(input),
                 }));
             }
             Event::ToolResult {
@@ -565,6 +569,14 @@ impl Workspace {
                     .child(answer.text()),
             );
         }
+        if tool.outside {
+            head = head.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(color("danger"))
+                    .child(OUTSIDE_TAG),
+            );
+        }
         if tool.state == StepState::Running {
             head = head.child(div().text_color(color("accent-blue")).child("running"));
         } else if let Some(detail) = &tool.detail {
@@ -812,9 +824,14 @@ pub fn row_label(row: &ActivityRow) -> String {
                 Some(reason) if tool.state == StepState::Blocked => blocked_label(&label, reason),
                 _ => label,
             };
-            match tool.answer {
+            let label = match tool.answer {
                 Some(answer) => format!("{label} · {}", answer.text()),
                 None => label,
+            };
+            if tool.outside {
+                format!("{label} · {OUTSIDE_TAG}")
+            } else {
+                label
             }
         }
         ActivityRow::Denied {
@@ -868,7 +885,7 @@ fn code(text: String) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityRow, DiffLine, activity_rows, first_lines};
+    use super::{ActivityRow, DiffLine, activity_rows, first_lines, row_label};
     use crate::model::LoggedEvent;
     use crate::ui::run_card::StepState;
     use crew_core::event::{Event, ToolKind};
@@ -894,6 +911,27 @@ mod tests {
             is_error,
             output: output.into(),
         }
+    }
+
+    #[test]
+    fn a_call_outside_the_sandbox_is_tagged() {
+        let run = RunId::new();
+        let flagged = serde_json::json!({"command": "curl x", "dangerouslyDisableSandbox": true});
+        let events = vec![
+            at(run, 1, call("Bash", "t1", Some("curl x"), flagged)),
+            at(
+                run,
+                2,
+                call(
+                    "Bash",
+                    "t2",
+                    Some("ls"),
+                    serde_json::json!({"command": "ls"}),
+                ),
+            ),
+        ];
+        let labels: Vec<String> = activity_rows(&events, run).iter().map(row_label).collect();
+        assert_eq!(labels, ["Run curl x · outside sandbox", "Run ls"]);
     }
 
     #[test]

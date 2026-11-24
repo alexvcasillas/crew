@@ -15,7 +15,7 @@ use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::approval_card::input_text;
+use super::approval_card::{input_text, outside_sandbox, outside_sandbox_line};
 use super::common::{
     chip, cut_start, dot, elapsed, monogram, now_ms, rolling_text, runtime_badge_for, runtime_chip,
     spinner, status_word,
@@ -129,6 +129,8 @@ struct Row {
     /// What the agent is doing now.
     now: String,
     now_mono: bool,
+    /// The ask's command would run outside Claude Code's sandbox.
+    outside: bool,
     chip: String,
     /// The runtime behind `chip`, for its provider mark.
     runtime: Option<Runtime>,
@@ -496,6 +498,7 @@ impl Workspace {
             title: known.map_or_else(String::new, |t| t.title.clone()),
             now: String::new(),
             now_mono: false,
+            outside: false,
             chip: agent.map_or_else(String::new, |a| runtime_chip(&a.spec)),
             runtime: agent.map(|a| a.spec.runtime.clone()),
             state: String::new(),
@@ -541,6 +544,10 @@ impl Workspace {
         );
         row.now = now;
         row.now_mono = mono;
+        row.outside = match &approval.kind {
+            ApprovalKind::Permission { input, .. } => outside_sandbox(input),
+            _ => false,
+        };
         row.state = if handoff {
             "Handoff"
         } else if blocked {
@@ -769,7 +776,13 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .aria_label(row.now.clone())
                         .child(row.now)
                         .test_support(),
-                ),
+                )
+                .when(row.outside, |col| {
+                    col.child(
+                        outside_sandbox_line(SharedString::from(format!("{prefix}-sandbox-{id}")))
+                            .test_support(),
+                    )
+                }),
         )
         .child(
             div().flex_none().w(px(RUNTIME_COL)).child(

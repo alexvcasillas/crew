@@ -12,6 +12,7 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::approval_card::outside_sandbox;
 use super::common::{elapsed, now_ms, rolling_text, spinner};
 use super::inspector::NOTHING_TO_REVIEW;
 use super::workspace::Workspace;
@@ -47,7 +48,13 @@ pub struct Step {
     pub raw: Option<String>,
     /// How you answered the ask to run it, if it asked.
     pub answer: Option<Answer>,
+    /// It asked to run outside Claude Code's sandbox.
+    pub outside: bool,
 }
+
+/// The tag on a step or Activity row that ran outside Claude Code's
+/// sandbox.
+pub const OUTSIDE_TAG: &str = "outside sandbox";
 
 /// How you answered a permission ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +307,7 @@ pub fn summarize_asked(events: &[LoggedEvent], run: RunId, asks: &[DecidedAsk]) 
                 verb(&call.kind, &call.name, state == StepState::Running)
             };
             Step {
+                outside: outside_sandbox(&call.input),
                 verb,
                 state,
                 lines: call.lines.filter(|_| state == StepState::Done),
@@ -585,6 +593,9 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
     if let Some(answer) = step.answer {
         text = format!("{text} · {}", answer.text());
     }
+    if step.outside {
+        text = format!("{text} · {OUTSIDE_TAG}");
+    }
     div()
         .id(("run-step", ix))
         .flex()
@@ -638,6 +649,15 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
                     .text_size(px(11.))
                     .text_color(color("text-tertiary"))
                     .child(answer.text()),
+            )
+        })
+        .when(step.outside, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(color("danger"))
+                    .child(OUTSIDE_TAG),
             )
         })
         .when(step.state == StepState::Blocked, |row| {
@@ -760,6 +780,34 @@ mod tests {
         );
         assert_eq!(summary.steps[0].lines, Some((1, 2)));
         assert_eq!(summary.counts().as_deref(), Some("2 files · +4 −2"));
+    }
+
+    #[test]
+    fn a_call_outside_the_sandbox_is_tagged() {
+        let run = RunId::new();
+        let events = vec![
+            call(
+                run,
+                1,
+                "t1",
+                "Bash",
+                serde_json::json!({"command": "curl x", "dangerouslyDisableSandbox": true}),
+            ),
+            call(run, 2, "t2", "Bash", serde_json::json!({"command": "ls"})),
+            call(
+                run,
+                3,
+                "t3",
+                "Bash",
+                serde_json::json!({"command": "pwd", "dangerouslyDisableSandbox": false}),
+            ),
+        ];
+        let outside: Vec<bool> = summarize(&events, run)
+            .steps
+            .iter()
+            .map(|s| s.outside)
+            .collect();
+        assert_eq!(outside, [true, false, false]);
     }
 
     #[test]

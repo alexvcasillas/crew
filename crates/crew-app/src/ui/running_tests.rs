@@ -369,6 +369,7 @@ fn needs_you_row_approves_inline(cx: &mut TestAppContext) {
         label_of(cx, window, format!("running-ask-now-{id}")).as_deref(),
         Some("Bash: npm test")
     );
+    assert!(!has(cx, window, format!("running-ask-sandbox-{id}")));
     assert_eq!(
         label_of(cx, window, "running-summary").as_deref(),
         Some("1 agent is waiting on you.")
