@@ -4,7 +4,7 @@ use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, RunFilter, Store, StoreError, ThreadWorktree,
+    ApprovalKind, ApprovalStatus, Author, Limits, RunFilter, Store, StoreError, ThreadWorktree,
 };
 
 fn spec(name: &str) -> AgentSpec {
@@ -145,6 +145,58 @@ fn runs_start_queued_then_get_a_session() {
     assert!(store.has_run_session("thr-1").unwrap());
     assert!(!store.has_run_session("sess-1").unwrap());
     assert!(!store.has_run_session("nobody").unwrap());
+}
+
+#[test]
+fn beginning_a_run_starts_its_clock() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let r = store.create_run(t, a).unwrap();
+    let queued_at = store.run(r).unwrap().started_at;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.begin_run(r).unwrap();
+    let run = store.run(r).unwrap();
+    assert_eq!(run.status, RunStatus::Working);
+    assert!(run.started_at > queued_at);
+    assert!(run.session_id.is_empty());
+    assert!(matches!(
+        store.begin_run(crew_core::ids::RunId::new()),
+        Err(StoreError::NotFound("run"))
+    ));
+}
+
+/// A run cut off by a restart ends at its last sign of life, not when
+/// crewd came back, so a night away doesn't count as run time.
+#[test]
+fn an_interrupted_run_ends_at_its_last_activity() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let talked = store.create_run(t, a).unwrap();
+    store.start_run(talked, &Runtime::ClaudeCode, "s1").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let said = store
+        .add_message(t, Author::Agent(a), "half way", Some(talked))
+        .unwrap();
+    let said_at = store
+        .messages(t)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == said)
+        .unwrap()
+        .created_at;
+    let silent = store.create_run(t, a).unwrap();
+    store.start_run(silent, &Runtime::ClaudeCode, "s2").unwrap();
+    let silent_start = store.run(silent).unwrap().started_at;
+    let queued = store.create_run(t, a).unwrap();
+    let queued_at = store.run(queued).unwrap().started_at;
+
+    // The long gap before crewd comes back.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(store.mark_unfinished_runs_interrupted().unwrap(), 3);
+
+    assert_eq!(store.run(talked).unwrap().ended_at, Some(said_at));
+    assert_eq!(store.run(silent).unwrap().ended_at, Some(silent_start));
+    assert_eq!(store.run(queued).unwrap().ended_at, Some(queued_at));
 }
 
 #[test]
@@ -363,7 +415,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -739,7 +791,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -793,7 +845,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -826,7 +878,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -899,11 +951,237 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
     assert_eq!(index_names(&migrated), index_names(&fresh));
     assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V6: &str = include_str!("../src/store/schema_v6.sql");
+
+#[test]
+fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root, main_branch, created_at) VALUES ('00000000-0000-4000-8000-000000000001', 'demo', '/work/demo', 'main', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.projects().unwrap().len(), 1);
+    assert_eq!(store.limits().unwrap(), Limits::default());
+    store
+        .set_limits(&Limits {
+            max_runs: 2,
+            ..Limits::default()
+        })
+        .unwrap();
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn limits_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    let limits = Limits {
+        max_runs: 6,
+        paused: true,
+        handoff_policy: HandoffPolicy::Budget,
+        handoff_budget: 7,
+    };
+    store.set_limits(&limits).unwrap();
+    assert_eq!(store.limits().unwrap(), limits);
+}
+
+#[test]
+fn garbage_limits_fall_back_or_clamp() {
+    let store = Store::open_in_memory().unwrap();
+    store.set_setting("max_runs", "abc").unwrap();
+    store.set_setting("paused", "maybe").unwrap();
+    store.set_setting("handoff_policy", "per_agent").unwrap();
+    store.set_setting("handoff_budget", "-4").unwrap();
+    assert_eq!(store.limits().unwrap(), Limits::default());
+
+    store.set_setting("max_runs", "0").unwrap();
+    store.set_setting("handoff_budget", "99").unwrap();
+    let l = store.limits().unwrap();
+    assert_eq!((l.max_runs, l.handoff_budget), (1, 10));
+    store.set_setting("max_runs", "99").unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 8);
+}
+
+#[test]
+fn max_runs_seed_only_fills_a_missing_row() {
+    let store = Store::open_in_memory().unwrap();
+    store.seed_max_runs(2).unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 2);
+    store.seed_max_runs(7).unwrap();
+    assert_eq!(store.limits().unwrap().max_runs, 2);
+}
+
+/// Starts a run on `runtime` and ends it with `status`, waiting a little
+/// first so end times differ.
+fn finish_run(
+    store: &Store,
+    t: crew_core::ids::ThreadId,
+    a: crew_core::ids::AgentId,
+    runtime: &Runtime,
+    status: RunStatus,
+) -> crew_core::ids::RunId {
+    let r = store.create_run(t, a).unwrap();
+    store.start_run(r, runtime, "s").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.set_run_status(r, status).unwrap();
+    r
+}
+
+#[test]
+fn run_history_pages_newest_first_by_end_time() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let ids: Vec<_> = [
+        RunStatus::Done,
+        RunStatus::Failed,
+        RunStatus::Stopped,
+        RunStatus::Interrupted,
+        RunStatus::Done,
+    ]
+    .into_iter()
+    .map(|s| finish_run(&store, t, a, &Runtime::ClaudeCode, s))
+    .collect();
+    // Live and queued runs are not history.
+    let live = store.create_run(t, a).unwrap();
+    store.start_run(live, &Runtime::ClaudeCode, "s").unwrap();
+    store.create_run(t, a).unwrap();
+
+    let page = store.run_history(None, 3).unwrap();
+    let got: Vec<_> = page.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[4], ids[3], ids[2]]);
+    assert_eq!(page[1].status, RunStatus::Interrupted);
+
+    // The bound is inclusive: the page's last run comes again first.
+    let before = page.last().unwrap().ended_at;
+    let rest = store.run_history(before, 3).unwrap();
+    let got: Vec<_> = rest.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[2], ids[1], ids[0]]);
+    let last = store.run_history(rest.last().unwrap().ended_at, 3).unwrap();
+    let got: Vec<_> = last.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[0]]);
+}
+
+#[test]
+fn run_history_clamps_the_page_size() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    for _ in 0..3 {
+        finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    }
+    assert_eq!(store.run_history(None, 0).unwrap().len(), 1);
+    assert_eq!(store.run_history(None, 5000).unwrap().len(), 3);
+}
+
+#[test]
+fn usage_sums_runs_per_runtime_and_counts_live_ones() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let mut codex = spec("Cody");
+    codex.runtime = Runtime::Codex;
+    let c = store.create_agent(&codex).unwrap();
+
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Failed);
+    let live = store.create_run(t, c).unwrap();
+    store.start_run(live, &Runtime::Codex, "s").unwrap();
+    // Queued runs never count.
+    store.create_run(t, c).unwrap();
+
+    let started = store.run(live).unwrap().started_at;
+    let now = started + 60_000;
+    let usage = store.usage_since(0, now).unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
+    assert_eq!(usage[0].runs, 2);
+    assert!(usage[0].total_ms >= 10);
+    assert_eq!(usage[1].runtime, Runtime::Codex);
+    assert_eq!(usage[1].runs, 1);
+    assert_eq!(usage[1].total_ms, 60_000);
+}
+
+#[test]
+fn usage_counts_by_end_time_and_omits_empty_runtimes() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let r = finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    let run = store.run(r).unwrap();
+    let ended = run.ended_at.unwrap();
+
+    // Ended before the cut: nothing. Ended at it: the full duration counts.
+    assert!(store.usage_since(ended + 1, ended + 1).unwrap().is_empty());
+    let usage = store.usage_since(ended, ended + 1).unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].total_ms, ended - run.started_at);
+}
+
+#[test]
+fn usage_still_counts_runs_of_a_deleted_agent() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    store.delete_agent(a).unwrap();
+    assert_eq!(store.usage_since(0, i64::MAX / 2).unwrap().len(), 1);
+}
+
+#[test]
+fn set_limits_refuses_a_per_agent_policy() {
+    let store = Store::open_in_memory().unwrap();
+    let err = store
+        .set_limits(&Limits {
+            handoff_policy: HandoffPolicy::PerAgent,
+            ..Limits::default()
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(_)));
+    assert_eq!(store.limits().unwrap(), Limits::default());
+}
+
+#[test]
+fn runs_that_never_started_are_not_history_or_usage() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let queued = store.create_run(t, a).unwrap();
+    store.set_run_status(queued, RunStatus::Stopped).unwrap();
+    assert!(store.run_history(None, 10).unwrap().is_empty());
+    assert!(store.usage_since(0, i64::MAX / 2).unwrap().is_empty());
+}
+
+#[test]
+fn usage_follows_the_runtime_the_run_used() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    let mut changed = spec("Ada");
+    changed.runtime = Runtime::Codex;
+    store.update_agent(a, &changed).unwrap();
+    let usage = store.usage_since(0, i64::MAX / 2).unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
 }

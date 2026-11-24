@@ -159,6 +159,8 @@ pub struct Workspace {
     pub(super) runtimes_refresh: Option<Task<()>>,
     /// Settings, shown in place of the body.
     pub(super) settings: Option<SettingsView>,
+    /// Why the last change of limits failed, shown on their page.
+    pub(super) limits_error: Option<String>,
     /// The first launch, shown in place of the body until it is done.
     pub(super) first_launch: Option<FirstLaunch>,
     /// Whether the first snapshot was seen, which decides the first
@@ -251,6 +253,7 @@ impl Workspace {
             runtimes_checking: false,
             runtimes_refresh: None,
             settings,
+            limits_error: None,
             first_launch: None,
             snapshot_seen: false,
             pick_folder: native_picker(),
@@ -372,6 +375,7 @@ impl Workspace {
         let mut connected = false;
         let mut snapshot = false;
         let mut terminal_gone = false;
+        let mut run_ended = false;
         for event in events {
             // Only crewd saying so closes the open session: a snapshot
             // just after crewd starts may not list it yet.
@@ -379,6 +383,9 @@ impl Workspace {
                 && self.terminal.as_ref().is_some_and(|t| t.session == *id)
             {
                 terminal_gone = true;
+            }
+            if let ClientEvent::Msg(crew_proto::ServerMsg::RunStatus { status, .. }) = &event {
+                run_ended |= !matches!(status, RunStatus::Queued | RunStatus::Working);
             }
             connected |= event == ClientEvent::Connected;
             snapshot |= matches!(
@@ -409,6 +416,11 @@ impl Workspace {
                 self.first_launch = Some(FirstLaunch::default());
             }
             self.page_opened(window, cx);
+        }
+        // Today's runs change when one ends, and may have while away.
+        if run_ended || snapshot {
+            self.refresh_usage(cx);
+            self.refresh_history(cx);
         }
         self.sync_settings(window, cx);
         self.sync(cx);

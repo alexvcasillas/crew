@@ -9,7 +9,7 @@ use crew_core::event::{Event, RunStatus, ToolKind};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
+    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
     StoredProject, StoredRun, StoredThread,
 };
 use crew_proto::{ServerMsg, TerminalSession};
@@ -236,6 +236,10 @@ pub struct State {
     terminal: HashMap<String, TerminalSession>,
     /// One log per watched terminal session.
     terminal_logs: HashMap<String, TerminalLog>,
+    /// crewd's global limits, as last reported.
+    limits: Limits,
+    /// Limits sent to crewd and not yet reported back.
+    sent_limits: Option<Limits>,
 }
 
 /// A handoff policy and budget, `None` for "fall back".
@@ -262,8 +266,10 @@ impl State {
                 runs,
                 approvals,
                 terminal_sessions,
+                limits,
             } => {
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
+                self.limits_changed(limits);
                 self.terminal = terminal_sessions
                     .into_iter()
                     .map(|s| (s.id.clone(), s))
@@ -324,6 +330,7 @@ impl State {
                     log.events.push(LoggedEvent::new(run, seq, event));
                 }
             }
+            ServerMsg::LimitsChanged { limits } => self.limits_changed(limits),
             // The workspace keeps the runtimes.
             ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
         }
@@ -363,6 +370,13 @@ impl State {
                 .get(id)
                 .is_some_and(|t| (t.handoff_policy, t.handoff_budget) != *sent)
         });
+    }
+
+    /// Takes crewd's limits, which show from now on: crewd reports every
+    /// change in order, so its next word follows anything sent before.
+    fn limits_changed(&mut self, limits: Limits) {
+        self.sent_limits = None;
+        self.limits = limits;
     }
 
     /// Keeps the run as sent, unless a further-along copy is known.
@@ -543,6 +557,22 @@ impl State {
     /// Goes back to crewd's thread setting, as when sending failed.
     pub fn drop_thread_handoff(&mut self, thread: ThreadId) {
         self.sent_thread_handoffs.remove(&thread);
+    }
+
+    /// The global limits: the last ones sent, until crewd reports them,
+    /// else crewd's.
+    pub fn limits(&self) -> &Limits {
+        self.sent_limits.as_ref().unwrap_or(&self.limits)
+    }
+
+    /// Notes limits just sent to crewd.
+    pub fn expect_limits(&mut self, limits: Limits) {
+        self.sent_limits = Some(limits);
+    }
+
+    /// Goes back to crewd's limits, as when sending failed.
+    pub fn drop_limits(&mut self) {
+        self.sent_limits = None;
     }
 
     /// Any agent, deleted ones included, so old messages can name them.
@@ -1003,6 +1033,7 @@ mod tests {
             runs: vec![],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         (state, p, c, t)
     }
@@ -1258,6 +1289,7 @@ mod tests {
             runs: vec![r2.clone()],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -1560,6 +1592,69 @@ mod tests {
     }
 
     #[test]
+    fn limits_come_from_the_snapshot_and_follow_crewd() {
+        use crew_core::policy::HandoffPolicy;
+        use crew_core::store::Limits;
+        let mut state = State::default();
+        assert_eq!(*state.limits(), Limits::default());
+        let stored = Limits {
+            max_runs: 2,
+            paused: true,
+            handoff_policy: HandoffPolicy::Budget,
+            handoff_budget: 5,
+        };
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+            limits: stored,
+        });
+        assert_eq!(*state.limits(), stored);
+
+        // A change just sent shows at once, until crewd says anything.
+        let sent = Limits {
+            max_runs: 6,
+            ..stored
+        };
+        state.expect_limits(sent);
+        assert_eq!(*state.limits(), sent);
+        state.apply(ServerMsg::LimitsChanged { limits: sent });
+        assert_eq!(*state.limits(), sent);
+        // crewd's word wins, even when it differs from what was sent.
+        state.expect_limits(Limits {
+            max_runs: 8,
+            ..sent
+        });
+        let other = Limits {
+            paused: false,
+            ..sent
+        };
+        state.apply(ServerMsg::LimitsChanged { limits: other });
+        assert_eq!(*state.limits(), other);
+        // So does a fresh snapshot.
+        state.expect_limits(Limits::default());
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+            limits: other,
+        });
+        assert_eq!(*state.limits(), other);
+        // A failed request goes back to crewd's copy.
+        state.expect_limits(Limits::default());
+        state.drop_limits();
+        assert_eq!(*state.limits(), other);
+    }
+
+    #[test]
     fn edit_lines_are_counted_once_per_event() {
         let call = |input: serde_json::Value| {
             LoggedEvent::new(
@@ -1634,6 +1729,7 @@ mod tests {
                 session(p.id, "new", 30, false),
                 session(other, "elsewhere", 50, true),
             ],
+            limits: Default::default(),
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -1725,6 +1821,7 @@ mod tests {
             runs: vec![],
             approvals: vec![],
             terminal_sessions: vec![],
+            limits: Default::default(),
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

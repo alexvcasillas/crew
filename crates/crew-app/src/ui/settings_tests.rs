@@ -832,3 +832,170 @@ fn run_limits_read_short() {
     assert_eq!(run_limit_label(240), "4 h");
     assert_eq!(run_limit_label(45), "45 min");
 }
+
+/// A second app on crewd, which follows its limits.
+struct LimitsWatch {
+    _client: crate::client::ClientHandle,
+    events: futures::channel::mpsc::UnboundedReceiver<crate::client::ClientEvent>,
+    latest: Option<crew_proto::Limits>,
+}
+
+impl LimitsWatch {
+    fn new(home: &Path) -> Self {
+        let (client, events) = crate::client::spawn(crate::connection::ConnectionConfig {
+            crew_home: home.to_path_buf(),
+        });
+        Self {
+            _client: client,
+            events,
+            latest: None,
+        }
+    }
+
+    /// The limits crewd last told this app, taking in what has arrived.
+    /// Never blocks, so `wait_until` bounds how long a test waits.
+    fn latest(&mut self) -> Option<crew_proto::Limits> {
+        use crate::client::ClientEvent;
+        use crew_proto::ServerMsg;
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                ClientEvent::Msg(ServerMsg::Snapshot { limits, .. })
+                | ClientEvent::Msg(ServerMsg::LimitsChanged { limits }) => {
+                    self.latest = Some(limits);
+                }
+                _ => {}
+            }
+        }
+        self.latest
+    }
+}
+
+/// Opens the menu of the control `id` and picks its `ix`th item.
+fn pick_menu(cx: &mut TestAppContext, window: AnyWindowHandle, id: &str, ix: usize) {
+    click(cx, window, id.to_string());
+    assert!(has(cx, window, "popup-menu"), "the {id} menu");
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(ix, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let mut other = LimitsWatch::new(home.path());
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the project", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
+    });
+    click(cx, window, "title-settings");
+    click(cx, window, "settings-nav-limits");
+    assert_eq!(page(cx, &ws), Some(Page::Limits));
+
+    // The four rows with crewd's values.
+    for label in [
+        "Agents at once",
+        "New runs",
+        "Bringing in other agents",
+        "Handoffs per thread",
+    ] {
+        assert!(shows(cx, window, label), "{label}");
+    }
+    assert_eq!(
+        label_of(cx, window, "limits-max-runs-value").as_deref(),
+        Some("4")
+    );
+    assert!(shows(cx, window, "Running (selected)"));
+    assert!(shows(cx, window, "Ask first (selected)"));
+    assert_eq!(
+        label_of(cx, window, "limits-budget-value").as_deref(),
+        Some("3")
+    );
+
+    // Under Ask first the budget can't be picked.
+    click(cx, window, "limits-budget");
+    assert!(!has(cx, window, "popup-menu"), "no budget menu");
+
+    pick_menu(cx, window, "limits-max-runs", 1);
+    assert_eq!(
+        label_of(cx, window, "limits-max-runs-value").as_deref(),
+        Some("2")
+    );
+    wait_until(cx, "crewd to keep 2", |_| {
+        other.latest().is_some_and(|l| l.max_runs == 2)
+    });
+
+    // A pause from another app while the menu is open stays when you
+    // pick from it.
+    click(cx, window, "limits-max-runs");
+    assert!(has(cx, window, "popup-menu"));
+    let paused = crew_proto::Limits {
+        max_runs: 2,
+        paused: true,
+        ..Default::default()
+    };
+    let _: serde_json::Value = w.ask(Request::SetLimits { limits: paused });
+    wait_until(cx, "the other pause", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().limits().paused)
+    });
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(2usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    wait_until(cx, "crewd to keep 3 and the pause", |_| {
+        other.latest().is_some_and(|l| l.max_runs == 3 && l.paused)
+    });
+    let _: serde_json::Value = w.ask(Request::SetLimits {
+        limits: crew_proto::Limits {
+            max_runs: 2,
+            ..Default::default()
+        },
+    });
+    wait_until(cx, "the unpause", |cx| {
+        ws.read_with(cx, |ws, _| !ws.state().limits().paused)
+    });
+
+    click(cx, window, "limits-runs-paused");
+    assert!(shows(cx, window, "Paused (selected)"));
+    wait_until(cx, "crewd to pause", |_| {
+        other.latest().is_some_and(|l| l.paused)
+    });
+
+    click(cx, window, "limits-policy-budget");
+    assert!(shows(cx, window, "Run with budget (selected)"));
+    pick_menu(cx, window, "limits-budget", 3);
+    assert_eq!(
+        label_of(cx, window, "limits-budget-value").as_deref(),
+        Some("5")
+    );
+    wait_until(cx, "crewd to keep the budget", |_| {
+        other
+            .latest()
+            .is_some_and(|l| l.handoff_policy == HandoffPolicy::Budget && l.handoff_budget == 5)
+    });
+    // What crewd reports back stays shown.
+    wait_until(cx, "the app to hear back", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().limits().handoff_budget == 5)
+    });
+    assert!(!has(cx, window, "limits-error"));
+
+    // A change crewd can't take goes back and says why on the page.
+    drop(daemon);
+    wait_until(cx, "the lost connection", |cx| {
+        ws.read_with(cx, |ws, _| !ws.connected())
+    });
+    let notes = notifications(cx, window);
+    click(cx, window, "limits-runs-running");
+    wait_until(cx, "the error", |cx| has(cx, window, "limits-error"));
+    assert!(shows(cx, window, "Paused (selected)"));
+    assert_eq!(notifications(cx, window), notes, "shown on the page only");
+}

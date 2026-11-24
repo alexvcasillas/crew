@@ -22,7 +22,7 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -30,7 +30,57 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v4.sql"),
     include_str!("migrate_v5.sql"),
     include_str!("migrate_v6.sql"),
+    include_str!("migrate_v7.sql"),
 ];
+
+/// The global limits you set in the app. Stored as rows of `settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// Agents that may run at once, 1 to 8.
+    pub max_runs: u32,
+    /// While set, new runs stay queued. Live runs are not touched.
+    pub paused: bool,
+    /// The handoff policy when nothing narrower sets one. Only `AskFirst`
+    /// and `Budget` are valid here.
+    pub handoff_policy: HandoffPolicy,
+    /// Handoffs per thread when nothing narrower sets a budget, 1 to 10.
+    pub handoff_budget: u32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_runs: 4,
+            paused: false,
+            handoff_policy: HandoffPolicy::AskFirst,
+            handoff_budget: 3,
+        }
+    }
+}
+
+impl Limits {
+    /// Checks the ranges and policy a client may set.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(1..=8).contains(&self.max_runs) {
+            return Err("Choose between 1 and 8 agents at once.".into());
+        }
+        if !(1..=10).contains(&self.handoff_budget) {
+            return Err("Choose between 1 and 10 handoffs.".into());
+        }
+        if self.handoff_policy == HandoffPolicy::PerAgent {
+            return Err("Choose Ask first or Run with budget.".into());
+        }
+        Ok(())
+    }
+}
+
+/// What one runtime did in a span: runs and their summed duration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeUsage {
+    pub runtime: Runtime,
+    pub runs: u32,
+    pub total_ms: i64,
+}
 
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +93,8 @@ pub enum StoreError {
     NotFound(&'static str),
     #[error("an agent named {0:?} already exists")]
     DuplicateAgentName(String),
+    #[error("{0}")]
+    Invalid(String),
     #[error("This database was written by a newer Crew.")]
     NewerSchema,
     #[error("Upgrading the database left broken references. It was left as it was.")]
@@ -273,6 +325,94 @@ impl Store {
         }
         conn.pragma_update(None, "foreign_keys", true)?;
         Ok(Store { conn })
+    }
+
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Saves one setting, replacing its value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The limits. A missing or unreadable row gives its default and a
+    /// number out of range is clamped, so this never fails on bad data.
+    pub fn limits(&self) -> Result<Limits> {
+        let d = Limits::default();
+        let number = |key: &str, default: u32, range: std::ops::RangeInclusive<u32>| {
+            let Some(raw) = self.setting(key)? else {
+                return Ok::<u32, StoreError>(default);
+            };
+            Ok(match raw.parse::<u32>() {
+                Ok(n) => n.clamp(*range.start(), *range.end()),
+                Err(_) => {
+                    eprintln!("crew: ignoring setting {key} = {raw:?}");
+                    default
+                }
+            })
+        };
+        let paused = match self.setting("paused")?.as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(raw) => {
+                eprintln!("crew: ignoring setting paused = {raw:?}");
+                d.paused
+            }
+        };
+        let handoff_policy = match self.setting("handoff_policy")?.as_deref() {
+            None | Some("ask_first") => HandoffPolicy::AskFirst,
+            Some("budget") => HandoffPolicy::Budget,
+            Some(raw) => {
+                eprintln!("crew: ignoring setting handoff_policy = {raw:?}");
+                d.handoff_policy
+            }
+        };
+        Ok(Limits {
+            max_runs: number("max_runs", d.max_runs, 1..=8)?,
+            paused,
+            handoff_policy,
+            handoff_budget: number("handoff_budget", d.handoff_budget, 1..=10)?,
+        })
+    }
+
+    /// Saves all four limits. The caller validates them first.
+    pub fn set_limits(&self, limits: &Limits) -> Result<()> {
+        let policy = match limits.handoff_policy {
+            HandoffPolicy::Budget => "budget",
+            HandoffPolicy::AskFirst => "ask_first",
+            HandoffPolicy::PerAgent => {
+                return Err(StoreError::Invalid(
+                    "the global handoff policy is Ask first or Run with budget".into(),
+                ));
+            }
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        self.set_setting("max_runs", &limits.max_runs.to_string())?;
+        self.set_setting("paused", if limits.paused { "true" } else { "false" })?;
+        self.set_setting("handoff_policy", policy)?;
+        self.set_setting("handoff_budget", &limits.handoff_budget.to_string())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sets `max_runs` to `n` (clamped) unless it was saved before.
+    pub fn seed_max_runs(&self, n: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('max_runs', ?1)",
+            [n.clamp(1, 8).to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn create_project(&self, name: &str, root: &Path, main_branch: &str) -> Result<ProjectId> {
@@ -712,6 +852,20 @@ impl Store {
         Ok(())
     }
 
+    /// Moves a run to `Working` before its CLI starts, as while its
+    /// worktree is set up. `started_at` becomes now, so time spent queued
+    /// doesn't count. [`Self::start_run`] sets it again once the CLI runs.
+    pub fn begin_run(&self, r: RunId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = ?2, started_at = ?3 WHERE id = ?1",
+            params![r.to_string(), status_text(&RunStatus::Working)?, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     /// Whether any run has this session id.
     pub fn has_run_session(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
@@ -768,6 +922,52 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
+    /// Ended runs that started (any final status), newest `ended_at` first.
+    /// `before` is an inclusive `ended_at` in Unix ms, so runs that share the
+    /// last end time of a page come again on the next one and none is lost;
+    /// callers drop repeats by id. `limit` is clamped to 1..=200. A run
+    /// stopped while still queued never started and is left out.
+    pub fn run_history(&self, before: Option<i64>, limit: u32) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE ended_at IS NOT NULL AND session_id <> ''
+             AND (?1 IS NULL OR ended_at <= ?1)
+             ORDER BY ended_at DESC, ord DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![before, limit.clamp(1, 200)], read_run)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Runs per runtime that ended at or after `since_ms`, counted by their
+    /// full duration, plus live runs counted by their time so far at `now_ms`.
+    /// The runtime is the one the run used. Queued runs and runs that never
+    /// started don't count. A runtime with no runs is left out.
+    pub fn usage_since(&self, since_ms: i64, now_ms: i64) -> Result<Vec<RuntimeUsage>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE status = ?1 OR (ended_at >= ?2 AND session_id <> '') ORDER BY ord"
+        ))?;
+        let working = status_text(&RunStatus::Working)?;
+        let runs = stmt.query_map(params![working, since_ms], read_run)?;
+        let mut usage: Vec<RuntimeUsage> = Vec::new();
+        for run in runs {
+            let run = run??;
+            let runtime = run.runtime;
+            let ms = (run.ended_at.unwrap_or(now_ms) - run.started_at).max(0);
+            match usage.iter_mut().find(|u| u.runtime == runtime) {
+                Some(u) => {
+                    u.runs += 1;
+                    u.total_ms += ms;
+                }
+                None => usage.push(RuntimeUsage {
+                    runtime,
+                    runs: 1,
+                    total_ms: ms,
+                }),
+            }
+        }
+        usage.sort_by_key(|u| u.runtime != Runtime::ClaudeCode);
+        Ok(usage)
+    }
+
     /// Runs that are queued or working, plus those that ended at or after
     /// `ended_since` (Unix ms), in order.
     pub fn recent_runs(&self, ended_since: i64) -> Result<Vec<StoredRun>> {
@@ -815,12 +1015,22 @@ impl Store {
 
     /// Marks every `Queued` or `Working` run as `Interrupted`. Returns how
     /// many changed.
+    ///
+    /// Each ends at its last known activity: its latest message or
+    /// approval, else its start. Events carry no time, so a run that only
+    /// streamed events counts from its start to its last message. The time
+    /// crewd was down never counts.
     pub fn mark_unfinished_runs_interrupted(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE runs SET status = ?1, ended_at = ?2 WHERE status IN (?3, ?4)",
+            "UPDATE runs SET status = ?1, ended_at = MAX(
+                 started_at,
+                 COALESCE((SELECT MAX(created_at) FROM messages WHERE run_id = runs.id), 0),
+                 COALESCE((SELECT MAX(COALESCE(decided_at, created_at))
+                           FROM approvals WHERE run_id = runs.id), 0)
+             )
+             WHERE status IN (?2, ?3)",
             params![
                 status_text(&RunStatus::Interrupted)?,
-                now_ms(),
                 status_text(&RunStatus::Queued)?,
                 status_text(&RunStatus::Working)?
             ],

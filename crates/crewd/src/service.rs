@@ -21,7 +21,7 @@ use crew_core::store::{
     Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun, ThreadWorktree,
 };
 use crew_core::worktree::{self, Diff};
-use crew_proto::{PermissionAnswer, Request, ServerMsg};
+use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -173,11 +173,22 @@ impl Service {
         if let Err(e) = crate::approvals::cancel_stale_permissions(&store) {
             log(format!("couldn't cancel old permission asks: {e}"));
         }
+        // The run cap from the command line or environment only seeds the
+        // setting. Once it is saved, the saved value wins.
+        if let Err(e) = store.seed_max_runs(u32::try_from(max_runs).unwrap_or(u32::MAX)) {
+            log(format!("couldn't save the run cap: {e}"));
+        }
+        let limits = store.limits().unwrap_or_else(|e| {
+            log(format!("couldn't read the limits: {e}"));
+            Limits::default()
+        });
+        let mut scheduler = Scheduler::new(limits.max_runs as usize);
+        scheduler.set_paused(limits.paused);
         let (tx, _) = broadcast::channel(notice_buffer.max(1));
         Service(Arc::new(Inner {
             db: Mutex::new(Db { store, serial: 0 }),
             state: Mutex::new(State {
-                scheduler: Scheduler::new(max_runs),
+                scheduler,
                 live: HashMap::new(),
                 pending: HashMap::new(),
                 watchers: JoinSet::new(),
@@ -380,6 +391,22 @@ impl Service {
                 self.stop_all().map_err(|e| e.to_string())?;
                 Ok(serde_json::Value::Null)
             }
+            Request::SetLimits { limits } => {
+                self.set_limits(limits)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::RunHistory { before, limit } => json(
+                self.db()
+                    .store
+                    .run_history(before, limit)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Request::UsageSince { since_ms } => json(
+                self.db()
+                    .store
+                    .usage_since(since_ms, now_ms())
+                    .map_err(|e| e.to_string())?,
+            ),
             Request::ListRuns { status } => {
                 let filter = RunFilter {
                     status,
@@ -761,6 +788,7 @@ impl Service {
             runs,
             approvals,
             terminal_sessions: self.terminal().sessions(),
+            limits: db.store.limits()?,
         };
         Ok((msg, db.serial))
     }
@@ -1009,6 +1037,23 @@ impl Service {
         Ok(())
     }
 
+    /// Saves the limits, applies them to the scheduler, tells every client
+    /// and starts queued jobs the new limits allow. Live runs are never
+    /// stopped by a lower cap or a pause.
+    pub(crate) fn set_limits(&self, limits: Limits) -> Result<(), String> {
+        limits.validate()?;
+        {
+            let mut state = self.state();
+            let mut db = self.db();
+            db.store.set_limits(&limits).map_err(|e| e.to_string())?;
+            state.scheduler.set_cap(limits.max_runs as usize);
+            state.scheduler.set_paused(limits.paused);
+            self.publish_global(&mut db, ServerMsg::LimitsChanged { limits });
+        }
+        self.start_ready();
+        Ok(())
+    }
+
     /// Starts queued jobs while the scheduler allows.
     pub(crate) fn start_ready(&self) {
         let mut state = self.state();
@@ -1050,7 +1095,7 @@ impl Service {
         let (handle, stop_rx) = RunHandle::idle();
         {
             let mut db = self.db();
-            match db.store.set_run_status(job.run, RunStatus::Working) {
+            match db.store.begin_run(job.run) {
                 Ok(()) => self.publish_status(&mut db, job.thread, job.run, RunStatus::Working),
                 Err(e) => log(format!("couldn't mark run {} working: {e}", job.run)),
             }

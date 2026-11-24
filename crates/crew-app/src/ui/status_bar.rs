@@ -1,6 +1,6 @@
 //! The status bar: the connection when it isn't up, who is working, what
 //! waits on you, live terminal sessions, which agent CLIs are ready, and
-//! Stop all.
+//! Stop all. On Running now it explains Stop and links to the run cap.
 
 use crew_core::agent::Runtime;
 use crew_proto::RuntimeInfo;
@@ -10,6 +10,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{dot, spinner};
+use super::running_view::{STOP_HINT, max_runs_line};
+use super::settings::Page;
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
@@ -65,10 +67,13 @@ pub fn runtime_words(runtimes: &[RuntimeInfo]) -> Vec<(String, &'static str)> {
 }
 
 impl Workspace {
-    pub(super) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(super) fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let state = self.state();
         let connection = connection_line(state.connection());
         let connected = connection.is_none();
+        if self.running.is_some() {
+            return self.render_running_status(connection, cx);
+        }
         let names: Vec<String> = state
             .working_agents()
             .into_iter()
@@ -108,18 +113,7 @@ impl Workspace {
                 ))
             })
             .collect();
-        div()
-            .id("status-bar")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(16.))
-            .h(px(STATUS_BAR_HEIGHT))
-            .px(px(16.))
-            .border_t_1()
-            .border_color(color("border-100"))
-            .text_size(px(12.))
-            .text_color(color("text-secondary"))
+        status_frame()
             .when_some(connection, |bar, (token, text)| {
                 bar.child(item("status-connection", token, text.to_string()))
             })
@@ -169,7 +163,76 @@ impl Workspace {
                 )
             })
             .test_support()
+            .into_any_element()
     }
+
+    /// Running now's status bar: what Stop does, and the run cap with a
+    /// link to change it.
+    fn render_running_status(
+        &self,
+        connection: Option<(&'static str, &'static str)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cap = max_runs_line(self.state().limits().max_runs);
+        status_frame()
+            .when_some(connection, |bar, (token, text)| {
+                bar.child(item("status-connection", token, text.to_string()))
+            })
+            .child(
+                div()
+                    .id("status-running-hint")
+                    .flex_none()
+                    .aria_label(STOP_HINT)
+                    .child(STOP_HINT)
+                    .test_support(),
+            )
+            .child(div().flex_1())
+            .when(connection.is_none(), |bar| {
+                bar.child(
+                    div()
+                        .id("status-max-runs")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(4.))
+                        .aria_label(format!("{cap} · change"))
+                        .child(cap)
+                        .child(div().text_color(color("text-tertiary")).child("·"))
+                        .child(
+                            div()
+                                .id("status-limits-change")
+                                .cursor_pointer()
+                                .text_color(color("accent-blue"))
+                                .hover(|link| link.underline())
+                                .aria_label("change")
+                                .child("change")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(Page::Limits, window, cx);
+                                }))
+                                .test_support(),
+                        )
+                        .test_support(),
+                )
+            })
+            .test_support()
+            .into_any_element()
+    }
+}
+
+/// The bar itself, before its items.
+fn status_frame() -> Stateful<Div> {
+    div()
+        .id("status-bar")
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(16.))
+        .h(px(STATUS_BAR_HEIGHT))
+        .px(px(16.))
+        .border_t_1()
+        .border_color(color("border-100"))
+        .text_size(px(12.))
+        .text_color(color("text-secondary"))
 }
 
 /// A dot and words, labelled with the words.

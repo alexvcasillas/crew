@@ -1,7 +1,8 @@
-//! Settings, in place of the body: General, Agents, Projects, Runtimes
-//! and Shortcuts.
+//! Settings, in place of the body: General, Agents, Runtimes, Handoffs
+//! and limits, Projects and Shortcuts.
 
 pub mod agents;
+pub mod limits;
 pub mod projects;
 pub mod runtimes;
 
@@ -32,8 +33,6 @@ const SETTINGS_CONTEXT: &str = "Settings";
 const NAV_WIDTH: f32 = 220.;
 /// The label column of a form row.
 pub(super) const LABEL_WIDTH: f32 = 200.;
-/// How many runs crewd starts at once.
-const MAX_RUNS: &str = "4";
 
 /// Esc leaves settings.
 pub fn bindings() -> Vec<KeyBinding> {
@@ -49,16 +48,18 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum Page {
     General,
     Agents,
-    Projects,
     Runtimes,
+    Limits,
+    Projects,
     Shortcuts,
 }
 
-const PAGES: [(Page, &str, &str); 5] = [
+const PAGES: [(Page, &str, &str); 6] = [
     (Page::General, "settings-nav-general", "General"),
     (Page::Agents, "settings-nav-agents", "Agents"),
-    (Page::Projects, "settings-nav-projects", "Projects"),
     (Page::Runtimes, "settings-nav-runtimes", "Runtimes"),
+    (Page::Limits, "settings-nav-limits", "Handoffs and limits"),
+    (Page::Projects, "settings-nav-projects", "Projects"),
     (Page::Shortcuts, "settings-nav-shortcuts", "Shortcuts"),
 ];
 
@@ -134,6 +135,7 @@ impl Workspace {
             .unwrap_or_else(|| SettingsView::new(page, cx.focus_handle()));
         view.page = page;
         view.focus.focus(window, cx);
+        self.limits_error = None;
         self.settings = Some(view);
         self.page_opened(window, cx);
         self.sync(cx);
@@ -158,6 +160,7 @@ impl Workspace {
     pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.settings.as_mut() {
             view.page = page;
+            self.limits_error = None;
             self.page_opened(window, cx);
             cx.notify();
         }
@@ -221,6 +224,7 @@ impl Workspace {
             Page::Agents => self.render_agents_page(cx),
             Page::Projects => self.render_projects_page(cx),
             Page::Runtimes => self.render_runtimes_page(cx),
+            Page::Limits => self.render_limits_page(cx),
             Page::Shortcuts => render_shortcuts().into_any_element(),
         };
         div()
@@ -273,7 +277,11 @@ impl Workspace {
             .child(field(
                 "Max agents at once",
                 Some("More runs wait in a queue until one finishes."),
-                value_text("general-max-runs", MAX_RUNS.to_string(), false),
+                value_text(
+                    "general-max-runs",
+                    self.state().limits().max_runs.to_string(),
+                    false,
+                ),
             ))
     }
 }

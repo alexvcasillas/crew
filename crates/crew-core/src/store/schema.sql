@@ -86,3 +86,9 @@ CREATE TABLE approvals (
     decided_at INTEGER
 );
 CREATE INDEX approvals_by_status ON approvals(status, thread_id);
+
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX runs_ended ON runs(ended_at);

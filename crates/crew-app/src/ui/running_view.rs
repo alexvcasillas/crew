@@ -1,15 +1,17 @@
 //! Running now: every agent in every project, in place of the body, with
 //! stop controls. Groups are Needs you, Working, In terminal, Queued and
-//! Finished in the last hour.
+//! Finished in the last hour. Its nav also opens the History of ended
+//! runs and counts today's runs per runtime.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crew_core::agent::Runtime;
 use crew_core::claude::retry_rule;
 use crew_core::event::{RunStatus, tool_label};
 use crew_core::ids::{ApprovalId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalKind, StoredApproval, StoredRun};
-use crew_proto::TerminalSession;
+use crew_proto::{Limits, Request, RuntimeUsage, TerminalSession};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -17,8 +19,8 @@ use gpui_kit::*;
 
 use super::approval_card::{input_text, outside_sandbox, outside_sandbox_line};
 use super::common::{
-    chip, cut_start, dot, elapsed, monogram, now_ms, rolling_text, runtime_badge_for, runtime_chip,
-    spinner, status_word,
+    chip, clock, cut_start, dot, elapsed, monogram, now_ms, rolling_text, runtime_badge_for,
+    runtime_chip, spinner, status_word,
 };
 use super::inspector::run_state;
 use super::run_card::summarize;
@@ -42,7 +44,14 @@ const RUNTIME_COL: f32 = 150.;
 const STATUS_COL: f32 = 110.;
 const ACTIONS_COL: f32 = 190.;
 const ROW_MIN_HEIGHT: f32 = 56.;
-const COMING_SOON: &str = "Coming soon.";
+/// Ended runs per History page.
+pub const HISTORY_PAGE: u32 = 50;
+/// How often today's runs are asked for while Running now is open.
+const USAGE_EVERY: Duration = Duration::from_secs(60);
+/// The status bar's words on Running now.
+pub const STOP_HINT: &str = "Stop ends the agent process and keeps every file change for review.";
+pub const PLAN_NOTE: &str = "Plan limits stay with each provider. Crew only counts runs.";
+const NO_RUNS_TODAY: &str = "No runs yet today.";
 
 /// Esc leaves Running now.
 pub fn bindings() -> Vec<KeyBinding> {
@@ -53,23 +62,150 @@ pub fn bindings() -> Vec<KeyBinding> {
     )]
 }
 
+/// Which list Running now shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Section {
+    /// Every group.
+    All,
+    /// Only the Needs you group.
+    NeedsYou,
+    /// Ended runs, newest first.
+    History,
+}
+
 /// What Running now shows.
 pub(super) struct RunningView {
     /// Only this project's rows, if set.
     pub(super) project: Option<ProjectId>,
-    /// Only the Needs you group.
-    pub(super) needs_only: bool,
+    pub(super) section: Section,
     pub(super) focus: FocusHandle,
+    /// Today's runs per runtime, as crewd last said. `None` until it
+    /// answers.
+    usage: Option<Vec<RuntimeUsage>>,
+    usage_task: Option<Task<()>>,
+    /// Asks for today's runs every [`USAGE_EVERY`].
+    usage_timer: Option<Task<()>>,
+    /// History's ended runs, newest first, and whether older ones may
+    /// exist.
+    history: Vec<StoredRun>,
+    history_more: bool,
+    history_loaded: bool,
+    /// Why the last History load failed, if it did.
+    history_error: Option<String>,
+    history_task: Option<Task<()>>,
 }
 
 impl RunningView {
     pub(super) fn new(focus: FocusHandle) -> Self {
         Self {
             project: None,
-            needs_only: false,
+            section: Section::All,
             focus,
+            usage: None,
+            usage_task: None,
+            usage_timer: None,
+            history: Vec::new(),
+            history_more: false,
+            history_loaded: false,
+            history_error: None,
+            history_task: None,
         }
     }
+}
+
+/// "New runs are paused. 2 queued." or "... Nothing queued."
+pub fn paused_line(queued: usize) -> String {
+    if queued == 0 {
+        "New runs are paused. Nothing queued.".into()
+    } else {
+        format!("New runs are paused. {queued} queued.")
+    }
+}
+
+/// "Max 4 agents at once", or "Max 1 agent at once".
+pub fn max_runs_line(n: u32) -> String {
+    if n == 1 {
+        "Max 1 agent at once".into()
+    } else {
+        format!("Max {n} agents at once")
+    }
+}
+
+/// A total time as today's runs show it: "1h 52m", "4m" or "38s".
+pub fn usage_time(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// "1 run · 38s" or "14 runs · 1h 52m".
+pub fn usage_line(runs: u32, total_ms: i64) -> String {
+    let word = if runs == 1 { "run" } else { "runs" };
+    format!("{runs} {word} · {}", usage_time(total_ms))
+}
+
+/// The runtime's name and the key its rows use.
+fn runtime_name(runtime: &Runtime) -> (&'static str, &'static str) {
+    match runtime {
+        Runtime::ClaudeCode => ("Claude Code", "claude"),
+        Runtime::Codex => ("Codex", "codex"),
+    }
+}
+
+/// The start of the local day holding `now` (Unix ms), in the system's
+/// time zone. Where midnight doesn't exist that day, the day's first
+/// hour that does.
+pub fn local_midnight(now: i64) -> i64 {
+    use chrono::{Local, TimeZone as _};
+    let Some(today) = Local
+        .timestamp_millis_opt(now)
+        .single()
+        .map(|t| t.date_naive())
+    else {
+        return now - now.rem_euclid(24 * 60 * 60 * 1000);
+    };
+    (0..3)
+        .find_map(|hour| {
+            today
+                .and_hms_opt(hour, 0, 0)?
+                .and_local_timezone(Local)
+                .earliest()
+        })
+        .map_or(now, |t| t.timestamp_millis())
+}
+
+/// Adds a History page to what is known, skipping runs already listed: a
+/// page starts at the last one's end time, so it repeats runs that end
+/// then. Returns how many were new.
+pub fn merge_history(known: &mut Vec<StoredRun>, page: Vec<StoredRun>) -> usize {
+    let before = known.len();
+    for run in page {
+        if !known.iter().any(|r| r.id == run.id) {
+            known.push(run);
+        }
+    }
+    known.len() - before
+}
+
+/// When a run ended: "Ended 10:05" today, else with its date.
+fn ended_line(ended: i64, now: i64) -> String {
+    use chrono::{Local, TimeZone as _};
+    let today = local_midnight(now);
+    if ended >= today {
+        return format!("Ended {}", clock(ended));
+    }
+    Local
+        .timestamp_millis_opt(ended)
+        .single()
+        .map_or_else(String::new, |t| {
+            format!("Ended {}", t.format("%b %-d, %H:%M"))
+        })
 }
 
 /// "3 agents working across 2 projects. 1 is waiting on you."
@@ -116,6 +252,8 @@ enum RowKind {
     Working(RunId),
     Queued(RunId),
     Finished(RunId),
+    /// A row of History.
+    History(RunId),
 }
 
 /// One row, owned, so it renders without holding the state.
@@ -141,6 +279,8 @@ struct Row {
     state_mono: bool,
     /// Your answer to the row's approval was sent.
     deciding: bool,
+    /// The agent to ask to continue, for a stopped or interrupted run.
+    resume: Option<String>,
 }
 
 impl Workspace {
@@ -154,8 +294,173 @@ impl Workspace {
             .unwrap_or_else(|| RunningView::new(cx.focus_handle()));
         view.focus.focus(window, cx);
         self.running = Some(view);
+        self.refresh_usage(cx);
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|v| v.section == Section::History)
+        {
+            self.load_history(false, cx);
+        }
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Asks crewd for today's runs per runtime. "Today" starts at local
+    /// midnight. A failed ask keeps what was known.
+    pub(super) fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+        if self.running.is_none() || !self.connected() {
+            return;
+        }
+        self.watch_usage(cx);
+        let since_ms = local_midnight(now_ms());
+        let answer = self.client.request(Request::UsageSince { since_ms });
+        let task = cx.spawn(async move |this, cx| {
+            let usage = answer.await.and_then(|v| {
+                serde_json::from_value::<Vec<RuntimeUsage>>(v).map_err(|e| e.to_string())
+            });
+            this.update(cx, |this, cx| {
+                match usage {
+                    Ok(usage) => {
+                        if let Some(view) = this.running.as_mut() {
+                            view.usage = Some(usage);
+                        }
+                    }
+                    Err(e) => eprintln!("crew: couldn't ask for today's runs: {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(view) = self.running.as_mut() {
+            view.usage_task = Some(task);
+        }
+    }
+
+    /// Asks for today's runs every [`USAGE_EVERY`] while Running now is
+    /// open.
+    fn watch_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.running.as_mut() else {
+            return;
+        };
+        if view.usage_timer.is_some() {
+            return;
+        }
+        view.usage_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(USAGE_EVERY).await;
+                if this.update(cx, |this, cx| this.refresh_usage(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Asks crewd for History's first page, or with `older` the page
+    /// after the last run listed. The rows shown stay until the answer
+    /// lands; a fresh first page keeps older pages already loaded below it.
+    pub(super) fn load_history(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.running.as_ref() else {
+            return;
+        };
+        let before = if older {
+            view.history.last().and_then(|r| r.ended_at)
+        } else {
+            None
+        };
+        let answer = self.client.request(Request::RunHistory {
+            before,
+            limit: HISTORY_PAGE,
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let page = answer.await.and_then(|v| {
+                serde_json::from_value::<Vec<StoredRun>>(v).map_err(|e| e.to_string())
+            });
+            this.update(cx, |this, cx| {
+                let Some(view) = this.running.as_mut() else {
+                    return;
+                };
+                match page {
+                    Ok(page) => {
+                        let full = page.len() >= HISTORY_PAGE as usize;
+                        if older {
+                            let added = merge_history(&mut view.history, page);
+                            view.history_more = full && added > 0;
+                        } else {
+                            let known = std::mem::take(&mut view.history);
+                            let fresh = page.len();
+                            view.history = page;
+                            merge_history(&mut view.history, known);
+                            // Older pages were loaded already: their own
+                            // Show older still holds.
+                            if view.history.len() == fresh {
+                                view.history_more = full;
+                            }
+                        }
+                        view.history_loaded = true;
+                        view.history_error = None;
+                    }
+                    Err(e) => view.history_error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(view) = self.running.as_mut() {
+            view.history_task = Some(task);
+        }
+    }
+
+    /// Loads History's first page again while it is shown.
+    pub(super) fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|v| v.section == Section::History)
+            && self.connected()
+        {
+            self.load_history(false, cx);
+        }
+    }
+
+    fn show_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.running.as_mut() {
+            view.section = Section::History;
+            self.load_history(false, cx);
+            cx.notify();
+        }
+    }
+
+    /// Pauses new runs, or lets them start again.
+    fn toggle_pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let limits = *self.state().limits();
+        self.set_limits(
+            Limits {
+                paused: !limits.paused,
+                ..limits
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Asks `agent` in `thread` to continue where it stopped, then opens
+    /// the thread.
+    fn resume(
+        &mut self,
+        thread: ThreadId,
+        agent: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = self.client.request(Request::PostMessage {
+            thread,
+            body: format!("@{agent} continue where you stopped."),
+        });
+        self.spawn_request(window, cx, async move |_, _| {
+            answer.await.map(drop).map_err(|e| (e, None))
+        });
+        self.open_from_running(thread, window, cx);
     }
 
     /// Goes back to what was open before.
@@ -190,9 +495,9 @@ impl Workspace {
         }
     }
 
-    fn show_needs_only(&mut self, needs_only: bool, cx: &mut Context<Self>) {
+    fn show_section(&mut self, section: Section, cx: &mut Context<Self>) {
         if let Some(view) = self.running.as_mut() {
-            view.needs_only = needs_only;
+            view.section = section;
             cx.notify();
         }
     }
@@ -251,6 +556,18 @@ impl Workspace {
             .items_center()
             .gap(px(8.))
             // Like the status bar's, only while connected.
+            .children(self.connected().then(|| {
+                let label = if self.state().limits().paused {
+                    "Resume new runs"
+                } else {
+                    "Pause new runs"
+                };
+                Button::new("running-pause")
+                    .outline()
+                    .small()
+                    .label(label)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_pause(window, cx)))
+            }))
             .children(self.connected().then(|| {
                 let (enabled, token) = self.stop_all_look();
                 Button::new("running-stop-all")
@@ -326,37 +643,35 @@ impl Workspace {
             .border_color(color("border-100"))
             .overflow_y_scroll()
             .child(
-                nav_row("running-nav-all".into(), !view.needs_only)
+                nav_row("running-nav-all".into(), view.section == Section::All)
                     .aria_label(format!("Running now {live}"))
                     .child(div().flex_1().child("Running now"))
                     .child(count(live.to_string(), "text-secondary"))
-                    .on_click(cx.listener(|this, _, _, cx| this.show_needs_only(false, cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.show_section(Section::All, cx)))
                     .test_support(),
             )
             .child(
-                nav_row("running-nav-needs".into(), view.needs_only)
-                    .aria_label(format!("Needs you {needs}"))
-                    .child(div().flex_1().child("Needs you"))
-                    .when(needs > 0, |row| {
-                        row.child(count(needs.to_string(), "warning"))
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.show_needs_only(true, cx)))
-                    .test_support(),
+                nav_row(
+                    "running-nav-needs".into(),
+                    view.section == Section::NeedsYou,
+                )
+                .aria_label(format!("Needs you {needs}"))
+                .child(div().flex_1().child("Needs you"))
+                .when(needs > 0, |row| {
+                    row.child(count(needs.to_string(), "warning"))
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.show_section(Section::NeedsYou, cx)))
+                .test_support(),
             )
             .child(
-                div()
-                    .id("running-nav-history")
-                    .flex()
-                    .items_center()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .text_color(color("text-tertiary"))
-                    .aria_label("History")
-                    .child("History")
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(COMING_SOON).build(window, cx)
-                    })
-                    .test_support(),
+                nav_row(
+                    "running-nav-history".into(),
+                    view.section == Section::History,
+                )
+                .aria_label("History")
+                .child("History")
+                .on_click(cx.listener(|this, _, _, cx| this.show_history(cx)))
+                .test_support(),
             )
             .child(
                 div()
@@ -383,9 +698,15 @@ impl Workspace {
                     .test_support(),
             )
             .children(projects)
+            .child(div().flex_1().min_h(px(16.)))
+            .child(render_usage(view.usage.as_deref()))
     }
 
-    fn render_running_main(&self, view: &RunningView, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_running_main(&self, view: &RunningView, cx: &mut Context<Self>) -> AnyElement {
+        if view.section == Section::History {
+            return self.render_history(view, cx);
+        }
+        let needs_only = view.section == Section::NeedsYou;
         let state = self.state();
         let now = now_ms();
         let groups = state.running_now(view.project, now);
@@ -395,6 +716,10 @@ impl Workspace {
             .filter_map(|r| state.thread_project(r.thread))
             .collect();
         let summary = summary_line(groups.working.len(), projects.len(), groups.needs_you.len());
+        let paused = state
+            .limits()
+            .paused
+            .then(|| paused_line(groups.queued.len()));
         let rows = self.running_rows(&groups, now);
         let mut main = div()
             .id("running-main")
@@ -417,12 +742,23 @@ impl Workspace {
                 div()
                     .id("running-summary")
                     .mt(px(4.))
-                    .mb(px(16.))
                     .text_color(color("text-secondary"))
                     .aria_label(summary.clone())
                     .child(summary)
                     .test_support(),
-            );
+            )
+            .when_some(paused, |main, line| {
+                main.child(
+                    div()
+                        .id("running-paused")
+                        .mt(px(2.))
+                        .text_color(color("text-secondary"))
+                        .aria_label(line.clone())
+                        .child(line)
+                        .test_support(),
+                )
+            })
+            .child(div().h(px(16.)));
         let [needs, working, queued, finished] = rows;
         let shown: [(&str, &str, &str, Vec<Row>); 4] = [
             ("needs", "NEEDS YOU", "warning", needs),
@@ -432,7 +768,7 @@ impl Workspace {
         ];
         for (key, title, token, rows) in shown {
             // Claude Code at work in a terminal, after Crew's own runs.
-            if key == "queued" && !view.needs_only {
+            if key == "queued" && !needs_only {
                 let sessions: Vec<&TerminalSession> = state
                     .live_terminal_sessions()
                     .into_iter()
@@ -453,7 +789,7 @@ impl Workspace {
                     }
                 }
             }
-            if rows.is_empty() || (view.needs_only && key != "needs") {
+            if rows.is_empty() || (needs_only && key != "needs") {
                 continue;
             }
             main = main.child(group_header(key, title, token, rows.len()));
@@ -461,7 +797,89 @@ impl Workspace {
                 main = main.child(render_row(row, cx));
             }
         }
-        main
+        main.into_any_element()
+    }
+
+    /// Ended runs, newest first, with Show older while more may exist.
+    fn render_history(&self, view: &RunningView, cx: &mut Context<Self>) -> AnyElement {
+        let now = now_ms();
+        let rows: Vec<Row> = view
+            .history
+            .iter()
+            .filter(|r| {
+                view.project
+                    .is_none_or(|p| self.state().thread_project(r.thread) == Some(p))
+            })
+            .map(|r| {
+                let mut row = self.run_row(r, RowKind::History(r.id), now);
+                row.now = r
+                    .ended_at
+                    .map_or_else(String::new, |end| ended_line(end, now));
+                row.now_mono = false;
+                row
+            })
+            .collect();
+        let error = view
+            .history_error
+            .as_ref()
+            .map(|e| format!("Couldn't load history. {e}"));
+        let empty = view.history_loaded && error.is_none() && rows.is_empty();
+        let rows: Vec<AnyElement> = rows
+            .into_iter()
+            .map(|row| render_row(row, cx).into_any_element())
+            .collect();
+        div()
+            .id("running-main")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(32.))
+            .py(px(24.))
+            .child(
+                div()
+                    .mb(px(16.))
+                    .text_size(px(20.))
+                    .line_height(px(28.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("History"),
+            )
+            .when_some(error, |main, error| {
+                main.child(
+                    div()
+                        .id("history-error")
+                        .mb(px(12.))
+                        .text_color(color("danger"))
+                        .aria_label(error.clone())
+                        .child(error)
+                        .test_support(),
+                )
+            })
+            .when(empty, |main| {
+                main.child(
+                    div()
+                        .id("history-empty")
+                        .text_color(color("text-tertiary"))
+                        .aria_label("No ended runs yet.")
+                        .child("No ended runs yet.")
+                        .test_support(),
+                )
+            })
+            .children(rows)
+            .when(view.history_more, |main| {
+                main.child(
+                    div().pt(px(12.)).child(
+                        Button::new("history-older")
+                            .ghost()
+                            .small()
+                            .label("Show older")
+                            .on_click(cx.listener(|this, _, _, cx| this.load_history(true, cx))),
+                    ),
+                )
+            })
+            .into_any_element()
     }
 
     /// The rows of each group: needs you, working, queued, finished.
@@ -506,6 +924,7 @@ impl Workspace {
             state_token: "text-secondary",
             state_mono: false,
             deciding: false,
+            resume: None,
         }
     }
 
@@ -597,6 +1016,12 @@ impl Workspace {
                 row.now = step.unwrap_or_else(|| ended_word(&run.status).into());
                 row.state = word;
                 row.state_token = token;
+                if matches!(run.status, RunStatus::Stopped | RunStatus::Interrupted) {
+                    row.resume = state
+                        .agent(run.agent)
+                        .filter(|a| a.deleted_at.is_none())
+                        .map(|a| a.spec.name.clone());
+                }
             }
         }
         // Steps name paths and commands.
@@ -695,16 +1120,24 @@ fn group_header(key: &str, title: &str, token: &str, n: usize) -> impl IntoEleme
 fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
     let (id, ask) = match row.kind {
         RowKind::Ask { id, .. } => (id.to_string(), true),
-        RowKind::Working(run) | RowKind::Queued(run) | RowKind::Finished(run) => {
-            (run.to_string(), false)
-        }
+        RowKind::Working(run)
+        | RowKind::Queued(run)
+        | RowKind::Finished(run)
+        | RowKind::History(run) => (run.to_string(), false),
     };
-    let prefix = if ask { "running-ask" } else { "running" };
-    let (row_id, now_id, state_id) = if ask {
+    let history = matches!(row.kind, RowKind::History(_));
+    let prefix = if ask {
+        "running-ask"
+    } else if history {
+        "history"
+    } else {
+        "running"
+    };
+    let (row_id, now_id, state_id) = if ask || history {
         (
-            format!("running-ask-{id}"),
-            format!("running-ask-now-{id}"),
-            format!("running-ask-state-{id}"),
+            format!("{prefix}-{}{id}", if history { "run-" } else { "" }),
+            format!("{prefix}-now-{id}"),
+            format!("{prefix}-state-{id}"),
         )
     } else {
         (
@@ -713,6 +1146,7 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
             format!("running-state-{id}"),
         )
     };
+    let thread = row.thread;
     let label = format!(
         "{} · {} · #{} · {}",
         row.agent, row.project, row.channel, row.title
@@ -730,6 +1164,14 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
         .border_b_1()
         .border_color(color("border-100"))
         .when(ask, |row| row.bg(color("warning-subtle")))
+        // A History row opens its thread.
+        .when(history, |row| {
+            row.cursor_pointer()
+                .hover(|row| row.bg(color("surface-100")))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_from_running(thread, window, cx);
+                }))
+        })
         .aria_label(label)
         .child(
             div()
@@ -936,9 +1378,24 @@ fn render_terminal_row(
         .test_support()
 }
 
-/// Allow once / Deny or Approve / Decline, Open, Watch and Stop, by group.
+/// Allow once / Deny or Approve / Decline, Open, Watch, Stop and Resume,
+/// by group.
 fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
     let thread = row.thread;
+    let resume = |prefix: &str, run: RunId, cx: &mut Context<Workspace>| {
+        row.resume.clone().map(|agent| {
+            Button::new(SharedString::from(format!("{prefix}-resume-{run}")))
+                .outline()
+                .small()
+                .label("Resume")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    // A History row opens the thread on its own click.
+                    cx.stop_propagation();
+                    this.resume(thread, agent.clone(), window, cx);
+                }))
+                .into_any_element()
+        })
+    };
     let open = |id: String, label: &'static str, cx: &mut Context<Workspace>| {
         Button::new(SharedString::from(id))
             .ghost()
@@ -1009,13 +1466,165 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
             stop(run, cx),
         ],
         RowKind::Queued(run) => vec![stop(run, cx)],
-        RowKind::Finished(run) => vec![open(format!("running-open-{run}"), "Open", cx)],
+        RowKind::Finished(run) => resume("running", run, cx)
+            .into_iter()
+            .chain([open(format!("running-open-{run}"), "Open", cx)])
+            .collect(),
+        // The row itself opens the thread.
+        RowKind::History(run) => resume("history", run, cx).into_iter().collect(),
     }
+}
+
+/// The nav's footer: today's runs per runtime, then the plan note.
+fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
+    let rows: Vec<AnyElement> = usage
+        .unwrap_or_default()
+        .iter()
+        .filter(|u| u.runs > 0)
+        .map(|u| {
+            let (name, key) = runtime_name(&u.runtime);
+            let line = usage_line(u.runs, u.total_ms);
+            div()
+                .id(SharedString::from(format!("running-usage-{key}")))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(24.))
+                .aria_label(name)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(color("text-secondary"))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("running-usage-{key}-count")))
+                        .flex_none()
+                        .font_family(mono_font())
+                        .text_size(px(12.))
+                        .text_color(color("text-tertiary"))
+                        .aria_label(line.clone())
+                        .child(line)
+                        .test_support(),
+                )
+                .test_support()
+                .into_any_element()
+        })
+        .collect();
+    let none = usage.is_some() && rows.is_empty();
+    div()
+        .id("running-usage")
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(2.))
+        .px(px(8.))
+        .pt(px(12.))
+        .border_t_1()
+        .border_color(color("border-100"))
+        .child(
+            div()
+                .id("running-usage-title")
+                .h(px(24.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color("text-secondary"))
+                .aria_label("Today's runs")
+                .child("Today's runs")
+                .test_support(),
+        )
+        .children(rows)
+        .when(none, |col| {
+            col.child(
+                div()
+                    .id("running-usage-none")
+                    .text_size(px(12.))
+                    .text_color(color("text-tertiary"))
+                    .aria_label(NO_RUNS_TODAY)
+                    .child(NO_RUNS_TODAY)
+                    .test_support(),
+            )
+        })
+        .child(
+            div()
+                .id("running-usage-note")
+                .pt(px(8.))
+                .text_size(px(12.))
+                .text_color(color("text-tertiary"))
+                .aria_label(PLAN_NOTE)
+                .child(PLAN_NOTE)
+                .test_support(),
+        )
+        .test_support()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{queued_line, stop_all_look, summary_line};
+    use super::{
+        local_midnight, max_runs_line, merge_history, paused_line, queued_line, stop_all_look,
+        summary_line, usage_line, usage_time,
+    };
+    use crate::ui::common::clock;
+    use crew_core::agent::Runtime;
+    use crew_core::event::RunStatus;
+    use crew_core::ids::{AgentId, RunId, ThreadId};
+    use crew_core::store::StoredRun;
+
+    #[test]
+    fn the_paused_line_counts_the_queue() {
+        assert_eq!(paused_line(0), "New runs are paused. Nothing queued.");
+        assert_eq!(paused_line(1), "New runs are paused. 1 queued.");
+        assert_eq!(paused_line(3), "New runs are paused. 3 queued.");
+    }
+
+    #[test]
+    fn the_cap_reads_in_agents() {
+        assert_eq!(max_runs_line(1), "Max 1 agent at once");
+        assert_eq!(max_runs_line(4), "Max 4 agents at once");
+    }
+
+    #[test]
+    fn todays_runs_read_as_count_and_time() {
+        assert_eq!(usage_time(38_000), "38s");
+        assert_eq!(usage_time(4 * 60_000 + 12_000), "4m");
+        assert_eq!(usage_time((60 + 52) * 60_000 + 5_000), "1h 52m");
+        assert_eq!(usage_line(1, 38_000), "1 run · 38s");
+        assert_eq!(usage_line(14, (60 + 52) * 60_000), "14 runs · 1h 52m");
+    }
+
+    #[test]
+    fn today_starts_at_local_midnight() {
+        let now = super::now_ms();
+        let midnight = local_midnight(now);
+        assert!(midnight <= now);
+        assert!(now - midnight < 25 * 60 * 60 * 1000);
+        assert_eq!(clock(midnight), "00:00");
+        assert_eq!(local_midnight(midnight), midnight);
+    }
+
+    #[test]
+    fn a_history_page_adds_only_runs_not_listed() {
+        let run = |ended_at| StoredRun {
+            id: RunId::new(),
+            thread: ThreadId::new(),
+            agent: AgentId::new(),
+            session_id: "s".into(),
+            status: RunStatus::Done,
+            started_at: 0,
+            ended_at: Some(ended_at),
+            runtime: Runtime::ClaudeCode,
+        };
+        let (a, b, c) = (run(30), run(20), run(20));
+        let mut known = vec![a.clone(), b.clone()];
+        // The next page starts at 20, so it repeats b.
+        assert_eq!(merge_history(&mut known, vec![b.clone(), c.clone()]), 1);
+        let ids: Vec<_> = known.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![a.id, b.id, c.id]);
+        assert_eq!(merge_history(&mut known, vec![c]), 0);
+    }
 
     #[test]
     fn stop_all_is_red_only_while_it_can_stop_something() {

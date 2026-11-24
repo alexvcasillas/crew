@@ -10,7 +10,8 @@ use crew_proto::Request;
 use gpui_kit::{AnyWindowHandle, Entity, TestAppContext};
 
 use super::inspector_tests::{answer_of, ask_permission};
-use super::test_ui::{click, has, label_of, open, press, wait_until};
+use super::settings::Page;
+use super::test_ui::{click, has, label_of, open, press, shows, wait_to_show, wait_until};
 use super::thread_tests::{World, open_thread, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, fixture, recording_proxy, short_home};
@@ -308,8 +309,10 @@ fn queued_run_shows_in_queued_group(cx: &mut TestAppContext) {
         "FINISHED IN THE LAST HOUR · 1",
     );
 
-    // The status bar's Stop all ends the rest.
-    click(cx, window, "status-stop-all");
+    // The title bar's Stop all ends the rest. Running now's status bar
+    // explains Stop instead of offering it.
+    assert!(!has(cx, window, "status-stop-all"));
+    click(cx, window, "running-stop-all");
     run_in(cx, &ws, w.thread, forge, RunStatus::Stopped);
     wait_gone(cx, window, "running-group-working".into());
     wait_label(
@@ -382,14 +385,16 @@ fn needs_you_row_approves_inline(cx: &mut TestAppContext) {
     wait_label(cx, window, "running-group-working".into(), "WORKING · 1");
     assert!(has(cx, window, format!("running-run-{run}")));
     wait_label(cx, window, "title-running".into(), "1 running · 0 need you");
+    assert_eq!(
+        label_of(cx, window, "running-nav-all").as_deref(),
+        Some("Running now 1")
+    );
+    // Back on the threads, the status bar says who works again.
+    press(cx, window, "escape");
     assert!(!has(cx, window, "status-needs"));
     assert_eq!(
         label_of(cx, window, "status-working").as_deref(),
         Some("Forge working")
-    );
-    assert_eq!(
-        label_of(cx, window, "running-nav-all").as_deref(),
-        Some("Running now 1")
     );
 }
 
@@ -448,4 +453,240 @@ fn status_bar_names_a_claude_that_wont_say_its_version(cx: &mut TestAppContext) 
         "status-runtimes".into(),
         "Claude Code installed",
     );
+}
+
+/// A claude that reads a file and is done.
+fn quick_claude(dir: &Path) -> PathBuf {
+    fake_claude(
+        dir,
+        &format!("cat '{}'", fixture("read_file.jsonl").display()),
+    )
+}
+
+#[gpui_kit::test]
+fn pausing_new_runs_holds_new_runs_in_the_queue(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the connection", |cx| {
+        ws.read_with(cx, |ws, _| ws.connected())
+    });
+
+    press(cx, window, "cmd-2");
+    wait_label(cx, window, "running-pause".into(), "Pause new runs");
+    assert!(!has(cx, window, "running-paused"));
+    // The status bar explains Stop and links to the limits.
+    assert_eq!(
+        label_of(cx, window, "status-running-hint").as_deref(),
+        Some("Stop ends the agent process and keeps every file change for review.")
+    );
+    assert_eq!(
+        label_of(cx, window, "status-max-runs").as_deref(),
+        Some("Max 4 agents at once · change")
+    );
+
+    click(cx, window, "running-pause");
+    wait_label(cx, window, "running-pause".into(), "Resume new runs");
+    wait_label(
+        cx,
+        window,
+        "running-paused".into(),
+        "New runs are paused. Nothing queued.",
+    );
+    w.post("@Forge fix the tests");
+    let queued = run_in(cx, &ws, w.thread, forge, RunStatus::Queued);
+    wait_label(
+        cx,
+        window,
+        "running-paused".into(),
+        "New runs are paused. 1 queued.",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    ws.read_with(cx, |ws, _| {
+        assert_eq!(ws.state().run(queued).unwrap().status, RunStatus::Queued);
+    });
+
+    // Resuming starts it.
+    click(cx, window, "running-pause");
+    wait_label(cx, window, "running-pause".into(), "Pause new runs");
+    run_in(cx, &ws, w.thread, forge, RunStatus::Working);
+    wait_gone(cx, window, "running-paused".into());
+
+    // "change" opens Settings on the limits, where pausing flips the
+    // Running now button too.
+    click(cx, window, "status-limits-change");
+    ws.read_with(cx, |ws, _| {
+        assert_eq!(ws.settings.as_ref().map(|s| s.page), Some(Page::Limits));
+    });
+    click(cx, window, "limits-runs-paused");
+    press(cx, window, "cmd-2");
+    wait_label(cx, window, "running-pause".into(), "Resume new runs");
+}
+
+#[gpui_kit::test]
+fn todays_runs_and_history_show_a_finished_run(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), quick_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the connection", |cx| {
+        ws.read_with(cx, |ws, _| ws.connected())
+    });
+
+    press(cx, window, "cmd-2");
+    wait_to_show(cx, window, "Today's runs");
+    wait_label(
+        cx,
+        window,
+        "running-usage-none".into(),
+        "No runs yet today.",
+    );
+    assert!(shows(
+        cx,
+        window,
+        "Plan limits stay with each provider. Crew only counts runs."
+    ));
+
+    // History starts empty, and a run that ends while it is open shows
+    // there and in today's runs without asking again.
+    click(cx, window, "running-nav-history");
+    wait_to_show(cx, window, "No ended runs yet.");
+    w.post("@Forge read the file");
+    let run = run_in(cx, &ws, w.thread, forge, RunStatus::Done);
+    wait_until(cx, "the history row", |cx| {
+        has(cx, window, format!("history-run-{run}"))
+    });
+    wait_until(cx, "today's Claude Code runs", |cx| {
+        label_of(cx, window, "running-usage-claude-count")
+            .is_some_and(|l| l.starts_with("1 run · "))
+    });
+    assert_eq!(
+        label_of(cx, window, "running-usage-claude").as_deref(),
+        Some("Claude Code")
+    );
+    assert!(!has(cx, window, "running-usage-none"));
+    assert!(!has(cx, window, "running-usage-codex"), "no Codex runs");
+
+    // Clicking History again keeps the rows while it asks.
+    click(cx, window, "running-nav-history");
+    assert!(has(cx, window, format!("history-run-{run}")));
+    assert!(!has(cx, window, "history-empty"));
+    // Its row names the run, and opening it opens its thread.
+    assert_eq!(
+        label_of(cx, window, format!("history-run-{run}")).as_deref(),
+        Some("Forge · demo · #general · fix the login")
+    );
+    let state = label_of(cx, window, format!("history-state-{run}")).unwrap_or_default();
+    assert!(state.starts_with("Done · "), "{state}");
+    assert!(!has(cx, window, "history-older"), "one page only");
+    assert!(
+        !has(cx, window, format!("history-open-{run}")),
+        "the row opens it"
+    );
+    assert!(
+        !has(cx, window, format!("history-resume-{run}")),
+        "it is done"
+    );
+    click(cx, window, format!("history-run-{run}"));
+    assert!(!has(cx, window, "running"));
+    ws.read_with(cx, |ws, _| assert_eq!(ws.open_thread_id(), Some(w.thread)));
+}
+
+#[gpui_kit::test]
+fn resume_asks_a_stopped_agent_to_continue(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open(cx, home.path());
+
+    w.post("@Forge fix the tests");
+    let run = run_in(cx, &ws, w.thread, forge, RunStatus::Working);
+    let _: serde_json::Value = w.ask(Request::StopRun { run });
+    run_in(cx, &ws, w.thread, forge, RunStatus::Stopped);
+
+    press(cx, window, "cmd-2");
+    // History offers it too.
+    click(cx, window, "running-nav-history");
+    wait_until(cx, "the history resume", |cx| {
+        has(cx, window, format!("history-resume-{run}"))
+    });
+    click(cx, window, "running-nav-all");
+    wait_until(cx, "the finished row", |cx| {
+        has(cx, window, format!("running-resume-{run}"))
+    });
+    click(cx, window, format!("running-resume-{run}"));
+    assert!(!has(cx, window, "running"));
+    ws.read_with(cx, |ws, _| assert_eq!(ws.open_thread_id(), Some(w.thread)));
+    wait_until(cx, "the resume message", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(w.thread)
+                .iter()
+                .any(|m| m.body == "@Forge continue where you stopped.")
+        })
+    });
+    // It starts Forge again.
+    let mut again = None;
+    wait_until(cx, "a new run", |cx| {
+        again = ws.read_with(cx, |ws, _| {
+            ws.state()
+                .thread_runs(w.thread)
+                .iter()
+                .find(|r| r.id != run && r.agent == forge && r.status == RunStatus::Working)
+                .map(|r| r.id)
+        });
+        again.is_some()
+    });
+    let again = again.unwrap();
+
+    // History's Resume posts once and opens the thread, its row's click
+    // adding nothing.
+    let _: serde_json::Value = w.ask(Request::StopRun { run: again });
+    run_in(cx, &ws, w.thread, forge, RunStatus::Stopped);
+    wait_until(cx, "both stopped", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().run(again).unwrap().status == RunStatus::Stopped
+        })
+    });
+    press(cx, window, "cmd-2");
+    click(cx, window, "running-nav-history");
+    wait_until(cx, "the history resume", |cx| {
+        has(cx, window, format!("history-resume-{again}"))
+    });
+    click(cx, window, format!("history-resume-{again}"));
+    assert!(!has(cx, window, "running"));
+    ws.read_with(cx, |ws, _| assert_eq!(ws.open_thread_id(), Some(w.thread)));
+    let resumes = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(w.thread)
+                .iter()
+                .filter(|m| m.body == "@Forge continue where you stopped.")
+                .count()
+        })
+    };
+    wait_until(cx, "the second resume", |cx| resumes(cx) == 2);
+    let _: serde_json::Value = w.ask(Request::StopAll);
+    assert_eq!(resumes(cx), 2, "posted once");
+
+    // A History that can't load says why.
+    drop(daemon);
+    wait_until(cx, "the lost connection", |cx| {
+        ws.read_with(cx, |ws, _| !ws.connected())
+    });
+    press(cx, window, "cmd-2");
+    click(cx, window, "running-nav-history");
+    wait_until(cx, "the history error", |cx| {
+        label_of(cx, window, "history-error")
+            .is_some_and(|l| l.starts_with("Couldn't load history. "))
+    });
+    assert!(!has(cx, window, "history-empty"));
 }
