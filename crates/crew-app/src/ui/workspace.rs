@@ -16,6 +16,7 @@ use gpui_kit::component::select::SelectState;
 use gpui_kit::*;
 
 use super::approval_card::BriefEditor;
+use super::channel_view::ChannelView;
 use super::common::runtime_chip;
 use super::composer::{Composer, ComposerEvent};
 use super::diff_view::{Review, SavedMessage};
@@ -182,6 +183,8 @@ pub struct Workspace {
     /// The Editor row of General.
     pub(super) editor_select: Entity<EditorSelect>,
     _editor_events: Subscription,
+    /// The selected channel's cards and toolbar.
+    pub(super) channel_view: ChannelView,
 }
 
 /// The Editor select of General.
@@ -210,6 +213,7 @@ impl Workspace {
             SelectState::new(labels, ix, window, cx)
         });
         let editor_events = cx.subscribe_in(&editor_select, window, Self::editor_picked);
+        let channel_view = ChannelView::new(window, cx);
         let hooks = dev_hooks();
         let bundled_crewd = std::env::current_exe()
             .ok()
@@ -286,6 +290,7 @@ impl Workspace {
             opener: crate::editor::system_opener(),
             editor_select,
             _editor_events: editor_events,
+            channel_view,
         }
     }
 
@@ -404,7 +409,11 @@ impl Workspace {
         let mut snapshot = false;
         let mut terminal_gone = false;
         let mut run_ended = false;
+        let mut touched = Vec::new();
         for event in events {
+            if let ClientEvent::Msg(msg) = &event {
+                touched.extend(touched_thread(msg));
+            }
             // Only crewd saying so closes the open session: a snapshot
             // just after crewd starts may not list it yet.
             if let ClientEvent::Msg(crew_proto::ServerMsg::TerminalSessionRemoved { id }) = &event
@@ -450,6 +459,7 @@ impl Workspace {
             self.refresh_usage(cx);
             self.refresh_history(cx);
         }
+        self.channel_touched(&touched, snapshot);
         self.sync_settings(window, cx);
         self.sync(cx);
         self.sync_inspector(window, cx);
@@ -528,7 +538,7 @@ impl Workspace {
                 .running()
                 .iter()
                 .any(|r| r.status == RunStatus::Working);
-        if working.is_empty() && !running_ticks {
+        if working.is_empty() && !running_ticks && !self.channel_ticks() {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -540,6 +550,8 @@ impl Workspace {
                 }
             }));
         }
+
+        self.sync_channel(cx);
 
         let messages = self.nav.thread.map_or(0, |t| self.state.messages(t).len());
         if messages != self.nav.seen_messages {
@@ -577,6 +589,7 @@ impl Workspace {
         self.close_thread(cx);
         self.nav.drafting = false;
         self.look_at(Some(channel));
+        self.reset_channel_view(channel, window, cx);
         self.composer.update(cx, |composer, cx| {
             composer.set_first_message(false, window, cx)
         });
@@ -597,6 +610,7 @@ impl Workspace {
             self.close_thread(cx);
             self.watch_thread(thread);
             self.nav.thread = Some(thread);
+            self.channel_view.selected = Some(thread);
             self.nav.seen_messages = 0;
             self.nav.stick_to_bottom = true;
             self.sync_inspector(window, cx);
@@ -942,6 +956,20 @@ impl Workspace {
     }
 }
 
+/// The thread a message from crewd is about, if any.
+fn touched_thread(msg: &crew_proto::ServerMsg) -> Option<ThreadId> {
+    use crew_proto::ServerMsg;
+    match msg {
+        ServerMsg::Message { thread, .. }
+        | ServerMsg::RunStatus { thread, .. }
+        | ServerMsg::Approval { thread, .. } => Some(*thread),
+        ServerMsg::ThreadCreated { thread, .. } | ServerMsg::ThreadChanged { thread } => {
+            Some(thread.id)
+        }
+        _ => None,
+    }
+}
+
 /// A thread's title from its first message: the first line, at most
 /// [`TITLE_MAX`] characters.
 pub fn thread_title(text: &str) -> String {
@@ -1014,6 +1042,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let wide = window.viewport_size().width >= px(INSPECTOR_MIN_WINDOW);
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
+        self.refresh_channel_rows(cx);
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -1133,7 +1162,7 @@ impl Workspace {
                         self.render_new_thread(channel).into_any_element()
                     }
                     (_, Some(channel)) if self.state.channel(channel).is_some() => {
-                        self.render_thread_list(channel, cx).into_any_element()
+                        self.render_channel_view(channel, cx)
                     }
                     _ => render_nothing_selected().into_any_element(),
                 }

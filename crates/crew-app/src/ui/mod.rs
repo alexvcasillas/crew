@@ -2,6 +2,7 @@
 
 mod activity;
 mod approval_card;
+mod channel_view;
 mod common;
 pub mod composer;
 mod connect;
@@ -20,7 +21,6 @@ mod sidebar;
 mod status_bar;
 mod terminal_tab;
 mod terminal_view;
-mod thread_list;
 mod thread_settings;
 mod thread_view;
 mod title_bar;
@@ -28,6 +28,8 @@ pub mod workspace;
 
 #[cfg(test)]
 mod auto_tests;
+#[cfg(test)]
+mod channel_tests;
 #[cfg(test)]
 mod codex_tests;
 #[cfg(test)]
