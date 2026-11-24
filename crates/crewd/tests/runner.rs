@@ -324,3 +324,66 @@ async fn crash_with_held_stderr_keeps_tail() {
     }
     wait_for_pid_file(&pid_file).await;
 }
+
+#[tokio::test]
+async fn turn_end_with_lingering_process_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("background.pid");
+    let _leaked = Leaked(pid_file.clone());
+    let inv = invocation(
+        fake("claude_turn_then_lingers.sh"),
+        vec![
+            fixture("read_file.jsonl").to_string_lossy().into_owned(),
+            pid_file.to_string_lossy().into_owned(),
+        ],
+    );
+    let started = Instant::now();
+    let (_handle, mut rx, join) = spawn_run(inv);
+    let mut summary = None;
+    while let Some(ev) = rx.recv().await {
+        if let Event::TurnEnd {
+            ok: true,
+            summary: s,
+            ..
+        } = ev
+        {
+            summary = Some(s);
+        }
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("outcome within 10 s")
+        .unwrap();
+    assert_eq!(outcome, RunOutcome::Done);
+    assert_eq!(summary.as_deref(), Some("hello"));
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // The background child went with its group. Init reaps it soon after.
+    wait_for_pid_file(&pid_file).await;
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid = Pid::from_raw(pid);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while kill(pid, None) != Err(Errno::ESRCH) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(kill(pid, None), Err(Errno::ESRCH), "background child lives");
+}
+
+#[tokio::test]
+async fn turn_end_then_exit_is_done_without_waiting() {
+    let inv = invocation(
+        fake("claude_ok.sh"),
+        vec![fixture("read_file.jsonl").to_string_lossy().into_owned()],
+    );
+    let started = Instant::now();
+    let (_handle, _rx, join) = spawn_run(inv);
+    assert_eq!(join.await.unwrap(), RunOutcome::Done);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a process that exits by itself is not waited on"
+    );
+}
