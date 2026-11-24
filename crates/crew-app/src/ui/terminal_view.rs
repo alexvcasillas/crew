@@ -93,6 +93,7 @@ pub fn terminal_rows<'a>(
                     verb: verb(kind, name, true),
                     target: clean_line(&shorten(target.as_deref().unwrap_or_default())),
                     lines: None,
+                    reason: None,
                 };
                 start_turn(&mut rows);
                 let last = rows.len() - 1;

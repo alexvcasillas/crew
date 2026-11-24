@@ -1,6 +1,8 @@
 //! Settings › Agents: the list and the form that makes or changes one.
 
-use crew_core::agent::{AgentSpec, DEFAULT_MAX_RUN_MINUTES, PermissionMode, Runtime};
+use crew_core::agent::{
+    AgentSpec, DEFAULT_MAX_RUN_MINUTES, PermissionMode, Runtime, auto_supported,
+};
 use crew_core::ids::AgentId;
 use crew_core::policy::HandoffPolicy;
 use crew_proto::{ModelInfo, Request, RuntimeInfo};
@@ -39,11 +41,16 @@ pub const COMING_RUNTIMES: [(&str, &str); 3] = [
     ("cursor", "Cursor"),
     ("acp", "Other ACP"),
 ];
-const PERMISSIONS: [(PermissionMode, &str, &str); 2] = [
+const PERMISSIONS: [(PermissionMode, &str, &str); 3] = [
     (
         PermissionMode::EditFiles,
         "permission-edit",
         "Edit files, ask before commands",
+    ),
+    (
+        PermissionMode::Auto,
+        "permission-auto",
+        "Auto: edit files, ask only before risky commands",
     ),
     (
         PermissionMode::ReadOnly,
@@ -97,6 +104,14 @@ pub struct AgentForm {
     _edits: Vec<Subscription>,
 }
 
+/// Said when a Claude model can't use Auto.
+pub const AUTO_NEEDS: &str = "Auto needs Opus 4.6, Sonnet 4.6, Haiku 5.5 or newer.";
+
+/// Whether an agent of `runtime` on `model` may use Auto. Codex always can.
+pub fn auto_allowed(runtime: &Runtime, model: &str) -> bool {
+    *runtime == Runtime::Codex || auto_supported(model)
+}
+
 /// What a new agent starts as.
 pub fn blank_spec() -> AgentSpec {
     AgentSpec {
@@ -148,11 +163,15 @@ pub fn build_spec(d: &Draft<'_>, taken: &[&str]) -> Result<AgentSpec, String> {
         .filter(|n| *n >= 1)
         .ok_or_else(|| "Longest run must be a whole number of minutes, 1 or more.".to_string())?;
     let other = d.other_model.trim();
+    let model = if other.is_empty() { d.model } else { other };
+    if d.permission == PermissionMode::Auto && !auto_allowed(&d.runtime, model) {
+        return Err(AUTO_NEEDS.into());
+    }
     Ok(AgentSpec {
         name: name.to_string(),
         role: d.role.trim().to_string(),
         runtime: d.runtime.clone(),
-        model: if other.is_empty() { d.model } else { other }.to_string(),
+        model: model.to_string(),
         instructions: d.instructions.trim().to_string(),
         permission_mode: d.permission.clone(),
         // Only `claude` takes a list of tools to allow.
@@ -823,6 +842,13 @@ impl Workspace {
             .iter()
             .find(|(m, ..)| *m == form.permission)
             .map_or("", |(_, _, l)| l);
+        let model = form.other_model.read(cx).value().trim().to_string();
+        let model = if model.is_empty() {
+            form.model.clone()
+        } else {
+            model
+        };
+        let auto_ok = auto_allowed(&form.runtime, &model);
         let this = cx.entity().downgrade();
         let permission = Button::new("agent-permission")
             .outline()
@@ -832,11 +858,14 @@ impl Workspace {
             .dropdown_menu(move |menu, _, _| {
                 PERMISSIONS.iter().fold(menu, |menu, (mode, _, label)| {
                     let this = this.clone();
+                    let disabled = *mode == PermissionMode::Auto && !auto_ok;
                     let mode = mode.clone();
-                    menu.item(PopupMenuItem::new(*label).on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| this.set_permission(mode.clone(), cx))
-                            .ok();
-                    }))
+                    menu.item(PopupMenuItem::new(*label).disabled(disabled).on_click(
+                        move |_, _, cx| {
+                            this.update(cx, |this, cx| this.set_permission(mode.clone(), cx))
+                                .ok();
+                        },
+                    ))
                 })
             });
         let policies: Vec<AnyElement> = AGENT_POLICIES
@@ -970,7 +999,20 @@ impl Workspace {
                     .child(field(
                         "What it can do",
                         Some("Edits stay in the thread's own worktree."),
-                        div().flex().child(permission),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(div().flex().child(permission))
+                            .when(!auto_ok, |col| {
+                                col.child(
+                                    div()
+                                        .id("agent-auto-needs")
+                                        .aria_label(AUTO_NEEDS)
+                                        .child(help(AUTO_NEEDS))
+                                        .test_support(),
+                                )
+                            }),
                     ))
                     // Codex has no such list; it asks through its sandbox.
                     .when(form.runtime == Runtime::ClaudeCode, |col| {
@@ -1280,7 +1322,7 @@ fn runtime_card(id: impl Into<SharedString>, selected: bool, enabled: bool) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeCheck, Draft, build_spec, check_name, claude_check, default_codex_model,
+        AUTO_NEEDS, ClaudeCheck, Draft, build_spec, check_name, claude_check, default_codex_model,
         runtime_usable, split_tools,
     };
     use crew_core::agent::{PermissionMode, Runtime};
@@ -1300,6 +1342,34 @@ mod tests {
             budget: "",
             max_minutes: "20",
         }
+    }
+
+    #[test]
+    fn auto_needs_a_recent_claude_model_but_not_for_codex() {
+        let auto = |runtime: Runtime, model: &'static str, other: &'static str| {
+            build_spec(
+                &Draft {
+                    runtime,
+                    model,
+                    other_model: other,
+                    permission: PermissionMode::Auto,
+                    ..draft("Forge")
+                },
+                &[],
+            )
+        };
+        assert_eq!(
+            auto(Runtime::ClaudeCode, "sonnet", "")
+                .unwrap()
+                .permission_mode,
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            auto(Runtime::ClaudeCode, "sonnet", "claude-sonnet-4-5"),
+            Err(AUTO_NEEDS.to_string())
+        );
+        assert!(auto(Runtime::ClaudeCode, "sonnet", "claude-opus-4-6").is_ok());
+        assert!(auto(Runtime::Codex, "gpt-old-1", "").is_ok());
     }
 
     #[test]

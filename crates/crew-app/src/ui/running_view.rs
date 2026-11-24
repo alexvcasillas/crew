@@ -106,6 +106,8 @@ enum RowKind {
         id: ApprovalId,
         handoff: bool,
         paused: bool,
+        /// A call the safety check stopped, to retry or dismiss.
+        blocked: bool,
     },
     Working(RunId),
     Queued(RunId),
@@ -501,6 +503,7 @@ impl Workspace {
 
     fn ask_row(&self, approval: &StoredApproval) -> Row {
         let run = self.state().run(approval.run);
+        let blocked = matches!(approval.kind, ApprovalKind::Blocked { .. });
         let (handoff, paused, now, mono) = match &approval.kind {
             ApprovalKind::Handoff { to, paused, .. } => {
                 let to = self
@@ -523,11 +526,19 @@ impl Workspace {
                 id: approval.id,
                 handoff,
                 paused,
+                blocked,
             },
         );
         row.now = now;
         row.now_mono = mono;
-        row.state = if handoff { "Handoff" } else { "Permission" }.into();
+        row.state = if handoff {
+            "Handoff"
+        } else if blocked {
+            "Blocked"
+        } else {
+            "Permission"
+        }
+        .into();
         row.state_token = "warning";
         row.deciding = self.deciding.contains(&approval.id);
         row
@@ -930,11 +941,14 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
             id,
             handoff,
             paused,
+            blocked,
         } => {
             let mut buttons = Vec::new();
             if !paused {
                 let (yes, no) = if handoff {
                     ("Approve", "Decline")
+                } else if blocked {
+                    ("Allow and retry", "Dismiss")
                 } else {
                     ("Allow once", "Deny")
                 };
