@@ -11,7 +11,7 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{elapsed, now_ms};
+use super::common::{elapsed, now_ms, rolling_text, spinner};
 use super::inspector::NOTHING_TO_REVIEW;
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -43,7 +43,11 @@ pub struct Step {
 impl Step {
     /// What the step reads as, such as `Edited src/lib.rs`.
     pub fn text(&self) -> String {
-        format!("{} {}", self.verb, self.target)
+        if self.target.trim().is_empty() {
+            self.verb.clone()
+        } else {
+            format!("{} {}", self.verb, self.target)
+        }
     }
 }
 
@@ -209,10 +213,11 @@ impl Workspace {
     ) -> impl IntoElement + use<> {
         let id = run.id;
         let queued = matches!(run.status, crew_core::event::RunStatus::Queued);
+        let ms = now_ms() - run.started_at;
         let (word, token, time) = if queued {
             ("Queued", "text-tertiary", String::new())
         } else {
-            ("Working", "accent-blue", elapsed(now_ms() - run.started_at))
+            ("Working", "accent-blue", elapsed(ms))
         };
         let mut header = div()
             .flex()
@@ -222,11 +227,11 @@ impl Workspace {
             .px(px(12.))
             .text_size(px(12.))
             .when(!queued, |header| {
-                header.child(
-                    Icon::new(IconName::LoaderCircle)
-                        .size(px(14.))
-                        .text_color(color(token)),
-                )
+                header.child(spinner(
+                    SharedString::from(format!("run-spinner-{id}")),
+                    14.,
+                    token,
+                ))
             })
             .child(
                 div()
@@ -238,13 +243,13 @@ impl Workspace {
                     .test_support(),
             );
         if !time.is_empty() {
+            // It ticks once a second, so the last value is a second ago.
+            let prev = elapsed(ms - 1000);
             header = header.child(
-                div()
-                    .id(format!("run-elapsed-{id}"))
+                rolling_text(format!("run-elapsed-{id}"), &prev, &time)
                     .font_family(mono_font())
                     .text_color(color("text-secondary"))
                     .aria_label(time.clone())
-                    .child(time)
                     .test_support(),
             );
         }
@@ -404,10 +409,18 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
 }
 
 pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
-    let (icon, token) = match step.state {
-        StepState::Done => (IconName::Check, "success"),
-        StepState::Running => (IconName::LoaderCircle, "accent-blue"),
-        StepState::Failed => (IconName::CircleX, "danger"),
+    let icon = match step.state {
+        StepState::Done => Icon::new(IconName::Check)
+            .size(px(12.))
+            .text_color(color("success"))
+            .into_any_element(),
+        StepState::Running => {
+            spinner(("run-step-spinner", ix), 12., "accent-blue").into_any_element()
+        }
+        StepState::Failed => Icon::new(IconName::CircleX)
+            .size(px(12.))
+            .text_color(color("danger"))
+            .into_any_element(),
     };
     let text = step.text();
     div()
@@ -419,19 +432,21 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
         .text_size(px(12.))
         .text_color(color("text-secondary"))
         .aria_label(text)
-        .child(Icon::new(icon).size(px(12.)).text_color(color(token)))
+        .child(icon)
         .child(step.verb.clone())
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .px(px(4.))
-                .rounded(px(4.))
-                .bg(color("surface-300"))
-                .font_family(mono_font())
-                .text_color(color("text-primary"))
-                .child(step.target.clone()),
-        )
+        .when(!step.target.trim().is_empty(), |row| {
+            row.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .px(px(4.))
+                    .rounded(px(4.))
+                    .bg(color("surface-300"))
+                    .font_family(mono_font())
+                    .text_color(color("text-primary"))
+                    .child(step.target.clone()),
+            )
+        })
         .when_some(step.lines, |row, (added, removed)| {
             row.child(plus_minus(added, removed))
         })
@@ -578,6 +593,25 @@ mod tests {
         assert_eq!(summary.steps.len(), STEPS_SHOWN);
         assert_eq!(summary.steps[0].text(), "Running step 4");
         assert_eq!(summary.counts(), None);
+    }
+
+    #[test]
+    fn a_step_without_a_target_is_just_its_name() {
+        let run = RunId::new();
+        let events = vec![
+            LoggedEvent::new(
+                run,
+                1,
+                Event::Raw {
+                    line: r#"{"type":"system","subtype":"background_tasks_changed"}"#.into(),
+                },
+            ),
+            call(run, 2, "t1", "ToolSearch", serde_json::json!({})),
+        ];
+        let summary = summarize(&events, run);
+        assert_eq!(summary.steps.len(), 1, "system lines aren't steps");
+        assert_eq!(summary.steps[0].target, "");
+        assert_eq!(summary.steps[0].text(), "ToolSearch");
     }
 
     #[test]

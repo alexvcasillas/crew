@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
 use crew_core::ids::{ApprovalId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalKind, StoredApproval, StoredRun};
@@ -14,7 +15,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::approval_card::input_text;
-use super::common::{chip, cut_start, dot, elapsed, monogram, now_ms, runtime_chip, status_word};
+use super::common::{
+    chip, cut_start, dot, elapsed, monogram, now_ms, rolling_text, runtime_badge_for, runtime_chip,
+    spinner, status_word,
+};
 use super::inspector::run_state;
 use super::run_card::summarize;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
@@ -120,7 +124,11 @@ struct Row {
     now: String,
     now_mono: bool,
     chip: String,
+    /// The runtime behind `chip`, for its provider mark.
+    runtime: Option<Runtime>,
     state: String,
+    /// A working run's time a second ago, so the new one rolls in.
+    rolling_from: Option<String>,
     state_token: &'static str,
     state_mono: bool,
     /// Your answer to the row's approval was sent.
@@ -482,7 +490,9 @@ impl Workspace {
             now: String::new(),
             now_mono: false,
             chip: agent.map_or_else(String::new, |a| runtime_chip(&a.spec)),
+            runtime: agent.map(|a| a.spec.runtime.clone()),
             state: String::new(),
+            rolling_from: None,
             state_token: "text-secondary",
             state_mono: false,
             deciding: false,
@@ -536,6 +546,7 @@ impl Workspace {
         match kind {
             RowKind::Working(_) => {
                 row.state = elapsed(now - run.started_at);
+                row.rolling_from = Some(elapsed(now - run.started_at - 1000));
                 row.state_token = "accent-blue";
                 row.state_mono = true;
                 row.now = step.unwrap_or_else(|| "Working".into());
@@ -740,23 +751,42 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
         )
         .child(
             div().flex_none().w(px(RUNTIME_COL)).child(
-                chip(row.chip.clone())
-                    .id(SharedString::from(format!("{prefix}-chip-{id}")))
-                    .aria_label(row.chip)
-                    .test_support(),
+                match &row.runtime {
+                    Some(runtime) => runtime_badge_for(runtime, row.chip.clone()),
+                    None => chip(row.chip.clone()),
+                }
+                .id(SharedString::from(format!("{prefix}-chip-{id}")))
+                .aria_label(row.chip)
+                .test_support(),
             ),
         )
         .child(
             div()
                 .id(SharedString::from(state_id))
+                .flex()
                 .flex_none()
+                .items_center()
+                .gap(px(6.))
                 .w(px(STATUS_COL))
-                .truncate()
+                .overflow_hidden()
                 .text_size(px(12.))
                 .text_color(color(row.state_token))
                 .when(row.state_mono, |el| el.font_family(mono_font()))
                 .aria_label(row.state.clone())
-                .child(row.state)
+                .map(|el| match row.rolling_from {
+                    Some(from) => el
+                        .child(spinner(
+                            SharedString::from(format!("running-spinner-{id}")),
+                            12.,
+                            row.state_token,
+                        ))
+                        .child(rolling_text(
+                            SharedString::from(format!("running-elapsed-{id}")),
+                            &from,
+                            &row.state,
+                        )),
+                    None => el.child(div().min_w_0().truncate().child(row.state)),
+                })
                 .test_support(),
         )
         .child(
