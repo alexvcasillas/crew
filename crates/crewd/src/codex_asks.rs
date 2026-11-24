@@ -121,7 +121,8 @@ pub(crate) fn map_request(
             ask(ReplyKind::Approval, "Edit", input, Some(p.item_id))
         }
         ServerRequest::PermissionsApproval(p) => {
-            let granted = clamp(&p.permissions, cwd);
+            let cwd = real_cwd(cwd);
+            let granted = clamp(&p.permissions, &cwd);
             if granted.as_object().is_none_or(|g| g.is_empty()) {
                 return Mapped::Declined {
                     reply: ReplyKind::Permissions(granted).reply(Answer::No),
@@ -129,10 +130,7 @@ pub(crate) fn map_request(
                 };
             }
             // What is really asked, never the model's reason alone.
-            let mut label = describe(&p.permissions, cwd);
-            if let Some(reason) = p.reason.filter(|r| !r.trim().is_empty()) {
-                label = format!("{label} · {}", reason.trim());
-            }
+            let label = describe(&p.permissions, p.reason.as_deref(), &cwd);
             let input = json!({
                 "label": label,
                 "cwd": p.cwd.unwrap_or_default(),
@@ -191,9 +189,19 @@ fn elicited_tool(p: &ElicitationParams) -> String {
 const OUTSIDE_WORKTREE: &str = "Declined access outside the worktree.";
 /// Paths shown in an access ask before "+N more".
 const SHOWN_PATHS: usize = 3;
+/// Longest path shown in an access ask; longer ones are cut in the middle.
+const SHOWN_PATH_CHARS: usize = 40;
+/// Longest reason shown in an access ask, which always comes last.
+const SHOWN_REASON_CHARS: usize = 80;
 
-/// `path` against `cwd` if relative, with `.` and `..` worked out.
-fn absolute(path: &str, cwd: &Path) -> PathBuf {
+/// The real folder of a run: links resolved, if it exists.
+fn real_cwd(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical(cwd, ""))
+}
+
+/// `path` against `cwd` if relative, with `.` and `..` worked out on the
+/// text alone.
+fn lexical(cwd: &Path, path: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for part in cwd.join(path).components() {
         match part {
@@ -207,18 +215,55 @@ fn absolute(path: &str, cwd: &Path) -> PathBuf {
     out
 }
 
-fn inside(path: &str, cwd: &Path) -> bool {
-    absolute(path, cwd).starts_with(absolute("", cwd))
+/// Where `path` really is: the deepest part of it that exists with its
+/// links resolved, then the rest. `None` for a link that can't be
+/// resolved, such as one to a missing place, as it could point anywhere.
+fn resolve(path: &str, cwd: &Path) -> Option<PathBuf> {
+    let abs = lexical(cwd, path);
+    let existing = abs.ancestors().find(|a| a.symlink_metadata().is_ok())?;
+    let real = std::fs::canonicalize(existing).ok()?;
+    let rest = abs.strip_prefix(existing).ok()?;
+    Some(real.join(rest))
 }
 
-/// A path as shown: relative to `cwd` when inside it.
+/// `path` resolved, if that is inside `cwd`, a real folder.
+fn inside(path: &str, cwd: &Path) -> Option<PathBuf> {
+    resolve(path, cwd).filter(|real| real.starts_with(cwd))
+}
+
+/// Text from the agent, safe to show on one line: no control characters
+/// and no marks that flip the reading direction.
+fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect()
+}
+
+/// `text` cut to `max` characters, keeping its start and end.
+fn middle_cut(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let head: String = chars[..keep / 2].iter().collect();
+    let tail: String = chars[chars.len() - (keep - keep / 2)..].iter().collect();
+    format!("{head}...{tail}")
+}
+
+/// A path as shown: where it really is, relative to `cwd` when inside it,
+/// cleaned and cut to length.
 fn shown(path: &str, cwd: &Path) -> String {
-    let abs = absolute(path, cwd);
-    match abs.strip_prefix(absolute("", cwd)) {
+    let real = resolve(path, cwd).unwrap_or_else(|| lexical(cwd, path));
+    let text = match real.strip_prefix(cwd) {
         Ok(rel) if rel.as_os_str().is_empty() => ".".into(),
         Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => abs.to_string_lossy().into_owned(),
-    }
+        Err(_) => real.to_string_lossy().into_owned(),
+    };
+    middle_cut(&clean(&text), SHOWN_PATH_CHARS)
 }
 
 fn strings(v: &Value) -> Vec<&str> {
@@ -232,13 +277,16 @@ fn entry_shown(entry: &Value, cwd: &Path) -> String {
     let path = &entry["path"];
     match path["type"].as_str() {
         Some("path") => shown(path["path"].as_str().unwrap_or_default(), cwd),
-        Some("glob_pattern") => path["pattern"].as_str().unwrap_or_default().to_string(),
+        Some("glob_pattern") => middle_cut(
+            &clean(path["pattern"].as_str().unwrap_or_default()),
+            SHOWN_PATH_CHARS,
+        ),
         Some("special") => match path["value"]["kind"].as_str() {
             Some("root") => "/".into(),
-            Some(kind) => kind.to_string(),
+            Some(kind) => clean(kind),
             None => "?".into(),
         },
-        _ => path.to_string(),
+        _ => "?".into(),
     }
 }
 
@@ -246,8 +294,10 @@ fn network_asked(asked: &Value) -> bool {
     asked["network"]["enabled"] == json!(true)
 }
 
-/// What an access ask wants, such as `write gen, /, network`.
-fn describe(asked: &Value, cwd: &Path) -> String {
+/// What an access ask wants, such as `network, write gen, /`, then the
+/// agent's reason. Network and writes come first and paths are short, so
+/// nothing that matters is ever cut off.
+fn describe(asked: &Value, reason: Option<&str>, cwd: &Path) -> String {
     let fs = &asked["fileSystem"];
     let mut write: Vec<String> = strings(&fs["write"])
         .iter()
@@ -276,30 +326,41 @@ fn describe(asked: &Value, cwd: &Path) -> String {
         Some(text)
     };
     let parts: Vec<String> = [
+        network_asked(asked).then(|| "network".to_string()),
         list("write", write),
         list("read", read),
-        network_asked(asked).then(|| "network".to_string()),
     ]
     .into_iter()
     .flatten()
     .collect();
-    if parts.is_empty() {
+    let mut label = if parts.is_empty() {
         "more access".into()
     } else {
         parts.join(", ")
+    };
+    let reason = reason.map(clean).filter(|r| !r.trim().is_empty());
+    if let Some(reason) = reason {
+        let reason: String = reason.trim().chars().collect();
+        let cut: String = reason.chars().take(SHOWN_REASON_CHARS).collect();
+        let more = if cut.len() < reason.len() { "..." } else { "" };
+        label = format!("{label} · {cut}{more}");
     }
+    label
 }
 
-/// What may be granted of `asked`: file access only inside `cwd`, as
-/// absolute paths, and network only if asked for. Globs and special
-/// places can't be checked, so they are never granted. Empty if nothing.
+/// What may be granted of `asked`: write and read access only to paths
+/// that really are inside `cwd` (links resolved), as those resolved
+/// absolute paths, and network only if asked for. Reads are held to the
+/// same folder: the sandbox reads it already, and anything else would need
+/// its own ruling. Globs and special places can't be checked, so they are
+/// never granted. Empty if nothing remains.
 fn clamp(asked: &Value, cwd: &Path) -> Value {
     let fs = &asked["fileSystem"];
     let keep = |list: &Value| -> Vec<String> {
         strings(list)
             .into_iter()
-            .filter(|p| inside(p, cwd))
-            .map(|p| absolute(p, cwd).to_string_lossy().into_owned())
+            .filter_map(|p| inside(p, cwd))
+            .map(|p| p.to_string_lossy().into_owned())
             .collect()
     };
     let mut granted_fs = serde_json::Map::new();
@@ -314,11 +375,14 @@ fn clamp(asked: &Value, cwd: &Path) -> Value {
         .into_iter()
         .flatten()
         .filter(|e| matches!(e["access"].as_str(), Some("read" | "write")))
-        .filter(|e| {
-            e["path"]["type"] == "path"
-                && e["path"]["path"].as_str().is_some_and(|p| inside(p, cwd))
+        .filter(|e| e["path"]["type"] == "path")
+        .filter_map(|e| {
+            let real = inside(e["path"]["path"].as_str()?, cwd)?;
+            Some(json!({
+                "path": {"type": "path", "path": real.to_string_lossy()},
+                "access": e["access"],
+            }))
         })
-        .cloned()
         .collect();
     if !entries.is_empty() {
         granted_fs.insert("entries".into(), json!(entries));
@@ -460,7 +524,7 @@ mod tests {
         assert_eq!(a.tool, "Permissions");
         assert_eq!(
             a.input["label"],
-            "write gen, /, /work/etc, network · build output"
+            "network, write gen, /, /work/etc · build output"
         );
         assert_eq!(
             a.kind.reply(Answer::Yes),
@@ -529,6 +593,75 @@ mod tests {
             json!({"fileSystem": {"entries": [
                 {"path": {"type": "path", "path": "/work/demo/out"}, "access": "write"}
             ]}})
+        );
+        // Entries are granted as clean absolute paths, like the lists.
+        let a = asked(permissions(
+            json!({"fileSystem": {"entries": [
+                {"path": {"type": "path", "path": "sub/../out2"}, "access": "write"}
+            ]}}),
+            None,
+        ));
+        assert_eq!(
+            a.kind.reply(Answer::Yes)["permissions"]["fileSystem"]["entries"],
+            json!([{"path": {"type": "path", "path": "/work/demo/out2"}, "access": "write"}])
+        );
+    }
+
+    #[test]
+    fn labels_drop_control_characters_and_keep_network_first() {
+        let a = asked(permissions(
+            json!({"network": {"enabled": true}, "fileSystem": {"write": ["gen\n\u{202e}x"]}}),
+            Some("line one\nline two\t\u{2066}end"),
+        ));
+        assert_eq!(
+            a.input["label"],
+            "network, write genx · line oneline twoend"
+        );
+        // Each path is cut in the middle, the list never as a whole.
+        let long = format!("/work/demo/{}/end", "d".repeat(100));
+        let a = asked(permissions(
+            json!({"network": {"enabled": true}, "fileSystem": {"write": [long, long, long, long]}}),
+            Some(&"why ".repeat(50)),
+        ));
+        let label = a.input["label"].as_str().unwrap();
+        assert!(label.starts_with("network, write "), "{label}");
+        assert!(label.contains(" +1 more"), "{label}");
+        assert!(label.contains("..."), "{label}");
+        assert!(label.matches("/end").count() == 3, "{label}");
+        assert!(label.len() < 260, "{} {label}", label.len());
+    }
+
+    #[test]
+    fn links_out_of_the_worktree_are_not_granted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(cwd.join("gen")).unwrap();
+        std::os::unix::fs::symlink("/", cwd.join("escape")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/crew-test", cwd.join("dangling")).unwrap();
+        let ask = |write: Value| {
+            map_request(
+                "item/permissions/requestApproval",
+                &json!({"itemId": "i", "permissions": {"fileSystem": {"write": write}}}),
+                &HashMap::new(),
+                true,
+                &cwd,
+            )
+        };
+        for escaping in [
+            json!(["escape"]),
+            json!(["escape/etc"]),
+            json!(["dangling/x"]),
+        ] {
+            assert!(
+                matches!(ask(escaping.clone()), Mapped::Declined { .. }),
+                "{escaping}"
+            );
+        }
+        let a = asked(ask(json!(["gen/out", "escape/crew-none"])));
+        assert_eq!(a.input["label"], "write gen/out, /crew-none");
+        assert_eq!(
+            a.kind.reply(Answer::Yes)["permissions"]["fileSystem"]["write"],
+            json!([cwd.join("gen/out")])
         );
     }
 

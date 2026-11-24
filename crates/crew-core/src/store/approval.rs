@@ -92,12 +92,16 @@ pub fn short_input(input: &serde_json::Value) -> String {
 
 /// The thread note for a permission ask of `agent`.
 /// MCP tools, named `mcp__<server>__<tool>`, read as `server/tool`. A
-/// Codex `Permissions` ask reads as wanting more access.
+/// Codex `Permissions` ask reads as wanting more access, with its whole
+/// label: crewd builds it short and puts what is granted first, so cutting
+/// it could hide that.
 pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
-    let shown = short_input(input);
-    if tool == "Permissions" {
-        return format!("{agent} wants more access: {shown}");
+    if tool == "Permissions"
+        && let Some(label) = input.get("label").and_then(serde_json::Value::as_str)
+    {
+        return format!("{agent} wants more access: {label}");
     }
+    let shown = short_input(input);
     let (verb, what) = match tool.strip_prefix("mcp__") {
         Some(rest) => ("use", rest.replacen("__", "/", 1)),
         None => ("run", tool.to_string()),
@@ -312,6 +316,16 @@ mod tests {
                 &json!({"label": "write gen, network"})
             ),
             "Ada wants more access: write gen, network"
+        );
+        // An access ask shows its whole label, which crewd keeps short.
+        let label = format!("network, write {}", "x".repeat(120));
+        assert_eq!(
+            permission_text(
+                "Ada",
+                "Permissions",
+                &json!({"label": label, "command": "c"})
+            ),
+            format!("Ada wants more access: {label}")
         );
     }
 }
