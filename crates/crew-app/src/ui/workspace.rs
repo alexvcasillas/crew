@@ -203,6 +203,8 @@ pub(super) enum Place {
     Thread(ThreadId),
     Channel(ChannelId),
     Agent(AgentId),
+    /// Its first channel for now; the project overview later.
+    Project(ProjectId),
 }
 
 /// The Editor select of General.
@@ -737,8 +739,9 @@ impl Workspace {
     }
 
     /// Takes you to `place`, leaving settings, Running now or a review.
-    /// Every way to a thread, channel or agent from the palette goes
-    /// through here. An agent opens its settings for now.
+    /// Every way to a thread, channel, agent or project from the palette
+    /// goes through here. For now an agent opens its settings and a
+    /// project its first channel.
     pub(super) fn open_place(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_pages(cx);
         match place {
@@ -750,6 +753,15 @@ impl Workspace {
                 }
                 self.open_settings(Page::Agents, window, cx);
                 self.edit_agent(agent, window, cx);
+            }
+            Place::Project(project) => {
+                if self.recents.visited_project(project) {
+                    self.save_recents(cx);
+                }
+                let first = self.state.channels(project).first().map(|c| c.id);
+                if let Some(channel) = first {
+                    self.select_channel(channel, window, cx);
+                }
             }
         }
     }

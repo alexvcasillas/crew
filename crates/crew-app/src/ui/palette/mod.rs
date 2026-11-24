@@ -467,7 +467,7 @@ impl Palette {
                     .overflow_hidden()
                     .text_ellipsis()
                     .text_size(px(12.))
-                    .when(row.mono, |d| d.font_family(mono_font()))
+                    .when(row.mono || row.sub_mono, |d| d.font_family(mono_font()))
                     .text_color(color("text-tertiary"))
                     .child(row.sub.clone()),
             )
@@ -756,6 +756,7 @@ impl Workspace {
             Target::Thread(t) => self.open_place(Place::Thread(t), window, cx),
             Target::Channel(c) => self.open_place(Place::Channel(c), window, cx),
             Target::Agent(a) => self.open_place(Place::Agent(a), window, cx),
+            Target::Project(p) => self.open_place(Place::Project(p), window, cx),
             Target::File(hit) => self.open_file_hit(hit, window, cx),
             Target::NewThread { channel, text } => {
                 if self.nav.channel != Some(channel) || self.nav.thread.is_some() {

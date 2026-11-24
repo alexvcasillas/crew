@@ -20,6 +20,7 @@ pub const RECENT_THREADS: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionKind {
     Recent,
+    Projects,
     Threads,
     Channels,
     Agents,
@@ -33,6 +34,7 @@ pub enum Target {
     Thread(ThreadId),
     Channel(ChannelId),
     Agent(AgentId),
+    Project(ProjectId),
     File(FileHit),
     /// The new thread composer in the channel, holding `text` if any.
     NewThread {
@@ -72,6 +74,8 @@ pub struct Row {
     pub sub: String,
     /// Paths and branches are mono.
     pub mono: bool,
+    /// Only the grey text is mono, as a project's path.
+    pub sub_mono: bool,
     pub lead: Lead,
     /// The row's own shortcut.
     pub keys: Option<&'static str>,
@@ -86,6 +90,7 @@ impl Row {
             highlight: None,
             sub: String::new(),
             mono: false,
+            sub_mono: false,
             lead,
             keys: None,
             danger: false,
@@ -150,9 +155,13 @@ pub fn sections(i: &Inputs) -> Vec<Section> {
             totals,
             ..
         } = remote.results;
+        let projects = local_projects(i, query);
         let channels = local_channels(i, query);
         let agents = local_agents(i, query);
         vec![
+            capped(i, SectionKind::Projects, "Projects", 0, projects, |row| {
+                row.matching(query)
+            }),
             capped(
                 i,
                 SectionKind::Threads,
@@ -175,7 +184,7 @@ pub fn sections(i: &Inputs) -> Vec<Section> {
                 "Files in worktrees",
                 totals.files,
                 files,
-                |hit| file_row(i.state, hit).matching(query),
+                |hit| file_row(i, hit).matching(query),
             ),
             typed_actions(i, query),
         ]
@@ -246,6 +255,9 @@ fn recent(i: &Inputs) -> Section {
             thread_row_in(i, t.id, &t.title, &local, t.channel, false)
         })
         .collect();
+    if let Some(project) = i.recents.project.filter(|p| state.project(*p).is_some()) {
+        rows.push(project_row(state, project));
+    }
     if let Some(channel) = i.recents.channel.and_then(|c| state.channel(c)) {
         rows.push(channel_row(state, channel.id));
     }
@@ -372,6 +384,27 @@ fn channel_row(state: &State, channel: ChannelId) -> Row {
         .sub(format!("{project} · {active} active"))
 }
 
+/// A channel found by typing: "# name" + "{project}".
+fn found_channel_row(state: &State, channel: ChannelId) -> Row {
+    let project = state
+        .channel(channel)
+        .and_then(|c| state.project(c.project))
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    channel_row(state, channel).sub(project)
+}
+
+/// "name" + its folder, `~` for home.
+fn project_row(state: &State, project: ProjectId) -> Row {
+    let Some(p) = state.project(project) else {
+        return Row::new(Target::Project(project), "", Lead::Folder);
+    };
+    let mut row = Row::new(Target::Project(project), p.name.clone(), Lead::Folder)
+        .sub(super::super::title_bar::home_relative(&p.root));
+    row.sub_mono = true;
+    row
+}
+
 /// "Name" + "{role} · {runtime} · {model}".
 fn agent_row(state: &State, agent: AgentId) -> Row {
     let Some(a) = state.agent(agent) else {
@@ -386,8 +419,10 @@ fn agent_row(state: &State, agent: AgentId) -> Row {
     Row::new(Target::Agent(agent), name.clone(), Lead::Agent(name)).sub(sub)
 }
 
-/// The path, and the branch it is on, " · changed" when uncommitted.
-fn file_row(state: &State, hit: FileHit) -> Row {
+/// The path, and the branch it is on, " · changed" when uncommitted,
+/// led by the project's name when searching all of them.
+fn file_row(i: &Inputs, hit: FileHit) -> Row {
+    let state = i.state;
     let branch = match hit.thread {
         Some(t) => state
             .thread(t)
@@ -399,8 +434,13 @@ fn file_row(state: &State, hit: FileHit) -> Row {
             .map(|p| p.main_branch.clone())
             .unwrap_or_default(),
     };
-    let mut row = Row::new(Target::File(hit.clone()), hit.path.clone(), Lead::File)
-        .sub(file_sub(&branch, hit.changed));
+    let mut sub = file_sub(&branch, hit.changed);
+    if i.scope.is_none()
+        && let Some(p) = state.project(hit.project)
+    {
+        sub = format!("{} · {sub}", p.name);
+    }
+    let mut row = Row::new(Target::File(hit.clone()), hit.path.clone(), Lead::File).sub(sub);
     row.mono = true;
     row
 }
@@ -420,12 +460,37 @@ fn local_channels(i: &Inputs, query: &str) -> Vec<Row> {
         .projects()
         .into_iter()
         .filter(|p| i.scope.is_none_or(|s| s == p.id))
-        .flat_map(|p| state.channels(p.id))
-        .filter_map(|c| rank(&c.name, query).map(|r| (r, c.name.clone(), c.id)))
+        .flat_map(|p| {
+            state
+                .channels(p.id)
+                .into_iter()
+                .map(move |c| (format!("{} {}", p.name, c.name), c))
+        })
+        .filter_map(|(both, c)| {
+            let best = [rank(&c.name, query), rank(&both, query)]
+                .into_iter()
+                .flatten()
+                .min()?;
+            Some((best, c.name.clone(), c.id))
+        })
         .collect();
     hits.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
     hits.into_iter()
-        .map(|(_, _, id)| channel_row(state, id))
+        .map(|(_, _, id)| found_channel_row(state, id))
+        .collect()
+}
+
+/// Every project whose name matches, whatever the scope.
+fn local_projects(i: &Inputs, query: &str) -> Vec<Row> {
+    let state = i.state;
+    let mut hits: Vec<(u8, String, ProjectId)> = state
+        .projects()
+        .into_iter()
+        .filter_map(|p| rank(&p.name, query).map(|r| (r, p.name.to_lowercase(), p.id)))
+        .collect();
+    hits.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    hits.into_iter()
+        .map(|(_, _, id)| project_row(state, id))
         .collect()
 }
 
@@ -477,8 +542,26 @@ fn contains(text: &str, needle: &str) -> bool {
 }
 
 /// How well `name` matches `query`, ignoring case: 0 starts with it, 1
-/// has a word starting with it, 2 holds it. `None` if it doesn't.
+/// has a word starting with it, 2 holds it. A query of several words
+/// that isn't held whole matches when each word is, ranked by its worst
+/// word. `None` if it doesn't match.
 pub fn rank(name: &str, query: &str) -> Option<u8> {
+    if let Some(whole) = rank_whole(name, query) {
+        return Some(whole);
+    }
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    words
+        .iter()
+        .map(|w| rank_whole(name, w))
+        .collect::<Option<Vec<u8>>>()?
+        .into_iter()
+        .max()
+}
+
+fn rank_whole(name: &str, query: &str) -> Option<u8> {
     let at = match_range(name, query)?.start;
     if at == 0 {
         return Some(0);
@@ -543,6 +626,10 @@ mod tests {
         assert_eq!(rank("Big Build", "bu"), Some(1));
         assert_eq!(rank("rebuild", "bu"), Some(2));
         assert_eq!(rank("general", "bu"), None);
+        assert_eq!(rank("supapick general", "supa gen"), Some(1), "each word");
+        assert_eq!(rank("supapick general", "pick gen"), Some(2));
+        assert_eq!(rank("supapick general", "supa bugs"), None);
+        assert_eq!(rank("general", "gen eral"), Some(2));
     }
 
     #[test]

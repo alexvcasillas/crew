@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crew_core::ids::{AgentId, ChannelId, ThreadId};
+use crew_core::ids::{AgentId, ChannelId, ProjectId, ThreadId};
 use serde::{Deserialize, Serialize};
 
 /// Threads kept, more than shown, so deleted or archived ones leave
@@ -21,6 +21,8 @@ pub struct Recents {
     pub channel: Option<ChannelId>,
     /// The agent whose page you last opened.
     pub agent: Option<AgentId>,
+    /// The project you last went to.
+    pub project: Option<ProjectId>,
 }
 
 impl Recents {
@@ -54,6 +56,11 @@ impl Recents {
     }
 
     /// Whether anything changed.
+    pub fn visited_project(&mut self, project: ProjectId) -> bool {
+        self.project.replace(project) != Some(project)
+    }
+
+    /// Whether anything changed.
     pub fn visited_agent(&mut self, agent: AgentId) -> bool {
         self.agent.replace(agent) != Some(agent)
     }
@@ -61,7 +68,7 @@ impl Recents {
 
 #[cfg(test)]
 mod tests {
-    use crew_core::ids::{AgentId, ChannelId, ThreadId};
+    use crew_core::ids::{AgentId, ChannelId, ProjectId, ThreadId};
 
     use super::{KEPT_THREADS, Recents};
 
@@ -93,6 +100,9 @@ mod tests {
         r.opened_thread(thread());
         assert!(r.visited_channel(ChannelId::new()));
         assert!(r.visited_agent(AgentId::new()));
+        let project = ProjectId::new();
+        assert!(r.visited_project(project));
+        assert!(!r.visited_project(project));
         r.save(home.path()).unwrap();
         assert_eq!(Recents::load(home.path()), r);
         assert_eq!(

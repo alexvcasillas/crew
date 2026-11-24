@@ -323,8 +323,14 @@ fn a_changed_worktree_file_says_so_and_opens_its_review(cx: &mut TestAppContext)
 
     open_palette(cx, window);
     search(cx, window, "readme", "Files in worktrees · 2");
-    let changed = row_index(cx, window, "README.md", &format!("{branch} · changed"));
-    let main = row_index(cx, window, "README.md", "main");
+    // Nothing is open, so all projects are searched and named.
+    let changed = row_index(
+        cx,
+        window,
+        "README.md",
+        &format!("demo · {branch} · changed"),
+    );
+    let main = row_index(cx, window, "README.md", "demo · main");
 
     // ⌘C on the changed row copies the worktree file's path.
     for _ in 0..changed {
@@ -437,7 +443,7 @@ fn a_long_section_shows_five_then_all(cx: &mut TestAppContext) {
     assert!(has(cx, window, "palette"), "stays open");
     let channels = rows(cx, window)
         .iter()
-        .filter(|(_, sub)| sub == "demo · 0 active")
+        .filter(|(_, sub)| sub == "demo")
         .count();
     assert_eq!(channels, 6);
     assert!(
@@ -545,4 +551,177 @@ fn stop_all_shows_while_a_run_is_live(cx: &mut TestAppContext) {
     });
     open_palette(cx, window);
     assert!(!rows(cx, window).iter().any(|(l, _)| l == "Stop all agents"));
+}
+
+/// Projects named `names`, each with `#general`, rooted under `dir`, added
+/// through the world's client. Returns their ids and #general ids.
+fn more_projects(
+    w: &super::thread_tests::World,
+    dir: &Path,
+    names: &[&str],
+) -> Vec<(ProjectId, ChannelId)> {
+    names
+        .iter()
+        .map(|name| {
+            let root = dir.join(name);
+            repo_with_readme(&root);
+            let project: ProjectId = w.ask(Request::CreateProject {
+                name: (*name).into(),
+                root: root.to_string_lossy().into_owned(),
+                main_branch: "main".into(),
+            });
+            let channel: ChannelId = w.ask(Request::CreateChannel {
+                project,
+                name: "general".into(),
+            });
+            (project, channel)
+        })
+        .collect()
+}
+
+#[gpui_kit::test]
+fn typing_finds_projects_first_and_enter_opens_one(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    let w = world(home.path(), &root, &[]);
+    let added = more_projects(&w, tmp.path(), &["supapick", "supameter"]);
+    let (pick, pick_general) = added[0];
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the projects", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().channel(added[1].1).is_some())
+    });
+    let path = |name: &str| super::title_bar::home_relative(&tmp.path().join(name));
+
+    open_palette(cx, window);
+    type_text(cx, window, "supa");
+    assert!(shows_in_palette(cx, window, "Projects · 2"));
+    let found = rows(cx, window);
+    assert_eq!(
+        found[..2],
+        [
+            ("supameter".to_string(), path("supameter")),
+            ("supapick".to_string(), path("supapick")),
+        ],
+        "first, by name"
+    );
+    let pick_row = row_index(cx, window, "supapick", &path("supapick"));
+    for _ in 0..pick_row {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+    ws.read_with(cx, |ws, _| {
+        assert_eq!(ws.nav.channel, Some(pick_general), "its first channel");
+        assert_eq!(ws.recents.project, Some(pick));
+    });
+
+    // Recent lists it next time.
+    open_palette(cx, window);
+    assert!(
+        rows(cx, window).contains(&("supapick".into(), path("supapick"))),
+        "{:?}",
+        rows(cx, window)
+    );
+}
+
+#[gpui_kit::test]
+fn channels_match_with_their_project_name(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    let w = world(home.path(), &root, &[]);
+    let added = more_projects(&w, tmp.path(), &["supapick", "supameter"]);
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the projects", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().channel(added[1].1).is_some())
+    });
+
+    open_palette(cx, window);
+    type_text(cx, window, "supapick gen");
+    assert!(shows_in_palette(cx, window, "Channels · 1"));
+    let row = row_index(cx, window, "general", "supapick");
+    for _ in 0..row {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.nav.channel), Some(added[0].1));
+
+    // Now in supapick: its own channels only, until tab.
+    open_palette(cx, window);
+    type_text(cx, window, "supa gen");
+    assert!(shows_in_palette(cx, window, "Channels · 1"));
+    press(cx, window, "tab");
+    assert!(shows_in_palette(cx, window, "Channels · 2"));
+    let found = rows(cx, window);
+    assert!(found.contains(&("general".into(), "supameter".into())));
+    assert!(found.contains(&("general".into(), "supapick".into())));
+}
+
+#[gpui_kit::test]
+fn files_name_their_project_only_across_projects(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    let w = world(home.path(), &root, &[]);
+    let added = more_projects(&w, tmp.path(), &["supapick"]);
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the projects", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().channel(added[0].1).is_some())
+    });
+
+    open_palette(cx, window);
+    search(cx, window, "readme", "Files in worktrees · 2");
+    let found = rows(cx, window);
+    assert!(found.contains(&("README.md".into(), "demo · main".into())));
+    assert!(found.contains(&("README.md".into(), "supapick · main".into())));
+    press(cx, window, "escape");
+
+    go_to(cx, window, &ws, w.channel, w.thread);
+    open_palette(cx, window);
+    search(cx, window, "readme", "Files in worktrees · 1");
+    assert!(rows(cx, window).contains(&("README.md".into(), "main".into())));
+}
+
+#[gpui_kit::test]
+fn name_hits_come_before_files(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    for n in 0..7 {
+        std::fs::write(root.join(format!("supa-{n}.txt")), "x").unwrap();
+    }
+    let w = world(home.path(), &root, &[]);
+    let added = more_projects(&w, tmp.path(), &["supapick"]);
+    let _: ChannelId = w.ask(Request::CreateChannel {
+        project: w.project,
+        name: "supa-talk".into(),
+    });
+    let _: ThreadId = w.ask(Request::CreateThread {
+        channel: w.channel,
+        title: "supa launch".into(),
+    });
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the projects", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().channel(added[0].1).is_some())
+    });
+
+    open_palette(cx, window);
+    search(cx, window, "supa", "Files in worktrees · 7");
+    let found = rows(cx, window);
+    let position = |label: &str| found.iter().position(|(l, _)| l == label).unwrap();
+    let first_file = found.iter().position(|(l, _)| l.ends_with(".txt")).unwrap();
+    assert!(position("supapick") < first_file);
+    assert!(position("supa launch") < first_file);
+    assert!(position("supa-talk") < first_file);
+    let files = found.iter().filter(|(l, _)| l.ends_with(".txt")).count();
+    assert_eq!(files, 5, "capped");
+    assert!(found.iter().any(|(l, _)| l == "Show all 7"));
 }
