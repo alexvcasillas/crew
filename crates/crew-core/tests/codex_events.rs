@@ -47,7 +47,12 @@ fn item(method: &str, item: Value) -> Incoming {
 #[test]
 fn command_decline_and_final_answer() {
     let mut t = CodexTranslator::new();
-    let events = translate(&mut t, &fixture("command_and_decline.jsonl"));
+    let all = translate(&mut t, &fixture("command_and_decline.jsonl"));
+    assert!(all.iter().any(|e| matches!(e, Event::Usage { .. })));
+    let events: Vec<Event> = all
+        .into_iter()
+        .filter(|e| !matches!(e, Event::Usage { .. }))
+        .collect();
     let [
         Event::SessionStarted {
             session_id,
@@ -413,4 +418,27 @@ fn empty_reasoning_and_plan_give_nothing() {
     ] {
         assert!(t.on(&item("item/completed", it)).is_empty());
     }
+}
+
+#[test]
+fn token_usage_becomes_context_usage() {
+    let mut t = CodexTranslator::new();
+    let update = |input: u64, window: u64| {
+        msg(json!({"method": "thread/tokenUsage/updated", "params": {
+        "threadId": TID, "turnId": "t",
+        "tokenUsage": {
+            "total": {"inputTokens": 99999, "cachedInputTokens": 1},
+            "last": {"inputTokens": input, "cachedInputTokens": 8064},
+            "modelContextWindow": window
+        }}}))
+    };
+    assert_eq!(
+        translate(&mut t, &[update(18888, 258400)]),
+        vec![Event::Usage {
+            context_tokens: 18888,
+            context_window: Some(258400)
+        }]
+    );
+    // The same numbers again add nothing.
+    assert!(translate(&mut t, &[update(18888, 258400)]).is_empty());
 }

@@ -423,3 +423,88 @@ fn a_plain_denial_has_no_reason() {
     let events = parser.parse(&line);
     assert_eq!(events[0], denied("Bash", json!({"command": "ls"})));
 }
+
+fn usage(tokens: u64, window: Option<u64>) -> Event {
+    Event::Usage {
+        context_tokens: tokens,
+        context_window: window,
+    }
+}
+
+#[test]
+fn stream_parser_reports_context_usage_of_the_main_agent() {
+    let events: Vec<Event> = stream("usage.jsonl")
+        .into_iter()
+        .filter(|e| matches!(e, Event::Usage { .. } | Event::TurnEnd { .. }))
+        .collect();
+    // The repeated total and the subagent's line give nothing. The result
+    // picks the main model's window out of two, matching the init model
+    // by prefix.
+    assert_eq!(
+        events,
+        vec![
+            usage(2 + 28472 + 12333, None),
+            usage(3 + 10 + 40812, None),
+            usage(3 + 10 + 40812, Some(1_000_000)),
+            Event::TurnEnd {
+                ok: true,
+                summary: "Done.".into(),
+                duration_ms: 1200,
+                num_turns: 2,
+            },
+        ]
+    );
+}
+
+#[test]
+fn result_without_a_matching_model_gives_no_window() {
+    let mut parser = StreamParser::new();
+    parser.parse(
+        r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-x","cwd":"/w"}"#,
+    );
+    let events = parser.parse(
+        r#"{"type":"result","subtype":"success","num_turns":1,"result":"ok","modelUsage":{"a":{"inputTokens":1,"contextWindow":10},"b":{"inputTokens":1,"contextWindow":20}}}"#,
+    );
+    assert!(!events.iter().any(|e| matches!(e, Event::Usage { .. })));
+}
+
+fn result_events(model: &str, assistant: bool, model_usage: &str) -> Vec<Event> {
+    let mut parser = StreamParser::new();
+    parser.parse(&format!(
+        r#"{{"type":"system","subtype":"init","session_id":"s","model":"{model}","cwd":"/w"}}"#
+    ));
+    if assistant {
+        parser.parse(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[],"usage":{"input_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}}}"#,
+        );
+    }
+    parser.parse(&format!(
+        r#"{{"type":"result","subtype":"success","num_turns":1,"result":"ok","modelUsage":{model_usage}}}"#
+    ))
+}
+
+#[test]
+fn result_without_assistant_usage_gives_no_usage() {
+    let events = result_events(
+        "claude-x",
+        false,
+        r#"{"claude-x":{"inputTokens":900,"contextWindow":10}}"#,
+    );
+    assert!(!events.iter().any(|e| matches!(e, Event::Usage { .. })));
+}
+
+#[test]
+fn a_single_model_usage_entry_must_match_the_main_model() {
+    let other = r#"{"claude-y":{"inputTokens":1,"contextWindow":10}}"#;
+    let events = result_events("claude-x", true, other);
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::Usage {
+            context_window: Some(_),
+            ..
+        }
+    )));
+    let same = r#"{"claude-x[1m]":{"inputTokens":1,"contextWindow":10}}"#;
+    let events = result_events("claude-x", true, same);
+    assert!(events.contains(&usage(10, Some(10))));
+}

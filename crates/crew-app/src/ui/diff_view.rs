@@ -3,9 +3,8 @@
 //! It takes the place of the sidebar, the main area and the inspector.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
-use crew_core::ids::ThreadId;
+use crew_core::ids::{AgentId, ThreadId};
 use crew_core::store::Author;
 use crew_core::worktree::Diff;
 use crew_proto::Request;
@@ -15,14 +14,17 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Disableable as _, IconName, Selectable as _, Sizable as _};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Selectable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::dot;
+use super::common::{dot, spinner};
 use super::inspector::INSPECTOR_WIDTH;
+use super::markdown_view::render_doc;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
-use crate::diff_parse::{FileDiff, FileKind, LineKind, parse};
+use crate::checks::{Check, CheckState, checks};
+use crate::comments::{Comment, comments, place, reviewer_replies};
+use crate::diff_parse::{FileDiff, FileKind, Line, LineKind, parse, split_pairs};
 use crate::fonts::mono_font;
 use crate::theme::color;
 
@@ -47,6 +49,7 @@ const BODY_MAX_LINES: usize = 20;
 const GUTTER: f32 = 44.;
 const LINE_HEIGHT: f32 = 20.;
 const NOTHING_TO_REVIEW: &str = "No changes to review.";
+const OUTSIDE_TITLE: &str = "Comments outside the diff";
 const NOTE: &str = "Nothing is pushed. Committing stays on your machine, and the branch is yours to merge or open a PR from.";
 
 /// Esc leaves the commit message first, then the review.
@@ -71,10 +74,17 @@ enum Row {
     File(usize),
     Hunk(usize, usize),
     Line(usize, usize, usize),
+    /// A split row: the hunk's line on the left, by index, and the one on
+    /// the right. Context is on both sides.
+    Pair(usize, usize, Option<usize>, Option<usize>),
     /// The file's one-line note, such as for a binary file.
     Note(usize),
     /// A large file waiting for "Show diff".
     Folded(usize),
+    /// The title above comments that aren't on a shown line.
+    OutsideTitle,
+    /// A review comment, by its index, under the row before it.
+    Comment(usize),
 }
 
 /// The open review of a thread's changes.
@@ -84,12 +94,18 @@ pub(super) struct Review {
     loaded: bool,
     /// Parsed from the last diff read. The one source of file counts.
     files: Vec<FileDiff>,
+    /// Lines side by side, as chosen with Unified / Split.
+    split: bool,
     rows: Vec<Row>,
     /// Each file's header row.
     file_rows: Vec<usize>,
     list: ListState,
     /// Large files you asked to see, by path.
     shown: HashSet<String>,
+    /// Findings from the reviewers' latest replies.
+    comments: Vec<Comment>,
+    /// The latest reviewer and how many comments its reply left.
+    left: Option<(String, usize)>,
     message: Entity<TextareaState>,
     /// The draft from the agent's latest reply, empty if none.
     draft: String,
@@ -98,6 +114,15 @@ pub(super) struct Review {
     busy: bool,
     /// Why the last read failed, shown in place of the diff.
     failed: Option<String>,
+    /// The file you last picked in the list, by path.
+    current_file: Option<String>,
+    /// The checks the agent ran, read again when the thread's activity
+    /// changes.
+    checks: Vec<Check>,
+    /// What the comments and checks were read from.
+    synced: Option<(usize, usize, usize, usize)>,
+    /// Why Open in editor failed, shown above the diff.
+    open_error: Option<String>,
     focus: FocusHandle,
 }
 
@@ -129,25 +154,150 @@ pub fn draft_commit_message(reply: &str) -> String {
     }
 }
 
-/// The diff list's rows, and where each file starts.
-fn diff_rows(files: &[FileDiff], shown: &HashSet<String>) -> (Vec<Row>, Vec<usize>) {
+/// Whether a file's lines are drawn: it has no note and is small or
+/// asked for.
+fn lines_drawn(file: &FileDiff, shown: &HashSet<String>) -> bool {
+    file.note.is_none() && (file.line_count() <= LARGE_FILE_LINES || shown.contains(&file.path))
+}
+
+/// The diff list's rows, and where each file starts. Comments go under
+/// their line, or above the first file when their line isn't drawn.
+fn diff_rows(
+    files: &[FileDiff],
+    shown: &HashSet<String>,
+    comments: &[Comment],
+    split: bool,
+) -> (Vec<Row>, Vec<usize>) {
+    let placement = place(files, |f| lines_drawn(&files[f], shown), comments);
     let mut rows = Vec::new();
+    if !placement.outside.is_empty() {
+        rows.push(Row::OutsideTitle);
+        rows.extend(placement.outside.iter().map(|&c| Row::Comment(c)));
+    }
     let mut starts = Vec::new();
     for (f, file) in files.iter().enumerate() {
         starts.push(rows.len());
         rows.push(Row::File(f));
         if file.note.is_some() {
             rows.push(Row::Note(f));
-        } else if file.line_count() > LARGE_FILE_LINES && !shown.contains(&file.path) {
+        } else if !lines_drawn(file, shown) {
             rows.push(Row::Folded(f));
         } else {
             for (h, hunk) in file.hunks.iter().enumerate() {
                 rows.push(Row::Hunk(f, h));
-                rows.extend((0..hunk.lines.len()).map(|l| Row::Line(f, h, l)));
+                let under = |rows: &mut Vec<Row>, l: usize| {
+                    if let Some(under) = placement.under.get(&(f, h, l)) {
+                        rows.extend(under.iter().map(|&c| Row::Comment(c)));
+                    }
+                };
+                if split {
+                    for (left, right) in split_pairs(hunk) {
+                        rows.push(Row::Pair(f, h, left, right));
+                        if let Some(l) = left {
+                            under(&mut rows, l);
+                        }
+                        // Context is the same line on both sides.
+                        if let Some(l) = right.filter(|&r| Some(r) != left) {
+                            under(&mut rows, l);
+                        }
+                    }
+                } else {
+                    for l in 0..hunk.lines.len() {
+                        rows.push(Row::Line(f, h, l));
+                        under(&mut rows, l);
+                    }
+                }
             }
         }
     }
     (rows, starts)
+}
+
+/// Something a row stands for that survives a rebuild: a file by its
+/// path, then what is in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Anchor {
+    /// The comments listed above the first file.
+    Outside,
+    File(String),
+    Hunk(String, usize),
+    Line(String, usize, usize),
+    Note(String),
+    Folded(String),
+}
+
+impl Anchor {
+    /// What to look for when this is gone.
+    fn parent(&self) -> Option<Anchor> {
+        match self {
+            Anchor::Line(path, h, _) => Some(Anchor::Hunk(path.clone(), *h)),
+            Anchor::Hunk(path, _) | Anchor::Note(path) | Anchor::Folded(path) => {
+                Some(Anchor::File(path.clone()))
+            }
+            Anchor::File(_) | Anchor::Outside => None,
+        }
+    }
+}
+
+/// What the row at `ix` stands for. A comment stands for the row above
+/// it, as the cards are not part of the diff.
+fn anchor_at(rows: &[Row], files: &[FileDiff], ix: usize) -> Option<Anchor> {
+    let mut ix = ix.min(rows.len().checked_sub(1)?);
+    while matches!(rows[ix], Row::Comment(_)) && ix > 0 {
+        ix -= 1;
+    }
+    let path = |f: usize| files.get(f).map(|f| f.path.clone());
+    match rows[ix] {
+        Row::OutsideTitle | Row::Comment(_) => Some(Anchor::Outside),
+        Row::File(f) => path(f).map(Anchor::File),
+        Row::Hunk(f, h) => path(f).map(|p| Anchor::Hunk(p, h)),
+        Row::Line(f, h, l) => path(f).map(|p| Anchor::Line(p, h, l)),
+        Row::Pair(f, h, left, right) => {
+            let l = left.or(right)?;
+            path(f).map(|p| Anchor::Line(p, h, l))
+        }
+        Row::Note(f) => path(f).map(Anchor::Note),
+        Row::Folded(f) => path(f).map(Anchor::Folded),
+    }
+}
+
+/// The row that stands for `anchor`, else for what it was part of.
+fn find_anchor(rows: &[Row], files: &[FileDiff], anchor: &Anchor) -> Option<usize> {
+    let mut anchor = Some(anchor.clone());
+    while let Some(a) = anchor {
+        let found = rows.iter().position(|row| {
+            let same_file = |f: usize, path: &String| files.get(f).is_some_and(|x| &x.path == path);
+            match (&a, *row) {
+                (Anchor::Outside, Row::OutsideTitle) => true,
+                (Anchor::File(p), Row::File(f)) => same_file(f, p),
+                (Anchor::Hunk(p, h), Row::Hunk(f, rh)) => rh == *h && same_file(f, p),
+                (Anchor::Line(p, h, l), Row::Line(f, rh, rl)) => {
+                    rh == *h && rl == *l && same_file(f, p)
+                }
+                (Anchor::Line(p, h, l), Row::Pair(f, rh, left, right)) => {
+                    rh == *h && (left == Some(*l) || right == Some(*l)) && same_file(f, p)
+                }
+                (Anchor::Note(p), Row::Note(f)) => same_file(f, p),
+                (Anchor::Folded(p), Row::Folded(f)) => same_file(f, p),
+                _ => false,
+            }
+        });
+        if found.is_some() {
+            return found;
+        }
+        anchor = a.parent();
+    }
+    None
+}
+
+/// The row at the top of the list, to come back to after a rebuild.
+struct Kept {
+    anchor: Option<Anchor>,
+    /// How far into that row the list was scrolled. Zero for a card, whose
+    /// height can change.
+    offset: Pixels,
+    /// Its place before, for when nothing matches.
+    ix: usize,
 }
 
 /// `M`, `A`, `D`, `R` and their colour tokens.
@@ -198,17 +348,25 @@ impl Workspace {
             thread,
             loaded: false,
             files: Vec::new(),
+            split: self.diff_split,
             rows: Vec::new(),
             file_rows: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             shown: HashSet::new(),
+            comments: Vec::new(),
+            left: None,
             message,
             draft,
             _message_events: events,
             busy: false,
             failed: None,
+            current_file: None,
+            checks: Vec::new(),
+            synced: None,
+            open_error: None,
             focus,
         });
+        self.sync_review_comments(cx);
         self.load_thread_diff(thread, cx);
         cx.notify();
     }
@@ -280,10 +438,138 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reads the reviewers' comments afresh, and redraws the rows when
+    /// they changed.
+    pub(super) fn sync_review_comments(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        let state = self.state();
+        let key = (
+            state.events(thread).len(),
+            state.messages(thread).len(),
+            state.thread_runs(thread).len(),
+            state.live_runs(thread).len(),
+        );
+        if self.review.as_ref().is_some_and(|r| r.synced == Some(key)) {
+            return;
+        }
+        let root = state
+            .thread(thread)
+            .and_then(|t| t.worktree.as_ref())
+            .map(|wt| wt.path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let replies = reviewer_replies(state, thread);
+        let mut found = Vec::new();
+        let mut left = None;
+        for (i, reply) in replies.iter().enumerate() {
+            let own = comments(state, std::slice::from_ref(reply), &root);
+            if i + 1 == replies.len()
+                && !own.is_empty()
+                && let Some(agent) = state.agent(reply.0)
+            {
+                left = Some((agent.spec.name.clone(), own.len()));
+            }
+            found.extend(own);
+        }
+        let checks = self.review_checks(thread);
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        review.synced = Some(key);
+        review.left = left;
+        let mut changed = false;
+        if checks != review.checks {
+            review.checks = checks;
+            changed = true;
+        }
+        if found != review.comments {
+            review.comments = found;
+            rebuild_rows(review);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Each comment pinned under a line: the file, the line's new
+    /// number and the card's header.
+    #[cfg(test)]
+    pub(super) fn pinned_comments(&self) -> Vec<(String, Option<u32>, String)> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let mut under = None;
+        let mut pinned = Vec::new();
+        for row in &review.rows {
+            match *row {
+                Row::Line(f, h, l) => {
+                    let file = &review.files[f];
+                    under = Some((file.path.clone(), file.hunks[h].lines[l].new));
+                }
+                Row::Pair(f, h, left, right) => {
+                    let file = &review.files[f];
+                    let lines = &file.hunks[h].lines;
+                    let line = right.map(|r| lines[r].new).or(left.map(|l| lines[l].old));
+                    under = Some((file.path.clone(), line.flatten()));
+                }
+                Row::Comment(c) => {
+                    if let Some((path, line)) = under.clone() {
+                        pinned.push((path, line, comment_header(&review.comments[c])));
+                    }
+                }
+                _ => under = None,
+            }
+        }
+        pinned
+    }
+
+    /// The list's top row.
+    #[cfg(test)]
+    pub(super) fn review_top(&self) -> Option<usize> {
+        self.review
+            .as_ref()
+            .map(|r| r.list.logical_scroll_top().item_ix)
+    }
+
+    /// Scrolls the list so row `ix` is at the top.
+    #[cfg(test)]
+    pub(super) fn scroll_review_to(&self, ix: usize) {
+        if let Some(review) = &self.review {
+            review.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
+        }
+    }
+
+    /// The headers of the comments listed outside the diff.
+    #[cfg(test)]
+    pub(super) fn outside_comments(&self) -> Vec<String> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let mut rows = review.rows.iter();
+        if rows.next() != Some(&Row::OutsideTitle) {
+            return Vec::new();
+        }
+        rows.map_while(|row| match row {
+            Row::Comment(c) => Some(comment_header(&review.comments[*c])),
+            _ => None,
+        })
+        .collect()
+    }
+
     /// The agent whose changes these are: the one of the latest run that
     /// may have changed files, else the latest to reply, else the latest
     /// to run.
     fn review_agent(&self, thread: ThreadId) -> Option<String> {
+        let id = self.review_agent_id(thread)?;
+        self.state().agent(id).map(|a| a.spec.name.clone())
+    }
+
+    fn review_agent_id(&self, thread: ThreadId) -> Option<AgentId> {
         let state = self.state();
         let edited = state.editing_run(thread).map(|r| r.agent);
         let replied = state
@@ -295,11 +581,34 @@ impl Workspace {
                 _ => None,
             });
         let ran = state.thread_runs(thread).last().map(|r| r.agent);
-        edited
-            .or(replied)
-            .or(ran)
-            .and_then(|a| state.agent(a))
-            .map(|a| a.spec.name.clone())
+        edited.or(replied).or(ran)
+    }
+
+    /// The checks the titled agent ran. One that never ended, because
+    /// its run is over, is left out.
+    fn review_checks(&self, thread: ThreadId) -> Vec<Check> {
+        let state = self.state();
+        let Some(agent) = self.review_agent_id(thread) else {
+            return Vec::new();
+        };
+        let runs: Vec<_> = state
+            .thread_runs(thread)
+            .iter()
+            .filter(|r| r.agent == agent)
+            .map(|r| r.id)
+            .collect();
+        let live: Vec<_> = state.live_runs(thread).iter().map(|r| r.id).collect();
+        checks(state.events(thread), &runs, &live)
+    }
+
+    /// Goes back to the thread with the inspector's Terminal tab on the
+    /// command that ran a check.
+    fn open_check(&mut self, check: &Check, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        self.close_review(window, cx);
+        self.show_run_command(thread, check.run, check.call.clone(), window, cx);
     }
 
     /// Reads the open thread's uncommitted changes, for the inspector and
@@ -332,13 +641,21 @@ impl Workspace {
                 match read {
                     Ok((diff, files)) => {
                         if let (Some(review), Some(files)) = (review, files) {
+                            let kept = keep_scroll(review);
                             review.loaded = true;
                             review.failed = None;
                             review.files = files;
                             review
                                 .shown
                                 .retain(|p| review.files.iter().any(|f| &f.path == p));
-                            rebuild_rows(review);
+                            if review
+                                .current_file
+                                .as_ref()
+                                .is_some_and(|p| !review.files.iter().any(|f| &f.path == p))
+                            {
+                                review.current_file = None;
+                            }
+                            rebuild_rows_from(review, kept);
                         }
                         this.inspector.diff = Some(diff);
                     }
@@ -361,6 +678,19 @@ impl Workspace {
         }
     }
 
+    /// Shows the lines side by side or one after the other, for the rest of
+    /// the session.
+    fn set_split(&mut self, split: bool, cx: &mut Context<Self>) {
+        self.diff_split = split;
+        if let Some(review) = &mut self.review
+            && review.split != split
+        {
+            review.split = split;
+            rebuild_rows(review);
+        }
+        cx.notify();
+    }
+
     fn show_large_file(&mut self, file: usize, cx: &mut Context<Self>) {
         if let Some(review) = &mut self.review
             && let Some(f) = review.files.get(file)
@@ -372,9 +702,10 @@ impl Workspace {
     }
 
     fn scroll_to_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        if let Some(review) = &self.review
+        if let Some(review) = &mut self.review
             && let Some(&row) = review.file_rows.get(file)
         {
+            review.current_file = review.files.get(file).map(|f| f.path.clone());
             review.list.scroll_to(ListOffset {
                 item_ix: row,
                 offset_in_item: px(0.),
@@ -597,22 +928,47 @@ impl Workspace {
         }
     }
 
-    /// Opens the worktree folder in the editor app, or in Finder.
+    /// Opens the worktree in your editor, or in Finder. With a file
+    /// picked in the list, an editor gets that file too. Failing says so
+    /// under the title of the diff.
     fn open_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .review
-            .as_ref()
-            .and_then(|r| self.state().thread(r.thread))
+        let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
+            return;
+        };
+        let Some(worktree) = self
+            .state()
+            .thread(thread)
             .and_then(|t| t.worktree.as_ref())
             .map(|wt| wt.path.clone())
         else {
             return;
         };
-        let opened = cx
-            .background_executor()
-            .spawn(async move { open_folder(path, editor_app()) });
-        self.spawn_request(window, cx, async move |_, _| {
-            opened.await.map_err(|e| (e, None))
+        let app = self.editor_app();
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        review.open_error = None;
+        let file = review
+            .current_file
+            .as_ref()
+            .and_then(|path| review.files.iter().find(|f| &f.path == path))
+            .filter(|f| !matches!(f.kind, FileKind::Deleted))
+            .map(|f| worktree.join(&f.path));
+        let args = crate::editor::open_args(app.as_deref(), &worktree, file.as_deref());
+        let opener = self.opener.clone();
+        let opened = cx.background_executor().spawn(async move { opener(args) });
+        self.spawn_request(window, cx, async move |this, cx| {
+            if let Err(e) = opened.await {
+                eprintln!("crew: open failed: {e}");
+                this.update_in(cx, |this, _, cx| {
+                    if let Some(review) = this.review.as_mut() {
+                        review.open_error = Some(crate::editor::open_failed(app.as_deref()));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            Ok(())
         });
     }
 
@@ -749,6 +1105,26 @@ impl Workspace {
                     .test_support()
                     .into_any_element()
             }
+            Row::Pair(f, h, left, right) => {
+                let lines = &review.files[f].hunks[h].lines;
+                let (left, right) = (left.map(|i| &lines[i]), right.map(|i| &lines[i]));
+                let label = [side_label(left, true), side_label(right, false)].join(" | ");
+                div()
+                    .id(("diff-row", ix))
+                    .w_full()
+                    .flex()
+                    .h(px(LINE_HEIGHT))
+                    .items_center()
+                    .font_family(mono_font())
+                    .text_size(px(12.))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .aria_label(label)
+                    .child(split_side(("diff-left", ix), left, true))
+                    .child(split_side(("diff-right", ix), right, false))
+                    .test_support()
+                    .into_any_element()
+            }
             Row::Note(f) => {
                 let note = review.files[f].note.clone().unwrap_or_default();
                 div()
@@ -760,6 +1136,64 @@ impl Workspace {
                     .text_color(color("text-tertiary"))
                     .aria_label(note.clone())
                     .child(note)
+                    .test_support()
+                    .into_any_element()
+            }
+            Row::OutsideTitle => div()
+                .id(("diff-row", ix))
+                .w_full()
+                .flex()
+                .items_center()
+                .h(px(40.))
+                .px(px(16.))
+                .text_size(px(12.))
+                .text_color(color("text-secondary"))
+                .aria_label(OUTSIDE_TITLE)
+                .child(OUTSIDE_TITLE)
+                .test_support()
+                .into_any_element(),
+            Row::Comment(c) => {
+                let comment = &review.comments[c];
+                let header = comment_header(comment);
+                let doc = crate::markdown::parse(&comment.body);
+                // In split view the card spans both columns.
+                let gutters = if review.split { 1. } else { 2. };
+                div()
+                    .id(("diff-row", ix))
+                    .w_full()
+                    .py(px(6.))
+                    .pl(px(GUTTER * gutters + 16.))
+                    .pr(px(16.))
+                    .child(
+                        div()
+                            .id(("review-comment", c))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .max_w(px(720.))
+                            .px(px(12.))
+                            .py(px(10.))
+                            .bg(color("surface-raised"))
+                            .border_1()
+                            .border_color(color("border-200"))
+                            .rounded(px(8.))
+                            .aria_label(header.clone())
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(color("text-secondary"))
+                                    .child(header),
+                            )
+                            .child(
+                                div()
+                                    .id(("review-comment-body", c))
+                                    .aria_label(comment.body.clone())
+                                    .child(render_doc(&doc, &[], &format!("review-comment-{c}")))
+                                    .test_support(),
+                            )
+                            .test_support(),
+                    )
                     .test_support()
                     .into_any_element()
             }
@@ -873,16 +1307,17 @@ impl Workspace {
                         Button::new("review-unified")
                             .ghost()
                             .xsmall()
-                            .selected(true)
-                            .label("Unified"),
+                            .selected(!review.split)
+                            .label("Unified")
+                            .on_click(cx.listener(|this, _, _, cx| this.set_split(false, cx))),
                     )
                     .child(
                         Button::new("review-split")
                             .ghost()
                             .xsmall()
+                            .selected(review.split)
                             .label("Split")
-                            .disabled(true)
-                            .tooltip("Split view is coming soon."),
+                            .on_click(cx.listener(|this, _, _, cx| this.set_split(true, cx))),
                     ),
             )
             .child(
@@ -937,6 +1372,10 @@ impl Workspace {
         let removed: u32 = files.iter().map(|f| f.3).sum();
         let n = files.len();
         let summary = format!("{n} {} changed · +{added} −{removed}", files_word(n));
+        let ran = review
+            .map(|r| (r.thread, r.checks.clone()))
+            .filter(|(_, c)| !c.is_empty());
+        let ran = ran.and_then(|(thread, list)| Some((self.review_agent(thread)?, list)));
         div()
             .id("review-files")
             .flex()
@@ -1013,6 +1452,74 @@ impl Workspace {
                             .test_support()
                     }),
             )
+            .when_some(ran, |col, (agent, list)| {
+                col.child(
+                    div()
+                        .id("review-checks")
+                        .flex()
+                        .flex_col()
+                        .mt(px(8.))
+                        .child(
+                            div()
+                                .id("review-checks-title")
+                                .aria_label(format!("Checks {agent} ran"))
+                                .test_support()
+                                .h(px(32.))
+                                .px(px(16.))
+                                .flex()
+                                .items_center()
+                                .text_size(px(12.))
+                                .text_color(color("text-secondary"))
+                                .child(format!("Checks {agent} ran")),
+                        )
+                        .children(list.into_iter().enumerate().map(|(ix, check)| {
+                            let word = match check.state {
+                                CheckState::Running => "Running",
+                                CheckState::Passed => "Passed",
+                                CheckState::Failed => "Failed",
+                            };
+                            let icon = match check.state {
+                                CheckState::Running => {
+                                    spinner(("review-check-spinner", ix), 12., "accent-blue")
+                                        .into_any_element()
+                                }
+                                CheckState::Passed => Icon::new(IconName::Check)
+                                    .size(px(12.))
+                                    .text_color(color("success"))
+                                    .into_any_element(),
+                                CheckState::Failed => Icon::new(IconName::CircleX)
+                                    .size(px(12.))
+                                    .text_color(color("danger"))
+                                    .into_any_element(),
+                            };
+                            div()
+                                .id(("review-check", ix))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .h(px(28.))
+                                .px(px(16.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(color("surface-100")))
+                                .aria_label(format!("{word} {}", check.command))
+                                .child(div().flex_none().child(icon))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(mono_font())
+                                        .text_size(px(12.))
+                                        .text_color(color("text-primary"))
+                                        .child(check.command.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_check(&check, window, cx);
+                                }))
+                                .test_support()
+                        })),
+                )
+            })
     }
 
     fn render_review_diff(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1027,6 +1534,7 @@ impl Workspace {
             Some(_) => None,
             None => Some(NOTHING_TO_REVIEW.to_string()),
         };
+        let open_error = review.and_then(|r| r.open_error.clone());
         let body = match (empty, review) {
             (None, Some(review)) => div()
                 .id("review-diff")
@@ -1062,6 +1570,14 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
+            .when_some(open_error, |col, error| {
+                col.child(
+                    div()
+                        .px(px(16.))
+                        .py(px(8.))
+                        .child(super::settings::form_error("review-open-error", error)),
+                )
+            })
             .child(body)
     }
 
@@ -1130,6 +1646,27 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("What next"),
             )
+            .when_some(review.left.clone(), |col, (agent, n)| {
+                let text = format!(
+                    "{agent} left {n} {}.",
+                    if n == 1 { "comment" } else { "comments" }
+                );
+                col.child(
+                    div()
+                        .id("review-callout")
+                        .px(px(12.))
+                        .py(px(10.))
+                        .bg(color("surface-100"))
+                        .border_1()
+                        .border_color(color("border-200"))
+                        .rounded(px(8.))
+                        .text_size(px(13.))
+                        .text_color(color("text-primary"))
+                        .aria_label(text.clone())
+                        .child(text)
+                        .test_support(),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1219,13 +1756,123 @@ impl Workspace {
     }
 }
 
+/// Notes where the list is scrolled, before its rows or files change.
+fn keep_scroll(review: &Review) -> Kept {
+    let top = review.list.logical_scroll_top();
+    let on_card = matches!(review.rows.get(top.item_ix), Some(Row::Comment(_)));
+    Kept {
+        anchor: anchor_at(&review.rows, &review.files, top.item_ix),
+        offset: if on_card { px(0.) } else { top.offset_in_item },
+        ix: top.item_ix,
+    }
+}
+
+/// Draws the rows again, keeping the list on the row it was on.
 fn rebuild_rows(review: &mut Review) {
-    let (rows, starts) = diff_rows(&review.files, &review.shown);
+    let kept = keep_scroll(review);
+    rebuild_rows_from(review, kept);
+}
+
+/// [`rebuild_rows`] for a change that already replaced the files.
+fn rebuild_rows_from(review: &mut Review, kept: Kept) {
+    let (rows, starts) = diff_rows(&review.files, &review.shown, &review.comments, review.split);
     if rows != review.rows {
+        let top = kept
+            .anchor
+            .as_ref()
+            .and_then(|a| find_anchor(&rows, &review.files, a))
+            .or_else(|| kept.ix.min(rows.len().saturating_sub(1)).into());
         review.list.reset(rows.len());
+        if let Some(item_ix) = top.filter(|&ix| ix > 0 || kept.offset > px(0.)) {
+            review.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: kept.offset,
+            });
+        }
     }
     review.rows = rows;
     review.file_rows = starts;
+}
+
+/// A split side's number, sign and text, as it is read back. Empty for
+/// no line.
+fn side_label(line: Option<&Line>, left: bool) -> String {
+    let Some(line) = line else {
+        return String::new();
+    };
+    let text = line.text.replace('\t', "    ");
+    if line.kind == LineKind::NoNewline {
+        return text;
+    }
+    let number = if left { line.old } else { line.new };
+    let sign = match line.kind {
+        LineKind::Added => "+",
+        LineKind::Removed => "−",
+        _ => " ",
+    };
+    format!(
+        "{} {sign} {text}",
+        number.map_or_else(|| "·".into(), |n| n.to_string())
+    )
+}
+
+/// One column of a split row: its own number gutter, the sign and the
+/// text. No line leaves it empty.
+fn split_side(id: (&'static str, usize), line: Option<&Line>, left: bool) -> impl IntoElement {
+    let (tint, sign, sign_colour) = match line.map(|l| l.kind) {
+        Some(LineKind::Added) => (Some("success-subtle"), "+", "success"),
+        Some(LineKind::Removed) => (Some("danger-subtle"), "−", "danger"),
+        _ => (None, " ", "text-tertiary"),
+    };
+    let number = line.and_then(|l| if left { l.old } else { l.new });
+    let no_newline = line.is_some_and(|l| l.kind == LineKind::NoNewline);
+    let text = line.map(|l| l.text.replace('\t', "    "));
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .when(!left, |side| {
+            side.border_l_1().border_color(color("border-100"))
+        })
+        .when_some(tint, |side, tint| side.bg(color(tint)))
+        .aria_label(side_label(line, left))
+        .child(
+            div()
+                .flex_none()
+                .w(px(GUTTER))
+                .pr(px(8.))
+                .flex()
+                .justify_end()
+                .text_color(color("text-gutter"))
+                .children(number.map(|n| n.to_string())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(16.))
+                .text_color(color(sign_colour))
+                .child(if no_newline { "" } else { sign }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_color(color(if no_newline {
+                    "text-tertiary"
+                } else {
+                    "text-primary"
+                }))
+                .children(text),
+        )
+        .test_support()
+}
+
+/// "{Agent} · {path}:{line}".
+fn comment_header(comment: &Comment) -> String {
+    format!("{} · {}:{}", comment.agent, comment.path, comment.line)
 }
 
 fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
@@ -1247,45 +1894,14 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
         )
 }
 
-/// `EDITOR_APP`, in debug builds only, such as `Zed`.
-fn editor_app() -> Option<String> {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var("EDITOR_APP")
-            .ok()
-            .filter(|a| !a.trim().is_empty())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        None
-    }
-}
-
-/// Opens `path` with `open`, in `app` if given. Blocks until `open`
-/// returns, so run it off the UI thread.
-fn open_folder(path: PathBuf, app: Option<String>) -> Result<(), String> {
-    let mut open = std::process::Command::new("open");
-    if let Some(app) = &app {
-        open.arg("-a").arg(app);
-    }
-    let status = open.arg(&path).status().map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(match app {
-            Some(app) => {
-                format!("{app} couldn't open the folder. Check that the app is installed.")
-            }
-            None => "The folder couldn't be opened. Refresh to check it still exists.".into(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{LARGE_FILE_LINES, Row, diff_rows, draft_commit_message};
+    use super::{
+        Anchor, LARGE_FILE_LINES, Row, anchor_at, diff_rows, draft_commit_message, find_anchor,
+    };
+    use crate::comments::Comment;
     use crate::diff_parse::parse;
 
     #[test]
@@ -1314,7 +1930,7 @@ mod tests {
             LARGE_FILE_LINES + 1
         );
         let files = parse(&patch);
-        let (rows, starts) = diff_rows(&files, &HashSet::new());
+        let (rows, starts) = diff_rows(&files, &HashSet::new(), &[], false);
         assert_eq!(
             rows,
             [
@@ -1328,7 +1944,93 @@ mod tests {
         );
         assert_eq!(starts, [0, 4]);
         let shown = HashSet::from(["big".to_string()]);
-        let (rows, _) = diff_rows(&files, &shown);
+        let (rows, _) = diff_rows(&files, &shown, &[], false);
         assert_eq!(rows.len(), 4 + 2 + LARGE_FILE_LINES + 1);
+    }
+
+    const MODIFIED: &str = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+        @@ -1,3 +1,3 @@\n one\n-two\n+deux\n three\n";
+    const ADDED: &str = "diff --git a/n b/n\nnew file mode 100644\n--- /dev/null\n+++ b/n\n\
+        @@ -0,0 +1,2 @@\n+x\n+y\n";
+    const DELETED: &str = "diff --git a/d b/d\ndeleted file mode 100644\n--- a/d\n+++ /dev/null\n\
+        @@ -1,2 +0,0 @@\n-x\n-y\n";
+
+    fn comment(path: &str, line: u32) -> Comment {
+        Comment {
+            agent: "Scout".into(),
+            path: path.into(),
+            line,
+            body: "note".into(),
+        }
+    }
+
+    #[test]
+    fn split_rows_pair_lines_and_keep_comments_under_their_pair() {
+        let files = parse(MODIFIED);
+        // Line 2 of the new file is `deux`, paired with `two`.
+        let (rows, _) = diff_rows(&files, &HashSet::new(), &[comment("a.rs", 2)], true);
+        assert_eq!(
+            rows,
+            [
+                Row::File(0),
+                Row::Hunk(0, 0),
+                Row::Pair(0, 0, Some(0), Some(0)),
+                Row::Pair(0, 0, Some(1), Some(2)),
+                Row::Comment(0),
+                Row::Pair(0, 0, Some(3), Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_of_added_and_deleted_files_has_one_empty_side() {
+        let files = parse(&format!("{ADDED}{DELETED}"));
+        // Deleted files are commented by their old line numbers.
+        let (rows, _) = diff_rows(&files, &HashSet::new(), &[comment("d", 2)], true);
+        assert_eq!(
+            rows,
+            [
+                Row::File(0),
+                Row::Hunk(0, 0),
+                Row::Pair(0, 0, None, Some(0)),
+                Row::Pair(0, 0, None, Some(1)),
+                Row::File(1),
+                Row::Hunk(1, 0),
+                Row::Pair(1, 0, Some(0), None),
+                Row::Pair(1, 0, Some(1), None),
+                Row::Comment(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_top_row_is_found_again_after_the_rows_change() {
+        let files = parse(MODIFIED);
+        let none = HashSet::new();
+        let (unified, _) = diff_rows(&files, &none, &[], false);
+        let (split, _) = diff_rows(&files, &none, &[], true);
+        // `deux` is unified row 4 and the split row 3.
+        let at = anchor_at(&unified, &files, 4).unwrap();
+        assert_eq!(at, Anchor::Line("a.rs".into(), 0, 2));
+        assert_eq!(find_anchor(&split, &files, &at), Some(3));
+        let back = anchor_at(&split, &files, 3).unwrap();
+        // The pair starts at the deletion, `two`.
+        assert_eq!(find_anchor(&unified, &files, &back), Some(3));
+        // A comment row stands for the line above it.
+        let (with, _) = diff_rows(&files, &none, &[comment("a.rs", 2)], false);
+        assert_eq!(with[5], Row::Comment(0));
+        assert_eq!(anchor_at(&with, &files, 5), Some(at.clone()));
+        assert_eq!(find_anchor(&with, &files, &at), Some(4));
+        // A line that is gone falls back to its hunk, then its file.
+        let gone = Anchor::Line("a.rs".into(), 0, 99);
+        assert_eq!(find_anchor(&unified, &files, &gone), Some(1));
+        assert_eq!(
+            find_anchor(&unified, &files, &Anchor::Folded("a.rs".into())),
+            Some(0)
+        );
+        assert_eq!(
+            find_anchor(&unified, &files, &Anchor::File("other".into())),
+            None
+        );
     }
 }

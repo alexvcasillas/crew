@@ -102,6 +102,13 @@ pub enum Event {
     Error {
         message: String,
     },
+    /// How full the agent's context is. `context_window` is the model's
+    /// size when the runtime said so.
+    Usage {
+        context_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+    },
     Raw {
         line: String,
     },

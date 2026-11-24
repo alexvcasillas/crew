@@ -977,3 +977,26 @@ fn wide_windows_show_the_inspector_until_hidden(cx: &mut TestAppContext) {
         Some("Show activity")
     );
 }
+
+#[gpui_kit::test]
+fn footer_shows_how_full_the_context_is(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = [
+        r#"printf '{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"claude-opus-5-1","tools":[]}\n'"#,
+        r#"printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":28472,"cache_read_input_tokens":12333,"output_tokens":8}}}\n'"#,
+        r#"printf '{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1,"num_turns":1,"permission_denials":[],"session_id":"s","modelUsage":{"claude-opus-5-1":{"contextWindow":200000}}}\n'"#,
+    ]
+    .join("\n");
+    let claude = fake_claude(tmp.path(), &run);
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    w.post("@Forge look");
+    run_of(cx, &ws, w.thread, w.agents[0], RunStatus::Done);
+    click(cx, window, "inspector-tab-activity");
+    // 40,807 of 200,000 is 20%.
+    wait_until(cx, "the context in the footer", |cx| {
+        label_of(cx, window, "context-usage").as_deref() == Some("Context 20%")
+    });
+}

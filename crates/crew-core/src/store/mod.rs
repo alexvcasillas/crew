@@ -346,6 +346,18 @@ impl Store {
         Ok(())
     }
 
+    /// The last context window seen for `model`, in tokens.
+    pub fn context_window(&self, model: &str) -> Result<Option<u64>> {
+        Ok(self
+            .setting(&format!("context_window:{model}"))?
+            .and_then(|raw| raw.parse().ok()))
+    }
+
+    /// Remembers the context window of `model`.
+    pub fn set_context_window(&self, model: &str, tokens: u64) -> Result<()> {
+        self.set_setting(&format!("context_window:{model}"), &tokens.to_string())
+    }
+
     /// The limits. A missing or unreadable row gives its default and a
     /// number out of range is clamped, so this never fails on bad data.
     pub fn limits(&self) -> Result<Limits> {

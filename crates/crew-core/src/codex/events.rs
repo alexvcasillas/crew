@@ -17,7 +17,6 @@ use crate::event::{Event, ToolKind};
 /// Notifications that carry no chat content. They are dropped, not shown raw.
 const QUIET: &[&str] = &[
     "thread/status/changed",
-    "thread/tokenUsage/updated",
     "thread/readState/changed",
     "thread/settings/updated",
     "thread/goal/cleared",
@@ -46,6 +45,8 @@ pub struct CodexTranslator {
     final_answer: Option<String>,
     /// Set once `SessionStarted` was given, so a resume doesn't repeat it.
     session: bool,
+    /// The last usage given, so a repeat is not given again.
+    usage: Option<(u64, Option<u64>)>,
 }
 
 impl CodexTranslator {
@@ -214,11 +215,30 @@ impl CodexTranslator {
             let text = |k: &str| thread.get(k).and_then(Value::as_str).unwrap_or("");
             return self.session_started(text("id"), text("model"), text("cwd"));
         }
+        if method == "thread/tokenUsage/updated" {
+            return self.token_usage(&v["params"]["tokenUsage"]);
+        }
         if QUIET.contains(&method) {
             return vec![];
         }
         vec![Event::Raw {
             line: v.to_string(),
+        }]
+    }
+
+    /// `Usage` for a token count. `last.inputTokens` is the size of the
+    /// latest request and already holds the cached tokens.
+    fn token_usage(&mut self, usage: &Value) -> Vec<Event> {
+        let Some(tokens) = usage.pointer("/last/inputTokens").and_then(Value::as_u64) else {
+            return vec![];
+        };
+        let window = usage.get("modelContextWindow").and_then(Value::as_u64);
+        if self.usage.replace((tokens, window)) == Some((tokens, window)) {
+            return vec![];
+        }
+        vec![Event::Usage {
+            context_tokens: tokens,
+            context_window: window,
         }]
     }
 

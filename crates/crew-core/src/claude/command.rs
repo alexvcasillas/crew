@@ -175,6 +175,11 @@ pub struct Teammate {
     pub edits: bool,
 }
 
+/// How agents write review findings, so Crew can pin them to the diff.
+/// [`crate::review::parse_findings`] reads them.
+const REVIEW_FORMAT: &str =
+    "When you review changes, list each finding on its own line as `path:line: comment`.";
+
 /// Where the agent works and with whom. Told to it in the system prompt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrewContext {
@@ -220,6 +225,7 @@ impl CrewContext {
                 "You are read-only: review and report, don't change files.".into()
             }
         });
+        lines.push(REVIEW_FORMAT.into());
         if !self.team.is_empty() {
             lines.push("Other agents here:".into());
             for mate in &self.team {
@@ -687,6 +693,7 @@ mod tests {
             vec![
                 "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
                  You are read-only: review and report, don't change files.\n\
+                 When you review changes, list each finding on its own line as `path:line: comment`.\n\
                  Other agents here:\n\
                  - Forge (Builds features, edits files)\n\
                  - Scout (read-only)\n\
@@ -718,7 +725,8 @@ mod tests {
             system_prompt(&inv),
             vec![
                 "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
-                 You can edit files in this thread's worktree."
+                 You can edit files in this thread's worktree.\n\
+                 When you review changes, list each finding on its own line as `path:line: comment`."
             ]
         );
     }
@@ -730,6 +738,7 @@ mod tests {
             context().render_codex(&a, true),
             "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
              You can edit files in this thread's worktree.\n\
+             When you review changes, list each finding on its own line as `path:line: comment`.\n\
              Other agents here:\n\
              - Forge (Builds features, edits files)\n\
              - Scout (read-only)\n\
@@ -831,7 +840,8 @@ mod tests {
         assert_eq!(
             ctx.render(&agent(PermissionMode::Auto), false),
             "You are reviewer, Reviews code, working in Crew with other agents in project demo.\n\
-             You can edit files in this thread's worktree. Commands run without asking unless a safety check stops them."
+             You can edit files in this thread's worktree. Commands run without asking unless a safety check stops them.\n\
+             When you review changes, list each finding on its own line as `path:line: comment`."
         );
     }
 

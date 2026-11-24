@@ -181,7 +181,6 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
         label_of(cx, window, "settings-title").as_deref(),
         Some("Settings")
     );
-    assert!(shows(cx, window, "4"), "max agents at once");
     click(cx, window, "settings-nav-agents");
     assert_eq!(
         label_of(cx, window, "agent-form-title").as_deref(),

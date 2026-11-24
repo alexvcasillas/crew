@@ -6,14 +6,16 @@ pub mod limits;
 pub mod projects;
 pub mod runtimes;
 
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::select::{Select, SelectEvent};
+use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::title_bar::home_relative;
-use super::workspace::Workspace;
+use super::workspace::{EditorSelect, Workspace};
 use crate::app::bindings as app_bindings;
+use crate::editor::{self, FINDER};
 use crate::fonts::mono_font;
 use crate::theme::color;
 
@@ -275,14 +277,78 @@ impl Workspace {
                 value_text("general-home", home_relative(&self.conn.crew_home), true),
             ))
             .child(field(
-                "Max agents at once",
-                Some("More runs wait in a queue until one finishes."),
-                value_text(
-                    "general-max-runs",
-                    self.state().limits().max_runs.to_string(),
-                    false,
-                ),
+                "Editor",
+                Some("Open in editor uses this app."),
+                div().w(px(280.)).child(control(
+                    "general-editor",
+                    Select::new(&self.editor_select)
+                        .small()
+                        .accessibility_label("Editor"),
+                )),
             ))
+    }
+}
+
+/// The Editor select's labels (Finder first) and the one shown for
+/// `chosen`.
+pub(super) fn editor_items(
+    chosen: Option<&str>,
+    detected: &[String],
+) -> (Vec<SharedString>, Option<IndexPath>) {
+    let labels: Vec<SharedString> = std::iter::once(FINDER.to_string())
+        .chain(detected.iter().cloned())
+        .map(SharedString::from)
+        .collect();
+    let shown = editor::resolve(chosen, detected).unwrap_or_else(|| FINDER.to_string());
+    let ix = labels.iter().position(|l| *l == shown).map(IndexPath::new);
+    (labels, ix)
+}
+
+impl Workspace {
+    /// The app Open in editor launches, or `None` for Finder.
+    pub(super) fn editor_app(&self) -> Option<String> {
+        editor::resolve(self.editor_choice.as_deref(), &self.editors)
+    }
+
+    pub(super) fn editor_picked(
+        &mut self,
+        _: &Entity<EditorSelect>,
+        event: &SelectEvent<Vec<SharedString>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let SelectEvent::Confirm(Some(label)) = event {
+            self.choose_editor(label.to_string(), cx);
+        }
+    }
+
+    /// Remembers `choice` (an app name or Finder) for next time too.
+    pub(super) fn choose_editor(&mut self, choice: String, cx: &mut Context<Self>) {
+        if let Err(e) = editor::save_choice(&self.conn.crew_home, &choice) {
+            self.last_error = Some(format!("Your editor choice wasn't saved: {e}.").into());
+        }
+        self.editor_choice = Some(choice);
+        cx.notify();
+    }
+
+    /// Replaces what was detected and the launcher, as tests do.
+    #[cfg(test)]
+    pub(super) fn set_editor_env(
+        &mut self,
+        detected: Vec<String>,
+        opener: editor::Opener,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editors = detected;
+        self.opener = opener;
+        let (labels, ix) = editor_items(self.editor_choice.as_deref(), &self.editors);
+        self.editor_select.update(cx, |select, cx| {
+            select.set_items(labels, window, cx);
+            if let Some(ix) = ix {
+                select.set_selected_index(Some(ix), window, cx);
+            }
+        });
     }
 }
 

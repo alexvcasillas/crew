@@ -458,7 +458,7 @@ fn event_line(event: &Event) -> Option<String> {
             output,
             ..
         } => Some(format!("tool failed: {}", first_line(output))),
-        Event::ToolResult { .. } | Event::TurnEnd { .. } => None,
+        Event::ToolResult { .. } | Event::TurnEnd { .. } | Event::Usage { .. } => None,
     }
 }
 

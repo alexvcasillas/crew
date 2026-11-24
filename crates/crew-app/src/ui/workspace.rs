@@ -12,6 +12,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::select::SelectState;
 use gpui_kit::*;
 
 use super::approval_card::BriefEditor;
@@ -25,7 +26,7 @@ use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
 use super::service_control::ServiceAction;
 use super::settings::projects::{PickFolder, native_picker};
-use super::settings::{Page, SettingsView};
+use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
     ApproveLatest, NewThread, OpenSettings, Search, ShowRunning, ShowThreads, StopAll,
@@ -132,11 +133,13 @@ pub struct Workspace {
     pub(super) deciding: HashSet<ApprovalId>,
     /// Whether you showed or hid the inspector. Until you do, it follows
     /// the window's width.
-    inspector_open: Option<bool>,
+    pub(super) inspector_open: Option<bool>,
     /// Whether the inspector is shown, as last drawn.
     pub(super) inspector_shown: bool,
     /// The open review of a thread's changes, shown in place of the body.
     pub(super) review: Option<Review>,
+    /// Review changes shows lines side by side. Kept while the app runs.
+    pub(super) diff_split: bool,
     /// Files you marked as viewed, per thread, kept in memory only.
     pub(super) viewed: HashMap<ThreadId, HashSet<String>>,
     /// A thread whose review opens once the thread is open (debug
@@ -170,7 +173,19 @@ pub struct Workspace {
     pub(super) pick_folder: PickFolder,
     /// Picking a folder and asking git about it.
     pub(super) folder_task: Option<Task<()>>,
+    /// The editor you chose in settings, if you did.
+    pub(super) editor_choice: Option<String>,
+    /// The editors found on this Mac.
+    pub(super) editors: Vec<String>,
+    /// Launches the editor.
+    pub(super) opener: crate::editor::Opener,
+    /// The Editor row of General.
+    pub(super) editor_select: Entity<EditorSelect>,
+    _editor_events: Subscription,
 }
+
+/// The Editor select of General.
+pub(super) type EditorSelect = SelectState<Vec<SharedString>>;
 
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -188,6 +203,13 @@ impl Workspace {
                     }
                 },
             );
+        let editor_choice = crate::editor::load_choice(&conn.crew_home);
+        let editors = crate::editor::detect_installed();
+        let editor_select = cx.new(|cx| {
+            let (labels, ix) = editor_items(editor_choice.as_deref(), &editors);
+            SelectState::new(labels, ix, window, cx)
+        });
+        let editor_events = cx.subscribe_in(&editor_select, window, Self::editor_picked);
         let hooks = dev_hooks();
         let bundled_crewd = std::env::current_exe()
             .ok()
@@ -242,6 +264,7 @@ impl Workspace {
             inspector_open: None,
             inspector_shown: false,
             review: None,
+            diff_split: false,
             viewed: HashMap::new(),
             review_pending: hooks.review,
             commit_messages: HashMap::new(),
@@ -258,6 +281,11 @@ impl Workspace {
             snapshot_seen: false,
             pick_folder: native_picker(),
             folder_task: None,
+            editor_choice,
+            editors,
+            opener: crate::editor::system_opener(),
+            editor_select,
+            _editor_events: editor_events,
         }
     }
 
@@ -426,6 +454,7 @@ impl Workspace {
         self.sync(cx);
         self.sync_inspector(window, cx);
         self.sync_review_draft(window, cx);
+        self.sync_review_comments(cx);
         self.open_if_known(window, cx);
         let open = self.terminal.as_ref().map(|t| t.session.as_str());
         if terminal_gone && open.is_some_and(|id| self.state.terminal_session(id).is_none()) {
