@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crew_core::claude::parse::classifier_reason;
-use crew_core::event::{Event, ToolKind, humanize_reason};
+use crew_core::event::{Event, ToolKind, humanize_reason, tool_label};
 use crew_core::ids::RunId;
 use crew_core::store::StoredRun;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -43,6 +43,8 @@ pub struct Step {
     pub lines: Option<(u32, u32)>,
     /// Why the safety check stopped it, as a sentence, if it did.
     pub reason: Option<String>,
+    /// The tool's own name, when [`tool_label`] reads it another way.
+    pub raw: Option<String>,
 }
 
 impl Step {
@@ -188,7 +190,7 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
             };
             // A stopped call never ran: it reads as what it would have done.
             let verb = if state == StepState::Blocked {
-                super::activity::verb(&call.kind, &call.name).to_string()
+                super::activity::verb(&call.kind, &call.name)
             } else {
                 verb(&call.kind, &call.name, state == StepState::Running)
             };
@@ -198,6 +200,7 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
                 lines: call.lines.filter(|_| state == StepState::Done),
                 target: call.target,
                 reason,
+                raw: raw_name(&call.name),
             }
         })
         .collect();
@@ -212,9 +215,14 @@ pub(super) fn verb(kind: &ToolKind, name: &str, ongoing: bool) -> String {
         ToolKind::Edit => ("Editing", "Edited"),
         ToolKind::Create => ("Creating", "Created"),
         ToolKind::Run => ("Running", "Ran"),
-        ToolKind::Other => return name.to_string(),
+        ToolKind::Other => return tool_label(name),
     };
     if ongoing { now } else { then }.to_string()
+}
+
+/// `name` when [`tool_label`] shows it another way, for a tooltip.
+pub(super) fn raw_name(name: &str) -> Option<String> {
+    (tool_label(name) != name).then(|| name.to_string())
 }
 
 /// `path` relative to the run's folder, if it is inside it.
@@ -477,8 +485,13 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
         .text_size(px(12.))
         .text_color(color("text-secondary"))
         .aria_label(text)
+        .when_some(step.raw.clone(), |row, raw| {
+            row.tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(raw.clone()).build(window, cx)
+            })
+        })
         .child(icon)
-        .child(step.verb.clone())
+        .child(div().flex_none().child(step.verb.clone()))
         .when(!step.target.trim().is_empty(), |row| {
             row.child(
                 div()
@@ -714,6 +727,27 @@ mod tests {
         // Before its result comes, the denial alone says so.
         let step = summarize(&events[..2], run).steps.remove(0);
         assert_eq!(step.state, StepState::Blocked);
+    }
+
+    #[test]
+    fn mcp_steps_read_as_server_and_tool() {
+        let run = RunId::new();
+        let name = "mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page";
+        let events = vec![
+            call(run, 1, "t1", name, serde_json::json!({"url": "x"})),
+            call(
+                run,
+                2,
+                "t2",
+                "mcp__crew_run__handoff",
+                serde_json::json!({}),
+            ),
+        ];
+        let steps = summarize(&events, run).steps;
+        assert_eq!(steps[0].text(), "chrome-devtools · navigate page");
+        assert_eq!(steps[0].raw.as_deref(), Some(name));
+        assert_eq!(steps[1].text(), "mcp__crew_run__handoff");
+        assert_eq!(steps[1].raw, None);
     }
 
     #[test]

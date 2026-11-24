@@ -708,7 +708,7 @@ async fn crew_elicitations_pass_and_other_servers_ask() {
 
     assert!(
         system_texts(&seen)
-            .contains(&r#"Forge wants to use github/create_issue: {"title":"x"}"#.to_string()),
+            .contains(&r#"Forge wants to use github · create issue: {"title":"x"}"#.to_string()),
         "{seen:#?}"
     );
 

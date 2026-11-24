@@ -26,6 +26,37 @@ impl ToolKind {
     }
 }
 
+/// A tool's name as people read it. An MCP tool, named
+/// `mcp__<server>__<tool>`, reads as `<server> · <tool>` with spaces for
+/// underscores. A plugin's server, `plugin_<plugin>_<server>`, reads as
+/// just `<server>`. Crew's own tools and every other name stay as they are.
+pub fn tool_label(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("mcp__") else {
+        return name.to_string();
+    };
+    if rest.starts_with("crew_run__") {
+        return name.to_string();
+    }
+    let (server, tool) = match rest.split_once("__") {
+        Some((server, tool)) => (server, Some(tool)),
+        None => (rest, None),
+    };
+    let server = match server.strip_prefix("plugin_") {
+        Some(plugin) => plugin.rsplit('_').next().unwrap_or(plugin),
+        None => server,
+    };
+    if server.is_empty() {
+        return name.to_string();
+    }
+    match tool
+        .map(|t| t.replace('_', " "))
+        .filter(|t| !t.trim().is_empty())
+    {
+        Some(tool) => format!("{server} · {}", tool.trim()),
+        None => server.to_string(),
+    }
+}
+
 /// One thing an agent did or said during a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -196,6 +227,26 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    #[test]
+    fn mcp_tools_read_as_server_and_tool() {
+        use super::tool_label;
+        assert_eq!(
+            tool_label("mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page"),
+            "chrome-devtools · navigate page"
+        );
+        assert_eq!(
+            tool_label("mcp__github__create_issue"),
+            "github · create issue"
+        );
+        assert_eq!(tool_label("mcp__docs"), "docs");
+        assert_eq!(
+            tool_label("mcp__crew_run__handoff"),
+            "mcp__crew_run__handoff"
+        );
+        assert_eq!(tool_label("Bash"), "Bash");
+        assert_eq!(tool_label("mcp____x"), "mcp____x");
     }
 
     #[test]
