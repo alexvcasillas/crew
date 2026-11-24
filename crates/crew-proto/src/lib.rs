@@ -285,6 +285,11 @@ pub struct ChannelStats {
 }
 
 /// What a thread card shows.
+///
+/// `files`, `added` and `removed` are the thread's whole work: its
+/// worktree against the base it started from, commits included. Review
+/// changes (`ThreadDiff`) shows only what isn't committed yet, so after a
+/// commit the card still counts files that Review changes no longer lists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadSummary {
     pub thread: ThreadId,
@@ -318,6 +323,10 @@ pub struct ThreadSummary {
     /// Time of all its runs, live ones so far, in ms.
     #[serde(default)]
     pub agent_ms: i64,
+    /// The counts are still being worked out: `files`, `added` and
+    /// `removed` are their last known values, or zeros.
+    #[serde(default)]
+    pub counting: bool,
 }
 
 /// One run in a thread card's strip.
@@ -654,6 +663,7 @@ mod tests {
                 added: 3,
                 removed: 1,
                 agent_ms: 1200,
+                counting: true,
             }],
         };
         let json = serde_json::to_value(&overview).unwrap();

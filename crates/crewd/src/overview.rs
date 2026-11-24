@@ -1,10 +1,13 @@
 //! A channel at a glance: stats and one summary per thread.
 //!
 //! Change counts come from git, so they are cached per thread and only
-//! worked out again once something may have changed them: a run ended, a
-//! commit, a discard or a worktree setup.
+//! worked out again once something may have changed them: a run ended or
+//! edited a file, a commit, a discard or a worktree setup. An overview
+//! waits a short while for counts it lacks; the rest keep being worked out
+//! in the background and the overview says so.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ChannelId, ThreadId};
@@ -12,7 +15,6 @@ use crew_core::store::{StoredRun, StoredThread, ThreadActivity};
 use crew_core::text::clean_line;
 use crew_core::worktree::{self, ChangeCounts};
 use crew_proto::{ChannelOverview, ChannelStats, RunBar, ThreadSummary, WorktreeState};
-use tokio::task::JoinSet;
 
 use crate::service::{Reply, Service, json, log, now_ms};
 
@@ -20,16 +22,32 @@ use crate::service::{Reply, Service, json, log, now_ms};
 pub const EXCERPT_LEN: usize = 240;
 /// What "this week" covers.
 const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// Threads whose counts are worked out at once.
-const GIT_AT_ONCE: usize = 8;
+/// Threads whose counts are worked out at once, across all overviews.
+pub(crate) const GIT_AT_ONCE: usize = 8;
+/// How long an overview waits for counts it lacks.
+const OVERVIEW_WAIT: Duration = Duration::from_millis(1500);
+/// How often a live run's edits may drop its thread's counts.
+const LIVE_EVERY: Duration = Duration::from_secs(5);
+/// How often counts are worked out again when the thread keeps changing
+/// meanwhile.
+const TRIES: u32 = 3;
 
 /// Change counts per thread. Each thread has a generation that grows when
 /// its counts may have changed, so counts worked out before that are
-/// never saved over the change.
+/// never saved as current. The last counts stay, to show while new ones
+/// are worked out.
 #[derive(Default)]
 pub(crate) struct ChangeCache {
     generation: HashMap<ThreadId, u64>,
     counts: HashMap<ThreadId, (u64, ChangeCounts)>,
+    /// Threads whose counts are being worked out.
+    computing: HashSet<ThreadId>,
+    /// When a live run last dropped each thread's counts.
+    live: HashMap<ThreadId, Instant>,
+    /// Threads with a live edit that came too soon after the last drop.
+    live_pending: HashSet<ThreadId>,
+    /// Edit and write calls of live runs that haven't finished, by thread.
+    edits: HashSet<(ThreadId, String)>,
 }
 
 impl ChangeCache {
@@ -38,38 +56,97 @@ impl ChangeCache {
     }
 
     /// The counts, if worked out since the last change.
-    fn get(&self, thread: ThreadId) -> Option<ChangeCounts> {
+    pub(crate) fn fresh(&self, thread: ThreadId) -> Option<ChangeCounts> {
         let (generation, counts) = self.counts.get(&thread)?;
         (*generation == self.generation(thread)).then_some(*counts)
     }
 
-    /// Saves counts worked out at `generation`, unless the thread changed
-    /// since.
-    fn put(&mut self, thread: ThreadId, generation: u64, counts: ChangeCounts) {
-        if generation == self.generation(thread) {
+    /// The last counts worked out, current or not.
+    fn last(&self, thread: ThreadId) -> Option<ChangeCounts> {
+        self.counts.get(&thread).map(|(_, c)| *c)
+    }
+
+    /// Marks the thread's counts as being worked out and returns the
+    /// generation they are for, unless that is already under way.
+    pub(crate) fn claim(&mut self, thread: ThreadId) -> Option<u64> {
+        self.computing
+            .insert(thread)
+            .then(|| self.generation(thread))
+    }
+
+    /// Saves counts worked out at `generation`. If the thread changed
+    /// since, nothing is saved and the new generation is returned, still
+    /// claimed, to work them out again; with `retry` off it is released.
+    pub(crate) fn finish(
+        &mut self,
+        thread: ThreadId,
+        generation: u64,
+        counts: ChangeCounts,
+        retry: bool,
+    ) -> Option<u64> {
+        let now = self.generation(thread);
+        if generation == now {
             self.counts.insert(thread, (generation, counts));
+        } else if retry {
+            return Some(now);
+        }
+        self.computing.remove(&thread);
+        None
+    }
+
+    /// Drops the thread's counts as current.
+    pub(crate) fn invalidate(&mut self, thread: ThreadId) {
+        *self.generation.entry(thread).or_default() += 1;
+        self.live_pending.remove(&thread);
+    }
+
+    /// Drops the thread's counts for a live run's edit, at most once per
+    /// [`LIVE_EVERY`]. An edit that comes sooner is kept for
+    /// [`Self::apply_due`]. Returns whether it dropped them.
+    pub(crate) fn invalidate_live(&mut self, thread: ThreadId, now: Instant) -> bool {
+        if self
+            .live
+            .get(&thread)
+            .is_some_and(|at| now.duration_since(*at) < LIVE_EVERY)
+        {
+            self.live_pending.insert(thread);
+            return false;
+        }
+        self.live.insert(thread, now);
+        self.invalidate(thread);
+        true
+    }
+
+    /// Drops the thread's counts for a held back live edit once
+    /// [`LIVE_EVERY`] has passed.
+    pub(crate) fn apply_due(&mut self, thread: ThreadId, now: Instant) {
+        if self.live_pending.contains(&thread) {
+            self.invalidate_live(thread, now);
         }
     }
 
-    /// Forgets the thread's counts.
-    pub(crate) fn invalidate(&mut self, thread: ThreadId) {
-        *self.generation.entry(thread).or_default() += 1;
-        self.counts.remove(&thread);
+    /// Notes an edit or write call of a live run.
+    pub(crate) fn edit_started(&mut self, thread: ThreadId, call: String) {
+        self.edits.insert((thread, call));
+    }
+
+    /// Forgets the thread's unfinished edit calls, as when its run ended.
+    pub(crate) fn forget_edits(&mut self, thread: ThreadId) {
+        self.edits.retain(|(t, _)| *t != thread);
+    }
+
+    /// Whether `call` was an edit or write call. Forgets it.
+    pub(crate) fn edit_finished(&mut self, thread: ThreadId, call: &str) -> bool {
+        self.edits.remove(&(thread, call.to_string()))
     }
 }
 
-/// A thread whose counts must be worked out.
-struct Stale {
-    thread: ThreadId,
-    generation: u64,
-    path: std::path::PathBuf,
-    base: String,
-}
-
 impl Service {
-    /// Answers `ChannelOverview`. Git only runs for threads whose counts
-    /// are not cached, a few at a time, and a git failure only zeroes that
-    /// thread's counts.
+    /// Answers `ChannelOverview`. Git only runs for threads that aren't
+    /// archived and whose counts are not current, a few at a time, and a
+    /// git failure only zeroes that thread's counts. Counts not worked out
+    /// within [`OVERVIEW_WAIT`] come as their last value, or zeros, marked
+    /// `counting`.
     pub(crate) async fn channel_overview(&self, channel: ChannelId) -> Reply {
         let (threads, activity, runs, copied) = {
             let db = self.db();
@@ -83,59 +160,125 @@ impl Service {
             });
             found.map_err(|e| e.to_string())?
         };
+        let deadline = tokio::time::Instant::now() + OVERVIEW_WAIT;
+
+        let mut wanted = Vec::new();
+        {
+            let mut cache = self.changes();
+            let now = Instant::now();
+            for thread in &threads {
+                let Some(wt) = &thread.worktree else { continue };
+                cache.apply_due(thread.id, now);
+                if thread.archived_at.is_some() || cache.fresh(thread.id).is_some() {
+                    continue;
+                }
+                wanted.push(thread.id);
+                if let Some(generation) = cache.claim(thread.id) {
+                    self.count_in_background(
+                        thread.id,
+                        generation,
+                        wt.path.clone(),
+                        wt.base.clone(),
+                        copied.clone(),
+                    );
+                }
+            }
+        }
+
+        loop {
+            let counted = self.counted();
+            tokio::pin!(counted);
+            counted.as_mut().enable();
+            let all_counted = {
+                let cache = self.changes();
+                wanted.iter().all(|t| cache.fresh(*t).is_some())
+            };
+            if all_counted {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, counted).await.is_err() {
+                break;
+            }
+        }
 
         let mut counts = HashMap::new();
-        let mut stale = Vec::new();
+        let mut counting = HashSet::new();
         {
             let cache = self.changes();
             for thread in &threads {
                 let Some(wt) = &thread.worktree else { continue };
-                match cache.get(thread.id) {
-                    Some(c) => {
-                        counts.insert(thread.id, c);
+                let c = match cache.fresh(thread.id) {
+                    Some(c) => c,
+                    None => {
+                        if thread.archived_at.is_none() {
+                            counting.insert(thread.id);
+                        }
+                        cache.last(thread.id).unwrap_or_default()
                     }
-                    None => stale.push(Stale {
-                        thread: thread.id,
-                        generation: cache.generation(thread.id),
-                        path: wt.path.clone(),
-                        base: wt.base.clone(),
-                    }),
+                };
+                // A folder deleted outside Crew since the counts were made.
+                let c = if wt.path.is_dir() {
+                    c
+                } else {
+                    counting.remove(&thread.id);
+                    ChangeCounts::default()
+                };
+                counts.insert(thread.id, c);
+            }
+        }
+
+        json(summarise(
+            &threads,
+            &activity,
+            &runs,
+            &counts,
+            &counting,
+            now_ms(),
+        ))
+    }
+
+    /// Works out the thread's counts off the async threads, waiting for
+    /// one of [`GIT_AT_ONCE`] slots, and saves them. Goes on even if the
+    /// overview that asked stopped waiting.
+    fn count_in_background(
+        &self,
+        thread: ThreadId,
+        mut generation: u64,
+        path: std::path::PathBuf,
+        base: String,
+        copied: Vec<String>,
+    ) {
+        let svc = self.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=TRIES {
+                let counts = match svc.count_slots().acquire_owned().await {
+                    Ok(slot) => {
+                        let delay = svc.count_delay();
+                        let (path, base, copied) = (path.clone(), base.clone(), copied.clone());
+                        let job = tokio::task::spawn_blocking(move || {
+                            let _slot = slot;
+                            std::thread::sleep(delay);
+                            count_changes(thread, &path, &base, &copied)
+                        });
+                        job.await.unwrap_or_else(|e| {
+                            log(format!(
+                                "counting the changes of thread {thread} ended: {e}"
+                            ));
+                            ChangeCounts::default()
+                        })
+                    }
+                    Err(_) => ChangeCounts::default(),
+                };
+                let again = svc
+                    .changes()
+                    .finish(thread, generation, counts, attempt < TRIES);
+                svc.notify_counted();
+                match again {
+                    Some(next) => generation = next,
+                    None => break,
                 }
             }
-        }
-        for batch in stale.chunks(GIT_AT_ONCE) {
-            let mut set = JoinSet::new();
-            for s in batch {
-                let (path, base, copied) = (s.path.clone(), s.base.clone(), copied.clone());
-                let (thread, generation) = (s.thread, s.generation);
-                set.spawn_blocking(move || {
-                    (
-                        thread,
-                        generation,
-                        count_changes(thread, &path, &base, &copied),
-                    )
-                });
-            }
-            while let Some(done) = set.join_next().await {
-                let Ok((thread, generation, c)) = done else {
-                    log("a change count task ended early");
-                    continue;
-                };
-                self.changes().put(thread, generation, c);
-                counts.insert(thread, c);
-            }
-        }
-
-        // A folder deleted outside Crew since the counts were cached.
-        for thread in &threads {
-            if let Some(wt) = &thread.worktree
-                && !wt.path.is_dir()
-            {
-                counts.insert(thread.id, ChangeCounts::default());
-            }
-        }
-
-        json(summarise(&threads, &activity, &runs, &counts, now_ms()))
+        });
     }
 }
 
@@ -192,6 +335,7 @@ pub(crate) fn summarise(
     activity: &[ThreadActivity],
     runs: &[StoredRun],
     counts: &HashMap<ThreadId, ChangeCounts>,
+    counting: &HashSet<ThreadId>,
     now: i64,
 ) -> ChannelOverview {
     let since = now - WEEK_MS;
@@ -245,6 +389,7 @@ pub(crate) fn summarise(
             files: c.files,
             added: c.added,
             removed: c.removed,
+            counting: counting.contains(&thread.id),
         };
 
         if thread.archived_at.is_none() {
@@ -369,7 +514,94 @@ fn strip_links(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::overview::{EXCERPT_LEN, pick_excerpt, plain_excerpt};
+    use std::time::{Duration, Instant};
+
+    use crew_core::ids::ThreadId;
+    use crew_core::worktree::ChangeCounts;
+
+    use crate::overview::{ChangeCache, EXCERPT_LEN, pick_excerpt, plain_excerpt};
+
+    fn files(n: u32) -> ChangeCounts {
+        ChangeCounts {
+            files: n,
+            ..ChangeCounts::default()
+        }
+    }
+
+    #[test]
+    fn counts_are_worked_out_once_at_a_time() {
+        let mut cache = ChangeCache::default();
+        let t = ThreadId::new();
+        let generation = cache.claim(t).unwrap();
+        assert_eq!(cache.claim(t), None, "already under way");
+        assert_eq!(cache.finish(t, generation, files(2), true), None);
+        assert_eq!(cache.fresh(t), Some(files(2)));
+        // Free again once done.
+        assert!(cache.claim(t).is_some());
+    }
+
+    #[test]
+    fn counts_from_before_a_change_are_not_current() {
+        let mut cache = ChangeCache::default();
+        let t = ThreadId::new();
+        let generation = cache.claim(t).unwrap();
+        assert_eq!(cache.finish(t, generation, files(1), true), None);
+        let generation = cache.claim(t).unwrap();
+        cache.invalidate(t);
+        // Worked out again, still claimed.
+        let next = cache.finish(t, generation, files(2), true).unwrap();
+        assert_eq!(cache.claim(t), None);
+        assert_eq!(cache.fresh(t), None);
+        assert_eq!(cache.last(t), Some(files(1)));
+        assert_eq!(cache.finish(t, next, files(3), true), None);
+        assert_eq!(cache.fresh(t), Some(files(3)));
+        // Out of tries: released, nothing saved.
+        let generation = cache.claim(t).unwrap();
+        cache.invalidate(t);
+        assert_eq!(cache.finish(t, generation, files(4), false), None);
+        assert_eq!(cache.fresh(t), None);
+        assert!(cache.claim(t).is_some());
+    }
+
+    #[test]
+    fn live_edits_drop_counts_at_most_every_five_seconds() {
+        let mut cache = ChangeCache::default();
+        let t = ThreadId::new();
+        let generation = cache.claim(t).unwrap();
+        cache.finish(t, generation, files(1), true);
+        let start = Instant::now();
+        assert!(cache.invalidate_live(t, start));
+        assert_eq!(cache.fresh(t), None);
+        let generation = cache.claim(t).unwrap();
+        cache.finish(t, generation, files(2), true);
+        assert!(!cache.invalidate_live(t, start + Duration::from_secs(4)));
+        assert_eq!(cache.fresh(t), Some(files(2)));
+        // The held back edit drops them once its time comes.
+        cache.apply_due(t, start + Duration::from_millis(4900));
+        assert_eq!(cache.fresh(t), Some(files(2)));
+        cache.apply_due(t, start + Duration::from_secs(5));
+        assert_eq!(cache.fresh(t), None);
+        let generation = cache.claim(t).unwrap();
+        cache.finish(t, generation, files(3), true);
+        // Nothing held back: nothing to do.
+        cache.apply_due(t, start + Duration::from_secs(20));
+        assert_eq!(cache.fresh(t), Some(files(3)));
+        assert!(cache.invalidate_live(t, start + Duration::from_secs(20)));
+        assert_eq!(cache.fresh(t), None);
+        // Each thread on its own.
+        assert!(cache.invalidate_live(ThreadId::new(), start));
+    }
+
+    #[test]
+    fn only_edit_calls_count() {
+        let mut cache = ChangeCache::default();
+        let t = ThreadId::new();
+        cache.edit_started(t, "e1".into());
+        assert!(!cache.edit_finished(t, "r1"));
+        assert!(!cache.edit_finished(ThreadId::new(), "e1"));
+        assert!(cache.edit_finished(t, "e1"));
+        assert!(!cache.edit_finished(t, "e1"));
+    }
 
     #[test]
     fn the_excerpt_prefers_the_ask_then_the_agent_then_you() {

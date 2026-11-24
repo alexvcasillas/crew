@@ -39,6 +39,8 @@ pub const NO_CREW_MCP: &str = "Permission prompts are off: crew-mcp wasn't found
 const YOU_NAME: &str = "You";
 /// Tool call id of the setup command's events.
 const SETUP_ID: &str = "setup";
+/// Longest channel description, in characters.
+const MAX_DESCRIPTION: usize = 280;
 /// How long finished runs stay in a `SubscribeAll` snapshot.
 const RECENT_RUNS_MS: i64 = 60 * 60 * 1000;
 
@@ -125,6 +127,12 @@ struct Inner {
     terminal_cmd: OnceLock<mpsc::UnboundedSender<Cmd>>,
     /// Change counts of thread worktrees, for channel overviews.
     changes: Mutex<ChangeCache>,
+    /// Woken each time counts were worked out.
+    counted: tokio::sync::Notify,
+    /// Slots for working out counts, so git runs a few at a time.
+    count_slots: Arc<tokio::sync::Semaphore>,
+    /// Extra time each count takes, in ms. Tests set it.
+    count_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -212,6 +220,9 @@ impl Service {
             terminal: Mutex::new(TerminalState::default()),
             terminal_cmd: OnceLock::new(),
             changes: Mutex::new(ChangeCache::default()),
+            counted: tokio::sync::Notify::new(),
+            count_slots: Arc::new(tokio::sync::Semaphore::new(crate::overview::GIT_AT_ONCE)),
+            count_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -269,7 +280,59 @@ impl Service {
 
     /// Forgets the thread's cached change counts.
     fn changes_may_differ(&self, thread: ThreadId) {
-        self.changes().invalidate(thread);
+        let mut cache = self.changes();
+        cache.invalidate(thread);
+        cache.forget_edits(thread);
+    }
+
+    /// Resolves the next time counts were worked out.
+    pub(crate) fn counted(&self) -> tokio::sync::futures::Notified<'_> {
+        self.0.counted.notified()
+    }
+
+    pub(crate) fn notify_counted(&self) {
+        self.0.counted.notify_waiters();
+    }
+
+    pub(crate) fn count_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.0.count_slots.clone()
+    }
+
+    pub(crate) fn count_delay(&self) -> Duration {
+        Duration::from_millis(
+            self.0
+                .count_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Makes each change count take `delay` longer, for tests.
+    pub fn set_count_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.0
+            .count_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drops the thread's counts when a live run finished editing or
+    /// writing a file, at most once every few seconds.
+    fn note_edit(&self, thread: ThreadId, event: &Event) {
+        match event {
+            Event::ToolCall {
+                id,
+                kind: ToolKind::Edit | ToolKind::Create,
+                ..
+            } => {
+                self.changes().edit_started(thread, id.clone());
+            }
+            Event::ToolResult { id, .. } => {
+                let mut cache = self.changes();
+                if cache.edit_finished(thread, id) {
+                    cache.invalidate_live(thread, std::time::Instant::now());
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn terminal(&self) -> MutexGuard<'_, TerminalState> {
@@ -582,9 +645,20 @@ impl Service {
         name: &str,
         description: &str,
     ) -> Result<(), String> {
+        if description.chars().count() > MAX_DESCRIPTION {
+            return Err(format!(
+                "Keep the description under {MAX_DESCRIPTION} characters."
+            ));
+        }
         let mut db = self.db();
         let stored = db.store.channel(channel).map_err(|e| e.to_string())?;
-        let name = crew_core::slug::channel_name(name)?;
+        // A name kept as it is stays valid, even one from before the rules.
+        let typed = name.trim();
+        let name = if typed.strip_prefix('#').unwrap_or(typed) == stored.name {
+            stored.name.clone()
+        } else {
+            crew_core::slug::channel_name(name)?
+        };
         let project = db
             .store
             .project(stored.project)
@@ -1782,6 +1856,7 @@ impl Service {
 
     /// Saves a run's event and notifies the thread.
     fn record_event(&self, thread: ThreadId, run: RunId, event: Event) {
+        self.note_edit(thread, &event);
         let mut db = self.db();
         match db.store.append_event(run, &event) {
             Ok(seq) => self.publish(

@@ -1405,3 +1405,167 @@ async fn agent_id(c: &mut Client, name: &str) -> AgentId {
         .await;
     agents.into_iter().find(|a| a.spec.name == name).unwrap().id
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_settings_keep_an_old_name_and_cap_the_description() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    // Made before names were checked.
+    let old: ChannelId = c
+        .ok(Request::CreateChannel {
+            project: s.project,
+            name: "Old Name".into(),
+        })
+        .await;
+    c.call(Request::UpdateChannel {
+        channel: old,
+        name: "Old Name".into(),
+        description: "Still here".into(),
+    })
+    .await
+    .unwrap();
+    let channels: Vec<StoredChannel> = c.ok(Request::ListChannels { project: s.project }).await;
+    let ch = channels.iter().find(|ch| ch.id == old).unwrap();
+    assert_eq!(
+        (ch.name.as_str(), ch.description.as_str()),
+        ("Old Name", "Still here")
+    );
+    // A new name still has to follow the rules.
+    let err = c
+        .call(Request::UpdateChannel {
+            channel: old,
+            name: "Newer Name".into(),
+            description: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Use lowercase letters, numbers and dashes.");
+
+    let update = |description: String| Request::UpdateChannel {
+        channel: s.channel,
+        name: "general".into(),
+        description,
+    };
+    c.call(update("é".repeat(280))).await.unwrap();
+    let err = c.call(update("x".repeat(281))).await.unwrap_err();
+    assert_eq!(err, "Keep the description under 280 characters.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_count_comes_later_and_archived_threads_skip_git() {
+    let scripts = tempfile::tempdir().unwrap();
+    let opts = ServeOptions {
+        count_delay: Duration::from_secs(3),
+        ..ServeOptions::default()
+    };
+    let d = Daemon::start_with(editing_script(scripts.path()), opts, false).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+
+    // Archived: no git, no waiting, nothing to count.
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: true,
+    })
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let o = overview(&mut c, s.channel).await;
+    assert!(started.elapsed() < Duration::from_millis(1000));
+    let fix = summary(&o, s.thread);
+    assert!(!fix.counting);
+    assert_eq!((fix.files, fix.worktree), (0, WorktreeState::Clean));
+
+    // Back again: the overview answers at its deadline, still counting.
+    c.call(Request::ArchiveThread {
+        thread: s.thread,
+        archived: false,
+    })
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    let o = overview(&mut c, s.channel).await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(1400), "{waited:?}");
+    assert!(waited < Duration::from_millis(2900), "{waited:?}");
+    let fix = summary(&o, s.thread);
+    assert!(fix.counting);
+    assert_eq!(fix.files, 0);
+
+    // The count goes on in the background and lands in the cache.
+    let fresh = timeout(WAIT, async {
+        loop {
+            let o = overview(&mut c, s.channel).await;
+            if !summary(&o, s.thread).counting {
+                return o;
+            }
+        }
+    })
+    .await
+    .expect("the count never finished");
+    let fix = summary(&fresh, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 2 });
+    assert_eq!((fix.files, fix.added, fix.removed), (2, 3, 1));
+}
+
+/// First run: edits `a.txt` and writes `file.txt` without reporting an
+/// edit. Once `file.txt` exists, it writes `extra.txt`, reports one
+/// finished edit and keeps working.
+fn edits_then_works_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-edits-then-works.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ -f file.txt ]; then\n  printf 'x\\n' > extra.txt\n  head -n 3 '{fixture}'\n  sleep 60\n  exit 0\nfi\nprintf 'ONE\\ntwo\\n' > a.txt\nexec '{writes}' '{quiet}'\n",
+            fixture = fixture("edit_and_test.jsonl").display(),
+            writes = fake("claude_writes.sh").display(),
+            quiet = fixture("read_file.jsonl").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_edit_refreshes_the_counts() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(edits_then_works_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    assert_eq!(
+        summary(&overview(&mut c, s.channel).await, s.thread).files,
+        2
+    );
+
+    post(&mut c, s.thread, "@Forge more").await;
+    c.until(|m| {
+        matches!(
+            m,
+            ServerMsg::Event {
+                event: Event::ToolResult { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    let o = overview(&mut c, s.channel).await;
+    let fix = summary(&o, s.thread);
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 3 });
+    assert_eq!(fix.files, 3);
+    assert_eq!(
+        fix.runs.last().map(|r| r.status.clone()),
+        Some(RunStatus::Working)
+    );
+
+    c.call(Request::StopThread { thread: s.thread })
+        .await
+        .unwrap();
+    c.until_status(RunStatus::Stopped).await;
+}
