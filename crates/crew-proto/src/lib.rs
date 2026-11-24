@@ -5,6 +5,7 @@
 use std::io;
 
 use crew_core::agent::{AgentSpec, Runtime};
+use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -75,7 +76,7 @@ pub enum Request {
     /// Answered first, then a [`ServerMsg::Snapshot`], then every
     /// `RunStatus`, `Message` and `Approval` of all threads, plus
     /// `ThreadCreated` and `AgentChanged`. Events stay per thread: use
-    /// `Subscribe` for those.
+    /// `Subscribe` for those. Also `TerminalSessionChanged`.
     SubscribeAll,
     StopRun {
         run: RunId,
@@ -177,6 +178,36 @@ pub enum Request {
     /// over a second, the answer says only which CLIs were found, and
     /// `ServerMsg::RuntimesChanged` follows with the rest.
     Runtimes,
+    /// Answered first, then the session's last items as
+    /// [`ServerMsg::TerminalEvent`]s, then new ones as they are written.
+    /// Terminal sessions are read-only.
+    SubscribeTerminal {
+        session: String,
+    },
+    /// Stops the items of a terminal session.
+    UnsubscribeTerminal {
+        session: String,
+    },
+}
+
+/// A Claude Code session someone runs in their own terminal, inside one of
+/// the projects. Crew only reads it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSession {
+    /// Claude Code's session id.
+    pub id: String,
+    pub project: ProjectId,
+    /// Where it runs.
+    pub cwd: String,
+    /// The first line of the first prompt, at most 80 characters. Empty
+    /// until there is one.
+    pub title: String,
+    /// Unix milliseconds.
+    pub started_at: i64,
+    /// Unix milliseconds of the last line written.
+    pub last_active_at: i64,
+    /// Whether Claude Code is working in it now.
+    pub live: bool,
 }
 
 /// One agent CLI crewd can find. The answer to [`Request::Runtimes`] is a
@@ -269,6 +300,18 @@ pub enum ServerMsg {
         agents: Vec<StoredAgent>,
         runs: Vec<StoredRun>,
         approvals: Vec<StoredApproval>,
+        /// Terminal sessions in the projects, most recent first.
+        #[serde(default)]
+        terminal_sessions: Vec<TerminalSession>,
+    },
+    /// A terminal session appeared or changed.
+    TerminalSessionChanged { session: TerminalSession },
+    /// One item of a subscribed terminal session, with its sequence number
+    /// in that session.
+    TerminalEvent {
+        session: String,
+        seq: u64,
+        item: TranscriptItem,
     },
     /// A project was created or its settings changed.
     ProjectChanged { project: StoredProject },
@@ -411,6 +454,50 @@ mod tests {
         );
         let a: PermissionAnswer = serde_json::from_str(r#"{"allow":true,"message":null}"#).unwrap();
         assert!(a.allow);
+    }
+
+    #[test]
+    fn terminal_messages_round_trip() {
+        let msgs = vec![
+            ServerMsg::TerminalSessionChanged {
+                session: TerminalSession {
+                    id: "s1".into(),
+                    project: ProjectId::new(),
+                    cwd: "/work/demo".into(),
+                    title: "Fix the test".into(),
+                    started_at: 1,
+                    last_active_at: 2,
+                    live: true,
+                },
+            },
+            ServerMsg::TerminalEvent {
+                session: "s1".into(),
+                seq: 3,
+                item: TranscriptItem::UserPrompt("hi".into()),
+            },
+            ServerMsg::TerminalEvent {
+                session: "s1".into(),
+                seq: 4,
+                item: TranscriptItem::Event(Event::Message { text: "ok".into() }),
+            },
+        ];
+        for msg in msgs {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn an_older_snapshot_has_no_terminal_sessions() {
+        let json = r#"{"type":"snapshot","projects":[],"channels":[],"threads":[],
+            "agents":[],"runs":[],"approvals":[]}"#;
+        let ServerMsg::Snapshot {
+            terminal_sessions, ..
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("not a snapshot");
+        };
+        assert!(terminal_sessions.is_empty());
     }
 
     #[tokio::test]

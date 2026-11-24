@@ -142,6 +142,9 @@ fn runs_start_queued_then_get_a_session() {
         store.set_run_session(crew_core::ids::RunId::new(), "x"),
         Err(StoreError::NotFound("run"))
     ));
+    assert!(store.has_run_session("thr-1").unwrap());
+    assert!(!store.has_run_session("sess-1").unwrap());
+    assert!(!store.has_run_session("nobody").unwrap());
 }
 
 #[test]

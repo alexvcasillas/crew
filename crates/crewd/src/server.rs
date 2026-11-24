@@ -53,6 +53,10 @@ pub struct ServeOptions {
     /// How long `Runtimes` waits for slow CLIs before answering with what
     /// it found on `PATH`. `None` is one second.
     pub runtimes_wait: Option<Duration>,
+    /// Claude Code's home, whose sessions are shown read-only as terminal
+    /// sessions. `None` turns them off. The `crewd` binary uses
+    /// `CREW_CLAUDE_HOME`, else `~/.claude`.
+    pub claude_home: Option<PathBuf>,
 }
 
 impl Default for ServeOptions {
@@ -65,6 +69,7 @@ impl Default for ServeOptions {
             minute: Duration::from_secs(60),
             notice_buffer: 4096,
             runtimes_wait: None,
+            claude_home: None,
         }
     }
 }
@@ -169,6 +174,10 @@ pub async fn serve_until(
         opts.minute,
         opts.notice_buffer,
     );
+    let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
+    let terminal = opts
+        .claude_home
+        .map(|claude_home| service.watch_terminal(claude_home, terminal_stopped));
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
         let accepted = tokio::select! {
@@ -196,6 +205,10 @@ pub async fn serve_until(
     // We still hold the lock, so the socket is ours to remove.
     if let Err(e) = std::fs::remove_file(&sock) {
         log(format!("couldn't remove {}: {e}", sock.display()));
+    }
+    let _ = stop_terminal.send(());
+    if let Some(terminal) = terminal {
+        let _ = terminal.await;
     }
     service.shutdown().await;
     log("stopped");
@@ -302,6 +315,22 @@ struct Asks {
     waiting: HashMap<u64, ApprovalId>,
 }
 
+/// Terminal sessions one connection subscribes to, each with the serial
+/// its backlog covered. Each counts as a subscriber until the connection
+/// ends.
+struct TerminalSubs {
+    service: Service,
+    seen: HashMap<String, u64>,
+}
+
+impl Drop for TerminalSubs {
+    fn drop(&mut self) {
+        for (session, _) in self.seen.drain() {
+            self.service.unsubscribe_terminal(&session);
+        }
+    }
+}
+
 impl Drop for Asks {
     fn drop(&mut self) {
         for (_, approval) in self.waiting.drain() {
@@ -323,8 +352,14 @@ async fn next_notice(
 /// Whether a connection gets a notice, and so gets each notice at most
 /// once. `all` is the serial a `SubscribeAll` snapshot covered, if any;
 /// `subscribed` maps each subscribed thread to the serial its backlog
-/// covered.
-fn wanted(n: &Notice, all: Option<u64>, subscribed: &HashMap<ThreadId, u64>) -> bool {
+/// covered, and `terminals` each subscribed terminal session to the
+/// serial its backlog covered.
+fn wanted(
+    n: &Notice,
+    all: Option<u64>,
+    subscribed: &HashMap<ThreadId, u64>,
+    terminals: &HashMap<String, u64>,
+) -> bool {
     let by_thread = n
         .thread
         .and_then(|t| subscribed.get(&t))
@@ -333,6 +368,9 @@ fn wanted(n: &Notice, all: Option<u64>, subscribed: &HashMap<ThreadId, u64>) -> 
     match n.msg {
         // Too many for everyone: only for the thread's subscribers.
         ServerMsg::Event { .. } => by_thread,
+        ServerMsg::TerminalEvent { ref session, .. } => {
+            terminals.get(session).is_some_and(|seen| n.serial > *seen)
+        }
         _ => by_thread || by_all,
     }
 }
@@ -359,6 +397,10 @@ async fn requests_and_notices(
     let mut asks = Asks {
         service: service.clone(),
         waiting: HashMap::new(),
+    };
+    let mut terminals = TerminalSubs {
+        service: service.clone(),
+        seen: HashMap::new(),
     };
     loop {
         tokio::select! {
@@ -396,6 +438,34 @@ async fn requests_and_notices(
                             }
                             Err(e) => respond(wr, id, Err(e.to_string())).await?,
                         }
+                    }
+                    Request::SubscribeTerminal { session } => {
+                        notices.get_or_insert_with(|| service.notices());
+                        let counted = terminals.seen.contains_key(&session);
+                        let ready = if counted {
+                            Ok(())
+                        } else {
+                            service.subscribe_terminal(&session).await
+                        };
+                        match ready {
+                            Ok(()) => {
+                                let backlog = service.terminal_backlog(&session);
+                                // Counted before anything is written, so a
+                                // write error still lets it go.
+                                terminals.seen.insert(session, backlog.serial);
+                                respond(wr, id, Ok(serde_json::Value::Null)).await?;
+                                for msg in &backlog.msgs {
+                                    write_frame(wr, msg).await?;
+                                }
+                            }
+                            Err(e) => respond(wr, id, Err(e)).await?,
+                        }
+                    }
+                    Request::UnsubscribeTerminal { session } => {
+                        if terminals.seen.remove(&session).is_some() {
+                            service.unsubscribe_terminal(&session);
+                        }
+                        respond(wr, id, Ok(serde_json::Value::Null)).await?;
                     }
                     Request::Hello { .. } => {
                         respond(wr, id, Err("Hello was already sent.".into())).await?;
@@ -437,7 +507,7 @@ async fn requests_and_notices(
             }
             notice = next_notice(&mut notices) => match notice {
                 Ok(n) => {
-                    if wanted(&n, all, &subscribed) {
+                    if wanted(&n, all, &subscribed, &terminals.seen) {
                         write_frame(wr, &n.msg).await?;
                     }
                 }

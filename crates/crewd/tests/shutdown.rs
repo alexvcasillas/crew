@@ -204,6 +204,8 @@ async fn sigterm_stops_agents_and_marks_runs_interrupted() {
     let mut crewd = tokio::process::Command::new(env!("CARGO_BIN_EXE_crewd"))
         .env("CREW_HOME", &home)
         .env("CREW_CLAUDE_BIN", sleeping_script(tmp.path(), &pid_file))
+        // Never the real claude home.
+        .env("CREW_CLAUDE_HOME", tmp.path().join("claude"))
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -286,6 +288,7 @@ async fn a_second_crewd_exits_cleanly() {
     let home = tmp.path().join("crew");
     let _first = tokio::process::Command::new(env!("CARGO_BIN_EXE_crewd"))
         .env("CREW_HOME", &home)
+        .env("CREW_CLAUDE_HOME", tmp.path().join("claude"))
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -295,6 +298,7 @@ async fn a_second_crewd_exits_cleanly() {
         WAIT,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_crewd"))
             .env("CREW_HOME", &home)
+            .env("CREW_CLAUDE_HOME", tmp.path().join("claude"))
             .output(),
     )
     .await

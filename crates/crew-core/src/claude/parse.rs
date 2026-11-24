@@ -81,18 +81,18 @@ pub fn parse_line(line: &str) -> Vec<Event> {
     }
 }
 
-fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-fn blocks(v: &Value) -> &[Value] {
+pub(crate) fn blocks(v: &Value) -> &[Value] {
     v.pointer("/message/content")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
 }
 
-fn assistant_block(b: &Value) -> Option<Event> {
+pub(crate) fn assistant_block(b: &Value) -> Option<Event> {
     match str_at(b, "type") {
         "text" => Some(Event::Message {
             text: str_at(b, "text").to_string(),
@@ -119,7 +119,7 @@ fn assistant_block(b: &Value) -> Option<Event> {
     }
 }
 
-fn tool_result(b: &Value) -> Option<Event> {
+pub(crate) fn tool_result(b: &Value) -> Option<Event> {
     if str_at(b, "type") != "tool_result" {
         return None;
     }
