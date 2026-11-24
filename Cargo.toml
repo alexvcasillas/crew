@@ -22,6 +22,8 @@ assert_cmd = "2.2.2"
 futures = "0.3.34"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 notify = "9.0.0"
+shlex = "2.0.1"
+libc = "0.2.191"
 pulldown-cmark = { version = "0.13.6", default-features = false }
 # The app's UI. gpui-kit 0.8.1 pins this exact GPUI; upgrade both together.
 gpui-kit = "=0.8.1"

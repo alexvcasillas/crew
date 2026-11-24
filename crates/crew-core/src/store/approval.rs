@@ -68,10 +68,39 @@ pub struct StoredApproval {
 /// Longest tool input shown in a permission ask.
 const SHORT_INPUT: usize = 80;
 
+/// Said after a command's label when a read-only Codex agent asks to run
+/// it: approved, it runs without the sandbox, in the thread's folder.
+pub const OUTSIDE_SANDBOX: &str = " (runs outside the sandbox, in your folder)";
+
 /// A short, one-line view of a tool's input: its label, command or path
 /// if it has one, else its JSON.
 pub fn short_input(input: &serde_json::Value) -> String {
-    let text = ["label", "command", "file_path", "path", "url", "pattern"]
+    short_by(
+        input,
+        &["label", "command", "file_path", "path", "url", "pattern"],
+    )
+}
+
+/// Like [`short_input`] for a tool's ask. A shell command shows the
+/// command itself first, so a label can never hide part of it.
+pub fn short_ask(tool: &str, input: &serde_json::Value) -> String {
+    if tool != "Bash" {
+        return short_input(input);
+    }
+    let shown = short_by(input, &["command", "label"]);
+    let outside = input
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|l| l.ends_with(OUTSIDE_SANDBOX));
+    if outside {
+        format!("{shown}{OUTSIDE_SANDBOX}")
+    } else {
+        shown
+    }
+}
+
+fn short_by(input: &serde_json::Value, keys: &[&str]) -> String {
+    let text = keys
         .iter()
         .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
         .map(String::from)
@@ -101,7 +130,7 @@ pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> St
     {
         return format!("{agent} wants more access: {label}");
     }
-    let shown = short_input(input);
+    let shown = short_ask(tool, input);
     let (verb, what) = match tool.strip_prefix("mcp__") {
         Some(rest) => ("use", rest.replacen("__", "/", 1)),
         None => ("run", tool.to_string()),
@@ -288,6 +317,26 @@ mod tests {
         assert_eq!(
             short_input(&json!({ "command": long })),
             format!("{}...", "x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn a_command_ask_shows_the_command_first() {
+        let input = json!({"command": "/bin/zsh -lc 'ls && rm -rf x'", "label": "ls (+ more)"});
+        assert_eq!(
+            permission_text("Ada", "Bash", &input),
+            "Ada wants to run Bash: /bin/zsh -lc 'ls && rm -rf x'"
+        );
+        let input = json!({"command": "/bin/zsh -lc 'ls'",
+                           "label": format!("ls{OUTSIDE_SANDBOX}")});
+        assert_eq!(
+            permission_text("Scout", "Bash", &input),
+            "Scout wants to run Bash: /bin/zsh -lc 'ls' (runs outside the sandbox, in your folder)"
+        );
+        // Other tools keep the label first.
+        assert_eq!(
+            short_ask("Edit", &json!({"label": "a", "command": "b"})),
+            "a"
         );
     }
 

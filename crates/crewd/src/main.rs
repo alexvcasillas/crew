@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crewd::{AlreadyRunning, ServeOptions, serve};
+use crewd::{AlreadyRunning, ServeOptions, claude_home_from, serve};
 
 fn non_empty(v: Option<OsString>) -> Option<OsString> {
     v.filter(|v| !v.is_empty())
@@ -28,9 +28,11 @@ fn options() -> Result<(PathBuf, ServeOptions), String> {
     }
     opts.claude_bin = non_empty(std::env::var_os("CREW_CLAUDE_BIN")).map(PathBuf::from);
     opts.codex_bin = non_empty(std::env::var_os("CREW_CODEX_BIN")).map(PathBuf::from);
-    opts.claude_home = non_empty(std::env::var_os("CREW_CLAUDE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| non_empty(std::env::var_os("HOME")).map(|h| PathBuf::from(h).join(".claude")));
+    opts.claude_home = claude_home_from(
+        std::env::var_os("CREW_CLAUDE_HOME"),
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        std::env::var_os("HOME"),
+    );
     Ok((home, opts))
 }
 

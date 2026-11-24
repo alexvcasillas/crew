@@ -526,7 +526,9 @@ async fn command_approvals_are_decided_in_crew() {
         asked.kind,
         ApprovalKind::Permission {
             tool: "Bash".into(),
-            input: json!({"command": "mkdir sub", "cwd": "/work/demo"}),
+            // A read-only agent's command runs without the sandbox.
+            input: json!({"command": "mkdir sub", "cwd": "/work/demo",
+                          "label": "mkdir sub (runs outside the sandbox, in your folder)"}),
             tool_use_id: Some("exec-1".into()),
         }
     );
@@ -540,6 +542,38 @@ async fn command_approvals_are_decided_in_crew() {
     assert!(
         system_texts(&seen).iter().all(|t| !t.contains("failed")),
         "{seen:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_agents_are_refused_writes_without_asking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let change = json!({"type": "fileChange", "id": "exec-9", "status": "inProgress", "changes": [{"path": "/work/demo/notes.md", "kind": {"type": "add"}, "diff": "crew\n"}]});
+    let mut steps = start();
+    steps.extend([
+        item("item/started", change),
+        json!({"request": "item/fileChange/requestApproval", "id": 0, "params": {"threadId": TID, "turnId": "turn-1", "itemId": "exec-9"}, "reply": {"decision": "decline"}}),
+        json!({"request": "item/permissions/requestApproval", "id": 1, "params": {"threadId": TID, "turnId": "turn-1", "itemId": "p-1", "cwd": "/work/demo", "reason": null,
+            "permissions": {"fileSystem": {"write": ["/work/demo/gen"]}}}, "reply": {"permissions": {}, "scope": "turn"}}),
+    ]);
+    steps.extend(finish("Couldn't write."));
+    scenario(dir, 1, steps);
+    let d = Daemon::start(codex_script(dir, 0), None).await;
+    let mut c = d.client().await;
+    let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
+    let run = ask_forge(&mut c, thread, "@Forge write notes").await;
+    let seen = c.until_ended(run).await;
+    assert_eq!(status_of(&seen), RunStatus::Done, "{seen:#?}");
+    assert!(
+        !seen.iter().any(|m| matches!(m, ServerMsg::Approval { .. })),
+        "{seen:#?}"
+    );
+    let notes = system_texts(&seen);
+    assert_eq!(
+        notes.iter().filter(|t| *t == "Forge is read-only.").count(),
+        2,
+        "{notes:?}"
     );
 }
 
@@ -606,7 +640,7 @@ async fn edit_agents_write_in_the_worktree_and_file_changes_ask() {
         "{instructions}"
     );
     assert!(
-        instructions.contains("call the handoff tool of the crew MCP server"),
+        instructions.contains("call the handoff tool of the crew_run MCP server"),
         "{instructions}"
     );
 
@@ -616,20 +650,20 @@ async fn edit_agents_write_in_the_worktree_and_file_changes_ask() {
     let mcp = std::fs::canonicalize(&crew_mcp).unwrap();
     assert!(
         line.contains(&format!(
-            "-c mcp_servers.crew.command=\"{}\"",
+            "-c mcp_servers.crew_run.command=\"{}\"",
             mcp.display()
         )),
         "{line}"
     );
     assert!(
         line.contains(&format!(
-            "-c mcp_servers.crew.args=[\"--run\",\"{run}\",\"--tools\",\"handoff\"]"
+            "-c mcp_servers.crew_run.args=[\"--run\",\"{run}\",\"--tools\",\"handoff\"]"
         )),
         "{line}"
     );
     assert!(
         line.contains(&format!(
-            "-c mcp_servers.crew.env.CREW_HOME=\"{}\"",
+            "-c mcp_servers.crew_run.env.CREW_HOME=\"{}\"",
             home.display()
         )),
         "{line}"
@@ -648,7 +682,7 @@ async fn crew_elicitations_pass_and_other_servers_ask() {
     };
     let mut steps = start();
     steps.extend([
-        json!({"request": "mcpServer/elicitation/request", "id": 0, "params": elicit("crew", "handoff"), "reply": {"action": "accept", "content": {}, "_meta": null}}),
+        json!({"request": "mcpServer/elicitation/request", "id": 0, "params": elicit("crew_run", "handoff"), "reply": {"action": "accept", "content": {}, "_meta": null}}),
         json!({"request": "mcpServer/elicitation/request", "id": 1, "params": elicit("github", "create_issue"), "reply": {"action": "decline", "content": null, "_meta": null}}),
     ]);
     steps.extend(finish("Skipped the issue."));
@@ -757,7 +791,13 @@ async fn stop_interrupts_then_kills_a_codex_that_ignores_it() {
         json!({"expect": "turn/interrupt", "match": {"threadId": TID, "turnId": "turn-1"}}),
         json!({"sleep": 120}),
     ]);
-    scenario_with(dir, 1, steps, json!({"ignore_sigint": true}));
+    let signals = dir.join("signals.log");
+    scenario_with(
+        dir,
+        1,
+        steps,
+        json!({"ignore_sigint": true, "signal_log": signals}),
+    );
     let d = Daemon::start(codex_script(dir, 0), None).await;
     let mut c = d.client().await;
     let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
@@ -788,6 +828,10 @@ async fn stop_interrupts_then_kills_a_codex_that_ignores_it() {
         messages(dir, 1)
             .iter()
             .any(|m| m["method"] == "turn/interrupt")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&signals).unwrap_or_default(),
+        "SIGINT\nSIGTERM\n"
     );
 }
 
@@ -1061,22 +1105,24 @@ async fn stop_cancels_a_pending_approval_then_interrupts() {
             json!({"threadId": TID, "turn": {"id": "turn-1", "status": "interrupted", "items": []}}),
         ),
     ]);
-    scenario(dir, 1, steps);
+    let signals = dir.join("signals.log");
+    scenario_with(dir, 1, steps, json!({"signal_log": signals}));
     let d = Daemon::start(codex_script(dir, 0), None).await;
     let mut c = d.client().await;
     let thread = setup(&mut c, &d.tmp.path().join("repo"), PermissionMode::ReadOnly).await;
     let run = ask_forge(&mut c, thread, "@Forge build").await;
     let asked = c.until_asked().await;
 
-    let stopped_at = Instant::now();
     c.call(Request::StopRun { run }).await.unwrap();
     let seen = c.until_ended(run).await;
     assert_eq!(status_of(&seen), RunStatus::Stopped, "{seen:#?}");
-    // Codex honoured the interrupt, so no signals were needed.
-    assert!(
-        stopped_at.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        stopped_at.elapsed()
+    // Codex honoured the interrupt, so no signals were needed. Give a late
+    // one time to land before looking.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        std::fs::read_to_string(&signals).unwrap_or_default(),
+        "",
+        "the app-server was signalled"
     );
     assert!(
         seen.iter()
@@ -1096,7 +1142,8 @@ async fn stop_cancels_a_pending_approval_then_interrupts() {
 }
 
 /// Codex asks for more than its sandbox: you see what, and only what is
-/// inside the thread's folder can be granted.
+/// inside the thread's folder can be granted. A read-only agent asks to
+/// read; its asks to write never reach you.
 #[tokio::test(flavor = "multi_thread")]
 async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1115,12 +1162,12 @@ async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
     steps.extend([
         ask(
             0,
-            json!({"network": {"enabled": true}, "fileSystem": {"read": null, "write": [inside, "/"]}}),
-            json!({"permissions": {"network": {"enabled": true}, "fileSystem": {"write": [inside]}}, "scope": "turn"}),
+            json!({"network": {"enabled": true}, "fileSystem": {"read": [inside, "/"], "write": null}}),
+            json!({"permissions": {"network": {"enabled": true}, "fileSystem": {"read": [inside]}}, "scope": "turn"}),
         ),
         ask(
             1,
-            json!({"network": null, "fileSystem": {"read": null, "write": ["/etc"]}}),
+            json!({"network": null, "fileSystem": {"read": ["/etc"], "write": null}}),
             json!({"permissions": {}, "scope": "turn"}),
         ),
     ]);
@@ -1142,7 +1189,7 @@ async fn access_requests_show_what_is_asked_and_stay_in_the_worktree() {
     let texts = system_texts(&seen);
     assert!(
         texts
-            .contains(&"Forge wants more access: network, write gen, / · build output".to_string()),
+            .contains(&"Forge wants more access: network, read gen, read / (outside the worktree, not granted) · build output".to_string()),
         "{texts:?}"
     );
     assert!(
@@ -1184,12 +1231,12 @@ async fn access_through_links_is_refused_and_network_shows_first() {
         // `escape` links to `/`.
         ask(
             0,
-            json!({"fileSystem": {"write": ["escape", "escape/etc"]}}),
+            json!({"fileSystem": {"read": ["escape", "escape/etc"]}}),
             json!({"permissions": {}, "scope": "turn"}),
         ),
         ask(
             1,
-            json!({"network": {"enabled": true}, "fileSystem": {"write": ["gen\n", long]}}),
+            json!({"network": {"enabled": true}, "fileSystem": {"read": ["gen\n", long]}}),
             json!({"permissions": {}, "scope": "turn"}),
         ),
     ]);
@@ -1227,7 +1274,7 @@ async fn access_through_links_is_refused_and_network_shows_first() {
         .find(|t| t.starts_with("Forge wants more access: "))
         .unwrap();
     assert!(
-        shown.starts_with("Forge wants more access: network, write gen, "),
+        shown.starts_with("Forge wants more access: network, read gen, "),
         "{shown}"
     );
     assert!(!shown.contains('\n'), "{shown}");

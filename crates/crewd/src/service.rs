@@ -204,6 +204,17 @@ impl Service {
         self.0.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Process ids of the live runs whose process started. Each is its
+    /// own process group.
+    pub(crate) fn live_run_pids(&self) -> Vec<i32> {
+        self.state()
+            .live
+            .values()
+            .filter_map(|(_, handle)| handle.pid())
+            .filter_map(|pid| i32::try_from(pid).ok())
+            .collect()
+    }
+
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1376,6 +1387,7 @@ impl Service {
                 .join("\n\n");
                 Invocation::Codex(CodexInvocation {
                     bin: crate::runtimes::codex_bin(&self.0.bins),
+                    agent: spec.name.clone(),
                     cwd,
                     model: spec.model.clone(),
                     permission_mode: spec.permission_mode.clone(),

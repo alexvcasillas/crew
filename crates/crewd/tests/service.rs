@@ -794,7 +794,7 @@ async fn runs_get_crew_mcp_when_it_exists() {
     let args = &calls[0];
     let config: serde_json::Value =
         serde_json::from_str(&arg_after(args, "--mcp-config").expect("--mcp-config")).unwrap();
-    let crew = &config["mcpServers"]["crew"];
+    let crew = &config["mcpServers"]["crew_run"];
     assert_eq!(crew["type"], "stdio");
     assert_eq!(
         crew["command"],
@@ -810,7 +810,7 @@ async fn runs_get_crew_mcp_when_it_exists() {
     );
     assert_eq!(
         arg_after(args, "--permission-prompt-tool").as_deref(),
-        Some("mcp__crew__approve")
+        Some("mcp__crew_run__approve")
     );
     assert_eq!(
         arg_after(args, "--permission-mode").as_deref(),
@@ -819,7 +819,7 @@ async fn runs_get_crew_mcp_when_it_exists() {
     assert!(!args.iter().any(|a| a == "--permission-prompts"));
     let allowed = arg_after(args, "--allowedTools").expect("--allowedTools");
     assert!(
-        allowed.split(',').any(|t| t == "mcp__crew__handoff"),
+        allowed.split(',').any(|t| t == "mcp__crew_run__handoff"),
         "{allowed}"
     );
     // Edits go through without asking only inside the working folder.
@@ -881,7 +881,7 @@ async fn runs_hear_their_crew_context_in_one_system_prompt() {
          You are read-only: review and report, don't change files.\n\
          Other agents here:\n\
          - Forge (Builds things, edits files)\n\
-         To bring in another agent, call the mcp__crew__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
+         To bring in another agent, call the mcp__crew_run__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
          \n\
          Be brief."
     );
@@ -918,7 +918,7 @@ async fn read_only_runs_get_handoff_but_no_prompt_tool() {
     assert!(arg_after(args, "--mcp-config").is_some());
     assert_eq!(
         arg_after(args, "--allowedTools").as_deref(),
-        Some("mcp__crew__handoff")
+        Some("mcp__crew_run__handoff")
     );
     assert_eq!(
         arg_after(args, "--permission-mode").as_deref(),
@@ -1069,4 +1069,178 @@ async fn resumed_agent_hears_what_it_missed() {
         prompt_of(&calls[2]),
         format!("You: @Triage check it\nTriage: {summary}\n\n@Forge and again")
     );
+}
+
+/// A process an agent run started connects to crewd. It may hand off and
+/// ask for permission, as crew-mcp does, but nothing else: an agent must
+/// not be able to approve its own asks or steer Crew.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_from_inside_a_run_may_only_hand_off_and_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let mcp_bin = base.join("crew-mcp");
+    std::fs::write(&mcp_bin, "").unwrap();
+
+    // The requests, as crewd reads them. The helper puts the real run id
+    // in place of this one.
+    let placeholder = RunId::new();
+    let requests = [
+        Request::Hello {
+            version: PROTO_VERSION,
+        },
+        Request::Decide {
+            approval: crew_core::ids::ApprovalId::new(),
+            approve: true,
+            brief: None,
+        },
+        Request::StopAll,
+        Request::CreateAgent { spec: forge() },
+        Request::SubscribeAll,
+        Request::Handoff {
+            run: placeholder,
+            agent: "Nobody".into(),
+            brief: "help".into(),
+        },
+        Request::PermissionAsk {
+            run: placeholder,
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "make"}),
+            tool_use_id: Some("toolu_1".into()),
+        },
+    ];
+    let frames = base.join("frames.jsonl");
+    let lines: Vec<String> = requests
+        .into_iter()
+        .enumerate()
+        .map(|(i, req)| {
+            serde_json::to_string(&ClientMsg::Request {
+                id: i as u64 + 1,
+                req,
+            })
+            .unwrap()
+        })
+        .collect();
+    std::fs::write(&frames, lines.join("\n") + "\n").unwrap();
+    let answers = base.join("answers.jsonl");
+    // Connects as a child of the run, like crew-mcp or a command the
+    // agent runs, sends each request and writes down each answer.
+    let helper = base.join("agent_client.py");
+    std::fs::write(
+        &helper,
+        format!(
+            r#"import json, os, socket, struct, sys
+args = sys.argv[1:]
+config = json.loads(args[args.index("--mcp-config") + 1])
+server = config["mcpServers"]["crew_run"]
+run = server["args"][server["args"].index("--run") + 1]
+sock = socket.socket(socket.AF_UNIX)
+sock.connect(os.path.join(server["env"]["CREW_HOME"], "crewd.sock"))
+def read_exact(n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise SystemExit("crewd hung up")
+        data += chunk
+    return data
+out = open({answers:?}, "w")
+for line in open({frames:?}):
+    body = line.strip().replace({placeholder:?}, run).encode()
+    sock.sendall(struct.pack(">I", len(body)) + body)
+    while True:
+        (size,) = struct.unpack(">I", read_exact(4))
+        msg = json.loads(read_exact(size))
+        if msg.get("type") == "response":
+            out.write(json.dumps(msg) + "\n")
+            out.flush()
+            break
+"#,
+            answers = answers.display().to_string(),
+            frames = frames.display().to_string(),
+            placeholder = placeholder.to_string(),
+        ),
+    )
+    .unwrap();
+    let script = base.join("claude-agent-client.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\npython3 '{}' \"$@\" >&2 || exit 9\nexec '{}' '{}'\n",
+            helper.display(),
+            fake("claude_ok.sh").display(),
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let d = Daemon::start_with(4, script, Some(mcp_bin)).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, &base.join("repo"), 1).await;
+    let thread = threads[0];
+    c.call(Request::Subscribe { thread }).await.unwrap();
+    c.call(Request::PostMessage {
+        thread,
+        body: "@Forge build".into(),
+    })
+    .await
+    .unwrap();
+    // The ask from inside the run reaches you, and you decide it.
+    let seen = c
+        .until(|m| {
+            matches!(m, ServerMsg::Approval { approval, .. }
+            if approval.status == crew_core::store::ApprovalStatus::Pending)
+        })
+        .await;
+    let Some(ServerMsg::Approval { approval, .. }) = seen.last() else {
+        unreachable!()
+    };
+    c.call(Request::Decide {
+        approval: approval.id,
+        approve: true,
+        brief: None,
+    })
+    .await
+    .unwrap();
+    let seen = c
+        .until(|m| {
+            matches!(m, ServerMsg::RunStatus { status, .. }
+                if !matches!(status, RunStatus::Queued | RunStatus::Working))
+        })
+        .await;
+    assert!(
+        is_status(seen.last().unwrap(), RunStatus::Done),
+        "{seen:#?}"
+    );
+
+    let answers: Vec<serde_json::Value> = std::fs::read_to_string(&answers)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(answers.len(), 7, "{answers:#?}");
+    let refused = serde_json::json!({"Err": crewd::server::NOT_FROM_AGENTS});
+    assert_eq!(answers[0]["result"], serde_json::json!({"Ok": null}));
+    for (i, what) in [
+        (1, "Decide"),
+        (2, "StopAll"),
+        (3, "CreateAgent"),
+        (4, "SubscribeAll"),
+    ] {
+        assert_eq!(answers[i]["result"], refused, "{what}: {answers:#?}");
+    }
+    // Handed off and asked like crew-mcp does.
+    assert_ne!(answers[5]["result"], refused, "{answers:#?}");
+    assert_eq!(
+        answers[6]["result"]["Ok"]["allow"],
+        serde_json::json!(true),
+        "{answers:#?}"
+    );
+    // Nothing it tried took effect.
+    let agents: Vec<crew_core::store::StoredAgent> = c
+        .ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
+    assert_eq!(agents.len(), 1);
 }

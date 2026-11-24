@@ -32,9 +32,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::codex_asks::{Answer, AskFor, CREW_SERVER, Mapped, ReplyKind, map_request};
+use crate::codex_asks::{Answer, AskFor, CREW_SERVER, Mapped, ReplyKind, Scope, map_request};
 use crate::runner::{
-    EVENT_BUFFER, READERS_GRACE, RunHandle, RunOutcome, STDERR_TAIL, escalate, join_until,
+    EVENT_BUFFER, PidSlot, READERS_GRACE, RunHandle, RunOutcome, STDERR_TAIL, escalate, join_until,
     read_tail, signal_group,
 };
 use crate::runtimes::codex_signed_in;
@@ -88,6 +88,8 @@ pub struct Resume {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexInvocation {
     pub bin: PathBuf,
+    /// The agent's name, for notes in the thread.
+    pub agent: String,
     /// The thread's folder. The app-server runs here, and an `EditFiles`
     /// agent may write only here.
     pub cwd: PathBuf,
@@ -219,15 +221,15 @@ impl CodexInvocation {
 /// Starts a Codex run and streams its events.
 ///
 /// Must be called inside a tokio runtime. Dropping the returned
-/// [`RunHandle`] stops the run. Its pid is unknown: the process starts
+/// [`RunHandle`] stops the run. Its pid is set once the process starts,
 /// after the sign-in check.
 pub fn spawn_codex_run(
     inv: CodexInvocation,
     hooks: Hooks,
 ) -> (RunHandle, mpsc::Receiver<Event>, JoinHandle<RunOutcome>) {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
-    let (handle, stop_rx) = RunHandle::idle();
-    let join = tokio::spawn(run(inv, hooks, tx, stop_rx));
+    let (handle, stop_rx, pid) = RunHandle::starting();
+    let join = tokio::spawn(run(inv, hooks, tx, stop_rx, pid));
     (handle, rx, join)
 }
 
@@ -236,6 +238,7 @@ async fn run(
     hooks: Hooks,
     tx: mpsc::Sender<Event>,
     mut stop_rx: watch::Receiver<bool>,
+    pid: PidSlot,
 ) -> RunOutcome {
     if !inv.cwd.is_dir() {
         return RunOutcome::Failed(format!(
@@ -268,6 +271,9 @@ async fn run(
         Ok(child) => child,
         Err(e) => return RunOutcome::Failed(start_error(&e)),
     };
+    if let Some(id) = child.id() {
+        let _ = pid.set(id);
+    }
     let pgid = child.id().map(|p| Pid::from_raw(p as i32));
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -594,13 +600,19 @@ impl<'a> Driver<'a> {
         stop: &watch::Receiver<bool>,
     ) {
         // The app-server may be gone; its end shows elsewhere.
-        let wired = self.inv.mcp.is_some();
+        let scope = Scope {
+            files: &self.files,
+            crew_wired: self.inv.mcp.is_some(),
+            cwd: &self.inv.cwd,
+            read_only: self.inv.permission_mode == PermissionMode::ReadOnly,
+            agent: &self.inv.agent,
+        };
         let AskFor {
             kind,
             tool,
             input,
             item,
-        } = match map_request(method, params, &self.files, wired, &self.inv.cwd) {
+        } = match map_request(method, params, &scope) {
             Mapped::Reply(result) => {
                 let _ = self.conn.reply(id, result).await;
                 return;
@@ -704,6 +716,7 @@ mod tests {
     fn inv(mode: PermissionMode) -> CodexInvocation {
         CodexInvocation {
             bin: "codex".into(),
+            agent: "Ada".into(),
             cwd: "/work/demo".into(),
             model: "gpt-test".into(),
             permission_mode: mode,
@@ -764,11 +777,11 @@ mod tests {
             [
                 "app-server".to_string(),
                 "-c".into(),
-                r#"mcp_servers.crew.command="/work/bin/crew \"mcp\"""#.into(),
+                r#"mcp_servers.crew_run.command="/work/bin/crew \"mcp\"""#.into(),
                 "-c".into(),
-                format!(r#"mcp_servers.crew.args=["--run","{run}","--tools","handoff"]"#),
+                format!(r#"mcp_servers.crew_run.args=["--run","{run}","--tools","handoff"]"#),
                 "-c".into(),
-                r#"mcp_servers.crew.env.CREW_HOME="/work/home""#.into(),
+                r#"mcp_servers.crew_run.env.CREW_HOME="/work/home""#.into(),
             ]
         );
     }

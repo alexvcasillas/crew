@@ -29,7 +29,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
 const UNREACHABLE: &str = "Crew isn't reachable right now.";
 /// Tools of this server, which `approve` lets through without asking.
-const OWN_TOOLS: &str = "mcp__crew__";
+const OWN_TOOLS: &str = "mcp__crew_run__";
 
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
