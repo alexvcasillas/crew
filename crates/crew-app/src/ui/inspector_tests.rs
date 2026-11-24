@@ -26,7 +26,7 @@ use crate::test_support::{Daemon, fake_claude, short_home};
 /// A claude that logs each prompt to `prompts.log` (each ends with byte
 /// 0x1f). A prompt ending in `WAIT` waits for the file `go`. Then it
 /// replies "ok".
-fn waiting_claude(dir: &Path) -> PathBuf {
+pub(super) fn waiting_claude(dir: &Path) -> PathBuf {
     let at = dir.display();
     let run = [
         "for last in \"$@\"; do :; done".to_string(),
@@ -48,7 +48,11 @@ fn prompts(dir: &Path) -> Vec<String> {
 }
 
 /// The newest pending approval of the thread, once there is one.
-fn pending(cx: &mut TestAppContext, ws: &Entity<Workspace>, thread: ThreadId) -> ApprovalId {
+pub(super) fn pending(
+    cx: &mut TestAppContext,
+    ws: &Entity<Workspace>,
+    thread: ThreadId,
+) -> ApprovalId {
     let mut found = None;
     wait_until(cx, "a pending approval", |cx| {
         found = ws.read_with(cx, |ws, _| {
@@ -87,12 +91,17 @@ pub(super) fn run_of(
 }
 
 /// Forge working on `body`, and its run.
-fn start_forge(cx: &mut TestAppContext, ws: &Entity<Workspace>, w: &World, body: &str) -> RunId {
+pub(super) fn start_forge(
+    cx: &mut TestAppContext,
+    ws: &Entity<Workspace>,
+    w: &World,
+    body: &str,
+) -> RunId {
     w.post(body);
     live_run(cx, ws, w.thread)
 }
 
-fn hand_off(w: &World, run: RunId, to: &str, brief: &str) -> String {
+pub(super) fn hand_off(w: &World, run: RunId, to: &str, brief: &str) -> String {
     w.ask(Request::Handoff {
         run,
         agent: to.into(),

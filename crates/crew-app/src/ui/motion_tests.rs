@@ -6,14 +6,18 @@ use std::path::{Path, PathBuf};
 use crew_core::agent::{AgentSpec, Runtime};
 use crew_core::event::RunStatus;
 use crew_core::ids::AgentId;
+use crew_core::policy::HandoffPolicy;
 use crew_core::store::{ApprovalStatus, Author};
 use crew_proto::Request;
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{AnyWindowHandle, AppContext as _, ElementId, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, ElementId, Entity, TestAppContext};
 
-use super::inspector_tests::{answer_of, ask_permission, run_of};
+use super::inspector_tests::{
+    answer_of, ask_permission, hand_off, pending, run_of, start_forge, waiting_claude,
+};
 use super::test_ui::{bounds_of, click, has, label_of, press, wait_until};
-use super::thread_tests::{agent, live_run, open_thread, world};
+use super::thread_tests::{World, agent, live_run, open_thread, world};
+use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, fixture, short_home};
 
 /// A claude that starts on a step, then works until it is stopped.
@@ -217,4 +221,87 @@ fn the_inspector_timer_sits_level_with_its_words(cx: &mut TestAppContext) {
     wait_until(cx, "the run to end", |cx| {
         !has(cx, window, format!("live-{run}"))
     });
+}
+
+/// Asserts the card `card` starts where your message's text does, past
+/// the avatar. A card, not a folded line, stays no wider than 560 px.
+fn assert_inset(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ws: &Entity<Workspace>,
+    w: &World,
+    card: &str,
+    pending: bool,
+) {
+    let message = ws.read_with(cx, |ws, _| {
+        ws.state()
+            .messages(w.thread)
+            .iter()
+            .find(|m| m.author == Author::You)
+            .map(|m| m.id)
+            .unwrap()
+    });
+    let body = bounds_of(cx, window, format!("message-body-{message}")).unwrap();
+    let bounds = bounds_of(cx, window, card.to_string()).unwrap();
+    let thread = bounds_of(cx, window, "thread-messages").unwrap();
+    assert_eq!(
+        bounds.origin.x, body.origin.x,
+        "{card} starts where text does"
+    );
+    assert_eq!(
+        (bounds.origin.x - thread.origin.x).as_f32(),
+        24. + 32. + 12.
+    );
+    if pending {
+        assert!(bounds.size.width.as_f32() <= 560.);
+    }
+}
+
+#[gpui_kit::test]
+fn handoff_cards_line_up_with_message_bodies(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), waiting_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    hand_off(&w, run, "Scout", "check the edit");
+    let id = pending(cx, &ws, w.thread);
+    let card = format!("approval-{id}");
+    wait_until(cx, "the handoff card", |cx| has(cx, window, card.clone()));
+    assert_inset(cx, window, &ws, &w, &card, true);
+
+    click(cx, window, format!("approval-decline-{id}"));
+    wait_until(cx, "the folded line", |cx| {
+        label_of(cx, window, card.clone()).is_some_and(|l| !l.starts_with("Needs you"))
+    });
+    assert_inset(cx, window, &ws, &w, &card, false);
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+    let () = w.ask(Request::StopThread { thread: w.thread });
+}
+
+#[gpui_kit::test]
+fn budget_pause_cards_line_up_with_message_bodies(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), waiting_claude(tmp.path()));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let () = w.ask(Request::SetThreadHandoff {
+        thread: w.thread,
+        policy: Some(HandoffPolicy::Budget),
+        budget: Some(1),
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    let run = start_forge(cx, &ws, &w, "@Forge do it WAIT");
+    hand_off(&w, run, "Scout", "one");
+    hand_off(&w, run, "Scout", "two");
+    let id = pending(cx, &ws, w.thread);
+    let card = format!("approval-{id}");
+    wait_until(cx, "the pause card", |cx| {
+        label_of(cx, window, card.clone()).is_some_and(|l| l.starts_with("Paused."))
+    });
+    assert_inset(cx, window, &ws, &w, &card, true);
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+    let () = w.ask(Request::StopThread { thread: w.thread });
 }
