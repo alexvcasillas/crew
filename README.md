@@ -25,6 +25,16 @@ session files under `~/.claude/projects`, or under `CREW_CLAUDE_HOME` or
 on your Mac. It never changes them, sends them anywhere or types into those
 sessions.
 
+## Security notes
+
+- Agent runs can only hand off and ask for permission over Crew's socket.
+  Anything else they send is refused.
+- That is a guard, not a sandbox. A process that deliberately leaves the
+  run's process tree can still reach the socket, so treat command approvals
+  as the real gate.
+- Worktree setup commands come from your own project settings and run with
+  your permissions.
+
 ## Uninstall
 
 ```sh
