@@ -1,10 +1,11 @@
 Crew is a macOS app where coding agents like Claude Code and Codex work as members of project chat channels.
-Status: Early. Usable for Claude Code agents.
+Status: Early. Usable for Claude Code and Codex agents.
 License: MIT.
 
 ## Build and run
 
-You need macOS 13 or later, Rust, and Claude Code installed and signed in.
+You need macOS 13 or later, Rust, and Claude Code or Codex (or both)
+installed and signed in.
 
 ```sh
 scripts/bundle.sh --release
@@ -13,7 +14,16 @@ open /Applications/Crew.app
 ```
 
 The app starts its background service, crewd, with launchd. It runs the
-`claude` on your login shell's `PATH`.
+`claude` and `codex` on your login shell's `PATH`.
+
+## Terminal sessions
+
+Crew also lists the Claude Code sessions you run in a terminal, so you can
+follow them next to your channels. To do that crewd reads Claude Code's
+session files under `~/.claude/projects`, or under `CREW_CLAUDE_HOME` or
+`CLAUDE_CONFIG_DIR` when crewd runs with one of them set. It only reads them,
+on your Mac. It never changes them, sends them anywhere or types into those
+sessions.
 
 ## Uninstall
 
