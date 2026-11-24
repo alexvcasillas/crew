@@ -41,8 +41,8 @@ impl Daemon {
         )
     }
 
-    /// Like [`Daemon::start_with`], with more settings. Codex and
-    /// crew-mcp are always off.
+    /// Like [`Daemon::start_with`], with more settings. crew-mcp is always
+    /// off, and Codex too unless `opts` names a fake one.
     pub fn start_with_options(home: PathBuf, opts: crewd::ServeOptions) -> Self {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serve_home = home.clone();
@@ -51,7 +51,10 @@ impl Daemon {
             rt.block_on(async move {
                 let opts = crewd::ServeOptions {
                     // Never the real codex.
-                    codex_bin: Some(PathBuf::from("/nonexistent/codex")),
+                    codex_bin: opts
+                        .codex_bin
+                        .clone()
+                        .or_else(|| Some(PathBuf::from("/nonexistent/codex"))),
                     crew_mcp_bin: None,
                     ..opts
                 };
@@ -160,6 +163,43 @@ pub fn fake_claude(dir: &Path, run: &str) -> PathBuf {
     let bin = dir.join("claude.sh");
     let body = format!(
         "#!/bin/sh\ncase \"$1\" in\n  --version) echo '9.9.9 (Claude Code)'; exit 0;;\n  auth) exit 0;;\nesac\n{run}\n"
+    );
+    std::fs::write(&bin, body).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The scripted stand-in for `codex app-server` in crew-core's tests.
+pub fn fake_app_server() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../crew-core/tests/fake/codex_app_server.py")
+}
+
+/// A fake `codex` in `dir`. `login status` exits with `login_exit`. An
+/// app-server started in `run_dir` (a run) plays `run-<n>.json` for the
+/// n-th run; one started anywhere else (crewd listing models) plays
+/// `models.json`. Scenarios are those of [`fake_app_server`].
+pub fn fake_codex(dir: &Path, run_dir: &Path, login_exit: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("codex");
+    let d = dir.display();
+    let run_dir = run_dir.canonicalize().unwrap();
+    let body = format!(
+        "#!/bin/sh
+         case \"$1\" in
+         --version) echo 'codex-cli 0.165.0' ;;
+         login) exit {login_exit} ;;
+         app-server)
+           here=$(pwd -P)
+           if [ \"$here\" = '{run}' ]; then
+             n=$(cat '{d}/runs' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{d}/runs'
+             exec python3 '{fake}' '{d}/run-'$n'.json'
+           fi
+           exec python3 '{fake}' '{d}/models.json' ;;
+         *) exit 2 ;;
+         esac
+",
+        run = run_dir.display(),
+        fake = fake_app_server().display(),
     );
     std::fs::write(&bin, body).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();

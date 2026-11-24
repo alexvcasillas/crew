@@ -21,6 +21,8 @@ use crate::theme::color;
 pub const OUTPUT_LINES: usize = 12;
 /// Diff lines an Edit row shows.
 pub const DIFF_LINES: usize = 12;
+/// Lines of a unified diff an Edit row shows until you ask for all of it.
+pub const PATCH_LINES: usize = 20;
 
 /// One line of an edit's mini diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,9 @@ pub struct ToolRow {
     /// What came back, such as `212 lines` or `2 matches`.
     pub detail: Option<String>,
     pub diff: Vec<DiffLine>,
+    /// A unified diff, as Codex gives an edit in place of its old and new
+    /// text.
+    pub patch: Option<String>,
     /// A command's output.
     pub output: Option<String>,
 }
@@ -103,6 +108,7 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                     lines: changed_lines(kind, input),
                     detail: None,
                     diff: mini_diff(kind, input),
+                    patch: patch(kind, input),
                     output: None,
                 }));
             }
@@ -188,6 +194,31 @@ fn mini_diff(kind: &ToolKind, input: &serde_json::Value) -> Vec<DiffLine> {
         }
     }
     lines
+}
+
+/// An edit's unified diff, if it came as one.
+fn patch(kind: &ToolKind, input: &serde_json::Value) -> Option<String> {
+    if *kind != ToolKind::Edit {
+        return None;
+    }
+    input
+        .get("diff")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// The colour token behind a unified diff line, if it has one.
+fn patch_tint(line: &str) -> Option<&'static str> {
+    if line.starts_with("+++") || line.starts_with("---") {
+        None
+    } else if line.starts_with('+') {
+        Some("success-subtle")
+    } else if line.starts_with('-') {
+        Some("danger-subtle")
+    } else {
+        None
+    }
 }
 
 /// The first `n` lines of `text` and how many more there are.
@@ -401,6 +432,10 @@ impl Workspace {
                     )
                 })
         });
+        let patch = tool
+            .patch
+            .as_ref()
+            .map(|text| self.render_patch(ix, &tool.id, text, cx).into_any_element());
         let output = tool.output.as_ref().filter(|o| !o.is_empty()).map(|text| {
             let key = self
                 .inspector
@@ -460,7 +495,80 @@ impl Workspace {
             .flex_col()
             .child(head)
             .children(diff)
+            .children(patch)
             .children(output)
+    }
+
+    /// A unified diff: its first [`PATCH_LINES`], added lines green and
+    /// removed ones red, and "Show all" for the rest.
+    fn render_patch(
+        &self,
+        ix: usize,
+        tool_id: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let key = self
+            .inspector
+            .rows_from
+            .map(|(run, _)| (run, format!("{tool_id}#diff")));
+        let expanded = key
+            .as_ref()
+            .is_some_and(|k| self.inspector.expanded.contains(k));
+        let (shown, more) = if expanded {
+            (text.trim_end().to_string(), 0)
+        } else {
+            first_lines(text, PATCH_LINES)
+        };
+        div()
+            .mt(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .id(("activity-patch", ix))
+                    .flex()
+                    .flex_col()
+                    .py(px(2.))
+                    .border_1()
+                    .border_color(color("border-100"))
+                    .rounded(px(6.))
+                    .overflow_hidden()
+                    .font_family(mono_font())
+                    .text_size(px(11.5))
+                    .aria_label(shown.clone())
+                    .children(shown.lines().map(|line| {
+                        div()
+                            .px(px(8.))
+                            .min_w_0()
+                            .truncate()
+                            .when_some(patch_tint(line), |row, tint| row.bg(color(tint)))
+                            .when(line.starts_with("@@"), |row| {
+                                row.text_color(color("text-tertiary"))
+                            })
+                            .child(line.to_string())
+                    }))
+                    .test_support(),
+            )
+            .when(more > 0, |block| {
+                block.child(
+                    div()
+                        .id(("activity-patch-all", ix))
+                        .text_color(color("accent-blue"))
+                        .cursor_pointer()
+                        .aria_label(format!("Show all ({more} more lines)"))
+                        .child(format!("Show all ({more} more lines)"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(key) = key.clone() {
+                                this.inspector.expanded.insert(key);
+                            }
+                            this.inspector.list.remeasure_items(ix..ix + 1);
+                            cx.notify();
+                        }))
+                        .test_support(),
+                )
+            })
     }
 }
 
@@ -675,6 +783,36 @@ mod tests {
         };
         assert_eq!(bash.state, StepState::Failed);
         assert_eq!(bash.output.as_deref(), Some("test failed"));
+    }
+
+    #[test]
+    fn codex_edits_keep_their_unified_diff() {
+        let run = RunId::new();
+        let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n-a\n+b\n+c\n";
+        let events = vec![
+            at(
+                run,
+                0,
+                call(
+                    "Edit",
+                    "exec-1",
+                    Some("/work/demo/a.rs"),
+                    serde_json::json!({"path": "/work/demo/a.rs", "diff": diff}),
+                ),
+            ),
+            at(run, 1, result("exec-1", false, "Applied")),
+        ];
+        let rows = activity_rows(&events, run);
+        let ActivityRow::Tool(edit) = &rows[0] else {
+            panic!("an edit row")
+        };
+        assert_eq!(edit.patch.as_deref(), Some(diff));
+        assert!(edit.diff.is_empty(), "no old and new text");
+        assert_eq!(edit.lines, Some((2, 1)));
+        assert_eq!(super::patch_tint("+b"), Some("success-subtle"));
+        assert_eq!(super::patch_tint("-a"), Some("danger-subtle"));
+        assert_eq!(super::patch_tint("+++ b/a.rs"), None);
+        assert_eq!(super::patch_tint("@@ -1 +1,2 @@"), None);
     }
 
     #[test]

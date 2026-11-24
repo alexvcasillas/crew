@@ -17,13 +17,33 @@ pub fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// `claude · haiku`: the runtime and the short model name.
+/// `claude · haiku` or `codex · luna`: the runtime and the short model
+/// name.
 pub fn runtime_chip(spec: &AgentSpec) -> String {
-    let runtime = match spec.runtime {
-        Runtime::ClaudeCode => "claude",
-        Runtime::Codex => "codex",
+    match spec.runtime {
+        Runtime::ClaudeCode => format!("claude · {}", short_model(&spec.model)),
+        Runtime::Codex => format!("codex · {}", codex_short(&spec.model, None)),
+    }
+}
+
+/// The Codex model families a chip names on their own.
+const CODEX_FAMILIES: [&str; 4] = ["luna", "sol", "terra", "astra"];
+
+/// A Codex model as a chip names it: the family its label (or else its
+/// id) ends with, such as `luna` for `gpt-6-luna`, else the id. An empty
+/// id is Codex's own default.
+pub fn codex_short(id: &str, label: Option<&str>) -> String {
+    if id.trim().is_empty() {
+        return "default".into();
+    }
+    let family = |text: &str| {
+        let last = text.rsplit([' ', '-']).next()?.to_lowercase();
+        CODEX_FAMILIES.contains(&last.as_str()).then_some(last)
     };
-    format!("{runtime} · {}", short_model(&spec.model))
+    label
+        .and_then(family)
+        .or_else(|| family(id))
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// `claude-haiku-4-5` reads as `haiku`. Other names stay as they are.
@@ -117,7 +137,9 @@ pub fn dot(token: &str) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{elapsed, short_model};
+    use super::{codex_short, elapsed, runtime_chip, short_model};
+    use crate::ui::settings::agents::blank_spec;
+    use crew_core::agent::{AgentSpec, Runtime};
 
     #[test]
     fn model_names_read_short() {
@@ -125,6 +147,26 @@ mod tests {
         assert_eq!(short_model("claude-opus-4-1"), "opus");
         assert_eq!(short_model("sonnet"), "sonnet");
         assert_eq!(short_model("claude-sonnet"), "sonnet");
+    }
+
+    #[test]
+    fn codex_models_read_as_their_family() {
+        assert_eq!(codex_short("gpt-6-luna", Some("GPT-6-Luna")), "luna");
+        assert_eq!(codex_short("gpt-6.1-terra", Some("GPT-6.1 Terra")), "terra");
+        assert_eq!(codex_short("gpt-6.1-sol", None), "sol");
+        assert_eq!(codex_short("gpt-a", Some("GPT A")), "gpt-a");
+        assert_eq!(codex_short("", None), "default");
+        let codex = AgentSpec {
+            runtime: Runtime::Codex,
+            model: "gpt-6-luna".into(),
+            ..blank_spec()
+        };
+        assert_eq!(runtime_chip(&codex), "codex · luna");
+        let claude = AgentSpec {
+            model: "claude-opus-4-1".into(),
+            ..blank_spec()
+        };
+        assert_eq!(runtime_chip(&claude), "claude · opus");
     }
 
     #[test]

@@ -25,6 +25,8 @@ mod title_bar;
 pub mod workspace;
 
 #[cfg(test)]
+mod codex_tests;
+#[cfg(test)]
 mod diff_tests;
 #[cfg(test)]
 mod inspector_tests;

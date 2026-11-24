@@ -30,15 +30,6 @@ pub fn runtime_state(info: &RuntimeInfo) -> (&'static str, &'static str) {
     }
 }
 
-/// A runtime as lists show it: Claude Code's state, the rest "Coming
-/// soon" as only Claude Code can run agents yet.
-pub fn listed_state(info: &RuntimeInfo) -> (&'static str, &'static str) {
-    match info.runtime {
-        Runtime::ClaudeCode => runtime_state(info),
-        Runtime::Codex => ("Coming soon", "text-tertiary"),
-    }
-}
-
 impl Workspace {
     /// Asks crewd which CLIs it finds now.
     pub(super) fn refresh_runtimes(&mut self, cx: &mut Context<Self>) {
@@ -70,7 +61,7 @@ impl Workspace {
             .iter()
             .map(|info| {
                 let name = runtime_name(&info.runtime);
-                let (word, token) = listed_state(info);
+                let (word, token) = runtime_state(info);
                 let detail = [
                     info.version.as_ref().map(|v| format!("version {v}")),
                     info.path.clone(),
@@ -160,7 +151,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{listed_state, runtime_name, runtime_state};
+    use super::{runtime_name, runtime_state};
     use crew_core::agent::Runtime;
     use crew_proto::RuntimeInfo;
 
@@ -185,6 +176,10 @@ mod tests {
             installed: true,
             ..info
         };
-        assert_eq!(listed_state(&codex).0, "Coming soon");
+        assert_eq!(
+            runtime_state(&codex).0,
+            "Installed",
+            "no longer coming soon"
+        );
     }
 }

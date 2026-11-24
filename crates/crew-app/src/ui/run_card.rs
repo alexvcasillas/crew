@@ -184,6 +184,14 @@ pub(super) fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Optio
         v.as_str()
             .map_or(0, |s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX))
     };
+    // Codex gives a unified diff instead of old and new text.
+    if let Some(diff) = input.get("diff").and_then(|d| d.as_str()) {
+        return match kind {
+            ToolKind::Edit => Some(patch_lines(diff)),
+            ToolKind::Create => Some((lines(&input["diff"]), 0)),
+            _ => None,
+        };
+    }
     match kind {
         ToolKind::Edit => {
             let edits = match input.get("edits").and_then(|e| e.as_array()) {
@@ -197,6 +205,18 @@ pub(super) fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Optio
         ToolKind::Create => Some((lines(&input["content"]), 0)),
         _ => None,
     }
+}
+
+/// Lines a unified diff adds and removes, leaving out its file headers.
+fn patch_lines(diff: &str) -> (u32, u32) {
+    let count = |sign: char, header: &str| {
+        let n = diff
+            .lines()
+            .filter(|l| l.starts_with(sign) && !l.starts_with(header))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    };
+    (count('+', "+++"), count('-', "---"))
 }
 
 /// `path` relative to the run's folder, if it is inside it.
