@@ -364,6 +364,8 @@ struct FileState {
     mtime: SystemTime,
     /// Clients were told about it.
     announced: bool,
+    /// Queued prompts, so each shows once.
+    prompts: transcript::Prompts,
 }
 
 /// One registry entry of a running Claude Code.
@@ -462,10 +464,16 @@ impl Scanner {
         let mut updates = Vec::new();
         let mut more = false;
         let mut present = HashSet::new();
-        for path in self.session_files(&roots) {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
+        let mut files: Vec<(PathBuf, Metadata)> = self
+            .session_files(&roots)
+            .into_iter()
+            .filter_map(|path| std::fs::metadata(&path).ok().map(|meta| (path, meta)))
+            .collect();
+        // A replaced file someone watches needs a whole budget to re-read,
+        // so it goes first; otherwise steady writes elsewhere could keep it
+        // waiting for ever.
+        files.sort_by_key(|(path, meta)| !self.rotated(path, meta, &buffered));
+        for (path, meta) in files {
             let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
             if mtime.elapsed().is_ok_and(|age| age > MAX_AGE) {
                 continue;
@@ -495,6 +503,14 @@ impl Scanner {
         });
         svc.apply(updates, removed);
         more
+    }
+
+    /// Whether a watched session's file was replaced or cut short since
+    /// it was last read.
+    fn rotated(&self, path: &Path, meta: &Metadata, buffered: &HashSet<String>) -> bool {
+        self.files.get(path).is_some_and(|f| {
+            buffered.contains(&f.session) && (meta.ino() != f.ino || meta.len() < f.offset)
+        })
     }
 
     /// Session files in folders that may belong to a project.
@@ -564,6 +580,7 @@ impl Scanner {
                     started_at: None,
                     mtime,
                     announced: false,
+                    prompts: transcript::Prompts::default(),
                 },
             );
         }
@@ -619,6 +636,7 @@ impl Scanner {
                     let mut f = File::open(path)?;
                     let tail = tail_range(&mut f, len, TAIL_LINES, budget.left)?;
                     budget.spend(tail.scanned);
+                    file.prompts = transcript::Prompts::default();
                     reset = Some(take_lines(file, &tail.bytes));
                     file.ino = meta.ino();
                     file.offset = tail.end;
@@ -693,6 +711,7 @@ impl Scanner {
             ))
         };
         let (tail, ino) = read().map_err(|e| format!("Can't read the terminal session: {e}"))?;
+        file.prompts = transcript::Prompts::default();
         let items = take_lines(file, &tail.bytes);
         file.ino = ino;
         file.offset = tail.end;
@@ -811,7 +830,7 @@ fn take_lines(file: &mut FileState, bytes: &[u8]) -> Vec<TranscriptItem> {
         if file.title.is_none() {
             file.title = first_title(&parsed.items);
         }
-        items.extend(parsed.items);
+        items.extend(file.prompts.take(parsed));
     }
     items
 }
@@ -1264,5 +1283,53 @@ mod tests {
         assert!(!scanner.scan(&svc));
         assert!(scanner.bytes_read - before <= MAX_READ);
         assert_eq!(svc.terminal().sessions().len(), 200);
+    }
+
+    #[test]
+    fn a_replaced_watched_file_is_read_before_others() {
+        let (tmp, svc, mut scanner) = many_sessions(2, 1024);
+        scanner.scan(&svc);
+        let ids: Vec<String> = (0..2)
+            .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+            .collect();
+        for id in &ids {
+            scanner.load(&svc, id).unwrap();
+        }
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = base.join("ws");
+        let folder = base.join("claude/projects").join(folder_name(&root));
+        // The second session's file is replaced...
+        let replaced = folder.join(format!("{}.jsonl", ids[1]));
+        let fresh = serde_json::json!({
+            "type": "user", "message": {"content": "after the rewrite"},
+            "sessionId": ids[1], "cwd": root, "entrypoint": "cli",
+        });
+        let next = folder.join("next.tmp");
+        std::fs::write(&next, format!("{fresh}\n")).unwrap();
+        std::fs::rename(&next, &replaced).unwrap();
+        // ...while the first grows by more than a scan may read.
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"type": "attachment", "attachment": {"type": "x", "pad": "x".repeat(4000)}})
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(folder.join(format!("{}.jsonl", ids[0])))
+            .unwrap();
+        for _ in 0..(MAX_READ as usize / line.len() + 10) {
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        drop(f);
+
+        scanner.scan(&svc);
+        let backlog = svc.terminal().backlog(&ids[1]);
+        assert!(
+            backlog
+                .iter()
+                .any(|m| matches!(m, ServerMsg::TerminalEvent {
+                item: TranscriptItem::UserPrompt(t), ..
+            } if t == "after the rewrite")),
+            "{backlog:?}"
+        );
     }
 }
