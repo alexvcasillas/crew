@@ -244,8 +244,9 @@ fn a_blocked_call_shows_a_card_and_allow_retries_it(cx: &mut TestAppContext) {
     };
     assert_eq!(after("--permission-mode"), Some("auto"));
     assert_eq!(
-        after("--allowedTools"),
-        Some("Bash(rm -rf /work/demo/build)")
+        after("--settings"),
+        Some(r#"{"permissions":{"allow":["Bash(rm -rf /work/demo/build)"]}}"#),
+        "the rule, as it is"
     );
     assert!(after("--resume").is_some(), "the same session");
     assert!(
@@ -322,5 +323,43 @@ fn needs_you_dismisses_a_blocked_call_and_activity_says_why(cx: &mut TestAppCont
     ws.read_with(cx, |ws, _| {
         assert_eq!(ws.state().thread_runs(w.thread).len(), 1);
         assert_eq!(ws.state().thread_runs(w.thread)[0].id, run.id);
+    });
+}
+
+#[gpui_kit::test]
+fn a_call_no_rule_matches_exactly_can_only_be_dismissed(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    // The stopped call has a comma in it, which no rule can allow alone.
+    let lines = std::fs::read_to_string(fixture("auto_blocked_result.jsonl"))
+        .unwrap()
+        .replace(COMMAND, "git log --format=%h,%s");
+    let stream = tmp.path().join("stream.jsonl");
+    std::fs::write(&stream, lines).unwrap();
+    let claude = fake_claude(tmp.path(), &format!("cat '{}'", stream.display()));
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let (w, _) = auto_world(home.path(), &tmp.path().join("repo"));
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge show the log");
+    let id = blocked_ask(cx, &ws, &w);
+    wait_until(cx, "the card", |cx| {
+        has(cx, window, format!("approval-{id}"))
+    });
+    assert!(!has(cx, window, format!("approval-retry-{id}")));
+    assert!(has(cx, window, format!("approval-decline-{id}")));
+    assert_eq!(
+        label_of(cx, window, format!("approval-no-retry-{id}")).as_deref(),
+        Some(crew_core::claude::NO_EXACT_RULE)
+    );
+
+    press(cx, window, "cmd-2");
+    wait_until(cx, "the needs you row", |cx| {
+        has(cx, window, format!("running-deny-{id}"))
+    });
+    assert!(!has(cx, window, format!("running-allow-{id}")));
+    click(cx, window, format!("running-deny-{id}"));
+    wait_until(cx, "dismissed", |cx| {
+        status_of(cx, &ws, id) == ApprovalStatus::Declined
     });
 }

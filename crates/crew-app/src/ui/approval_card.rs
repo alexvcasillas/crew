@@ -3,6 +3,7 @@
 //! budget. Once decided, a card folds into one line.
 
 use crew_core::agent::PermissionMode;
+use crew_core::claude::{NO_EXACT_RULE, retry_rule};
 use crew_core::event::{humanize_reason, tool_label};
 use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval};
@@ -246,8 +247,12 @@ impl Workspace {
             ApprovalKind::Permission { tool, input, .. } => self
                 .render_permission(approval, tool, input, cx)
                 .into_any_element(),
-            ApprovalKind::Blocked { input, reason, .. } => self
-                .render_blocked(approval, input, reason, cx)
+            ApprovalKind::Blocked {
+                tool,
+                input,
+                reason,
+            } => self
+                .render_blocked(approval, tool, input, reason, cx)
                 .into_any_element(),
         }
     }
@@ -257,6 +262,7 @@ impl Workspace {
     fn render_blocked(
         &self,
         approval: &StoredApproval,
+        tool: &str,
         input: &serde_json::Value,
         reason: &str,
         cx: &mut Context<Self>,
@@ -281,6 +287,27 @@ impl Workspace {
         };
         let reason = humanize_reason(reason);
         let deciding = self.deciding.contains(&id);
+        // Only a call a rule can allow exactly, and nothing else, is retried.
+        let retryable = retry_rule(tool, input).is_some();
+        let mut buttons = Vec::new();
+        if retryable {
+            buttons.push(
+                Button::new(format!("approval-retry-{id}"))
+                    .primary()
+                    .small()
+                    .label("Allow and retry")
+                    .disabled(deciding)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.decide(id, true, None, window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        buttons.push(
+            decline(id, "Dismiss", cx)
+                .disabled(deciding)
+                .into_any_element(),
+        );
         let card = needs_you_card(id, &wants, &wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
             .when(!reason.is_empty(), |card| {
@@ -295,23 +322,18 @@ impl Workspace {
                         .test_support(),
                 )
             })
-            .child(card_footer(
-                vec![
-                    Button::new(format!("approval-retry-{id}"))
-                        .primary()
-                        .small()
-                        .label("Allow and retry")
-                        .disabled(deciding)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.decide(id, true, None, window, cx);
-                        }))
-                        .into_any_element(),
-                    decline(id, "Dismiss", cx)
-                        .disabled(deciding)
-                        .into_any_element(),
-                ],
-                false,
-            ))
+            .when(!retryable, |card| {
+                card.child(
+                    div()
+                        .id(format!("approval-no-retry-{id}"))
+                        .text_size(px(12.))
+                        .text_color(color("text-tertiary"))
+                        .aria_label(NO_EXACT_RULE)
+                        .child(NO_EXACT_RULE)
+                        .test_support(),
+                )
+            })
+            .child(card_footer(buttons, false))
             .test_support();
         indented(card)
     }
