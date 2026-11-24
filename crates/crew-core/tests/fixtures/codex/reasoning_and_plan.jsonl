@@ -1,0 +1,10 @@
+{"method":"turn/plan/updated","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","explanation":null,"plan":[{"step":"Read the file","status":"inProgress"}]}}
+{"method":"item/started","params":{"item":{"type":"reasoning","id":"rs_0001","summary":[],"content":[]},"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004"}}
+{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","itemId":"rs_0001","summaryIndex":0}}
+{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","itemId":"rs_0001","delta":"Looking","summaryIndex":0}}
+{"method":"item/reasoning/textDelta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","itemId":"rs_0001","delta":"x","contentIndex":0}}
+{"method":"item/completed","params":{"item":{"type":"reasoning","id":"rs_0001","summary":["Looking at the cart code.","Totals live in cart.py."],"content":[]},"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004"}}
+{"method":"item/completed","params":{"item":{"type":"reasoning","id":"rs_0002","summary":[],"content":["hidden"]},"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004"}}
+{"method":"item/plan/delta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","itemId":"pl_0001","delta":"1."}}
+{"method":"item/completed","params":{"item":{"type":"plan","id":"pl_0001","text":"1. Read cart.py\n2. Fix the total"},"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004"}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"00000000-0000-4000-8000-000000000001","turnId":"00000000-0000-4000-8000-000000000004","itemId":"c1","delta":"aGk="}}
