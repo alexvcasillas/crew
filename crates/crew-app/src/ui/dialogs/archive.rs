@@ -7,6 +7,7 @@ use gpui_kit::*;
 use super::super::workspace::Workspace;
 use super::{DialogKind, heading};
 use crate::theme::color;
+use crate::theme::scale::{self, ui_px};
 
 /// What archiving `title` in `#channel` does.
 pub fn archive_body(title: &str, channel: &str) -> String {
@@ -56,7 +57,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(ui_px(12.))
             .child(heading(
                 "archive-heading",
                 "Archive this thread?".into(),
@@ -67,13 +68,13 @@ impl Workspace {
                 let note = uncommitted_note(files);
                 div()
                     .id("archive-note")
-                    .px(px(12.))
-                    .py(px(10.))
+                    .px(ui_px(12.))
+                    .py(scale::row(10.))
                     .border_1()
                     .border_color(color("border-100"))
-                    .rounded(px(6.))
-                    .text_size(px(12.))
-                    .line_height(px(18.))
+                    .rounded(ui_px(6.))
+                    .text_size(scale::text(12.))
+                    .line_height(scale::line(18.))
                     .text_color(color("text-secondary"))
                     .aria_label(note.clone())
                     .child(note)

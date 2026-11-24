@@ -18,8 +18,8 @@ use super::common::{clean_line, clean_lines, clock, monogram, runtime_badge};
 use super::thread_settings::effective;
 use super::thread_view::indented;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// Input lines a permission card shows until you ask for all of it.
 const INPUT_LINES: usize = 6;
@@ -77,15 +77,15 @@ pub fn outside_sandbox_line(id: impl Into<ElementId>) -> Stateful<Div> {
         .id(id)
         .flex()
         .items_start()
-        .gap(px(6.))
+        .gap(ui_px(6.))
         .min_w_0()
-        .text_size(px(12.))
+        .text_size(scale::text(12.))
         .text_color(color("danger"))
         .aria_label(OUTSIDE_SANDBOX)
         .child(
-            div().flex_none().pt(px(2.)).child(
+            div().flex_none().pt(scale::row(2.)).child(
                 Icon::new(IconName::TriangleAlert)
-                    .size(px(12.))
+                    .size(ui_px(12.))
                     .text_color(color("danger")),
             ),
         )
@@ -356,7 +356,7 @@ impl Workspace {
                 card.child(
                     div()
                         .id(format!("approval-reason-{id}"))
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-secondary"))
                         .aria_label(line.clone())
                         .child(line)
@@ -367,7 +367,7 @@ impl Workspace {
                 card.child(
                     div()
                         .id(format!("approval-no-retry-{id}"))
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-tertiary"))
                         .aria_label(NO_EXACT_RULE)
                         .child(NO_EXACT_RULE)
@@ -391,11 +391,11 @@ impl Workspace {
                 .id(format!("approval-{}", approval.id))
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .text_size(px(12.))
+                .gap(ui_px(8.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-tertiary"))
                 .aria_label(text.clone())
-                .child(Icon::new(icon).size(px(12.)).text_color(color(token)))
+                .child(Icon::new(icon).size(ui_px(12.)).text_color(color(token)))
                 .child(text)
                 .test_support(),
         )
@@ -436,10 +436,10 @@ impl Workspace {
                 .id(format!("approval-brief-editor-{id}"))
                 .border_1()
                 .border_color(color("border-200"))
-                .rounded(px(6.))
+                .rounded(ui_px(6.))
                 .bg(color("bg-100"))
-                .p(px(4.))
-                .font_family(mono_font())
+                .p(ui_px(4.))
+                .font_family(code_family())
                 .child(Textarea::new(&editor.input).appearance(false))
                 .test_support()
                 .into_any_element(),
@@ -485,13 +485,17 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .child(monogram(&to_name, 24.))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(to_name.clone()))
+                    .child(
+                        div()
+                            .font_weight(weight(FontWeight::MEDIUM))
+                            .child(to_name.clone()),
+                    )
                     .when_some(target.map(|a| a.spec.role.clone()), |row, role| {
                         row.child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(scale::text(12.))
                                 .text_color(color("text-secondary"))
                                 .child(role),
                         )
@@ -506,7 +510,7 @@ impl Workspace {
                     format!("This thread: {used} of {budget} handoffs used · {to_name} {mode}");
                 div()
                     .id(format!("approval-note-{id}"))
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-secondary"))
                     .aria_label(note.clone())
                     .child(note)
@@ -556,8 +560,8 @@ impl Workspace {
                     div()
                         .id(format!("approval-command-{id}"))
                         .truncate()
-                        .font_family(mono_font())
-                        .text_size(px(11.))
+                        .font_family(code_family())
+                        .text_size(scale::mono(11.))
                         .text_color(color("text-tertiary"))
                         .aria_label(command.clone())
                         .child(command)
@@ -568,7 +572,7 @@ impl Workspace {
                 card.child(
                     div()
                         .id(format!("approval-input-more-{id}"))
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("accent-blue"))
                         .cursor_pointer()
                         .aria_label(format!("Show all ({more} more lines)"))
@@ -622,10 +626,10 @@ impl Workspace {
                 .id(format!("approval-{id}"))
                 .flex()
                 .flex_col()
-                .gap(px(10.))
-                .max_w(px(560.))
-                .p(px(12.))
-                .rounded(px(8.))
+                .gap(ui_px(10.))
+                .max_w(ui_px(560.))
+                .p(ui_px(12.))
+                .rounded(ui_px(8.))
                 .border_1()
                 .border_color(color("border-200"))
                 .aria_label(text.clone())
@@ -633,10 +637,10 @@ impl Workspace {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(ui_px(8.))
                         .child(
                             Icon::new(IconName::Pause)
-                                .size(px(14.))
+                                .size(ui_px(14.))
                                 .text_color(color("text-secondary")),
                         )
                         .child(text),
@@ -644,7 +648,7 @@ impl Workspace {
                 .child(
                     div()
                         .flex()
-                        .gap(px(8.))
+                        .gap(ui_px(8.))
                         .child(
                             Button::new(format!("approval-more-{id}"))
                                 .outline()
@@ -707,11 +711,11 @@ fn needs_you_card(id: ApprovalId, wants: &str, shown: &str) -> Stateful<Div> {
         .id(format!("approval-{id}"))
         .flex()
         .flex_col()
-        .gap(px(10.))
-        .max_w(px(560.))
-        .pt(px(12.))
-        .px(px(12.))
-        .rounded(px(8.))
+        .gap(ui_px(10.))
+        .max_w(ui_px(560.))
+        .pt(scale::row(12.))
+        .px(ui_px(12.))
+        .rounded(ui_px(8.))
         .border_1()
         .border_color(color("warning-border"))
         .bg(color("warning-subtle"))
@@ -723,19 +727,19 @@ fn needs_you_card(id: ApprovalId, wants: &str, shown: &str) -> Stateful<Div> {
                 .id(format!("approval-title-{id}"))
                 .flex()
                 .items_start()
-                .gap(px(8.))
+                .gap(ui_px(8.))
                 .min_w_0()
                 .child(
-                    div().flex_none().pt(px(2.)).child(
+                    div().flex_none().pt(scale::row(2.)).child(
                         Icon::new(IconName::TriangleAlert)
-                            .size(px(14.))
+                            .size(ui_px(14.))
                             .text_color(color("warning")),
                     ),
                 )
                 .child(
                     div()
                         .flex_none()
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(weight(FontWeight::MEDIUM))
                         .text_color(color("warning"))
                         .child("Needs you"),
                 )
@@ -756,14 +760,14 @@ fn needs_you_card(id: ApprovalId, wants: &str, shown: &str) -> Stateful<Div> {
 fn mono_box(id: String, text: String) -> impl IntoElement {
     div()
         .id(id)
-        .px(px(10.))
-        .py(px(8.))
-        .rounded(px(6.))
+        .px(ui_px(10.))
+        .py(scale::row(8.))
+        .rounded(ui_px(6.))
         .border_1()
         .border_color(color("border-200"))
         .bg(color("bg-100"))
-        .font_family(mono_font())
-        .text_size(px(12.))
+        .font_family(code_family())
+        .text_size(scale::mono(12.))
         .aria_label(text.clone())
         .child(text)
         .test_support()
@@ -773,10 +777,10 @@ fn card_footer(buttons: Vec<AnyElement>, hint: bool) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap(px(8.))
-        .mx(px(-12.))
-        .px(px(12.))
-        .py(px(8.))
+        .gap(ui_px(8.))
+        .mx(ui_px(-12.))
+        .px(ui_px(12.))
+        .py(scale::row(8.))
         .border_t_1()
         .border_color(color("warning-border"))
         .children(buttons)
@@ -784,8 +788,8 @@ fn card_footer(buttons: Vec<AnyElement>, hint: bool) -> impl IntoElement {
         .when(hint, |footer| {
             footer.child(
                 div()
-                    .font_family(mono_font())
-                    .text_size(px(11.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(11.))
                     .text_color(color("text-tertiary"))
                     .child("⌘↵ approve"),
             )

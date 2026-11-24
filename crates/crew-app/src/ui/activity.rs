@@ -16,9 +16,9 @@ use super::common::{clean_line, spinner};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{Answer, DecidedAsk, OUTSIDE_TAG, StepState, match_asks, relative};
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::model::{LoggedEvent, PatchMark, patch_marks};
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px};
 
 /// Output lines a Run row shows until you ask for all of it.
 pub const OUTPUT_LINES: usize = 12;
@@ -416,7 +416,7 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_wrap()
-                            .gap(px(6.))
+                            .gap(ui_px(6.))
                             .child(
                                 div()
                                     .min_w_0()
@@ -478,13 +478,13 @@ impl Workspace {
             // Rows and their hairlines span the whole column.
             .w_full()
             .flex()
-            .gap(px(8.))
-            .px(px(16.))
-            .py(px(10.))
+            .gap(ui_px(8.))
+            .px(ui_px(16.))
+            .py(scale::row(10.))
             .border_b_1()
             .border_color(color("surface-200"))
-            .text_size(px(12.))
-            .line_height(px(18.))
+            .text_size(scale::text(12.))
+            .line_height(scale::line(18.))
             .aria_label(row_label(row))
             .when_some(
                 match row {
@@ -497,12 +497,12 @@ impl Workspace {
                     })
                 },
             )
-            .child(div().flex_none().w(px(16.)).pt(px(2.)).child(
+            .child(div().flex_none().w(ui_px(16.)).pt(scale::row(2.)).child(
                 if matches!(row, ActivityRow::Tool(t) if t.state == StepState::Running) {
                     spinner(("activity-spinner", ix), 14., token).into_any_element()
                 } else {
                     Icon::new(icon)
-                        .size(px(14.))
+                        .size(ui_px(14.))
                         .text_color(color(token))
                         .into_any_element()
                 },
@@ -532,7 +532,7 @@ impl Workspace {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(6.))
+            .gap(ui_px(6.))
             // A long name is cut short inside the row.
             .child(
                 div()
@@ -550,14 +550,14 @@ impl Workspace {
             head = head
                 .child(
                     div()
-                        .font_family(mono_font())
+                        .font_family(code_family())
                         .text_color(color("success"))
                         .child(format!("+{added}")),
                 )
                 .when(removed > 0, |head| {
                     head.child(
                         div()
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .text_color(color("danger"))
                             .child(format!("−{removed}")),
                     )
@@ -566,7 +566,7 @@ impl Workspace {
         if let Some(answer) = tool.answer {
             head = head.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("text-tertiary"))
                     .child(answer.text()),
             );
@@ -574,7 +574,7 @@ impl Workspace {
         if tool.outside {
             head = head.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("danger"))
                     .child(OUTSIDE_TAG),
             );
@@ -592,15 +592,15 @@ impl Workspace {
         let diff = (!tool.diff.is_empty()).then(|| {
             let more = tool.diff.len().saturating_sub(DIFF_LINES);
             div()
-                .mt(px(6.))
+                .mt(ui_px(6.))
                 .flex()
                 .flex_col()
                 .border_1()
                 .border_color(color("border-100"))
-                .rounded(px(6.))
+                .rounded(ui_px(6.))
                 .overflow_hidden()
-                .font_family(mono_font())
-                .text_size(px(11.5))
+                .font_family(code_family())
+                .text_size(scale::mono(11.5))
                 .children(tool.diff.iter().take(DIFF_LINES).map(|line| {
                     let (sign, bg) = if line.added {
                         ("+", "success-subtle")
@@ -609,8 +609,8 @@ impl Workspace {
                     };
                     div()
                         .flex()
-                        .gap(px(8.))
-                        .px(px(8.))
+                        .gap(ui_px(8.))
+                        .px(ui_px(8.))
                         .bg(color(bg))
                         .child(
                             div()
@@ -623,7 +623,7 @@ impl Workspace {
                 .when(more > 0, |diff| {
                     diff.child(
                         div()
-                            .px(px(8.))
+                            .px(ui_px(8.))
                             .text_color(color("text-tertiary"))
                             .child(format!("{more} more lines")),
                     )
@@ -647,21 +647,21 @@ impl Workspace {
                 first_lines(text, OUTPUT_LINES)
             };
             div()
-                .mt(px(6.))
+                .mt(ui_px(6.))
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(ui_px(4.))
                 .child(
                     div()
                         .id(("activity-output", ix))
-                        .px(px(8.))
-                        .py(px(6.))
+                        .px(ui_px(8.))
+                        .py(scale::row(6.))
                         .bg(color("bg-100"))
                         .border_1()
                         .border_color(color("border-100"))
-                        .rounded(px(6.))
-                        .font_family(mono_font())
-                        .text_size(px(11.5))
+                        .rounded(ui_px(6.))
+                        .font_family(code_family())
+                        .text_size(scale::mono(11.5))
                         .text_color(color("text-secondary"))
                         .aria_label(shown.clone())
                         .child(shown)
@@ -731,28 +731,28 @@ impl Workspace {
             .collect::<Vec<_>>()
             .join("\n");
         div()
-            .mt(px(6.))
+            .mt(ui_px(6.))
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .child(
                 div()
                     .id(("activity-patch", ix))
                     .flex()
                     .flex_col()
-                    .py(px(2.))
-                    .max_h(px(PATCH_MAX_HEIGHT))
+                    .py(scale::row(2.))
+                    .max_h(ui_px(PATCH_MAX_HEIGHT))
                     .overflow_y_scroll()
                     .border_1()
                     .border_color(color("border-100"))
-                    .rounded(px(6.))
-                    .font_family(mono_font())
-                    .text_size(px(11.5))
+                    .rounded(ui_px(6.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(11.5))
                     .aria_label(label)
                     .children(shown.iter().map(|line| {
                         div()
                             .flex_none()
-                            .px(px(8.))
+                            .px(ui_px(8.))
                             .min_w_0()
                             .truncate()
                             .when_some(line.tint, |row, tint| row.bg(color(tint)))
@@ -787,8 +787,8 @@ impl Workspace {
 /// The safety check's reason under a blocked call.
 fn reason_line(reason: String) -> impl IntoElement {
     div()
-        .mt(px(2.))
-        .text_size(px(12.))
+        .mt(ui_px(2.))
+        .text_size(scale::text(12.))
         .text_color(color("text-secondary"))
         .child(format!("Reason: {reason}"))
 }
@@ -877,10 +877,10 @@ fn code(text: String) -> Div {
     div()
         .min_w_0()
         .truncate()
-        .px(px(4.))
-        .rounded(px(4.))
+        .px(ui_px(4.))
+        .rounded(ui_px(4.))
         .bg(color("surface-300"))
-        .font_family(mono_font())
+        .font_family(code_family())
         .text_color(color("text-primary"))
         .child(text)
 }

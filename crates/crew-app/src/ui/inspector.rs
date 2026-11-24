@@ -19,9 +19,9 @@ use super::common::{ROLL_LINE, clock, elapsed, monogram, now_ms, rolling_text};
 use super::run_card::{FileChange, decided_asks, summarize};
 use super::terminal_tab::CommandLog;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub const INSPECTOR_WIDTH: f32 = 400.;
 const NO_RUNS: &str = "No runs yet. Mention an agent to start one.";
@@ -447,7 +447,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(INSPECTOR_WIDTH))
+            .w(ui_px(INSPECTOR_WIDTH))
             .h_full()
             .border_l_1()
             .border_color(color("border-100"))
@@ -467,16 +467,16 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(8.))
-            .h(px(44.))
-            .px(px(16.))
+            .gap(ui_px(8.))
+            .h(scale::row(44.))
+            .px(ui_px(16.))
             .border_b_1()
             .border_color(color("border-100"));
         let Some(run) = self.shown_run(thread) else {
             return header.child(
                 div()
                     .id("inspector-empty")
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(NO_RUNS)
                     .child(NO_RUNS)
@@ -494,7 +494,7 @@ impl Workspace {
             .child(
                 div()
                     .id("inspector-agent")
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .aria_label(name.clone())
                     .child(name)
                     .test_support(),
@@ -505,7 +505,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color(token))
                     .aria_label(word.clone())
                     .map(|state| {
@@ -518,8 +518,8 @@ impl Workspace {
                             state
                                 .flex()
                                 .items_center()
-                                .gap(px(4.))
-                                .line_height(px(ROLL_LINE))
+                                .gap(ui_px(4.))
+                                .line_height(scale::line(ROLL_LINE))
                                 .child("Working ·")
                                 .child(
                                     rolling_text(
@@ -527,8 +527,8 @@ impl Workspace {
                                         &elapsed(ms - 1000),
                                         &elapsed(ms),
                                     )
-                                    .font_family(mono_font())
-                                    .text_size(px(12.))
+                                    .font_family(code_family())
+                                    .text_size(scale::mono(12.))
                                     .test_support(),
                                 )
                         } else {
@@ -560,9 +560,9 @@ impl Workspace {
                 .id(id)
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(ui_px(6.))
                 .h_full()
-                .px(px(2.))
+                .px(ui_px(2.))
                 .border_b_1()
                 .border_color(if selected {
                     color("primary")
@@ -586,23 +586,23 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(16.))
-            .h(px(34.))
-            .px(px(16.))
+            .gap(ui_px(16.))
+            .h(scale::row(34.))
+            .px(ui_px(16.))
             .border_b_1()
             .border_color(color("border-100"))
-            .text_size(px(12.))
+            .text_size(scale::text(12.))
             .child(tab("inspector-tab-activity", "Activity", InspectorTab::Activity).test_support())
             .child(
                 tab("inspector-tab-changes", "Changes", InspectorTab::Changes)
                     .when(changes > 0, |tab| {
                         tab.child(
                             div()
-                                .px(px(5.))
+                                .px(ui_px(5.))
                                 .rounded_full()
                                 .bg(color("surface-300"))
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(scale::text(11.))
+                                .font_weight(weight(FontWeight::MEDIUM))
                                 .child(changes.to_string()),
                         )
                     })
@@ -618,8 +618,8 @@ impl Workspace {
             div()
                 .id("inspector-run-picker")
                 .flex_none()
-                .px(px(16.))
-                .py(px(8.))
+                .px(ui_px(16.))
+                .py(scale::row(8.))
                 .border_b_1()
                 .border_color(color("border-100"))
                 .child(Select::new(select).small().accessibility_label("Run"))
@@ -650,8 +650,8 @@ impl Workspace {
             .child(if empty {
                 div()
                     .flex_1()
-                    .p(px(16.))
-                    .text_size(px(12.))
+                    .p(ui_px(16.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .child("Nothing yet. What the agent does shows up here.")
                     .into_any_element()
@@ -676,27 +676,27 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(32.))
-                    .px(px(16.))
+                    .gap(ui_px(6.))
+                    .h(scale::row(32.))
+                    .px(ui_px(16.))
                     .border_t_1()
                     .border_color(color("border-100"))
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .child(
                         Icon::new(IconName::SquareTerminal)
-                            .size(px(12.))
+                            .size(ui_px(12.))
                             .text_color(color("text-tertiary")),
                     )
                     .child("Runs your")
-                    .child(div().font_family(mono_font()).child("claude"))
+                    .child(div().font_family(code_family()).child("claude"))
                     .child("CLI")
                     .when_some(branch, |footer, branch| {
                         footer.child("· branch").child(
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .font_family(mono_font())
+                                .font_family(code_family())
                                 .child(branch),
                         )
                     })
@@ -729,10 +729,10 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .px(px(16.))
-                    .py(px(10.))
-                    .text_size(px(12.))
+                    .gap(ui_px(8.))
+                    .px(ui_px(16.))
+                    .py(scale::row(10.))
+                    .text_size(scale::text(12.))
                     .child(
                         div()
                             .flex_1()
@@ -746,9 +746,9 @@ impl Workspace {
                     .when(n > 0, |row| {
                         row.child(
                             div()
-                                .font_family(mono_font())
+                                .font_family(code_family())
                                 .flex()
-                                .gap(px(4.))
+                                .gap(ui_px(4.))
                                 .child(
                                     div()
                                         .text_color(color("success"))
@@ -767,11 +767,11 @@ impl Workspace {
                     .id(("change-file", ix))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .h(px(28.))
-                    .px(px(16.))
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .gap(ui_px(8.))
+                    .h(scale::row(28.))
+                    .px(ui_px(16.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .aria_label(f.path.clone())
                     .child(
                         div()
@@ -794,7 +794,7 @@ impl Workspace {
                     .test_support()
             }))
             .child(
-                div().px(px(16.)).py(px(12.)).child(
+                div().px(ui_px(16.)).py(scale::row(12.)).child(
                     Button::new("changes-review")
                         .outline()
                         .small()

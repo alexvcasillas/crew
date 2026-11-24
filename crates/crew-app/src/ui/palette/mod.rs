@@ -23,9 +23,9 @@ use super::settings::Page;
 use super::settings::projects::FolderFor;
 use super::workspace::{Place, Workspace};
 use crate::client::ClientHandle;
-use crate::fonts::mono_font;
 use crate::theme::color;
 
+use crate::theme::scale::{self, code_family, ui_px, weight};
 use rows::{Inputs, Lead, Row, Section, sections};
 pub(super) use rows::{Remote, SectionKind, Target};
 
@@ -368,14 +368,14 @@ impl Palette {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(10.))
-            .h(px(52.))
-            .px(px(16.))
+            .gap(ui_px(10.))
+            .h(scale::row(52.))
+            .px(ui_px(16.))
             .border_b_1()
             .border_color(color("border-100"))
             .child(
                 Icon::new(IconName::Search)
-                    .size(px(16.))
+                    .size(ui_px(16.))
                     .text_color(color("text-secondary")),
             )
             .child(
@@ -383,7 +383,7 @@ impl Palette {
                     Input::new(&self.input)
                         .appearance(false)
                         .p_0()
-                        .text_size(px(15.))
+                        .text_size(scale::text(15.))
                         .aria_label("Search"),
                 ),
             )
@@ -401,20 +401,20 @@ impl Palette {
         let lead = match &row.lead {
             Lead::Dot(token) => super::common::dot(token).into_any_element(),
             Lead::Hash => div()
-                .font_family(mono_font())
+                .font_family(code_family())
                 .text_color(color("text-secondary"))
                 .child("#")
                 .into_any_element(),
-            Lead::Agent(name) => monogram(name, 16.).rounded(px(4.)).into_any_element(),
+            Lead::Agent(name) => monogram(name, 16.).rounded(ui_px(4.)).into_any_element(),
             Lead::File => icon(IconName::FileText),
             Lead::Plus => icon(IconName::Plus),
             Lead::Pulse => Icon::default()
                 .data(PULSE_SVG)
-                .size(px(13.))
+                .size(ui_px(13.))
                 .text_color(color("text-secondary"))
                 .into_any_element(),
             Lead::Stop => Icon::new(IconName::Square)
-                .size(px(11.))
+                .size(ui_px(11.))
                 .text_color(color("danger"))
                 .into_any_element(),
             Lead::Folder => icon(IconName::Folder),
@@ -427,11 +427,11 @@ impl Palette {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(10.))
-            .h(px(ROW_H))
-            .mx(px(6.))
-            .px(px(10.))
-            .rounded(px(6.))
+            .gap(ui_px(10.))
+            .h(scale::row(ROW_H))
+            .mx(ui_px(6.))
+            .px(ui_px(10.))
+            .rounded(ui_px(6.))
             .whitespace_nowrap()
             .overflow_hidden()
             .cursor_pointer()
@@ -446,17 +446,19 @@ impl Palette {
                 div()
                     .flex()
                     .flex_none()
-                    .w(px(16.))
+                    .w(ui_px(16.))
                     .justify_center()
                     .child(lead),
             )
             .child(
                 div()
                     .flex_none()
-                    .max_w(px(360.))
+                    .max_w(ui_px(360.))
                     .overflow_hidden()
                     .text_ellipsis()
-                    .when(row.mono, |d| d.font_family(mono_font()).text_size(px(12.)))
+                    .when(row.mono, |d| {
+                        d.font_family(code_family()).text_size(scale::mono(12.))
+                    })
                     .text_color(color(if row.danger { "danger" } else { "text-primary" }))
                     .child(highlighted(&row.label, row.highlight.clone())),
             )
@@ -466,8 +468,10 @@ impl Palette {
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_size(px(12.))
-                    .when(row.mono || row.sub_mono, |d| d.font_family(mono_font()))
+                    .text_size(scale::text(12.))
+                    .when(row.mono || row.sub_mono, |d| {
+                        d.font_family(code_family()).text_size(scale::mono(12.))
+                    })
                     .text_color(color("text-tertiary"))
                     .child(row.sub.clone()),
             )
@@ -488,7 +492,7 @@ impl Palette {
 
 fn icon(name: IconName) -> AnyElement {
     Icon::new(name)
-        .size(px(13.))
+        .size(ui_px(13.))
         .text_color(color("text-secondary"))
         .into_any_element()
 }
@@ -498,12 +502,12 @@ fn key_chip(keys: &'static str) -> impl IntoElement {
     div()
         .flex_none()
         .ml_auto()
-        .px(px(5.))
-        .rounded(px(4.))
+        .px(ui_px(5.))
+        .rounded(ui_px(4.))
         .border_1()
         .border_color(color("border-200"))
-        .font_family(mono_font())
-        .text_size(px(11.))
+        .font_family(code_family())
+        .text_size(scale::mono(11.))
         .text_color(color("text-tertiary"))
         .child(keys)
 }
@@ -525,9 +529,9 @@ fn footer(file: bool) -> impl IntoElement {
         div()
             .id(SharedString::from(format!("palette-hint-{text}")))
             .flex()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .aria_label(format!("{keys} {text}"))
-            .child(div().font_family(mono_font()).child(keys))
+            .child(div().font_family(code_family()).child(keys))
             .child(text)
             .test_support()
     };
@@ -535,13 +539,13 @@ fn footer(file: bool) -> impl IntoElement {
         .id("palette-footer")
         .flex()
         .flex_none()
-        .gap(px(14.))
-        .px(px(16.))
-        .py(px(8.))
-        .mt(px(6.))
+        .gap(ui_px(14.))
+        .px(ui_px(16.))
+        .py(scale::row(8.))
+        .mt(ui_px(6.))
         .border_t_1()
         .border_color(color("border-100"))
-        .text_size(px(11.))
+        .text_size(scale::text(11.))
         .text_color(color("text-tertiary"))
         .child(hint("↑↓", "move"))
         .child(hint("↵", "open"))
@@ -560,8 +564,8 @@ impl Render for Palette {
             .id("palette-list")
             .flex()
             .flex_col()
-            .pb(px(2.))
-            .max_h(px(LIST_MAX_H))
+            .pb(scale::row(2.))
+            .max_h(ui_px(LIST_MAX_H))
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .role(Role::ListBox)
@@ -574,11 +578,11 @@ impl Render for Palette {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("palette-section-{pos}")))
-                    .pt(px(10.))
-                    .px(px(16.))
-                    .pb(px(4.))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::MEDIUM)
+                    .pt(scale::row(10.))
+                    .px(ui_px(16.))
+                    .pb(scale::row(4.))
+                    .text_size(scale::text(11.))
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color("text-tertiary"))
                     .aria_label(section.title.clone())
                     .child(section.title.to_uppercase())
@@ -610,10 +614,10 @@ impl Render for Palette {
             list = list.child(
                 div()
                     .id("palette-note")
-                    .py(px(padding))
-                    .px(px(16.))
+                    .py(ui_px(padding))
+                    .px(ui_px(16.))
                     .when(count == 0, |d| d.text_center())
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(note)
                     .child(note)
@@ -633,7 +637,7 @@ impl Render for Palette {
             .flex()
             .flex_col()
             .w_full()
-            .text_size(px(13.))
+            .text_size(scale::text(13.))
             .text_color(color("text-primary"))
             .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.select_by(-1, cx)))
             .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.select_by(1, cx)))
@@ -676,18 +680,18 @@ impl Workspace {
             let closed = closed.clone();
             dialog
                 .entrance(DialogEntrance::None)
-                .w(px(WIDTH))
-                .margin_top(px(TOP))
+                .w(ui_px(WIDTH))
+                .margin_top(ui_px(TOP))
                 .p_0()
                 .gap_0()
-                .rounded(px(12.))
+                .rounded(ui_px(12.))
                 .bg(color("surface-raised"))
                 .border_color(color("border-200"))
                 .shadow(vec![BoxShadow {
                     color: hsla(0., 0., 0., 0.8),
-                    offset: point(px(0.), px(16.)),
-                    blur_radius: px(48.),
-                    spread_radius: px(0.),
+                    offset: point(ui_px(0.), ui_px(16.)),
+                    blur_radius: ui_px(48.),
+                    spread_radius: ui_px(0.),
                     inset: false,
                 }])
                 .overflow_hidden()

@@ -12,8 +12,8 @@ use super::super::common::dot;
 use super::super::running_view::usage_time;
 use super::super::workspace::Workspace;
 use super::{Filter, Sort, count, lines_changed, thousands};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 const SEARCH_WIDTH: f32 = 240.;
 
@@ -40,10 +40,10 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_start()
-            .gap(px(12.))
-            .px(px(24.))
-            .pt(px(20.))
-            .pb(px(16.))
+            .gap(ui_px(12.))
+            .px(ui_px(24.))
+            .pt(ui_px(20.))
+            .pb(scale::row(16.))
             .when(ruled, |header| {
                 header.border_b_1().border_color(color("border-100"))
             })
@@ -53,25 +53,25 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(4.))
+                    .gap(ui_px(4.))
                     .child(
                         div()
                             .flex()
                             .items_end()
-                            .gap(px(10.))
+                            .gap(ui_px(10.))
                             .child(
                                 div()
                                     .id("channel-title")
                                     .flex()
                                     .min_w_0()
-                                    .text_size(px(20.))
-                                    .line_height(px(28.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(scale::text(20.))
+                                    .line_height(scale::line(28.))
+                                    .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label(format!("#{name}"))
                                     .child(
                                         div()
-                                            .font_family(mono_font())
-                                            .font_weight(FontWeight::NORMAL)
+                                            .font_family(code_family())
+                                            .font_weight(weight(FontWeight::NORMAL))
                                             .text_color(color("text-tertiary"))
                                             .child("#"),
                                     )
@@ -82,8 +82,8 @@ impl Workspace {
                                 div()
                                     .id("channel-project")
                                     .flex_none()
-                                    .pb(px(4.))
-                                    .text_size(px(12.))
+                                    .pb(scale::row(4.))
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-tertiary"))
                                     .aria_label(format!("in {project}"))
                                     .child(format!("in {project}"))
@@ -129,8 +129,8 @@ impl Workspace {
         let stats = self.channel_view.stats();
         let note = |text: String| {
             div()
-                .text_size(px(12.))
-                .font_weight(FontWeight::NORMAL)
+                .text_size(scale::text(12.))
+                .font_weight(weight(FontWeight::NORMAL))
                 .text_color(color("text-tertiary"))
                 .child(text)
         };
@@ -140,18 +140,18 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .flex_1()
-                .flex_basis(px(0.))
+                .flex_basis(ui_px(0.))
                 .min_w_0()
-                .gap(px(2.))
-                .px(px(16.))
-                .py(px(12.))
+                .gap(ui_px(2.))
+                .px(ui_px(16.))
+                .py(scale::row(12.))
                 .when(!last, |cell| {
                     cell.border_r_1().border_color(color("border-100"))
                 })
                 .aria_label(format!("{key} {label}"))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-tertiary"))
                         .child(key),
                 )
@@ -159,10 +159,10 @@ impl Workspace {
                     value
                         .flex()
                         .items_center()
-                        .gap(px(6.))
-                        .text_size(px(16.))
-                        .line_height(px(24.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .gap(ui_px(6.))
+                        .text_size(scale::text(16.))
+                        .line_height(scale::line(24.))
+                        .font_weight(weight(FontWeight::SEMIBOLD))
                         .whitespace_nowrap()
                         .overflow_hidden(),
                 )
@@ -176,10 +176,10 @@ impl Workspace {
             .id("channel-stats")
             .flex()
             .flex_none()
-            .mx(px(24.))
+            .mx(ui_px(24.))
             .border_1()
             .border_color(color("border-100"))
-            .rounded(px(8.))
+            .rounded(ui_px(8.))
             .child(cell(
                 "channel-stat-threads",
                 "Threads",
@@ -225,10 +225,10 @@ impl Workspace {
                 div().child(thousands(stats.files_week)).child(
                     div()
                         .flex()
-                        .gap(px(4.))
-                        .font_family(mono_font())
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::NORMAL)
+                        .gap(ui_px(4.))
+                        .font_family(code_family())
+                        .text_size(scale::mono(12.))
+                        .font_weight(weight(FontWeight::NORMAL))
                         .child(
                             div()
                                 .text_color(color("success"))
@@ -260,13 +260,13 @@ impl Workspace {
                     )))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(26.))
-                    .px(px(10.))
-                    .rounded(px(4.))
+                    .gap(ui_px(6.))
+                    .h(scale::row(26.))
+                    .px(ui_px(10.))
+                    .rounded(ui_px(4.))
                     .cursor_pointer()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(scale::text(12.))
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .when(on, |b| b.bg(color("surface-300")))
                     .text_color(color(if on { "text-primary" } else { "text-secondary" }))
                     .hover(|b| b.text_color(color("text-primary")))
@@ -275,7 +275,7 @@ impl Workspace {
                     .child(filter.label())
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(scale::text(11.))
                             .text_color(color(if amber { "warning" } else { "text-tertiary" }))
                             .child(n.to_string()),
                     )
@@ -311,19 +311,19 @@ impl Workspace {
             .flex_none()
             .flex_wrap()
             .items_center()
-            .gap(px(8.))
-            .px(px(24.))
-            .pt(px(16.))
-            .pb(px(12.))
+            .gap(ui_px(8.))
+            .px(ui_px(24.))
+            .pt(scale::row(16.))
+            .pb(scale::row(12.))
             .child(
                 div()
                     .id("channel-filters")
                     .flex()
-                    .gap(px(2.))
-                    .p(px(2.))
+                    .gap(ui_px(2.))
+                    .p(ui_px(2.))
                     .border_1()
                     .border_color(color("border-200"))
-                    .rounded(px(6.))
+                    .rounded(ui_px(6.))
                     .role(Role::Group)
                     .aria_label("Filter threads")
                     .children(filters)
@@ -341,13 +341,13 @@ impl Workspace {
             .child(
                 div()
                     .id("channel-search")
-                    .w(px(SEARCH_WIDTH))
+                    .w(ui_px(SEARCH_WIDTH))
                     .child(
                         Input::new(&view.search)
                             .aria_label("Search threads")
                             .prefix(
                                 Icon::new(IconName::Search)
-                                    .size(px(14.))
+                                    .size(ui_px(14.))
                                     .text_color(color("text-tertiary")),
                             ),
                     )
@@ -360,8 +360,8 @@ impl Workspace {
                     .label("New thread")
                     .child(
                         div()
-                            .font_family(mono_font())
-                            .text_size(px(11.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(11.))
                             .opacity(0.6)
                             .child("⌘N"),
                     )

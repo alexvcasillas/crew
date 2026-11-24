@@ -6,9 +6,9 @@ use gpui_kit::*;
 
 use super::common::{monogram, runtime_badge_for, status_word};
 use super::composer::{Composer, ComposerEvent};
-use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub const MENU_WIDTH: f32 = 420.;
 pub const NO_AGENTS: &str = "No agents yet. Add one in Settings.";
@@ -30,9 +30,10 @@ pub fn menu_height(rows: usize, any_agents: bool) -> f32 {
 }
 
 /// Whether the menu opens below a composer whose top is at `top` (window
-/// px): when above it would run under the title bar.
+/// px): when above it would run under the title bar. `height` is in
+/// window px too.
 pub fn opens_below(top: f32, height: f32) -> bool {
-    top - MENU_GAP - height < super::title_bar::TITLE_BAR_HEIGHT
+    top - f32::from(ui_px(MENU_GAP)) - height < f32::from(ui_px(super::title_bar::TITLE_BAR_HEIGHT))
 }
 
 /// An agent as the menu shows it.
@@ -86,45 +87,48 @@ impl Composer {
     ) -> impl IntoElement + use<> {
         let agents = matching(&self.agents, query);
         let caption = format!("Agents in {}", self.project).to_uppercase();
-        let height = menu_height(agents.len(), !self.agents.is_empty());
+        let height = f32::from(scale::row(menu_height(
+            agents.len(),
+            !self.agents.is_empty(),
+        )));
         let below = self.top.get().is_some_and(|top| opens_below(top, height));
         let mut menu = div()
             .id("mention-menu")
             .absolute()
             .map(|menu| {
                 if below {
-                    menu.top_full().mt(px(MENU_GAP))
+                    menu.top_full().mt(ui_px(MENU_GAP))
                 } else {
-                    menu.bottom_full().mb(px(MENU_GAP))
+                    menu.bottom_full().mb(ui_px(MENU_GAP))
                 }
             })
             .left_0()
-            .w(px(MENU_WIDTH))
+            .w(ui_px(MENU_WIDTH))
             .flex()
             .flex_col()
-            .py(px(6.))
+            .py(scale::row(6.))
             .bg(color("surface-raised"))
             .border_1()
             .border_color(color("border-200"))
-            .rounded(px(8.))
+            .rounded(ui_px(8.))
             .shadow_lg();
         if self.agents.is_empty() {
             return menu.child(render_no_agents(cx)).test_support();
         }
         menu = menu.child(
             div()
-                .px(px(12.))
-                .py(px(4.))
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
+                .px(ui_px(12.))
+                .py(scale::row(4.))
+                .text_size(scale::text(11.))
+                .font_weight(weight(FontWeight::MEDIUM))
                 .text_color(color("text-tertiary"))
                 .child(caption),
         );
         if agents.is_empty() {
             menu = menu.child(
                 div()
-                    .px(px(12.))
-                    .py(px(8.))
+                    .px(ui_px(12.))
+                    .py(scale::row(8.))
                     .text_color(color("text-tertiary"))
                     .child(format!("No agent matches “{query}”.")),
             );
@@ -146,13 +150,13 @@ impl Composer {
             .child(
                 div()
                     .flex()
-                    .gap(px(12.))
-                    .mt(px(4.))
-                    .px(px(12.))
-                    .pt(px(6.))
+                    .gap(ui_px(12.))
+                    .mt(ui_px(4.))
+                    .px(ui_px(12.))
+                    .pt(scale::row(6.))
                     .border_t_1()
                     .border_color(color("border-100"))
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("text-tertiary"))
                     .child(hint("↑↓", "choose"))
                     .child(hint("↵", "mention"))
@@ -168,11 +172,11 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
         .id(("mention-option", ix))
         .flex()
         .items_center()
-        .gap(px(10.))
-        .h(px(44.))
-        .mx(px(6.))
-        .px(px(6.))
-        .rounded(px(6.))
+        .gap(ui_px(10.))
+        .h(scale::row(44.))
+        .mx(ui_px(6.))
+        .px(ui_px(6.))
+        .rounded(ui_px(6.))
         .cursor_pointer()
         .when(selected, |row| row.bg(color("surface-300")))
         .hover(|row| row.bg(color("surface-200")))
@@ -187,13 +191,13 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
                 .min_w_0()
                 .child(
                     div()
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(weight(FontWeight::MEDIUM))
                         .child(agent.name.clone()),
                 )
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-secondary"))
                         .child(agent.role.clone()),
                 ),
@@ -202,9 +206,9 @@ fn render_option(ix: usize, agent: &MentionAgent, selected: bool) -> Stateful<Di
         .child(
             div()
                 .id(("mention-status", ix))
-                .w(px(64.))
+                .w(ui_px(64.))
                 .flex_none()
-                .text_size(px(11.))
+                .text_size(scale::text(11.))
                 .text_color(color(token))
                 .aria_label(word)
                 .child(word)
@@ -217,9 +221,9 @@ fn render_no_agents(cx: &mut Context<Composer>) -> impl IntoElement {
     div()
         .id("mention-empty")
         .flex()
-        .gap(px(4.))
-        .px(px(12.))
-        .py(px(10.))
+        .gap(ui_px(4.))
+        .px(ui_px(12.))
+        .py(scale::row(10.))
         .text_color(color("text-secondary"))
         .aria_label(NO_AGENTS)
         .child("No agents yet.")
@@ -239,10 +243,10 @@ fn render_no_agents(cx: &mut Context<Composer>) -> impl IntoElement {
 fn hint(keys: &'static str, what: &'static str) -> impl IntoElement {
     div()
         .flex()
-        .gap(px(4.))
+        .gap(ui_px(4.))
         .child(
             div()
-                .font_family(mono_font())
+                .font_family(code_family())
                 .text_color(color("text-secondary"))
                 .child(keys),
         )

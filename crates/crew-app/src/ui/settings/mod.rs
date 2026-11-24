@@ -16,8 +16,8 @@ use super::title_bar::home_relative;
 use super::workspace::{EditorSelect, Workspace};
 use crate::app::bindings as app_bindings;
 use crate::editor::{self, FINDER};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub use agents::AgentsPage;
 pub use projects::ProjectsPage;
@@ -189,7 +189,7 @@ impl Workspace {
         let left = div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .child(
                 Button::new("settings-back")
                     .ghost()
@@ -201,7 +201,7 @@ impl Workspace {
                 div()
                     .id("settings-title")
                     .flex_none()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .aria_label("Settings")
                     .child("Settings")
                     .test_support(),
@@ -210,7 +210,7 @@ impl Workspace {
         let right = div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .children(self.render_title_actions(cx))
             .into_any_element();
         Some((left, right))
@@ -251,11 +251,11 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(NAV_WIDTH))
+            .w(ui_px(NAV_WIDTH))
             .h_full()
-            .px(px(8.))
-            .py(px(12.))
-            .gap(px(2.))
+            .px(ui_px(8.))
+            .py(scale::row(12.))
+            .gap(ui_px(2.))
             .border_r_1()
             .border_color(color("border-100"))
             .children(PAGES.iter().map(|(p, id, name)| {
@@ -279,7 +279,7 @@ impl Workspace {
             .child(field(
                 "Editor",
                 Some("Open in editor uses this app."),
-                div().w(px(280.)).child(control(
+                div().w(ui_px(280.)).child(control(
                     "general-editor",
                     Select::new(&self.editor_select)
                         .small()
@@ -366,27 +366,27 @@ fn render_shortcuts() -> impl IntoElement {
             .id(SharedString::from(format!("shortcut-{}", s.label)))
             .flex()
             .items_center()
-            .h(px(36.))
+            .h(scale::row(36.))
             .border_b_1()
             .border_color(color("border-100"))
             .aria_label(format!("{} {pretty}", s.label))
             .child(div().flex_1().child(s.label))
             .child(
                 div()
-                    .px(px(6.))
+                    .px(ui_px(6.))
                     .border_1()
                     .border_color(color("border-200"))
-                    .rounded(px(4.))
+                    .rounded(ui_px(4.))
                     .bg(color("surface-300"))
-                    .font_family(mono_font())
-                    .text_size(px(11.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(11.))
                     .child(pretty),
             )
             .test_support()
     });
     page_scroll("settings-shortcuts")
         .child(page_title("Shortcuts"))
-        .child(div().flex().flex_col().max_w(px(560.)).children(rows))
+        .child(div().flex().flex_col().max_w(ui_px(560.)).children(rows))
 }
 
 /// A nav row of settings.
@@ -395,10 +395,10 @@ pub(super) fn nav_row(id: &'static str, selected: bool) -> Stateful<Div> {
         .id(id)
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(28.))
-        .px(px(8.))
-        .rounded(px(6.))
+        .gap(ui_px(8.))
+        .h(scale::row(28.))
+        .px(ui_px(8.))
+        .rounded(ui_px(6.))
         .cursor_pointer()
         .when(selected, |row| row.bg(color("surface-300")))
         .text_color(color(if selected {
@@ -419,16 +419,16 @@ pub(super) fn page_scroll(id: &'static str) -> Stateful<Div> {
         .min_w_0()
         .h_full()
         .overflow_y_scroll()
-        .px(px(32.))
-        .py(px(24.))
-        .gap(px(16.))
+        .px(ui_px(32.))
+        .py(ui_px(24.))
+        .gap(ui_px(16.))
 }
 
 pub(super) fn page_title(text: &'static str) -> impl IntoElement {
     div()
-        .text_size(px(20.))
-        .line_height(px(28.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(scale::text(20.))
+        .line_height(scale::line(28.))
+        .font_weight(weight(FontWeight::SEMIBOLD))
         .child(text)
 }
 
@@ -441,8 +441,8 @@ pub(super) fn field(
 ) -> Div {
     div()
         .flex()
-        .gap(px(24.))
-        .py(px(12.))
+        .gap(ui_px(24.))
+        .py(scale::row(12.))
         .border_b_1()
         .border_color(color("border-100"))
         .child(
@@ -450,13 +450,13 @@ pub(super) fn field(
                 .flex()
                 .flex_col()
                 .flex_none()
-                .gap(px(2.))
-                .w(px(LABEL_WIDTH))
-                .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                .gap(ui_px(2.))
+                .w(ui_px(LABEL_WIDTH))
+                .child(div().font_weight(weight(FontWeight::MEDIUM)).child(label))
                 .when_some(help, |col, help| {
                     col.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(scale::text(12.))
                             .text_color(color("text-tertiary"))
                             .child(help),
                     )
@@ -468,7 +468,7 @@ pub(super) fn field(
                 .flex_col()
                 .flex_1()
                 .min_w_0()
-                .gap(px(6.))
+                .gap(ui_px(6.))
                 .child(content),
         )
 }
@@ -478,7 +478,9 @@ pub(super) fn value_text(id: &'static str, text: String, mono: bool) -> impl Int
     div()
         .id(id)
         .text_color(color("text-secondary"))
-        .when(mono, |el| el.font_family(mono_font()).text_size(px(12.)))
+        .when(mono, |el| {
+            el.font_family(code_family()).text_size(scale::mono(12.))
+        })
         .aria_label(text.clone())
         .child(text)
         .test_support()
@@ -501,20 +503,20 @@ pub(super) fn segment(id: impl Into<SharedString>, label: &str, selected: bool) 
         .flex()
         .items_center()
         .justify_center()
-        .h(px(26.))
-        .px(px(10.))
-        .rounded(px(4.))
+        .h(scale::row(26.))
+        .px(ui_px(10.))
+        .rounded(ui_px(4.))
         .when(selected, |s| s.bg(color("surface-300")))
         .text_color(color(if selected {
             "text-primary"
         } else {
             "text-secondary"
         }))
-        .font_weight(if selected {
+        .font_weight(weight(if selected {
             FontWeight::MEDIUM
         } else {
             FontWeight::NORMAL
-        })
+        }))
         .cursor_pointer()
         .role(Role::Button)
         .aria_label(if selected {
@@ -529,11 +531,11 @@ pub(super) fn segment(id: impl Into<SharedString>, label: &str, selected: bool) 
 pub(super) fn segmented(children: Vec<AnyElement>) -> Div {
     div()
         .flex()
-        .gap(px(2.))
-        .p(px(2.))
+        .gap(ui_px(2.))
+        .p(ui_px(2.))
         .border_1()
         .border_color(color("border-200"))
-        .rounded(px(6.))
+        .rounded(ui_px(6.))
         .children(children)
 }
 
@@ -541,7 +543,7 @@ pub(super) fn segmented(children: Vec<AnyElement>) -> Div {
 pub(super) fn form_error(id: &'static str, text: String) -> impl IntoElement {
     div()
         .id(id)
-        .text_size(px(12.))
+        .text_size(scale::text(12.))
         .text_color(color("danger"))
         .aria_label(text.clone())
         .child(text)
@@ -551,7 +553,7 @@ pub(super) fn form_error(id: &'static str, text: String) -> impl IntoElement {
 /// A small help line.
 pub(super) fn help(text: impl Into<SharedString>) -> impl IntoElement {
     div()
-        .text_size(px(12.))
+        .text_size(scale::text(12.))
         .text_color(color("text-tertiary"))
         .child(text.into())
 }

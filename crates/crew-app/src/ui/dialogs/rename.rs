@@ -6,8 +6,8 @@ use gpui_kit::*;
 
 use super::super::workspace::Workspace;
 use super::{DialogKind, field_label, heading, hint};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{code_family, ui_px};
 
 impl Workspace {
     /// Asks for a new title for `thread`.
@@ -45,7 +45,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(ui_px(14.))
             .child(heading(
                 "rename-heading",
                 "Rename thread".into(),
@@ -57,7 +57,7 @@ impl Workspace {
                     .id("rename-title")
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(ui_px(6.))
                     .child(field_label("Title"))
                     .child(Input::new(title).aria_label("Title"))
                     .test_support(),
@@ -66,12 +66,12 @@ impl Workspace {
                 hint()
                     .id("rename-branch")
                     .flex()
-                    .gap(px(4.))
+                    .gap(ui_px(4.))
                     .aria_label(format!("The branch keeps its name: {branch}"))
                     .child("The branch keeps its name:")
                     .child(
                         div()
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .text_color(color("text-secondary"))
                             .child(branch),
                     )

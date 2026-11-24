@@ -16,8 +16,8 @@ use super::settings::projects::{FIRST_CHANNEL, FolderFor, Repo, create_project, 
 use super::settings::runtimes::{runtime_name, runtime_state};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub const STARTER_NAME: &str = "Forge";
 
@@ -231,14 +231,14 @@ impl Workspace {
                     .id("first-launch-project")
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .aria_label(format!("{name} added"))
                     .child(div().text_color(color("success")).child("✓"))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                    .child(div().font_weight(weight(FontWeight::MEDIUM)).child(name))
                     .child(
                         div()
-                            .font_family(mono_font())
-                            .text_size(px(12.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
                             .text_color(color("text-tertiary"))
                             .child(format!("{} · {}", home_relative(&repo.root), repo.branch)),
                     )
@@ -260,7 +260,7 @@ impl Workspace {
                 .into_any_element(),
         };
         let runtimes: Vec<AnyElement> = if self.runtimes.is_empty() {
-            vec![line("Checking which agent CLIs are installed…").into_any_element()]
+            vec![muted_line("Checking which agent CLIs are installed…").into_any_element()]
         } else {
             self.runtimes
                 .iter()
@@ -276,7 +276,7 @@ impl Workspace {
                         .id(SharedString::from(format!("first-launch-runtime-{name}")))
                         .flex()
                         .items_center()
-                        .gap(px(6.))
+                        .gap(ui_px(6.))
                         .aria_label(format!("{name}{version} {word}"))
                         .child(provider_icon(&info.runtime, 16.))
                         .child(div().child(format!("{name}{version}")))
@@ -308,26 +308,26 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .max_w(px(560.))
-                    .py(px(48.))
-                    .px(px(16.))
-                    .gap(px(24.))
+                    .max_w(ui_px(560.))
+                    .py(ui_px(48.))
+                    .px(ui_px(16.))
+                    .gap(ui_px(24.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .child(
                                 div()
                                     .id("first-launch-title")
-                                    .text_size(px(24.))
-                                    .line_height(px(32.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(scale::text(24.))
+                                    .line_height(scale::line(32.))
+                                    .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label("Welcome to Crew")
                                     .child("Welcome to Crew")
                                     .test_support(),
                             )
-                            .child(line(
+                            .child(muted_line(
                                 "Your coding agents work as members of a chat. Three steps and you can give them a task.",
                             )),
                     )
@@ -338,7 +338,7 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(ui_px(6.))
                             .child(step1)
                             .when_some(first.error.clone(), |col, e| {
                                 col.child(super::settings::form_error("first-launch-error", e))
@@ -352,9 +352,9 @@ impl Workspace {
                             .id("first-launch-runtimes")
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .children(runtimes)
-                            .when(claude_missing, |col| col.child(line(INSTALL_CLAUDE)))
+                            .when(claude_missing, |col| col.child(muted_line(INSTALL_CLAUDE)))
                             .test_support(),
                     ))
                     .child(step(
@@ -364,7 +364,7 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(ui_px(6.))
                             .when_some(note, |col, note| {
                                 col.child(
                                     div()
@@ -407,7 +407,7 @@ impl Workspace {
     }
 }
 
-fn line(text: &'static str) -> impl IntoElement {
+fn muted_line(text: &'static str) -> impl IntoElement {
     div().text_color(color("text-secondary")).child(text)
 }
 
@@ -420,19 +420,19 @@ fn step(
     let about: SharedString = about.into();
     div()
         .flex()
-        .gap(px(12.))
+        .gap(ui_px(12.))
         .child(
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(px(24.))
+                .size(ui_px(24.))
                 .rounded_full()
                 .border_1()
                 .border_color(color("border-200"))
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(scale::text(12.))
+                .font_weight(weight(FontWeight::MEDIUM))
                 .text_color(color("text-secondary"))
                 .child(n.to_string()),
         )
@@ -441,11 +441,11 @@ fn step(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .gap(px(8.))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .gap(ui_px(8.))
+                .child(div().font_weight(weight(FontWeight::SEMIBOLD)).child(title))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-tertiary"))
                         .id(SharedString::from(format!("first-launch-step-{n}")))
                         .aria_label(about.clone())

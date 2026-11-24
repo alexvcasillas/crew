@@ -8,8 +8,8 @@ use gpui_kit::*;
 
 use super::super::workspace::Workspace;
 use super::{DialogKind, heading};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px};
 
 /// File rows the dialog lists before "and N more files".
 const ROWS: usize = 2;
@@ -123,23 +123,23 @@ impl Workspace {
             .child("This deletes the folder for ")
             .child(
                 div()
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .text_color(color("text-primary"))
                     .child(branch),
             )
             .child(". Uncommitted changes can't be recovered.")
             .flex()
             .flex_wrap()
-            .gap(px(3.));
+            .gap(ui_px(3.));
         let row = || {
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .h(px(32.))
-                .px(px(10.))
-                .text_size(px(12.))
+                .gap(ui_px(10.))
+                .h(scale::row(32.))
+                .px(ui_px(10.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-secondary"))
         };
         let files = diff.map(|d| d.files.as_slice()).unwrap_or_default();
@@ -154,12 +154,12 @@ impl Workspace {
                 );
                 row()
                     .id(("discard-file", ix))
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .aria_label(text)
                     .child(
                         div()
-                            .w(px(10.))
-                            .text_size(px(10.))
+                            .w(scale::mono(10.))
+                            .text_size(scale::mono(10.))
                             .text_color(color("warning"))
                             .child(file.status.to_string()),
                     )
@@ -174,7 +174,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex()
-                            .gap(px(4.))
+                            .gap(ui_px(4.))
                             .child(
                                 div()
                                     .text_color(color("success"))
@@ -196,7 +196,7 @@ impl Workspace {
                 row()
                     .id("discard-more")
                     .aria_label(more.clone())
-                    .child(div().w(px(10.)))
+                    .child(div().w(ui_px(10.)))
                     .child(more)
                     .test_support()
                     .into_any_element(),
@@ -220,7 +220,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(ui_px(12.))
             .child(heading(
                 "discard-heading",
                 "Discard the worktree?".into(),
@@ -231,7 +231,7 @@ impl Workspace {
                 div()
                     .border_1()
                     .border_color(color("border-100"))
-                    .rounded(px(6.))
+                    .rounded(ui_px(6.))
                     .overflow_hidden()
                     .children(rows)
             }))

@@ -1,13 +1,11 @@
 //! App setup: fonts, theme, the shortcut table, menus and the window.
 
-use std::rc::Rc;
-
-use gpui_kit::component::{Theme, ThemeConfig};
 use gpui_kit::*;
 
 use crate::connection::ConnectionConfig;
+use crate::fonts;
+use crate::theme::scale;
 use crate::ui::workspace::Workspace;
-use crate::{fonts, theme};
 
 actions!(
     crew,
@@ -32,6 +30,12 @@ actions!(
         RenameThread,
         /// Archive the selected thread card (⌘⌫).
         ArchiveThread,
+        /// Zoom the window in a step (⌘+).
+        ZoomIn,
+        /// Zoom the window out a step (⌘−).
+        ZoomOut,
+        /// Zoom the window back to 100% (⌘0).
+        ResetZoom,
     ]
 );
 
@@ -74,6 +78,10 @@ pub fn bindings() -> Vec<Shortcut> {
         shortcut("cmd-enter", ApproveLatest, "Approve the newest request"),
         outside_text("cmd-r", RenameThread, "Rename thread"),
         outside_text("cmd-backspace", ArchiveThread, "Archive thread"),
+        outside_text("cmd-=", ZoomIn, "Bigger"),
+        outside_text("cmd-+", ZoomIn, "Bigger"),
+        outside_text("cmd--", ZoomOut, "Smaller"),
+        outside_text("cmd-0", ResetZoom, "Reset zoom"),
     ]
 }
 
@@ -97,11 +105,8 @@ fn menus() -> Vec<Menu> {
 
 /// Fonts, theme, key bindings, menus and Quit. Call after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
-    let (ui, mono) = fonts::load(cx);
-    match serde_json::from_value::<ThemeConfig>(theme::theme_config(ui, mono)) {
-        Ok(config) => Theme::update(cx, |t| t.apply_config(&Rc::new(config))),
-        Err(e) => eprintln!("crew: theme does not parse: {e}"),
-    }
+    fonts::load(cx);
+    scale::apply_kit_theme(cx);
     cx.bind_keys(bindings().into_iter().map(|s| s.binding));
     cx.bind_keys(crate::ui::composer::bindings());
     cx.bind_keys(crate::ui::diff_view::bindings());
@@ -110,6 +115,9 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(crate::ui::palette::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &ZoomIn, cx| scale::step_zoom(1, cx));
+    cx.on_action(|_: &ZoomOut, cx| scale::step_zoom(-1, cx));
+    cx.on_action(|_: &ResetZoom, cx| scale::step_zoom(0, cx));
 }
 
 pub fn run() {
@@ -176,6 +184,10 @@ mod tests {
                 "cmd-enter",
                 "cmd-r",
                 "cmd-backspace",
+                "cmd-=",
+                "cmd-+",
+                "cmd--",
+                "cmd-0",
             ]
         );
         let labels: Vec<&str> = bindings().iter().map(|s| s.label).collect();

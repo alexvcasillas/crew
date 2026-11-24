@@ -1,12 +1,14 @@
 //! Design tokens from `assets/tokens.json` (dark), and the Kit theme built
 //! from them.
 
+pub mod scale;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use gpui_kit::{Hsla, Rgba};
 
-const TOKENS_JSON: &str = include_str!("../assets/tokens.json");
+const TOKENS_JSON: &str = include_str!("../../assets/tokens.json");
 
 /// The dark color token `name`, with `{alias}` values resolved.
 ///
@@ -141,9 +143,14 @@ pub const KIT_COLORS: &[(&str, &str)] = &[
     ("scrollbar.thumb.hover.background", "text-disabled"),
 ];
 
-/// The Kit theme file: dark mode, the given font families and the tokens
-/// on the Kit's colors.
-pub fn theme_config(ui_font: &str, mono_font: &str) -> serde_json::Value {
+/// The Kit theme file: dark mode, the given font families and sizes, and
+/// the tokens on the Kit's colors.
+pub fn theme_config(
+    ui_font: &str,
+    mono_font: &str,
+    font_size: f32,
+    mono_font_size: f32,
+) -> serde_json::Value {
     let colors: serde_json::Map<String, serde_json::Value> = KIT_COLORS
         .iter()
         .map(|&(key, token)| (key.to_string(), hex(token).into()))
@@ -152,9 +159,9 @@ pub fn theme_config(ui_font: &str, mono_font: &str) -> serde_json::Value {
         "name": "Crew",
         "mode": "dark",
         "font.family": ui_font,
-        "font.size": 13.0,
+        "font.size": font_size,
         "mono_font.family": mono_font,
-        "mono_font.size": 13.0,
+        "mono_font.size": mono_font_size,
         "radius": 6,
         "radius.lg": 8,
         "shadow": false,
@@ -194,7 +201,7 @@ mod tests {
     #[test]
     fn theme_config_parses_as_dark() {
         let config: ThemeConfig =
-            serde_json::from_value(theme_config("Geist", "Geist Mono")).unwrap();
+            serde_json::from_value(theme_config("Geist", "Geist Mono", 13., 13.)).unwrap();
         assert!(config.mode.is_dark());
     }
 }

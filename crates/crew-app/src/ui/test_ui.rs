@@ -36,7 +36,7 @@ pub fn open_tall(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Enti
     open_sized_tall(cx, home, 1440., 1800.)
 }
 
-fn open_sized_tall(
+pub fn open_sized_tall(
     cx: &mut TestAppContext,
     home: &Path,
     width: f32,

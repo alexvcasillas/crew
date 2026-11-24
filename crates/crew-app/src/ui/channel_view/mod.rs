@@ -19,6 +19,7 @@ use super::composer::ComposerMode;
 use super::run_card::{Step, StepState};
 use super::workspace::Workspace;
 use crate::theme::color;
+use crate::theme::scale::{self, ui_px, weight};
 
 /// How long the view waits after a change before asking crewd again.
 const REFETCH_AFTER: Duration = Duration::from_millis(500);
@@ -958,9 +959,9 @@ impl Workspace {
                         div()
                             .id("channel-error")
                             .flex_none()
-                            .px(px(24.))
-                            .pb(px(8.))
-                            .text_size(px(12.))
+                            .px(ui_px(24.))
+                            .pb(scale::row(8.))
+                            .text_size(scale::text(12.))
                             .text_color(color("danger"))
                             .aria_label(text.clone())
                             .child(text)
@@ -979,7 +980,7 @@ impl Workspace {
                     .min_h_0()
                     .w_full()
                     // Written above, the cards step back.
-                    .when(drafting, |cards| cards.pt(px(20.)).opacity(0.45))
+                    .when(drafting, |cards| cards.pt(ui_px(20.)).opacity(0.45))
                     .child(
                         list(
                             self.channel_view.list.clone(),
@@ -1009,19 +1010,19 @@ impl Workspace {
                 .into_any_element(),
             Row::Cards(left, right) => div()
                 .flex()
-                .gap(px(12.))
-                .pb(px(12.))
+                .gap(ui_px(12.))
+                .pb(scale::row(12.))
                 .child(
                     div()
                         .flex_1()
-                        .flex_basis(px(0.))
+                        .flex_basis(ui_px(0.))
                         .min_w_0()
                         .child(self.render_card(left, cx)),
                 )
                 .child(
                     div()
                         .flex_1()
-                        .flex_basis(px(0.))
+                        .flex_basis(ui_px(0.))
                         .min_w_0()
                         .children(right.map(|t| self.render_card(t, cx))),
                 )
@@ -1035,7 +1036,7 @@ impl Workspace {
                 };
                 div()
                     .id("channel-nothing")
-                    .py(px(16.))
+                    .py(scale::row(16.))
                     .text_color(color("text-tertiary"))
                     .aria_label(text)
                     .child(text)
@@ -1043,7 +1044,7 @@ impl Workspace {
                     .into_any_element()
             }
         };
-        div().px(px(24.)).child(body).into_any_element()
+        div().px(ui_px(24.)).child(body).into_any_element()
     }
 
     fn render_section(
@@ -1073,19 +1074,19 @@ impl Workspace {
             )))
             .flex()
             .items_center()
-            .gap(px(8.))
-            .h(px(32.))
-            .px(px(8.))
-            .when(!first, |row| row.mt(px(8.)))
-            .mb(px(4.))
-            .rounded(px(6.))
+            .gap(ui_px(8.))
+            .h(scale::row(32.))
+            .px(ui_px(8.))
+            .when(!first, |row| row.mt(ui_px(8.)))
+            .mb(ui_px(4.))
+            .rounded(ui_px(6.))
             .cursor_pointer()
             .hover(|row| {
                 row.bg(color("surface-100"))
                     .text_color(color("text-primary"))
             })
-            .text_size(px(11.))
-            .font_weight(FontWeight::MEDIUM)
+            .text_size(scale::text(11.))
+            .font_weight(weight(FontWeight::MEDIUM))
             .text_color(color("text-tertiary"))
             .role(Role::Button)
             .aria_label(label)
@@ -1095,7 +1096,7 @@ impl Workspace {
                 } else {
                     IconName::ChevronRight
                 })
-                .size(px(14.)),
+                .size(ui_px(14.)),
             )
             .children(dot.map(super::common::dot))
             .child(section.title().to_uppercase())
@@ -1107,8 +1108,8 @@ impl Workspace {
             .when(older, |row| {
                 row.child(
                     div()
-                        .ml(px(4.))
-                        .font_weight(FontWeight::NORMAL)
+                        .ml(ui_px(4.))
+                        .font_weight(weight(FontWeight::NORMAL))
                         .child("· last activity over 7 days ago"),
                 )
             })

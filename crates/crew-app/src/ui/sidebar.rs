@@ -13,9 +13,9 @@ use super::common::{ago, dot, monogram, now_ms, status_word};
 use super::settings::Page;
 use super::settings::projects::FolderFor;
 use super::workspace::{SIDEBAR_WIDTH, Workspace};
-use crate::fonts::mono_font;
 use crate::model::ThreadStatus;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// What a channel row shows on its right: a status, unread messages or
 /// nothing.
@@ -55,7 +55,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(ui_px(SIDEBAR_WIDTH))
             .h_full()
             .border_r_1()
             .border_color(color("border-100"))
@@ -67,8 +67,8 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(8.))
-                    .py(px(12.))
+                    .px(ui_px(8.))
+                    .py(scale::row(12.))
                     .child(section_header(
                         "sidebar-projects",
                         "Projects",
@@ -81,9 +81,9 @@ impl Workspace {
                     .children(projects)
                     .child(
                         div()
-                            .my(px(12.))
-                            .mx(px(8.))
-                            .h(px(1.))
+                            .my(ui_px(12.))
+                            .mx(ui_px(8.))
+                            .h(ui_px(1.))
                             .bg(color("border-100")),
                     )
                     .child(section_header(
@@ -124,8 +124,8 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(
-                row(format!("project-{id}"))
-                    .gap(px(6.))
+                sidebar_row(format!("project-{id}"))
+                    .gap(ui_px(6.))
                     .aria_label(project.name.clone())
                     .child(
                         Icon::new(if open {
@@ -133,7 +133,7 @@ impl Workspace {
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(px(14.))
+                        .size(ui_px(14.))
                         .text_color(color("text-tertiary")),
                     )
                     .child(
@@ -141,7 +141,7 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(weight(FontWeight::MEDIUM))
                             .child(project.name.clone()),
                     )
                     .when_some(status_dot(status), |row, dot| row.child(dot))
@@ -156,9 +156,9 @@ impl Workspace {
         let selected = self.nav.channel == Some(id);
         let badge = self.channel_badge(id);
         let name = format!("#{}", channel.name);
-        row(format!("channel-{id}"))
-            .pl(px(28.))
-            .gap(px(4.))
+        sidebar_row(format!("channel-{id}"))
+            .pl(ui_px(28.))
+            .gap(ui_px(4.))
             .when(selected, |row| row.bg(color("surface-300")))
             .text_color(color(if selected {
                 "text-primary"
@@ -168,7 +168,7 @@ impl Workspace {
             .aria_label(name)
             .child(
                 div()
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .text_color(color("text-tertiary"))
                     .child("#"),
             )
@@ -196,9 +196,9 @@ impl Workspace {
         let open = self.nav.terminal_groups.contains(&project);
         let label = format!("In terminal · {}", sessions.len());
         let mut rows = vec![
-            row(format!("terminal-group-{project}"))
-                .pl(px(28.))
-                .gap(px(4.))
+            sidebar_row(format!("terminal-group-{project}"))
+                .pl(ui_px(28.))
+                .gap(ui_px(4.))
                 .text_color(color("text-secondary"))
                 .aria_label(label.clone())
                 .child(
@@ -207,7 +207,7 @@ impl Workspace {
                     } else {
                         IconName::ChevronRight
                     })
-                    .size(px(12.))
+                    .size(ui_px(12.))
                     .text_color(color("text-tertiary")),
                 )
                 .child(div().flex_1().min_w_0().truncate().child(label))
@@ -242,9 +242,9 @@ impl Workspace {
             session.title.clone()
         };
         let open = id.clone();
-        row(format!("terminal-session-{id}"))
-            .pl(px(44.))
-            .gap(px(6.))
+        sidebar_row(format!("terminal-session-{id}"))
+            .pl(ui_px(44.))
+            .gap(ui_px(6.))
             .when(selected, |row| row.bg(color("surface-300")))
             .text_color(color(if selected {
                 "text-primary"
@@ -256,7 +256,7 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("text-tertiary"))
                     .child(ago(session.last_active_at, now)),
             )
@@ -265,7 +265,7 @@ impl Workspace {
                     div()
                         .id(SharedString::from(format!("terminal-live-{id}")))
                         .flex_none()
-                        .p(px(2.))
+                        .p(ui_px(2.))
                         .aria_label("live")
                         .tooltip(|window, cx| {
                             gpui_kit::component::tooltip::Tooltip::new("live").build(window, cx)
@@ -310,8 +310,8 @@ impl Workspace {
         let id = agent.id;
         let status = self.state().agent_status(id);
         let (word, token) = status_word(status);
-        row(format!("agent-{id}"))
-            .gap(px(8.))
+        sidebar_row(format!("agent-{id}"))
+            .gap(ui_px(8.))
             .aria_label(agent.spec.name.clone())
             .child(monogram(&agent.spec.name, 20.))
             .child(
@@ -330,7 +330,7 @@ impl Workspace {
                 div()
                     .id(format!("agent-status-{id}"))
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color(token))
                     .aria_label(word)
                     .child(word)
@@ -349,14 +349,14 @@ impl Workspace {
 }
 
 /// A 28 px sidebar row.
-fn row(id: String) -> Stateful<Div> {
+fn sidebar_row(id: String) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
         .flex()
         .items_center()
-        .h(px(28.))
-        .px(px(8.))
-        .rounded(px(6.))
+        .h(scale::row(28.))
+        .px(ui_px(8.))
+        .rounded(ui_px(6.))
         .cursor_pointer()
         .hover(|row| row.bg(color("surface-200")))
 }
@@ -371,14 +371,14 @@ fn section_header(
     div()
         .flex()
         .items_center()
-        .h(px(28.))
-        .pl(px(8.))
+        .h(scale::row(28.))
+        .pl(ui_px(8.))
         .child(
             div()
                 .id(id)
                 .flex_1()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
+                .text_size(scale::text(12.))
+                .font_weight(weight(FontWeight::MEDIUM))
                 .text_color(color("text-secondary"))
                 .aria_label(title)
                 .child(title)
@@ -411,11 +411,11 @@ fn render_badge(channel: ChannelId, badge: &ChannelBadge) -> impl IntoElement {
     match badge {
         ChannelBadge::Status(status) => el.when_some(status_dot(*status), |el, dot| el.child(dot)),
         ChannelBadge::Unread(n) => el
-            .px(px(6.))
-            .rounded(px(9.))
+            .px(ui_px(6.))
+            .rounded(ui_px(9.))
             .bg(color("surface-300"))
-            .text_size(px(11.))
-            .font_weight(FontWeight::MEDIUM)
+            .text_size(scale::text(11.))
+            .font_weight(weight(FontWeight::MEDIUM))
             .text_color(color("text-primary"))
             .child(n.to_string()),
         ChannelBadge::None => el,
@@ -429,12 +429,12 @@ fn render_footer(running: usize, stopping: bool, cx: &mut Context<Workspace>) ->
     div()
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(44.))
-        .px(px(16.))
+        .gap(ui_px(8.))
+        .h(scale::row(44.))
+        .px(ui_px(16.))
         .border_t_1()
         .border_color(color("border-100"))
-        .text_size(px(12.))
+        .text_size(scale::text(12.))
         .text_color(color("text-secondary"))
         .child(dot("accent-blue"))
         .child({
