@@ -10,7 +10,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, TestAppContext};
 
 use super::test_ui::{WAIT, click, has, label_of, shows, wait_until};
-use super::thread_tests::{open_thread, world};
+use super::thread_tests::{go_to, open_thread, world};
 use crate::test_support::{Daemon, fake_claude, short_home};
 
 /// A recorded session of `n` Bash calls named `step {i}`. Call 0 prints
@@ -263,4 +263,55 @@ fn the_tab_catches_up_and_follows_a_live_run(cx: &mut TestAppContext) {
         label_of(cx, window, ("terminal-command", 1usize)).as_deref(),
         Some("$ second")
     );
+}
+
+#[gpui_kit::test]
+fn the_tab_is_complete_after_leaving_the_thread_and_coming_back(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let go = tmp.path().join("go");
+    let script = format!(
+        "{INIT}{}{}while [ ! -e '{}' ]; do sleep 0.02; done\n{}{}{END}",
+        line("t1", "first"),
+        done_line("t1"),
+        go.display(),
+        line("t2", "second"),
+        done_line("t2"),
+    );
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), fake_claude(tmp.path(), &script));
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let other: crew_core::ids::ThreadId = w.ask(Request::CreateThread {
+        channel: w.channel,
+        title: "second thread".into(),
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    w.post("@Forge go");
+    click(cx, window, "inspector-tab-terminal");
+    wait_until(cx, "the first command", |cx| {
+        has(cx, window, ("terminal-state", 0usize))
+            && label_of(cx, window, ("terminal-state", 0usize)).as_deref() == Some("Passed")
+    });
+
+    go_to(cx, window, &ws, w.channel, other);
+    std::fs::write(&go, "").unwrap();
+    let started = Instant::now();
+    loop {
+        let done: Vec<crew_core::store::StoredRun> = w.ask(Request::ListRuns {
+            status: Some(RunStatus::Done),
+        });
+        if !done.is_empty() {
+            break;
+        }
+        assert!(started.elapsed() < WAIT, "the run never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    go_to(cx, window, &ws, w.channel, w.thread);
+    wait_until(cx, "both commands", |cx| {
+        has(cx, window, ("terminal-command", 1usize))
+    });
+    let rows: Vec<String> = (0..2usize)
+        .map(|ix| label_of(cx, window, ("terminal-command", ix)).unwrap())
+        .collect();
+    assert_eq!(rows, ["$ first", "$ second"]);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.inspector.term.rows.len()), 2);
 }

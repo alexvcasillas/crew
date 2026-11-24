@@ -73,6 +73,10 @@ pub(super) struct Inspector {
     pub(super) term_done: usize,
     /// Whether that run is still live.
     pub(super) term_live: bool,
+    /// The thread and the last event (run, seq) `term` has taken in, to
+    /// tell a replayed log from the one it was made from.
+    pub(super) term_thread: Option<ThreadId>,
+    pub(super) term_last: Option<(RunId, u64)>,
     /// Commands, by run and call id, whose whole output is shown.
     pub(super) term_expanded: HashSet<(RunId, String)>,
     /// A command to scroll to once the rows have it.
@@ -100,6 +104,8 @@ impl Default for Inspector {
             term_run: None,
             term_done: 0,
             term_live: false,
+            term_thread: None,
+            term_last: None,
             term_expanded: HashSet::new(),
             term_reveal: None,
         }

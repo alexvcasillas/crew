@@ -127,6 +127,7 @@ impl Workspace {
             return;
         }
         let Some(run) = run else {
+            self.inspector.term_thread = None;
             if self.inspector.term_run.take().is_some() {
                 self.inspector.term = CommandLog::default();
                 self.inspector.term_done = 0;
@@ -138,9 +139,15 @@ impl Workspace {
         let live = self.state().live_runs(thread).iter().any(|r| r.id == run);
         let mut term = std::mem::take(&mut self.inspector.term);
         let (mut done, was) = (self.inspector.term_done, self.inspector.term_run);
+        let (was_thread, was_last) = (self.inspector.term_thread, self.inspector.term_last);
         let list = self.inspector.term_list.clone();
         let events = self.state().events(thread);
-        if was != Some(run) || events.len() < done {
+        // The events taken in must still be the log's first `done`: the
+        // log is dropped and replayed when the thread is left and opened
+        // again.
+        let last_of = |n: usize| n.checked_sub(1).map(|i| (events[i].run, events[i].seq));
+        let same_log = was_thread == Some(thread) && was_last == last_of(done);
+        if was != Some(run) || events.len() < done || !same_log {
             term = commands(events, run);
             list.reset(term.rows.len());
             // A run opens at its end, and follows it while it is live.
@@ -159,8 +166,11 @@ impl Workspace {
             }
         }
         done = events.len();
+        let last = last_of(done);
         self.inspector.term = term;
         self.inspector.term_done = done;
+        self.inspector.term_thread = Some(thread);
+        self.inspector.term_last = last;
         self.inspector.term_live = live;
         self.inspector.term_run = Some(run);
         self.inspector.term_expanded.retain(|(r, _)| *r == run);
