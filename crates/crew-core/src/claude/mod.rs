@@ -1,7 +1,9 @@
-//! Parsing of Claude Code output and building of its command line.
+//! Parsing of Claude Code output and session files, and building of its
+//! command line.
 
 pub mod command;
 pub mod parse;
+pub mod transcript;
 
 pub use command::{
     APPROVE_TOOL, ClaudeInvocation, CrewContext, HANDOFF_TOOL, McpWiring, SessionArg, Teammate,

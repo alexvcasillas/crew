@@ -212,6 +212,7 @@ impl State {
                 agents,
                 runs,
                 approvals,
+                ..
             } => self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals),
             ServerMsg::ProjectChanged { project } => {
                 self.projects.insert(project.id, project);
@@ -249,7 +250,11 @@ impl State {
                 }
             }
             // The workspace keeps the runtimes.
-            ServerMsg::Response { .. } | ServerMsg::Resync | ServerMsg::RuntimesChanged { .. } => {}
+            ServerMsg::Response { .. }
+            | ServerMsg::Resync
+            | ServerMsg::RuntimesChanged { .. }
+            | ServerMsg::TerminalSessionChanged { .. }
+            | ServerMsg::TerminalEvent { .. } => {}
         }
     }
 
@@ -850,6 +855,7 @@ mod tests {
             agents: vec![],
             runs: vec![],
             approvals: vec![],
+            terminal_sessions: vec![],
         });
         (state, p, c, t)
     }
@@ -1104,6 +1110,7 @@ mod tests {
             agents: vec![],
             runs: vec![r2.clone()],
             approvals: vec![],
+            terminal_sessions: vec![],
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);

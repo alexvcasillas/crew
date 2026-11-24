@@ -248,6 +248,7 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
         agents,
         runs,
         approvals,
+        terminal_sessions,
     } = c.recv().await
     else {
         panic!("expected a snapshot first");
@@ -263,6 +264,8 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
     assert_eq!(agents[0].deleted_at, None);
     assert!(runs.is_empty());
     assert!(approvals.is_empty());
+    // Terminal sessions are off without a claude home.
+    assert!(terminal_sessions.is_empty());
 
     // Also following thread `a` must not send its notices twice.
     c.call(Request::Subscribe { thread: a }).await.unwrap();

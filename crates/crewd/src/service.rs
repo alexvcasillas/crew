@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::codex_runner::{CodexInvocation, Hooks, Resume, spawn_codex_run};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
+use crate::terminal::{Cmd, TerminalState};
 
 /// Told once per run when permission prompts can't reach crewd.
 pub const NO_CREW_MCP: &str = "Permission prompts are off: crew-mcp wasn't found next to crewd.";
@@ -64,6 +65,13 @@ pub struct Backlog {
 pub(crate) struct Db {
     pub(crate) store: Store,
     serial: u64,
+}
+
+impl Db {
+    /// The serial of the last notice.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
 }
 
 /// What a queued run needs besides its job.
@@ -106,6 +114,10 @@ struct Inner {
     slugs: Mutex<()>,
     /// How long one minute of a run's time limit lasts.
     minute: Duration,
+    /// Terminal sessions. Locked after `db` when both are.
+    terminal: Mutex<TerminalState>,
+    /// Requests to the terminal session watcher, once it runs.
+    terminal_cmd: OnceLock<mpsc::UnboundedSender<Cmd>>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -178,6 +190,8 @@ impl Service {
             crew_mcp,
             slugs: Mutex::new(()),
             minute,
+            terminal: Mutex::new(TerminalState::default()),
+            terminal_cmd: OnceLock::new(),
         }))
     }
 
@@ -192,6 +206,45 @@ impl Service {
 
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn terminal(&self) -> MutexGuard<'_, TerminalState> {
+        self.0
+            .terminal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_terminal_cmd(&self, tx: mpsc::UnboundedSender<Cmd>) {
+        if self.0.terminal_cmd.set(tx).is_err() {
+            log("the terminal session watcher was already started");
+        }
+    }
+
+    pub(crate) fn send_terminal_cmd(&self, cmd: Cmd) -> Result<(), String> {
+        let tx = self
+            .0
+            .terminal_cmd
+            .get()
+            .ok_or("Terminal sessions are off.")?;
+        tx.send(cmd)
+            .map_err(|_| "Terminal sessions stopped.".to_string())
+    }
+
+    /// Where thread worktrees go.
+    pub(crate) fn worktrees(&self) -> &Path {
+        &self.0.worktrees
+    }
+
+    /// Whether one of Crew's runs uses this session id.
+    pub(crate) fn is_crew_session(&self, session: &str) -> bool {
+        self.db()
+            .store
+            .has_run_session(session)
+            .unwrap_or_else(|e| {
+                log(format!("couldn't look up session {session}: {e}"));
+                false
+            })
     }
 
     /// Handles every request except `Hello`, `Subscribe`, `SubscribeAll`
@@ -214,6 +267,8 @@ impl Service {
             Request::Hello { .. }
             | Request::Subscribe { .. }
             | Request::SubscribeAll
+            | Request::SubscribeTerminal { .. }
+            | Request::UnsubscribeTerminal { .. }
             | Request::PermissionAsk { .. } => {
                 Err("This request is handled by the connection.".into())
             }
@@ -385,6 +440,8 @@ impl Service {
     fn project_changed(&self, db: &mut Db, project: ProjectId) -> Result<(), String> {
         let project = db.store.project(project).map_err(|e| e.to_string())?;
         self.publish_global(db, ServerMsg::ProjectChanged { project });
+        // Sessions may belong to it now.
+        self.rescan_terminal();
         Ok(())
     }
 
@@ -667,6 +724,7 @@ impl Service {
             agents: db.store.all_agents()?,
             runs,
             approvals,
+            terminal_sessions: self.terminal().sessions(),
         };
         Ok((msg, db.serial))
     }

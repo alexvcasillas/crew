@@ -710,6 +710,15 @@ impl Store {
         Ok(())
     }
 
+    /// Whether any run has this session id.
+    pub fn has_run_session(&self, session_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id = ?1)",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Saves a run's session id once the CLI names it, as Codex does.
     pub fn set_run_session(&self, r: RunId, session_id: &str) -> Result<()> {
         let changed = self.conn.execute(

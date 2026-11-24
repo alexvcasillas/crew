@@ -7,5 +7,6 @@ pub mod runner;
 mod runtimes;
 pub mod server;
 pub mod service;
+mod terminal;
 
 pub use server::{AlreadyRunning, ServeOptions, serve, serve_until};

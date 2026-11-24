@@ -28,6 +28,9 @@ fn options() -> Result<(PathBuf, ServeOptions), String> {
     }
     opts.claude_bin = non_empty(std::env::var_os("CREW_CLAUDE_BIN")).map(PathBuf::from);
     opts.codex_bin = non_empty(std::env::var_os("CREW_CODEX_BIN")).map(PathBuf::from);
+    opts.claude_home = non_empty(std::env::var_os("CREW_CLAUDE_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| non_empty(std::env::var_os("HOME")).map(|h| PathBuf::from(h).join(".claude")));
     Ok((home, opts))
 }
 
