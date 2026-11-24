@@ -52,16 +52,27 @@ pub struct ParsedLine {
 /// How many queued prompts are remembered for [`Prompts`].
 const QUEUED_KEPT: usize = 16;
 
+/// How long, in milliseconds, a queued prompt waits for Claude Code to
+/// write it again as sent.
+const QUEUED_FOR: i64 = 2 * 60 * 1000;
+
 /// Reads a session's lines in order, showing a queued prompt once: when
-/// it is queued, not again when Claude Code sends it.
+/// it is queued, not again when Claude Code sends it. Each queued prompt
+/// hides at most one later copy, written within two minutes.
 #[derive(Debug, Clone, Default)]
 pub struct Prompts {
-    queued: VecDeque<String>,
+    /// Queued text and when it was queued, if the line said.
+    queued: VecDeque<(String, Option<i64>)>,
 }
 
 impl Prompts {
     /// The items of `line` to show.
     pub fn take(&mut self, line: ParsedLine) -> Vec<TranscriptItem> {
+        let now = line.info.timestamp;
+        if let Some(now) = now {
+            self.queued
+                .retain(|(_, at)| at.is_none_or(|at| now - at <= QUEUED_FOR));
+        }
         let mut items = line.items;
         if line.queued {
             for item in &items {
@@ -69,14 +80,18 @@ impl Prompts {
                     if self.queued.len() == QUEUED_KEPT {
                         self.queued.pop_front();
                     }
-                    self.queued.push_back(text.clone());
+                    self.queued.push_back((text.clone(), now));
                 }
             }
             return items;
         }
         items.retain(|item| match item {
             TranscriptItem::UserPrompt(text) => {
-                match self.queued.iter().position(|q| q.trim() == text.trim()) {
+                match self
+                    .queued
+                    .iter()
+                    .position(|(q, _)| q.trim() == text.trim())
+                {
                     Some(at) => {
                         self.queued.remove(at);
                         false
@@ -116,11 +131,11 @@ fn is_queued(v: &Value) -> bool {
         && v.pointer("/attachment/type").and_then(Value::as_str) == Some("queued_command")
 }
 
-/// A prompt typed while the agent was busy, unless something other than
-/// the person wrote it.
+/// A prompt typed while the agent was busy. Its `origin` is not trusted
+/// to hide it: typed input is never hidden on a guess.
 fn queued_prompt(v: &Value) -> Vec<TranscriptItem> {
     let a = &v["attachment"];
-    if flag(v, "isMeta") || flag(a, "isMeta") || !human(v) || !human(a) {
+    if flag(v, "isMeta") || flag(a, "isMeta") {
         return vec![];
     }
     a.get("prompt")

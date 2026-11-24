@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use crew_core::ids::{ApprovalId, ThreadId};
+use crew_core::ids::{ApprovalId, RunId, ThreadId};
 use crew_core::store::Store;
 use crew_proto::{ClientMsg, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
 use nix::errno::Errno;
@@ -273,26 +273,43 @@ async fn respond(
 /// Said to a request an agent's connection may not make.
 pub const NOT_FROM_AGENTS: &str = "Not allowed from inside an agent run.";
 
-/// What a connection from inside an agent run may ask: hand off, and ask
-/// you for a permission. crew-mcp needs nothing else.
-fn agent_may(req: &Request) -> bool {
-    matches!(
-        req,
-        Request::Hello { .. } | Request::Handoff { .. } | Request::PermissionAsk { .. }
-    )
+/// Who a connection is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Who {
+    /// The app, the CLI or another client of yours.
+    Client,
+    /// A process an agent run started: the run, if crewd could tell which.
+    Agent(Option<RunId>),
 }
 
-/// Whether the connecting process was started by a live run.
-async fn peer_of(service: &Service, pid: Option<i32>) -> Peer {
+/// What a connection from inside an agent run may ask: hand off, and ask
+/// you for a permission, both only for its own run. crew-mcp needs
+/// nothing else. A connection whose run couldn't be told may only say
+/// hello.
+fn agent_may(req: &Request, own: Option<RunId>) -> bool {
+    match req {
+        Request::Hello { .. } => true,
+        Request::Handoff { run, .. } | Request::PermissionAsk { run, .. } => own == Some(*run),
+        _ => false,
+    }
+}
+
+/// Whether the connecting process was started by a live run, and which.
+async fn peer_of(service: &Service, pid: Option<i32>) -> Who {
     let runs = service.live_run_pids();
-    let fallback = if runs.is_empty() {
-        Peer::Client
-    } else {
-        Peer::Agent
-    };
-    tokio::task::spawn_blocking(move || peer::classify(pid, &runs, peer::proc_info))
+    if runs.is_empty() {
+        return Who::Client;
+    }
+    let pids: Vec<i32> = runs.iter().map(|(pid, _)| *pid).collect();
+    let peer = tokio::task::spawn_blocking(move || peer::classify(pid, &pids, peer::proc_info))
         .await
-        .unwrap_or(fallback)
+        .unwrap_or(Peer::Agent(None));
+    match peer {
+        Peer::Client => Who::Client,
+        Peer::Agent(found) => Who::Agent(
+            found.and_then(|f| runs.iter().find(|(pid, _)| *pid == f).map(|(_, run)| *run)),
+        ),
+    }
 }
 
 async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
@@ -453,7 +470,7 @@ async fn requests_and_notices(
     service: &Service,
     wr: &mut OwnedWriteHalf,
     mut req_rx: mpsc::Receiver<ClientMsg>,
-    peer: Peer,
+    peer: Who,
 ) -> io::Result<()> {
     // Thread -> serial already covered by that thread's backlog.
     let mut subscribed: HashMap<ThreadId, u64> = HashMap::new();
@@ -510,7 +527,9 @@ async fn requests_and_notices(
                 let Some(ClientMsg::Request { id, req }) = msg else {
                     return Ok(());
                 };
-                if peer == Peer::Agent && !agent_may(&req) {
+                if let Who::Agent(own) = peer
+                    && !agent_may(&req, own)
+                {
                     respond(wr, id, Err(NOT_FROM_AGENTS.into())).await?;
                     continue;
                 }
@@ -647,6 +666,34 @@ mod tests {
             thread: None,
             msg,
         }
+    }
+
+    #[test]
+    fn agents_ask_only_as_their_own_run() {
+        let (a, b) = (RunId::new(), RunId::new());
+        let handoff = |run| Request::Handoff {
+            run,
+            agent: "Forge".into(),
+            brief: "x".into(),
+        };
+        let ask = |run| Request::PermissionAsk {
+            run,
+            tool: "Bash".into(),
+            input: serde_json::Value::Null,
+            tool_use_id: None,
+        };
+        assert!(agent_may(&handoff(a), Some(a)));
+        assert!(agent_may(&ask(a), Some(a)));
+        assert!(!agent_may(&handoff(b), Some(a)));
+        assert!(!agent_may(&ask(b), Some(a)));
+        // A run that couldn't be told asks for nothing.
+        assert!(!agent_may(&handoff(a), None));
+        assert!(!agent_may(&ask(a), None));
+        let hello = Request::Hello {
+            version: PROTO_VERSION,
+        };
+        assert!(agent_may(&hello, None));
+        assert!(!agent_may(&Request::StopAll, Some(a)));
     }
 
     #[test]

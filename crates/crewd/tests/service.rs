@@ -1084,6 +1084,7 @@ async fn connections_from_inside_a_run_may_only_hand_off_and_ask() {
     // The requests, as crewd reads them. The helper puts the real run id
     // in place of this one.
     let placeholder = RunId::new();
+    let other = RunId::new();
     let requests = [
         Request::Hello {
             version: PROTO_VERSION,
@@ -1096,6 +1097,18 @@ async fn connections_from_inside_a_run_may_only_hand_off_and_ask() {
         Request::StopAll,
         Request::CreateAgent { spec: forge() },
         Request::SubscribeAll,
+        // Asking as another run.
+        Request::Handoff {
+            run: other,
+            agent: "Nobody".into(),
+            brief: "help".into(),
+        },
+        Request::PermissionAsk {
+            run: other,
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "make"}),
+            tool_use_id: None,
+        },
         Request::Handoff {
             run: placeholder,
             agent: "Nobody".into(),
@@ -1218,7 +1231,7 @@ for line in open({frames:?}):
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(answers.len(), 7, "{answers:#?}");
+    assert_eq!(answers.len(), 9, "{answers:#?}");
     let refused = serde_json::json!({"Err": crewd::server::NOT_FROM_AGENTS});
     assert_eq!(answers[0]["result"], serde_json::json!({"Ok": null}));
     for (i, what) in [
@@ -1226,13 +1239,15 @@ for line in open({frames:?}):
         (2, "StopAll"),
         (3, "CreateAgent"),
         (4, "SubscribeAll"),
+        (5, "Handoff as another run"),
+        (6, "PermissionAsk as another run"),
     ] {
         assert_eq!(answers[i]["result"], refused, "{what}: {answers:#?}");
     }
     // Handed off and asked like crew-mcp does.
-    assert_ne!(answers[5]["result"], refused, "{answers:#?}");
+    assert_ne!(answers[7]["result"], refused, "{answers:#?}");
     assert_eq!(
-        answers[6]["result"]["Ok"]["allow"],
+        answers[8]["result"]["Ok"]["allow"],
         serde_json::json!(true),
         "{answers:#?}"
     );

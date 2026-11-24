@@ -14,8 +14,9 @@ pub(crate) enum Peer {
     /// The app, the CLI or another client of yours.
     Client,
     /// A process started by an agent run, such as crew-mcp or a command
-    /// the agent ran.
-    Agent,
+    /// the agent ran. Holds the process id of that run, or `None` if the
+    /// process tree couldn't be read and no run can be named.
+    Agent(Option<i32>),
 }
 
 /// A process's parent and process group.
@@ -28,6 +29,8 @@ pub(crate) struct ProcInfo {
 /// Sorts a peer by its process tree. `runs` are the process ids of the
 /// live runs, each also its own process group. The peer is an agent if it
 /// or any ancestor is a run's process or in a run's group.
+///
+/// The run named is the one whose process or group was found.
 ///
 /// If the tree can't be read (the peer is gone, a lookup fails or the
 /// tree is deeper than [`MAX_DEPTH`]), the peer counts as an agent while
@@ -42,17 +45,17 @@ pub(crate) fn classify(
         return Peer::Client;
     }
     let Some(mut pid) = peer.filter(|p| *p > 0) else {
-        return Peer::Agent;
+        return Peer::Agent(None);
     };
     for _ in 0..MAX_DEPTH {
         if runs.contains(&pid) {
-            return Peer::Agent;
+            return Peer::Agent(Some(pid));
         }
         let Ok(p) = info(pid) else {
-            return Peer::Agent;
+            return Peer::Agent(None);
         };
         if runs.contains(&p.pgid) {
-            return Peer::Agent;
+            return Peer::Agent(Some(p.pgid));
         }
         // launchd, or the root of the tree.
         if p.ppid <= 1 || p.ppid == pid {
@@ -60,7 +63,7 @@ pub(crate) fn classify(
         }
         pid = p.ppid;
     }
-    Peer::Agent
+    Peer::Agent(None)
 }
 
 /// The parent and group of a running process.
@@ -141,10 +144,10 @@ mod tests {
             // Reparented to launchd, still in the run's group.
             (600, 1, 200),
         ]);
-        let runs = [200];
-        assert_eq!(classify(Some(200), &runs, &t), Peer::Agent);
-        assert_eq!(classify(Some(400), &runs, &t), Peer::Agent);
-        assert_eq!(classify(Some(600), &runs, &t), Peer::Agent);
+        let runs = [200, 700];
+        assert_eq!(classify(Some(200), &runs, &t), Peer::Agent(Some(200)));
+        assert_eq!(classify(Some(400), &runs, &t), Peer::Agent(Some(200)));
+        assert_eq!(classify(Some(600), &runs, &t), Peer::Agent(Some(200)));
         assert_eq!(classify(Some(500), &runs, &t), Peer::Client);
         assert_eq!(classify(Some(100), &runs, &t), Peer::Client);
     }
@@ -153,9 +156,9 @@ mod tests {
     fn an_unreadable_tree_is_an_agent_only_while_runs_are_live() {
         let t = tree(&[(300, 999, 300)]);
         // The peer, or an ancestor, can't be read.
-        assert_eq!(classify(Some(42), &[200], &t), Peer::Agent);
-        assert_eq!(classify(Some(300), &[200], &t), Peer::Agent);
-        assert_eq!(classify(None, &[200], &t), Peer::Agent);
+        assert_eq!(classify(Some(42), &[200], &t), Peer::Agent(None));
+        assert_eq!(classify(Some(300), &[200], &t), Peer::Agent(None));
+        assert_eq!(classify(None, &[200], &t), Peer::Agent(None));
         assert_eq!(classify(Some(42), &[], &t), Peer::Client);
         assert_eq!(classify(None, &[], &t), Peer::Client);
         // A loop or a very deep tree is not walked for ever.
@@ -165,7 +168,7 @@ mod tests {
                 pgid: pid,
             })
         };
-        assert_eq!(classify(Some(10), &[5], looped), Peer::Agent);
+        assert_eq!(classify(Some(10), &[5], looped), Peer::Agent(None));
     }
 
     #[test]
