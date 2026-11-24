@@ -506,7 +506,7 @@ fn other_installed_font_lists_the_fonts_and_applies_one(cx: &mut TestAppContext)
     wait_until(cx, "the font list", |cx| {
         super::test_ui::has(cx, window, "font-picker")
     });
-    for name in ["Avenir Next", "Helvetica", "Menlo"] {
+    for name in ["Avenir Next (highlighted)", "Helvetica", "Menlo"] {
         assert!(super::test_ui::shows(cx, window, name), "{name}");
     }
     // Picking Other doesn't change the font yet.
@@ -514,8 +514,15 @@ fn other_installed_font_lists_the_fonts_and_applies_one(cx: &mut TestAppContext)
     assert_eq!(font_selects(cx, &ws).0, "Geist");
 
     super::test_ui::type_text(cx, window, "helv");
-    assert!(!super::test_ui::shows(cx, window, "Avenir Next"));
-    assert_eq!(label(cx, window, "font-option-0"), "Helvetica");
+    assert!(!super::test_ui::shows(
+        cx,
+        window,
+        "Avenir Next (highlighted)"
+    ));
+    assert_eq!(
+        label(cx, window, "font-option-0"),
+        "Helvetica (highlighted)"
+    );
     super::test_ui::click(cx, window, "font-option-0");
 
     assert!(!super::test_ui::has(cx, window, "font-picker"), "closed");
@@ -628,4 +635,145 @@ fn a_font_no_longer_installed_says_so_and_falls_back(cx: &mut TestAppContext) {
         cx.update(|_| scale::code_family()),
         crate::fonts::mono_font()
     );
+}
+
+#[gpui_kit::test]
+fn the_font_list_says_it_is_loading_and_picks_with_the_keyboard(cx: &mut TestAppContext) {
+    use super::settings::appearance::{FontSlot, OTHER_FONT};
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (window, ws, _) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+    cx.update(scale::forget_installed_fonts);
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.pick_font(FontSlot::Code, OTHER_FONT, window, cx)
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(super::test_ui::shows(cx, window, "Loading fonts…"));
+    assert!(!super::test_ui::has(cx, window, "font-option-0"));
+
+    cx.update(|cx| {
+        scale::set_installed_fonts(vec!["Courier".into(), "Menlo".into(), "Monaco".into()], cx)
+    });
+    cx.run_until_parked();
+    assert!(!super::test_ui::shows(cx, window, "Loading fonts…"));
+    assert_eq!(label(cx, window, "font-option-0"), "Courier (highlighted)");
+    press(cx, window, "down down down up");
+    assert_eq!(label(cx, window, "font-option-1"), "Menlo (highlighted)");
+    assert_eq!(label(cx, window, "font-option-0"), "Courier");
+    press(cx, window, "enter");
+    assert!(!super::test_ui::has(cx, window, "font-picker"), "closed");
+    assert_eq!(current(cx).code_font, "Menlo");
+}
+
+/// Every control of the page, by id.
+fn page_controls() -> Vec<String> {
+    let mut ids: Vec<String> = crate::prefs::UI_SIZES
+        .iter()
+        .map(|n| format!("appearance-ui-size-{n}"))
+        .chain(
+            crate::prefs::CODE_SIZES
+                .iter()
+                .map(|n| format!("appearance-code-size-{n}")),
+        )
+        .collect();
+    ids.extend(
+        [
+            "appearance-reset",
+            "appearance-ui-font",
+            "appearance-code-font",
+            "appearance-line-compact",
+            "appearance-line-comfortable",
+            "appearance-line-roomy",
+            "appearance-render-standard",
+            "appearance-render-bolder",
+            "appearance-density-compact",
+            "appearance-density-comfortable",
+            "appearance-sidebar-projects",
+            "appearance-sidebar-threads",
+            "appearance-zoom-out",
+            "appearance-zoom-value",
+            "appearance-zoom-in",
+        ]
+        .map(String::from),
+    );
+    ids
+}
+
+/// The preview sits under the form, as wide as the page, and every
+/// control fits in the form without touching it.
+fn assert_preview_wraps(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    let layout = bounds(cx, window, "appearance-layout".into());
+    let form = bounds(cx, window, "settings-appearance".into());
+    let preview = bounds(cx, window, "appearance-preview".into());
+    assert!(preview.top() >= form.bottom(), "{form:?} {preview:?}");
+    assert!(
+        near(preview.size.width, f32::from(layout.size.width)),
+        "{layout:?} {preview:?}"
+    );
+    for id in page_controls() {
+        let b = bounds(cx, window, id.clone());
+        assert!(
+            b.left() >= form.left() && b.right() <= form.right(),
+            "{id} {b:?} outside the form {form:?}"
+        );
+        assert!(
+            b.intersect(&preview).is_empty(),
+            "{id} {b:?} on {preview:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn the_preview_wraps_under_the_form_in_the_smallest_window(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, _ws) = super::test_ui::open_sized_tall(
+        cx,
+        home.path(),
+        crate::app::WINDOW_MIN_WIDTH,
+        crate::app::WINDOW_MIN_HEIGHT,
+    );
+    open_page(cx, window);
+    assert_preview_wraps(cx, window);
+}
+
+#[gpui_kit::test]
+fn the_preview_wraps_under_the_form_at_150_percent(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, _ws) = super::test_ui::open(cx, home.path());
+    cx.update(|cx| {
+        scale::set_appearance(
+            Appearance {
+                zoom: 150,
+                ..Appearance::default()
+            },
+            cx,
+        )
+    });
+    open_page(cx, window);
+    assert_preview_wraps(cx, window);
+}
+
+#[gpui_kit::test]
+fn the_preview_sits_beside_the_form_at_the_default_size(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, _ws) = super::test_ui::open(cx, home.path());
+    open_page(cx, window);
+    let form = bounds(cx, window, "settings-appearance".into());
+    let preview = bounds(cx, window, "appearance-preview".into());
+    assert_eq!(preview.top(), form.top());
+    assert!(near(preview.size.width, 440.), "{preview:?}");
+    assert!(form.right() <= preview.left());
 }

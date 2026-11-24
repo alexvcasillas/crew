@@ -205,7 +205,14 @@ pub fn font_installed(name: &str, cx: &App) -> bool {
     if name == DEFAULT_UI_FONT || name == DEFAULT_CODE_FONT || is_system_font(name) {
         return true;
     }
-    installed_fonts(cx).is_none_or(|names| names.iter().any(|f| f == name))
+    listed(installed_fonts(cx).as_deref().map(Vec::as_slice), name)
+}
+
+/// Whether `names` has `family`. Until the list is in (`None`), every
+/// family counts as installed, so a font of your own draws from the
+/// start; GPUI falls back on a family it can't load.
+fn listed(names: Option<&[String]>, family: &str) -> bool {
+    names.is_none_or(|n| n.iter().any(|f| f == family))
 }
 
 /// Where the settings are saved, and the save in flight.
@@ -240,8 +247,8 @@ pub fn load(crew_home: PathBuf, cx: &mut App) {
         _listing: None,
     });
     apply(saved, cx);
-    // Listing the installed fonts is slow, so it runs off the UI thread. A
-    // font of your own shows once the list is in.
+    // Listing the installed fonts is slow, so it runs off the UI thread.
+    // Until it is in, a font of your own is drawn as named.
     let text_system = cx.text_system().clone();
     let list = cx
         .background_executor()
@@ -253,6 +260,9 @@ pub fn load(crew_home: PathBuf, cx: &mut App) {
             let a = appearance(cx);
             if a.ui_font != DEFAULT_UI_FONT || a.code_font != DEFAULT_CODE_FONT {
                 apply(a, cx);
+            } else {
+                // The font list shows the fonts now.
+                cx.refresh_windows();
             }
         });
     });
@@ -278,6 +288,15 @@ pub fn set_installed_fonts(names: Vec<String>, cx: &mut App) {
     fonts.names = Some(Arc::new(names));
     fonts._listing = None;
     apply(appearance(cx), cx);
+}
+
+/// Forgets the list of installed fonts, as if it were still loading.
+#[cfg(test)]
+pub fn forget_installed_fonts(cx: &mut App) {
+    cx.set_global(Fonts {
+        names: None,
+        _listing: None,
+    });
 }
 
 /// The settings in use.
@@ -318,11 +337,7 @@ pub fn step_zoom(direction: i8, cx: &mut App) {
 /// Makes `appearance` the one the helpers and the Kit read, and redraws.
 fn apply(appearance: Appearance, cx: &mut App) {
     let names = installed_fonts(cx);
-    let installed = |family: &str| {
-        names
-            .as_ref()
-            .is_some_and(|n| n.iter().any(|f| f == family))
-    };
+    let installed = |family: &str| listed(names.as_deref().map(Vec::as_slice), family);
     let ui = resolve_family(&appearance.ui_font, DEFAULT_UI_FONT, installed);
     let code = resolve_family(&appearance.code_font, DEFAULT_CODE_FONT, installed);
     set_scale(Scale::of(&appearance, ui, code));
@@ -350,8 +365,8 @@ mod tests {
     use gpui_kit::{FontWeight, SharedString, px};
 
     use super::{
-        Scale, chrome, code_family, line, mono, mono_line, relative_line, resolve_family, row,
-        set_scale, text, ui_family, ui_px, weight,
+        Scale, chrome, code_family, line, listed, mono, mono_line, relative_line, resolve_family,
+        row, set_scale, text, ui_family, ui_px, weight,
     };
     use crate::prefs::{Appearance, Density, LineHeight};
 
@@ -468,6 +483,13 @@ mod tests {
         ));
         assert_eq!(ui_family(), "Helvetica");
         assert_eq!(code_family(), "Menlo");
+    }
+
+    #[test]
+    fn a_font_counts_as_installed_until_the_list_is_in() {
+        assert!(listed(None, "Helvetica"));
+        assert!(!listed(Some(&[]), "Helvetica"));
+        assert!(listed(Some(&["Helvetica".to_string()]), "Helvetica"));
     }
 
     #[test]

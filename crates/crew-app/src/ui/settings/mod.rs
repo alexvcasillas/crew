@@ -38,13 +38,15 @@ const NAV_WIDTH: f32 = 220.;
 /// The label column of a form row.
 pub(super) const LABEL_WIDTH: f32 = 200.;
 
-/// Esc leaves settings.
+/// Esc leaves settings; ↑ ↓ ↵ pick from the font list.
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new(
+    let mut bindings = vec![KeyBinding::new(
         "escape",
         CloseSettings,
         Some(SETTINGS_CONTEXT),
-    )]
+    )];
+    bindings.extend(appearance::bindings());
+    bindings
 }
 
 /// A settings page.

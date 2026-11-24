@@ -38,6 +38,8 @@ const COMING_SOON: &str = "Coming soon.";
 const PREVIEW_WIDTH: f32 = 440.;
 /// How wide the form gets.
 const FORM_WIDTH: f32 = 720.;
+/// The form column's width before the preview wraps under it.
+const FORM_BASIS: f32 = 560.;
 const SELECT_WIDTH: f32 = 200.;
 const FONT_LIST_HEIGHT: f32 = 320.;
 const FONT_PICKER_WIDTH: f32 = 420.;
@@ -347,18 +349,30 @@ impl Workspace {
                 Some("Scales the whole window."),
                 zoom(a.zoom),
             ));
+        // As on the board, the preview drops under the form once the form
+        // would be narrower than its basis. Both are at least as tall as
+        // the page and grow with what they hold; the page scrolls them.
         div()
+            .id("appearance-layout")
             .flex()
+            .flex_wrap()
             .flex_1()
             .min_w_0()
             .h_full()
+            .overflow_y_scroll()
             .child(
                 page_scroll("settings-appearance")
+                    .flex_grow(999.)
+                    .flex_shrink(1.)
+                    .flex_basis(ui_px(FORM_BASIS))
+                    .h_auto()
+                    .min_h_full()
                     .pb(ui_px(32.))
                     .child(form)
                     .test_support(),
             )
             .child(preview(&a))
+            .test_support()
             .into_any_element()
     }
 
@@ -427,6 +441,7 @@ fn sizes(
         .collect();
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap(ui_px(10.))
         .child(segmented(options))
@@ -512,7 +527,15 @@ fn rendering_card(
             div()
                 .flex()
                 .flex_col()
-                .child(div().font_weight(weight(FontWeight::MEDIUM)).child(title))
+                .child(
+                    div()
+                        .font_weight(weight(if selected {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        }))
+                        .child(title),
+                )
                 .when_some(help, |col, help| {
                     col.child(
                         div()
@@ -648,9 +671,10 @@ fn preview(a: &Appearance) -> impl IntoElement {
         .id("appearance-preview")
         .flex()
         .flex_col()
-        .flex_none()
-        .w(ui_px(PREVIEW_WIDTH))
-        .h_full()
+        .flex_grow(1.)
+        .flex_shrink(0.)
+        .flex_basis(ui_px(PREVIEW_WIDTH))
+        .min_h_full()
         .border_l_1()
         .border_color(color("border-100"))
         .aria_label("Preview")
@@ -683,11 +707,12 @@ fn preview(a: &Appearance) -> impl IntoElement {
         )
         .child(
             div()
+                .id("appearance-preview-body")
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .overflow_hidden()
+                .overflow_y_scroll()
                 .p(ui_px(16.))
                 .gap(ui_px(16.))
                 .child(
@@ -750,11 +775,40 @@ fn preview(a: &Appearance) -> impl IntoElement {
         .test_support()
 }
 
+actions!(
+    font_picker,
+    [
+        /// The font above.
+        FontUp,
+        /// The font below.
+        FontDown,
+        /// Uses the highlighted font.
+        FontPick,
+    ]
+);
+
+/// The font list's key context.
+const PICKER_CONTEXT: &str = "FontPicker";
+const LOADING_FONTS: &str = "Loading fonts…";
+
+/// ↑ ↓ and ↵ in the font list's search field.
+pub fn bindings() -> Vec<KeyBinding> {
+    let field = Some("FontPicker > Input");
+    vec![
+        KeyBinding::new("up", FontUp, field),
+        KeyBinding::new("down", FontDown, field),
+        KeyBinding::new("enter", FontPick, field),
+    ]
+}
+
 /// The list of every installed font, searchable.
 pub struct FontPicker {
     slot: FontSlot,
     search: Entity<InputState>,
     query: String,
+    /// The row ↵ picks.
+    highlighted: usize,
+    scroll: UniformListScrollHandle,
     _search_events: Subscription,
 }
 
@@ -764,6 +818,8 @@ impl FontPicker {
         let events = cx.subscribe(&search, |this: &mut Self, search, event, cx| {
             if matches!(event, InputEvent::Change) {
                 this.query = search.read(cx).value().to_lowercase();
+                this.highlighted = 0;
+                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }
         });
@@ -771,9 +827,43 @@ impl FontPicker {
             slot,
             search,
             query: String::new(),
+            highlighted: 0,
+            scroll: UniformListScrollHandle::new(),
             _search_events: events,
         }
     }
+
+    /// The fonts shown, or `None` while the list is still loading.
+    fn names(&self, cx: &App) -> Option<Vec<String>> {
+        scale::installed_fonts(cx).map(|n| matching_fonts(&n, &self.query))
+    }
+
+    fn move_by(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.names(cx).map_or(0, |n| n.len());
+        if count == 0 {
+            return;
+        }
+        self.highlighted = self.highlighted.saturating_add_signed(delta).min(count - 1);
+        self.scroll
+            .scroll_to_item(self.highlighted, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    fn pick_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .names(cx)
+            .and_then(|n| n.get(self.highlighted).cloned())
+        else {
+            return;
+        };
+        use_font(self.slot, name, window, cx);
+    }
+}
+
+/// Applies the font picked from the list and closes it.
+fn use_font(slot: FontSlot, name: String, window: &mut Window, cx: &mut App) {
+    change(cx, |a| slot.set(a, name));
+    window.close_dialog(cx);
 }
 
 /// The fonts in `names` whose name holds `query`, any case.
@@ -788,24 +878,45 @@ pub fn matching_fonts(names: &[String], query: &str) -> Vec<String> {
 
 impl Render for FontPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let names = scale::installed_fonts(cx)
-            .map(|n| matching_fonts(&n, &self.query))
-            .unwrap_or_default();
-        let names = std::rc::Rc::new(names);
+        let names = self.names(cx);
+        let loading = names.is_none();
+        let names = std::rc::Rc::new(names.unwrap_or_default());
         let slot = self.slot;
+        let highlighted = self.highlighted;
         let count = names.len();
         div()
             .id("font-picker")
+            .key_context(PICKER_CONTEXT)
+            .on_action(cx.listener(|this, _: &FontUp, _, cx| this.move_by(-1, cx)))
+            .on_action(cx.listener(|this, _: &FontDown, _, cx| this.move_by(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &FontPick, window, cx| this.pick_highlighted(window, cx)),
+            )
             .flex()
             .flex_col()
             .gap(ui_px(8.))
             .child(Input::new(&self.search).aria_label("Search fonts"))
+            .when(loading, |picker| {
+                picker.child(
+                    div()
+                        .id("font-loading")
+                        .flex()
+                        .items_center()
+                        .h(scale::row(28.))
+                        .px(ui_px(8.))
+                        .text_color(color("text-tertiary"))
+                        .aria_label(LOADING_FONTS)
+                        .child(LOADING_FONTS)
+                        .test_support(),
+                )
+            })
             .child(
                 uniform_list("font-list", count, move |range, _, _| {
                     range
                         .map(|ix| {
                             let name = names[ix].clone();
                             let picked = name.clone();
+                            let on = ix == highlighted;
                             div()
                                 .id(SharedString::from(format!("font-option-{ix}")))
                                 .flex()
@@ -814,18 +925,22 @@ impl Render for FontPicker {
                                 .px(ui_px(8.))
                                 .rounded(ui_px(6.))
                                 .cursor_pointer()
+                                .when(on, |r| r.bg(color("surface-300")))
                                 .hover(|r| r.bg(color("surface-200")))
-                                .aria_label(name.clone())
+                                .aria_label(if on {
+                                    format!("{name} (highlighted)")
+                                } else {
+                                    name.clone()
+                                })
                                 .child(name)
                                 .on_click(move |_, window, cx| {
-                                    let name = picked.clone();
-                                    change(cx, |a| slot.set(a, name));
-                                    window.close_dialog(cx);
+                                    use_font(slot, picked.clone(), window, cx);
                                 })
                                 .test_support()
                         })
                         .collect()
                 })
+                .track_scroll(&self.scroll)
                 .h(ui_px(FONT_LIST_HEIGHT)),
             )
             .test_support()
