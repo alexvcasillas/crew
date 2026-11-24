@@ -900,3 +900,44 @@ async fn two_clients_adding_one_folder_make_one_project() {
     let projects: Vec<serde_json::Value> = c.ok(Request::ListProjects).await;
     assert_eq!(projects.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinning_a_project_is_broadcast_and_kept() {
+    let d = Daemon::start(PathBuf::from("/nonexistent/claude")).await;
+    let root = d.path("demo");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut c = d.client().await;
+    let p = c.project("demo", &root).await;
+    c.call(Request::SubscribeAll).await.unwrap();
+    c.call(Request::PinProject {
+        project: p,
+        pinned: true,
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(m, ServerMsg::ProjectChanged { project } if project.id == p && project.pinned_at.is_some())
+    })
+    .await;
+    let listed: Vec<crew_core::store::StoredProject> = c.ok(Request::ListProjects).await;
+    assert!(listed[0].pinned_at.is_some());
+    c.call(Request::PinProject {
+        project: p,
+        pinned: false,
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(m, ServerMsg::ProjectChanged { project } if project.id == p && project.pinned_at.is_none())
+    })
+    .await;
+    c.call(Request::RemoveProject { project: p }).await.unwrap();
+    let err = c
+        .call(Request::PinProject {
+            project: p,
+            pinned: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, crew_core::store::REMOVED);
+}

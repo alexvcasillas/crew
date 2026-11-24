@@ -25,7 +25,7 @@ pub use approval::{
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v8.sql"),
     include_str!("migrate_v9.sql"),
     include_str!("migrate_v10.sql"),
+    include_str!("migrate_v11.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -167,6 +168,10 @@ pub struct StoredProject {
     /// Where agents write.
     #[serde(default)]
     pub work_mode: WorkMode,
+    /// When it was pinned to the top of the sidebar, in Unix
+    /// milliseconds. `None` when it isn't pinned.
+    #[serde(default)]
+    pub pinned_at: Option<i64>,
 }
 
 /// A channel as saved in the store.
@@ -561,6 +566,20 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE projects SET name = ?2 WHERE id = ?1 AND removed_at IS NULL",
             params![p.to_string(), name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("project"));
+        }
+        Ok(())
+    }
+
+    /// Pins the project to the top of the sidebar, or unpins it. Pinning
+    /// a pinned project keeps the time it was first pinned.
+    pub fn pin_project(&self, p: ProjectId, pinned: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET pinned_at = CASE WHEN ?2 THEN COALESCE(pinned_at, ?3) END
+             WHERE id = ?1 AND removed_at IS NULL",
+            params![p.to_string(), pinned, now_ms()],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound("project"));
@@ -1472,7 +1491,7 @@ const OPEN_CHANNELS: &str = "SELECT c.id FROM channels c JOIN projects p ON p.id
      WHERE p.removed_at IS NULL AND (?1 IS NULL OR p.id = ?1)";
 
 const PROJECT_COLUMNS: &str = "SELECT p.id, p.name, p.root, p.main_branch, p.created_at,
-     p.setup_command, p.copy_files, p.kind, p.work_mode FROM projects p";
+     p.setup_command, p.copy_files, p.kind, p.work_mode, p.pinned_at FROM projects p";
 
 fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
     let copy_files: String = r.get(6)?;
@@ -1486,6 +1505,7 @@ fn read_project(r: &Row) -> rusqlite::Result<Result<StoredProject>> {
         copy_files: Vec::new(),
         kind: ProjectKind::Repo,
         work_mode: WorkMode::OwnCopy,
+        pinned_at: r.get(9)?,
     };
     let (kind, mode): (String, String) = (r.get(7)?, r.get(8)?);
     Ok((|| {

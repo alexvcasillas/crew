@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 12;
+pub const PROTO_VERSION: u32 = 13;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -297,6 +297,12 @@ pub enum Request {
     /// [`ServerMsg::ProjectRemoved`].
     RemoveProject {
         project: ProjectId,
+    },
+    /// Pins the project to the top of the sidebar, or unpins it. Answered
+    /// with null; every client gets a [`ServerMsg::ProjectChanged`].
+    PinProject {
+        project: ProjectId,
+        pinned: bool,
     },
 }
 

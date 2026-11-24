@@ -328,7 +328,7 @@ async fn hello_with_wrong_version_is_refused() {
     let err = c.call(Request::Hello { version: 99 }).await.unwrap_err();
     assert_eq!(
         err,
-        "crewd speaks protocol 12, client speaks 99. Restart crewd."
+        "crewd speaks protocol 13, client speaks 99. Restart crewd."
     );
     assert!(c.recv().await.is_none(), "connection should be closed");
 }

@@ -874,6 +874,7 @@ mod tests {
             copy_files: vec![],
             kind: Default::default(),
             work_mode: Default::default(),
+            pinned_at: None,
         }
     }
 
