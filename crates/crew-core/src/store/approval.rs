@@ -91,12 +91,17 @@ pub fn short_input(input: &serde_json::Value) -> String {
 }
 
 /// The thread note for a permission ask of `agent`.
+/// MCP tools, named `mcp__<server>__<tool>`, read as `server/tool`.
 pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
     let shown = short_input(input);
+    let (verb, what) = match tool.strip_prefix("mcp__") {
+        Some(rest) => ("use", rest.replacen("__", "/", 1)),
+        None => ("run", tool.to_string()),
+    };
     if shown.is_empty() {
-        format!("{agent} wants to run {tool}.")
+        format!("{agent} wants to {verb} {what}.")
     } else {
-        format!("{agent} wants to run {tool}: {shown}")
+        format!("{agent} wants to {verb} {what}: {shown}")
     }
 }
 
@@ -270,6 +275,26 @@ mod tests {
         assert_eq!(
             short_input(&json!({ "command": long })),
             format!("{}...", "x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn mcp_tools_read_as_server_and_tool() {
+        assert_eq!(
+            permission_text("Ada", "Bash", &json!({"command": "ls"})),
+            "Ada wants to run Bash: ls"
+        );
+        assert_eq!(
+            permission_text("Ada", "mcp__github__create_issue", &json!({})),
+            "Ada wants to use github/create_issue."
+        );
+        assert_eq!(
+            permission_text("Ada", "mcp__github__create_issue", &json!({"title": "x"})),
+            r#"Ada wants to use github/create_issue: {"title":"x"}"#
+        );
+        assert_eq!(
+            permission_text("Ada", "mcp__github", &json!({})),
+            "Ada wants to use github."
         );
     }
 }

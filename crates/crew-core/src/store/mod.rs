@@ -692,6 +692,18 @@ impl Store {
         Ok(())
     }
 
+    /// Saves a run's session id once the CLI names it, as Codex does.
+    pub fn set_run_session(&self, r: RunId, session_id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET session_id = ?2 WHERE id = ?1",
+            params![r.to_string(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     /// Sets the status. A terminal status also sets `ended_at`.
     pub fn set_run_status(&self, r: RunId, s: RunStatus) -> Result<()> {
         let ended = is_terminal(&s).then(now_ms);

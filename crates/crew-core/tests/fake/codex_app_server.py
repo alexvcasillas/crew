@@ -36,13 +36,29 @@ The scenario file is a JSON object with a "steps" list. Steps run in order:
   {"exit": 0}
       Exit at once with that code, leaving anything unanswered.
 
+  {"stderr": "text"}
+      Write the text and a newline to stderr.
+
+  {"wait_file": "/path"}
+      Pause until that file exists.
+
+Optional top-level keys:
+
+  "log": "/path"      Append every client message read, one per line,
+                      including those read after the last step.
+  "ignore_sigint": true   Ignore SIGINT, so only SIGTERM or SIGKILL end it.
+
 After the last step the fake reads stdin until it closes, then exits 0.
 Any mismatch prints a line to stderr and exits with code 3.
 """
 
 import json
+import os
+import signal
 import sys
 import time
+
+LOG = None
 
 
 def fail(msg):
@@ -56,10 +72,17 @@ def send(obj):
     sys.stdout.flush()
 
 
+def log_line(line):
+    if LOG:
+        with open(LOG, "a") as f:
+            f.write(line if line.endswith("\n") else line + "\n")
+
+
 def read_message():
     line = sys.stdin.readline()
     if not line:
         fail("stdin closed while waiting for a message")
+    log_line(line)
     try:
         return json.loads(line)
     except ValueError:
@@ -79,6 +102,10 @@ def main():
         fail("usage: codex_app_server.py SCENARIO.json")
     with open(sys.argv[1]) as f:
         scenario = json.load(f)
+    global LOG
+    LOG = scenario.get("log")
+    if scenario.get("ignore_sigint"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     seen = {}
     for step in scenario.get("steps", []):
@@ -122,11 +149,20 @@ def main():
             time.sleep(step["sleep"])
         elif "exit" in step:
             sys.exit(step["exit"])
+        elif "stderr" in step:
+            sys.stderr.write(step["stderr"] + "\n")
+            sys.stderr.flush()
+        elif "wait_file" in step:
+            while not os.path.exists(step["wait_file"]):
+                time.sleep(0.02)
         else:
             fail("unknown step: " + json.dumps(step))
 
-    while sys.stdin.readline():
-        pass
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        log_line(line)
 
 
 if __name__ == "__main__":

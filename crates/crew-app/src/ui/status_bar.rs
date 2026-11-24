@@ -207,6 +207,7 @@ mod tests {
             version: None,
             signed_in,
             path: None,
+            models: vec![],
         };
         let words = runtime_words(&[
             info(Runtime::ClaudeCode, true, Some(true)),

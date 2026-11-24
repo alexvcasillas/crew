@@ -338,3 +338,50 @@ fn deltas_and_diffs_are_ignored_and_unknown_is_raw() {
     ));
     assert!(matches!(out.as_slice(), [Event::Raw { line }] if line.contains("warning")));
 }
+
+#[test]
+fn session_starts_once_per_run() {
+    let mut t = CodexTranslator::new();
+    let started = |id: &str| {
+        msg(
+            json!({"method": "thread/started", "params": {"thread": {"id": id, "model": "m", "cwd": "/work/demo"}}}),
+        )
+    };
+    let first = t.on(&started("thr-1"));
+    assert_eq!(
+        first,
+        vec![Event::SessionStarted {
+            session_id: "thr-1".into(),
+            model: "m".into(),
+            cwd: "/work/demo".into(),
+        }]
+    );
+    assert!(t.on(&started("thr-1")).is_empty(), "a resume repeats it");
+
+    // The driver may report the session from the start reply first.
+    let mut t = CodexTranslator::new();
+    let reported = t.session_started("thr-2", "m", "/work/demo");
+    assert_eq!(reported.len(), 1);
+    assert!(t.session_started("thr-2", "m", "/work/demo").is_empty());
+    assert!(t.on(&started("thr-2")).is_empty());
+}
+
+#[test]
+fn mcp_declined_or_failed_without_error_says_declined() {
+    for status in ["declined", "failed"] {
+        let mut t = CodexTranslator::new();
+        let out = t.on(&item(
+            "item/completed",
+            json!({"type": "mcpToolCall", "id": "m1", "server": "other", "tool": "x", "arguments": {}, "status": status, "result": null, "error": null}),
+        ));
+        assert_eq!(
+            out.last(),
+            Some(&Event::ToolResult {
+                id: "m1".into(),
+                is_error: true,
+                output: "Declined".into()
+            }),
+            "{status}"
+        );
+    }
+}

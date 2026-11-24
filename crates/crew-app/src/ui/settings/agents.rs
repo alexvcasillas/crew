@@ -1183,6 +1183,7 @@ mod tests {
             version: None,
             signed_in: None,
             path: None,
+            models: vec![],
         };
         assert_eq!(
             claude_check(std::slice::from_ref(&missing)),

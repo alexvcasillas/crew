@@ -1044,6 +1044,7 @@ mod tests {
             version: version.map(Into::into),
             signed_in,
             path: Some("/usr/local/bin/x".into()),
+            models: vec![],
         }
     }
 

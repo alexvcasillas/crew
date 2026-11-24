@@ -38,7 +38,7 @@ pub struct ServeOptions {
     pub max_runs: usize,
     /// Overrides the `claude` binary for every run.
     pub claude_bin: Option<PathBuf>,
-    /// Overrides the `codex` binary that `Runtimes` looks for.
+    /// Overrides the `codex` binary for every Codex run and `Runtimes`.
     pub codex_bin: Option<PathBuf>,
     /// The crew-mcp binary passed to every run, so agents can hand off
     /// and ask for permission. Runs go without it if it is `None` or
