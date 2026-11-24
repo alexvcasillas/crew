@@ -6,7 +6,9 @@ use std::ops::Range;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ThreadId};
 use crew_core::policy::HandoffPolicy;
-use crew_core::store::{ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun};
+use crew_core::store::{
+    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -14,7 +16,7 @@ use gpui_kit::*;
 
 use super::common::{clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip};
 use super::markdown_view::{DocKey, render_doc};
-use super::run_card::summarize;
+use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
 use super::workspace::Workspace;
 use crate::fonts::{mono_font, ui_font};
@@ -52,7 +54,11 @@ impl Workspace {
         let mut carded: HashSet<ApprovalId> = HashSet::new();
         for message in state.messages(thread) {
             if let Some(approval) = message.approval.and_then(|a| state.approval(a)) {
-                if !under_run(approval) && carded.insert(approval.id) {
+                // An answered permission ask tags its run's step instead,
+                // and one no longer needed shows nowhere.
+                let answered = matches!(approval.kind, ApprovalKind::Permission { .. })
+                    && approval.status != ApprovalStatus::Pending;
+                if !answered && !under_run(approval) && carded.insert(approval.id) {
                     items.push(self.render_approval(approval, cx));
                 }
                 continue;
@@ -339,7 +345,8 @@ impl Workspace {
         let agent = state.agent(run.agent);
         let name = agent.map_or_else(|| "Agent".to_string(), |a| a.spec.name.clone());
         let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
-        let summary = summarize(state.events(run.thread), run.id);
+        let asks = decided_asks(&state.thread_approvals(run.thread), run.id);
+        let summary = summarize_asked(state.events(run.thread), run.id, &asks);
         let id = run.id;
         div()
             .id(format!("live-{id}"))

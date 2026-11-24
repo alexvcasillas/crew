@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crew_core::claude::parse::classifier_reason;
 use crew_core::event::{Event, ToolKind, humanize_reason, tool_label};
 use crew_core::ids::RunId;
-use crew_core::store::StoredRun;
+use crew_core::store::{ApprovalKind, ApprovalStatus, StoredApproval, StoredRun};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -45,6 +45,96 @@ pub struct Step {
     pub reason: Option<String>,
     /// The tool's own name, when [`tool_label`] reads it another way.
     pub raw: Option<String>,
+    /// How you answered the ask to run it, if it asked.
+    pub answer: Option<Answer>,
+}
+
+/// How you answered a permission ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Allowed,
+    Denied,
+}
+
+impl Answer {
+    pub fn text(self) -> &'static str {
+        match self {
+            Answer::Allowed => "allowed by you",
+            Answer::Denied => "denied by you",
+        }
+    }
+}
+
+/// A permission ask you answered, to tag the call it was about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecidedAsk {
+    pub tool_use_id: Option<String>,
+    pub tool: String,
+    pub input: serde_json::Value,
+    pub answer: Answer,
+}
+
+/// `run`'s permission asks that you allowed or denied, oldest first, from
+/// a thread's approvals in that order. One no longer needed tags nothing.
+pub fn decided_asks(approvals: &[&StoredApproval], run: RunId) -> Vec<DecidedAsk> {
+    approvals
+        .iter()
+        .filter(|a| a.run == run)
+        .filter_map(|a| {
+            let ApprovalKind::Permission {
+                tool,
+                input,
+                tool_use_id,
+            } = &a.kind
+            else {
+                return None;
+            };
+            let answer = match a.status {
+                ApprovalStatus::Approved => Answer::Allowed,
+                ApprovalStatus::Declined => Answer::Denied,
+                _ => return None,
+            };
+            Some(DecidedAsk {
+                tool_use_id: tool_use_id.clone(),
+                tool: tool.clone(),
+                input: input.clone(),
+                answer,
+            })
+        })
+        .collect()
+}
+
+/// For each of a run's calls, as id, tool and input in order, the answer
+/// of the ask about it. An ask finds its call by tool use id, else it
+/// takes the first call not yet matched with the same tool and input,
+/// else the first with the same tool.
+pub fn match_asks(
+    calls: &[(&str, &str, &serde_json::Value)],
+    asks: &[DecidedAsk],
+) -> Vec<Option<Answer>> {
+    let mut answers: Vec<Option<Answer>> = vec![None; calls.len()];
+    let mut later = Vec::new();
+    for ask in asks {
+        let by_id = ask
+            .tool_use_id
+            .as_deref()
+            .and_then(|id| calls.iter().position(|c| c.0 == id));
+        match by_id {
+            Some(ix) => answers[ix] = Some(ask.answer),
+            None => later.push(ask),
+        }
+    }
+    for ask in later {
+        let free = |ix: &usize| answers[*ix].is_none() && calls[*ix].1 == ask.tool;
+        let ix = (0..calls.len())
+            .filter(free)
+            .find(|ix| *calls[*ix].2 == ask.input)
+            .or_else(|| (0..calls.len()).find(free));
+        if let Some(ix) = ix {
+            answers[ix] = Some(ask.answer);
+        }
+    }
+    answers
 }
 
 impl Step {
@@ -97,6 +187,7 @@ impl RunSummary {
 /// A tool call as first seen.
 struct Call {
     id: String,
+    input: serde_json::Value,
     kind: ToolKind,
     name: String,
     /// Relative to the run's folder.
@@ -107,6 +198,11 @@ struct Call {
 
 /// Sums up `run`'s events among a thread's.
 pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
+    summarize_asked(events, run, &[])
+}
+
+/// Like [`summarize`], each step tagged with your answer if it asked.
+pub fn summarize_asked(events: &[LoggedEvent], run: RunId, asks: &[DecidedAsk]) -> RunSummary {
     let mut cwd = String::new();
     let mut calls: Vec<Call> = Vec::new();
     let mut ends: HashMap<String, bool> = HashMap::new();
@@ -119,11 +215,12 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
                 name,
                 kind,
                 target,
-                ..
+                input,
             } => {
                 let target = target.as_deref().map(|t| relative(t, &cwd));
                 calls.push(Call {
                     id: id.clone(),
+                    input: input.clone(),
                     kind: kind.clone(),
                     name: name.clone(),
                     target: shorten(target.as_deref().unwrap_or_default()),
@@ -176,11 +273,19 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
             }),
         }
     }
+    let answers = match_asks(
+        &calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str(), &c.input))
+            .collect::<Vec<_>>(),
+        asks,
+    );
     let skip = calls.len().saturating_sub(STEPS_SHOWN);
     let steps = calls
         .into_iter()
+        .zip(answers)
         .skip(skip)
-        .map(|call| {
+        .map(|(call, answer)| {
             let reason = blocked.get(&call.id).map(|r| humanize_reason(r));
             let state = match (ends.get(&call.id), &reason) {
                 (_, Some(_)) => StepState::Blocked,
@@ -201,6 +306,7 @@ pub fn summarize(events: &[LoggedEvent], run: RunId) -> RunSummary {
                 target: call.target,
                 reason,
                 raw: raw_name(&call.name),
+                answer,
             }
         })
         .collect();
@@ -469,13 +575,16 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
             .text_color(color("danger"))
             .into_any_element(),
     };
-    let text = match (&step.state, &step.reason) {
+    let mut text = match (&step.state, &step.reason) {
         (StepState::Blocked, Some(reason)) if !reason.is_empty() => {
             format!("{} · Blocked · {reason}", step.text())
         }
         (StepState::Blocked, _) => format!("{} · Blocked", step.text()),
         _ => step.text(),
     };
+    if let Some(answer) = step.answer {
+        text = format!("{text} · {}", answer.text());
+    }
     div()
         .id(("run-step", ix))
         .flex()
@@ -521,6 +630,15 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
         })
         .when_some(step.lines, |row, (added, removed)| {
             row.child(plus_minus(added, removed))
+        })
+        .when_some(step.answer, |row, answer| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(color("text-tertiary"))
+                    .child(answer.text()),
+            )
         })
         .when(step.state == StepState::Blocked, |row| {
             row.child(
@@ -762,6 +880,42 @@ mod tests {
         assert_eq!(steps[0].raw.as_deref(), Some(name));
         assert_eq!(steps[1].text(), "mcp__crew_run__handoff");
         assert_eq!(steps[1].raw, None);
+    }
+
+    #[test]
+    fn answers_find_their_calls_by_id_then_input_then_tool() {
+        use super::{Answer, DecidedAsk, match_asks};
+        let (a, b, c) = (
+            serde_json::json!({"command": "a"}),
+            serde_json::json!({"command": "b"}),
+            serde_json::json!({"url": "x"}),
+        );
+        let calls = [
+            ("t1", "Bash", &a),
+            ("t2", "Bash", &b),
+            ("t3", "Bash", &a),
+            ("t4", "WebFetch", &c),
+        ];
+        let ask = |id: Option<&str>, tool: &str, input: &serde_json::Value, answer| DecidedAsk {
+            tool_use_id: id.map(String::from),
+            tool: tool.into(),
+            input: input.clone(),
+            answer,
+        };
+        let asks = [
+            ask(None, "Bash", &a, Answer::Allowed),
+            ask(Some("t1"), "Bash", &a, Answer::Denied),
+            ask(None, "WebFetch", &serde_json::json!({}), Answer::Allowed),
+        ];
+        assert_eq!(
+            match_asks(&calls, &asks),
+            [
+                Some(Answer::Denied),
+                None,
+                Some(Answer::Allowed),
+                Some(Answer::Allowed)
+            ]
+        );
     }
 
     #[test]

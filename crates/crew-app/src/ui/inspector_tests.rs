@@ -285,8 +285,9 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
     click(cx, window, format!("approval-allow-{id}"));
     let got = answer_of(cx, &answer);
     assert!(got.allow, "{got:?}");
-    wait_until(cx, "the card to fold", |cx| {
-        starts(cx, window, card.clone(), "Bash allowed by you · ")
+    // An answered ask leaves the thread; its run's step carries it.
+    wait_until(cx, "the card to go", |cx| {
+        status_of(cx, &ws, id) == ApprovalStatus::Approved && !has(cx, window, card.clone())
     });
 
     // A long input starts folded. ⌘↵ in the composer leaves it alone;
@@ -321,8 +322,8 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
     .unwrap();
     press(cx, window, "cmd-enter");
     assert!(answer_of(cx, &answer).allow);
-    wait_until(cx, "the second card to fold", |cx| {
-        starts(cx, window, format!("approval-{id}"), "Bash allowed by you")
+    wait_until(cx, "the second card to go", |cx| {
+        !has(cx, window, format!("approval-{id}"))
     });
     std::thread::sleep(Duration::from_millis(100));
     cx.run_until_parked();
@@ -338,13 +339,9 @@ fn permission_card_allows_the_command(cx: &mut TestAppContext) {
     let got = answer_of(cx, &answer);
     assert!(!got.allow);
     assert_eq!(got.message.as_deref(), Some("The user declined this."));
-    wait_until(cx, "the denied line", |cx| {
-        starts(
-            cx,
-            window,
-            format!("approval-{id}"),
-            "Bash denied by you · ",
-        )
+    wait_until(cx, "the denied card to go", |cx| {
+        status_of(cx, &ws, id) == ApprovalStatus::Declined
+            && !has(cx, window, format!("approval-{id}"))
     });
     std::fs::write(tmp.path().join("go"), "").unwrap();
 }
@@ -372,15 +369,11 @@ fn a_pending_ask_stands_under_its_runs_card(cx: &mut TestAppContext) {
         "the ask {ask:?} is under the run card {run_card:?}"
     );
 
-    // Once decided, the card stays where it was asked, above the run.
+    // Once answered, the card goes; the run's card has it now.
     click(cx, window, format!("approval-allow-{id}"));
     assert!(answer_of(cx, &answer).allow);
-    wait_until(cx, "the card to fold", |cx| {
-        starts(cx, window, card.clone(), "Bash allowed by you · ")
-    });
-    let run_card = bounds_of(cx, window, format!("run-card-{run}")).unwrap();
-    let decided = bounds_of(cx, window, card).unwrap();
-    assert!(decided.bottom() <= run_card.top());
+    wait_until(cx, "the card to go", |cx| !has(cx, window, card.clone()));
+    assert!(has(cx, window, format!("run-card-{run}")));
     std::fs::write(tmp.path().join("go"), "").unwrap();
 }
 
