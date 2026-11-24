@@ -8,7 +8,8 @@ use crate::ids::{AgentId, ApprovalId, RunId, ThreadId};
 
 /// What is being asked. On the wire:
 /// `{"kind":"handoff","from":..,"to":..,"brief":..,"paused":..}` or
-/// `{"kind":"permission","tool":..,"input":..,"tool_use_id":..}`.
+/// `{"kind":"permission","tool":..,"input":..,"tool_use_id":..}` or
+/// `{"kind":"blocked","tool":..,"input":..,"reason":..}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalKind {
@@ -28,6 +29,15 @@ pub enum ApprovalKind {
         #[serde(default)]
         tool_use_id: Option<String>,
     },
+    /// Claude Code's auto mode safety check stopped a call. The run went
+    /// on without it. Approving starts a run that may make that one call.
+    Blocked {
+        tool: String,
+        input: serde_json::Value,
+        /// The safety check's category, as it gave it. Empty if none.
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 impl ApprovalKind {
@@ -35,6 +45,7 @@ impl ApprovalKind {
         match self {
             ApprovalKind::Handoff { .. } => "handoff",
             ApprovalKind::Permission { .. } => "permission",
+            ApprovalKind::Blocked { .. } => "blocked",
         }
     }
 }
@@ -139,6 +150,16 @@ pub fn permission_text(agent: &str, tool: &str, input: &serde_json::Value) -> St
         format!("{agent} wants to {verb} {what}.")
     } else {
         format!("{agent} wants to {verb} {what}: {shown}")
+    }
+}
+
+/// The thread note for a call the safety check stopped.
+pub fn blocked_text(agent: &str, tool: &str, input: &serde_json::Value) -> String {
+    let shown = short_ask(tool, input);
+    if shown.is_empty() {
+        format!("Claude's safety check stopped {agent}: {tool}.")
+    } else {
+        format!("Claude's safety check stopped {agent}: {shown}")
     }
 }
 
@@ -337,6 +358,25 @@ mod tests {
         assert_eq!(
             short_ask("Edit", &json!({"label": "a", "command": "b"})),
             "a"
+        );
+    }
+
+    #[test]
+    fn a_blocked_call_round_trips_and_names_the_check() {
+        let kind = ApprovalKind::Blocked {
+            tool: "Bash".into(),
+            input: json!({"command": "rm -rf build"}),
+            reason: "Destructive or unwanted actions".into(),
+        };
+        let text = serde_json::to_string(&kind).unwrap();
+        assert!(text.contains(r#""kind":"blocked""#));
+        assert_eq!(serde_json::from_str::<ApprovalKind>(&text).unwrap(), kind);
+        let bare: ApprovalKind =
+            serde_json::from_str(r#"{"kind":"blocked","tool":"Bash","input":{}}"#).unwrap();
+        assert!(matches!(bare, ApprovalKind::Blocked { reason, .. } if reason.is_empty()));
+        assert_eq!(
+            blocked_text("Forge", "Bash", &json!({"command": "rm -rf build"})),
+            "Claude's safety check stopped Forge: rm -rf build"
         );
     }
 

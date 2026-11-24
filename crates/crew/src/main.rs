@@ -16,7 +16,8 @@ use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId}
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, StoredAgent, StoredApproval, StoredChannel,
-    StoredProject, StoredRun, StoredThread, handoff_ask_text, paused_text, permission_text,
+    StoredProject, StoredRun, StoredThread, blocked_text, handoff_ask_text, paused_text,
+    permission_text,
 };
 use crew_core::worktree::Diff;
 use crew_proto::{Request, RuntimeInfo, ServerMsg};
@@ -445,6 +446,11 @@ fn event_line(event: &Event) -> Option<String> {
         Event::SessionStarted { model, .. } => Some(format!("started ({model})")),
         Event::Thinking { .. } => Some("thinking…".into()),
         Event::Message { text } => Some(format!("says: {}", first_line(text))),
+        Event::PermissionDenied {
+            tool,
+            reason: Some(_),
+            ..
+        } => Some(format!("blocked {tool}")),
         Event::PermissionDenied { tool, .. } => Some(format!("denied {tool}")),
         Event::Error { message } => Some(format!("error: {message}")),
         Event::Raw { line } => Some(format!(
@@ -541,6 +547,10 @@ async fn approval_text(
         ApprovalKind::Permission { tool, input, .. } => {
             let name = names.of_run(ctl, approval.run).await?;
             permission_text(&name, tool, input)
+        }
+        ApprovalKind::Blocked { tool, input, .. } => {
+            let name = names.of_run(ctl, approval.run).await?;
+            blocked_text(&name, tool, input)
         }
         ApprovalKind::Handoff {
             from, to, paused, ..
@@ -997,8 +1007,15 @@ mod tests {
         let denied = Event::PermissionDenied {
             tool: "Bash".into(),
             input: serde_json::json!({"command": "rm -rf x"}),
+            reason: None,
         };
         assert_eq!(event_line(&denied).as_deref(), Some("denied Bash"));
+        let blocked = Event::PermissionDenied {
+            tool: "Bash".into(),
+            input: serde_json::json!({"command": "rm -rf x"}),
+            reason: Some("Destructive".into()),
+        };
+        assert_eq!(event_line(&blocked).as_deref(), Some("blocked Bash"));
 
         let error = Event::Error {
             message: "rate limited".into(),

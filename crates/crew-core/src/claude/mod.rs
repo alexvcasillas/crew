@@ -7,6 +7,6 @@ pub mod transcript;
 
 pub use command::{
     APPROVE_TOOL, ClaudeInvocation, CrewContext, HANDOFF_TOOL, McpWiring, SessionArg, Teammate,
-    build_claude, claude_bin_from,
+    build_claude, claude_bin_from, retry_prompt, retry_rule,
 };
 pub use parse::{StreamParser, parse_line};

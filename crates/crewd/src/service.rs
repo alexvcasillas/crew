@@ -98,6 +98,9 @@ pub(crate) struct State {
     timers: HashMap<RunId, AbortHandle>,
     /// Runs stopped by their time limit, with the limit in minutes.
     timed_out: HashMap<RunId, u32>,
+    /// Allow rules a queued run gets for itself only: the call you let a
+    /// retry make.
+    pub(crate) retry_rules: HashMap<RunId, Vec<String>>,
 }
 
 struct Inner {
@@ -183,6 +186,7 @@ impl Service {
                 handed: HashMap::new(),
                 timers: HashMap::new(),
                 timed_out: HashMap::new(),
+                retry_rules: HashMap::new(),
             }),
             tx,
             bins,
@@ -804,6 +808,7 @@ impl Service {
         match state.scheduler.remove(run) {
             Some(job) => {
                 state.pending.remove(&run);
+                state.retry_rules.remove(&run);
                 self.note_dropped(&[job], RunStatus::Stopped)
                     .map_err(|e| e.to_string())
             }
@@ -831,6 +836,7 @@ impl Service {
         }
         for job in &dropped {
             state.pending.remove(&job.run);
+            state.retry_rules.remove(&job.run);
         }
         self.note_dropped(&dropped, RunStatus::Stopped)
     }
@@ -844,6 +850,7 @@ impl Service {
         }
         let dropped = state.scheduler.clear();
         state.pending.clear();
+        state.retry_rules.clear();
         self.note_dropped(&dropped, RunStatus::Stopped)
     }
 
@@ -1024,8 +1031,9 @@ impl Service {
         pending: Option<Pending>,
         announce: bool,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let extra = state.retry_rules.remove(&job.run).unwrap_or_default();
         let mut db = self.db();
-        match self.prepare(&mut db, &job, pending, announce) {
+        match self.prepare(&mut db, &job, pending, announce, &extra) {
             Ok((name, inv)) => {
                 drop(db);
                 let (handle, rx, join) = match inv {
@@ -1278,6 +1286,7 @@ impl Service {
         job: &Job,
         pending: Option<Pending>,
         announce: bool,
+        extra_allowed: &[String],
     ) -> Result<(String, Invocation), StoreError> {
         let agents = db.store.agents_with_deleted()?;
         let spec = db.store.agent(job.agent)?;
@@ -1342,7 +1351,7 @@ impl Service {
         }
         // Codex asks through its app-server, so it needs no crew-mcp for that.
         if self.0.crew_mcp.is_none()
-            && spec.permission_mode == PermissionMode::EditFiles
+            && spec.permission_mode.edits()
             && spec.runtime == Runtime::ClaudeCode
         {
             self.add_message(db, job.thread, Author::System, NO_CREW_MCP, Some(job.run))?;
@@ -1360,7 +1369,7 @@ impl Service {
                 .into_iter()
                 .filter(|(id, _)| *id != job.agent)
                 .map(|(_, a)| Teammate {
-                    edits: a.permission_mode == PermissionMode::EditFiles,
+                    edits: a.permission_mode.edits(),
                     name: a.name,
                     role: a.role,
                 })
@@ -1372,7 +1381,15 @@ impl Service {
                     Some((id, prompt)) => (SessionArg::Resume(id), prompt),
                     None => (SessionArg::New(new_session), fresh),
                 };
-                let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring, Some(&context));
+                let mut inv = build_claude(
+                    &spec,
+                    &prompt,
+                    &cwd,
+                    session,
+                    wiring,
+                    Some(&context),
+                    extra_allowed,
+                );
                 if let Some(bin) = &self.0.bins.claude {
                     inv.bin = bin.clone();
                 }
@@ -1422,7 +1439,18 @@ impl Service {
                 Event::SessionStarted { session_id, .. } => self.name_session(run, session_id),
                 _ => {}
             }
+            let denied = match &event {
+                Event::PermissionDenied {
+                    tool,
+                    input,
+                    reason,
+                } => Some((tool.clone(), input.clone(), reason.clone())),
+                _ => None,
+            };
             self.record_event(thread, run, event);
+            if let Some((tool, input, reason)) = denied {
+                self.note_blocked(run, &tool, input, reason.unwrap_or_default());
+            }
         }
         let outcome = join
             .await

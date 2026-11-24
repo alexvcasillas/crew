@@ -104,6 +104,7 @@ pub fn decided_text(approval: &StoredApproval, name_of: impl Fn(AgentId) -> Stri
             format!("{tool} denied by you")
         }
         (ApprovalKind::Permission { tool, .. }, _) => format!("{tool} no longer needed"),
+        (ApprovalKind::Blocked { tool, .. }, _) => format!("{tool} no longer needed"),
     };
     if time.is_empty() {
         what
@@ -231,7 +232,8 @@ impl Workspace {
             } => self
                 .render_handoff(approval, *from, *to, brief, cx)
                 .into_any_element(),
-            ApprovalKind::Permission { tool, input, .. } => self
+            ApprovalKind::Permission { tool, input, .. }
+            | ApprovalKind::Blocked { tool, input, .. } => self
                 .render_permission(approval, tool, input, cx)
                 .into_any_element(),
         }

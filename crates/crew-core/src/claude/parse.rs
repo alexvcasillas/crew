@@ -1,19 +1,72 @@
+use std::collections::HashMap;
+
 use crate::event::{Event, ToolKind};
 use serde_json::Value;
 
 const MAX_OUTPUT_BYTES: usize = 8192;
 
-/// Parses one run's stdout line by line. Unlike [`parse_line`] it remembers
-/// the denials already reported by `permission_denied` lines, so the
-/// result's `permission_denials` list does not repeat them.
+/// What the auto mode safety check's refusal says in its tool result.
+pub const CLASSIFIER_DENIAL: &str = "denied by the Claude Code auto mode classifier";
+
+/// The category in a safety check refusal (`Reason: [<Category>]`), or
+/// empty if the text has none. `None` if `text` isn't such a refusal.
+pub fn classifier_reason(text: &str) -> Option<String> {
+    if !text.contains(CLASSIFIER_DENIAL) {
+        return None;
+    }
+    Some(bracketed_reason(text).unwrap_or_default())
+}
+
+fn bracketed_reason(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once("Reason: [")?;
+    let (category, _) = rest.split_once(']')?;
+    Some(category.trim().to_string())
+}
+
+/// The reason a `permission_denied` line gives, if any.
+fn line_reason(v: &Value) -> Option<String> {
+    for key in ["reason", "decision_reason", "message", "error"] {
+        let Some(text) = v.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(reason) = classifier_reason(text) {
+            return Some(reason);
+        }
+        if let Some(reason) = bracketed_reason(text) {
+            return Some(reason);
+        }
+        if matches!(key, "reason" | "decision_reason") && !text.trim().is_empty() {
+            let text = text.trim().trim_start_matches('[').trim_end_matches(']');
+            return Some(text.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Parses one run's stdout line by line. Unlike [`parse_line`] it reports
+/// each denial once: a `permission_denied` line, a tool result refused by
+/// the auto mode safety check and the result's `permission_denials` list
+/// can all be about the same call. A `permission_denied` line without a
+/// reason waits for its call's tool result, which may carry one.
 #[derive(Debug, Default)]
 pub struct StreamParser {
     denied: Vec<(Option<String>, String, Value)>,
+    /// Tool calls by id: name and input.
+    calls: HashMap<String, (String, Value)>,
+    /// Denials by tool use id that wait for their tool result.
+    held: Vec<(String, String, Value)>,
 }
 
 impl StreamParser {
     pub fn new() -> StreamParser {
         StreamParser::default()
+    }
+
+    fn reported(&self, key: &(Option<String>, String, Value)) -> bool {
+        self.denied.iter().any(|seen| match (&key.0, &seen.0) {
+            (Some(id), Some(seen_id)) => id == seen_id,
+            _ => key.1 == seen.1 && key.2 == seen.2,
+        })
     }
 
     /// Turns one stdout line into events.
@@ -24,22 +77,94 @@ impl StreamParser {
         match (str_at(&v, "type"), str_at(&v, "subtype")) {
             ("system", "permission_denied") => {
                 let events = parse_line(line);
-                if matches!(events.as_slice(), [Event::PermissionDenied { .. }]) {
-                    self.denied.push(denial_key(&v));
+                let [Event::PermissionDenied { reason, .. }] = events.as_slice() else {
+                    return events;
+                };
+                let key = denial_key(&v);
+                if self.reported(&key) {
+                    return vec![];
+                }
+                match (&key.0, reason) {
+                    (Some(id), None) => {
+                        self.held.push((id.clone(), key.1, key.2));
+                        vec![]
+                    }
+                    _ => {
+                        self.denied.push(key);
+                        events
+                    }
+                }
+            }
+            ("assistant", _) => {
+                let events = parse_line(line);
+                for event in &events {
+                    if let Event::ToolCall {
+                        id, name, input, ..
+                    } = event
+                    {
+                        self.calls.insert(id.clone(), (name.clone(), input.clone()));
+                    }
+                }
+                events
+            }
+            ("user", _) => {
+                let mut events = Vec::new();
+                for result in blocks(&v).iter().filter_map(tool_result) {
+                    if let Event::ToolResult {
+                        id,
+                        is_error,
+                        output,
+                    } = &result
+                    {
+                        events.extend(self.denial_for_result(id, *is_error, output));
+                    }
+                    events.push(result);
                 }
                 events
             }
             ("result", _) => {
-                let denied = &self.denied;
-                parse_result(&v, |key| {
-                    denied.iter().any(|seen| match (&key.0, &seen.0) {
-                        (Some(id), Some(seen_id)) => id == seen_id,
-                        _ => key.1 == seen.1 && key.2 == seen.2,
+                let mut events: Vec<Event> = std::mem::take(&mut self.held)
+                    .into_iter()
+                    .map(|(id, tool, input)| {
+                        self.denied.push((Some(id), tool.clone(), input.clone()));
+                        Event::PermissionDenied {
+                            tool,
+                            input,
+                            reason: None,
+                        }
                     })
-                })
+                    .collect();
+                let parser = &*self;
+                events.extend(parse_result(&v, |key| parser.reported(key)));
+                events
             }
             _ => parse_line(line),
         }
+    }
+
+    /// The denial a tool result reports: one held for its call, or a
+    /// refusal by the safety check. Nothing if it was reported already.
+    fn denial_for_result(&mut self, id: &str, is_error: bool, output: &str) -> Option<Event> {
+        let reason = is_error.then(|| classifier_reason(output)).flatten();
+        let held = self.held.iter().position(|(held, ..)| held == id);
+        let (tool, input) = match held {
+            Some(at) => {
+                let (_, tool, input) = self.held.remove(at);
+                (tool, input)
+            }
+            None if reason.is_some() => self.calls.get(id).cloned()?,
+            None => return None,
+        };
+        let key = (Some(id.to_string()), tool.clone(), input.clone());
+        if self.reported(&key) {
+            return None;
+        }
+        self.denied.push(key);
+        Some(Event::PermissionDenied {
+            tool,
+            input,
+            reason,
+        })
     }
 }
 
@@ -69,6 +194,7 @@ pub fn parse_line(line: &str) -> Vec<Event> {
                 vec![Event::PermissionDenied {
                     tool: str_at(&v, "tool_name").to_string(),
                     input: v.get("tool_input").cloned().unwrap_or(Value::Null),
+                    reason: line_reason(&v),
                 }]
             }
             _ => raw(),
@@ -172,7 +298,11 @@ fn parse_result(v: &Value, seen: impl Fn(&(Option<String>, String, Value)) -> bo
             d.iter()
                 .map(denial_key)
                 .filter(|key| !seen(key))
-                .map(|(_, tool, input)| Event::PermissionDenied { tool, input })
+                .map(|(_, tool, input)| Event::PermissionDenied {
+                    tool,
+                    input,
+                    reason: None,
+                })
                 .collect()
         })
         .unwrap_or_default();

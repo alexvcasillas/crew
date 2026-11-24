@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000001","model":"claude-haiku-4-5","cwd":"/work/demo","tools":[]}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"rm -rf /work/demo/build"}}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","is_error":true,"content":"Permission for this action has been denied by the Claude Code auto mode classifier. Reason: [Destructive or unwanted actions] Removing a folder outright. Find another way, or stop and explain."}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I couldn't remove it."}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"result","subtype":"success","is_error":false,"result":"I couldn't remove it.","duration_ms":900,"num_turns":2,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"rm -rf /work/demo/build"},"tool_use_id":"toolu_01"}],"session_id":"00000000-0000-4000-8000-000000000001"}
