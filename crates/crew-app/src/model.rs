@@ -641,22 +641,25 @@ impl State {
             .count()
     }
 
-    /// What counts as running everywhere: working runs that don't wait
-    /// on you, by start time. Queued runs don't count. A call the safety
-    /// check stopped doesn't hold its run up.
+    /// What counts as running everywhere: every working run, by start
+    /// time, even one waiting on you. Queued runs don't count.
     pub fn working_runs(&self) -> Vec<&StoredRun> {
-        let waiting: HashSet<RunId> = self
-            .approvals
+        self.running()
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Working)
+            .collect()
+    }
+
+    /// Working runs that wait on you to answer an ask. A call the safety
+    /// check stopped doesn't hold its run up.
+    fn waiting_runs(&self) -> HashSet<RunId> {
+        self.approvals
             .values()
             .filter(|a| {
                 a.status == ApprovalStatus::Pending
                     && !matches!(a.kind, crew_core::store::ApprovalKind::Blocked { .. })
             })
             .map(|a| a.run)
-            .collect();
-        self.running()
-            .into_iter()
-            .filter(|r| r.status == RunStatus::Working && !waiting.contains(&r.id))
             .collect()
     }
 
@@ -758,10 +761,12 @@ impl State {
             .map(|n| n.approval)
             .filter(|a| here(a.thread))
             .collect();
+        // A run waiting on you is listed with its ask, not again here.
+        let waiting = self.waiting_runs();
         let working = self
             .working_runs()
             .into_iter()
-            .filter(|r| here(r.thread))
+            .filter(|r| here(r.thread) && !waiting.contains(&r.id))
             .collect();
         let queued = self
             .running()
@@ -1352,7 +1357,7 @@ mod tests {
         assert_eq!(state.working_agents(), [forge]);
         assert_eq!(state.working_runs().len(), 2);
 
-        // A run waiting on you isn't counted as running.
+        // A run waiting on you still counts as running.
         let prism = AgentId::new();
         let mut w = run(t.id, RunStatus::Working, 4);
         w.agent = prism;
@@ -1364,8 +1369,13 @@ mod tests {
             thread: t.id,
             approval: ask,
         });
-        assert_eq!(state.working_agents(), [forge]);
-        assert_eq!(state.working_runs().len(), 2);
+        assert_eq!(state.working_agents(), [forge, prism]);
+        assert_eq!(state.working_runs().len(), 3);
+        assert_eq!(
+            state.running_now(None, 0).working.len(),
+            2,
+            "listed by its ask"
+        );
     }
 
     #[test]

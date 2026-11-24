@@ -192,9 +192,10 @@ impl Workspace {
     }
 
     /// Working runs that don't wait on you, and pending approvals.
+    /// Working runs, even those waiting on you, and pending asks.
     pub(super) fn run_counts(&self) -> (usize, usize) {
-        let now = self.state().running_now(None, now_ms());
-        (now.working.len(), now.needs_you.len())
+        let state = self.state();
+        (state.working_runs().len(), state.needs_you().len())
     }
 
     /// Whether the app is connected to crewd now.
