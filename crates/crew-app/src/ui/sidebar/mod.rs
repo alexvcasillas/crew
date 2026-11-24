@@ -6,8 +6,11 @@
 
 mod filter;
 mod projects;
+mod summaries;
 mod switcher;
+mod thread_popover;
 pub(crate) mod threads;
+mod threads_footer;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -180,6 +183,8 @@ pub(super) struct Sidebar {
     scroll_pending: bool,
     /// The form shown when last drawn.
     mode: Option<SidebarMode>,
+    /// The pointer is on the switch: its tip shows.
+    pub(super) switch_hovered: bool,
     /// The Threads form.
     pub(crate) threads: threads::ThreadsSidebar,
     /// The time grouping uses in place of now, as tests set it.
@@ -211,6 +216,7 @@ impl Sidebar {
             revealed: None,
             scroll_pending: false,
             mode: None,
+            switch_hovered: false,
             threads: threads::ThreadsSidebar::new(window, cx),
             #[cfg(test)]
             now: None,
@@ -508,6 +514,9 @@ impl Workspace {
             })
             .when(self.sidebar.menu_open, |sidebar| {
                 sidebar.child(deferred(self.render_filter_menu(false, cx)).with_priority(1))
+            })
+            .when(self.sidebar.switch_hovered, |sidebar| {
+                sidebar.child(filter::switch_tip("Show threads"))
             })
             .test_support()
     }

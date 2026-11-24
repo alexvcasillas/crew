@@ -971,7 +971,12 @@ async fn thread_summaries_cover_every_project_or_one() {
     .await
     .unwrap();
 
-    let all: Vec<ThreadSummary> = c.ok(Request::ThreadSummaries { project: None }).await;
+    let all: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: None,
+        })
+        .await;
     let mut ids: Vec<ThreadId> = all.iter().map(|s| s.thread).collect();
     ids.sort_by_key(|t| t.0);
     let mut want = vec![worked, idle];
@@ -986,14 +991,37 @@ async fn thread_summaries_cover_every_project_or_one() {
     let one: Vec<ThreadSummary> = c
         .ok(Request::ThreadSummaries {
             project: Some(shop),
+            channels: None,
         })
         .await;
     let ids: Vec<ThreadId> = one.iter().map(|s| s.thread).collect();
     assert_eq!(ids, [idle]);
+    // Only the channels asked for.
+    let some: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: Some(vec![general, shop_general]),
+        })
+        .await;
+    let mut ids: Vec<ThreadId> = some.iter().map(|s| s.thread).collect();
+    ids.sort_by_key(|t| t.0);
+    assert_eq!(ids, want);
+    let none: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: Some(vec![bugs]),
+        })
+        .await;
+    assert!(none.is_empty(), "only the archived thread is there");
 
     c.call(Request::RemoveProject { project: shop })
         .await
         .unwrap();
-    let after: Vec<ThreadSummary> = c.ok(Request::ThreadSummaries { project: None }).await;
+    let after: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: None,
+        })
+        .await;
     assert_eq!(after.iter().map(|s| s.thread).collect::<Vec<_>>(), [worked]);
 }

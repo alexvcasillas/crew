@@ -305,12 +305,15 @@ pub enum Request {
         pinned: bool,
     },
     /// Answered with one [`ThreadSummary`] per thread that isn't
-    /// archived, in `project` or in every project. Counts come from the
-    /// channel overviews' cache; a [`ServerMsg::ChannelOverviewStale`]
-    /// follows for a channel whose counts were still being worked out.
+    /// archived, in `project` or in every project, and only in
+    /// `channels` when given. Counts come from the channel overviews'
+    /// cache; a [`ServerMsg::ChannelOverviewStale`] follows for a channel
+    /// whose counts were still being worked out.
     ThreadSummaries {
         #[serde(default)]
         project: Option<ProjectId>,
+        #[serde(default)]
+        channels: Option<Vec<ChannelId>>,
     },
 }
 

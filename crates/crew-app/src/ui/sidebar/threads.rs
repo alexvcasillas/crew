@@ -5,19 +5,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crew_core::event::RunStatus;
 use crew_core::ids::{ChannelId, ProjectId, ThreadId};
-use crew_core::store::{ApprovalKind, StoredApproval};
-use crew_proto::{Request, SearchResults, ThreadSummary, WorktreeState};
+use crew_core::store::ApprovalKind;
+use crew_proto::{Request, SearchResults};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::super::channel_view::{CardStatus, card_status, retry_after};
-use super::super::common::{ago, elapsed, now_ms, provider_icon, runtime_chip};
+use super::super::channel_view::{CardStatus, card_status};
+use super::super::common::{elapsed, now_ms, provider_icon};
 use super::super::palette::{highlighted, match_range};
-use super::super::settings::Page;
 use super::super::workspace::{Place, Workspace};
 use super::filter::{COMPOSE_SVG, FOLDER_PLUS_SVG, FUNNEL_SVG, icon_button, switch_button};
 use super::projects::{ACTIVE_WITHIN_MS, group_projects};
@@ -37,21 +35,15 @@ actions!(
         ThreadsOpen,
         /// Empties the search.
         ThreadsClear,
+        /// Leaves the list for the search.
+        ThreadsBack,
     ]
 );
 
-/// How long a change waits before the summaries are asked for again.
-const REFETCH_AFTER: Duration = Duration::from_millis(500);
-/// Asks again if crewd never says counts it was working out are done.
-const COUNTING_FALLBACK: Duration = Duration::from_secs(3);
 /// How long typing must pause before crewd searches messages.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Most threads a message search brings.
 const SEARCH_LIMIT: u32 = 200;
-/// How long the popover stays once the pointer leaves its row.
-const POPOVER_LINGER: Duration = Duration::from_millis(150);
-/// The popover's width, from the board.
-const POPOVER_WIDTH: f32 = 300.;
 
 /// Needs you: a circle with a bang.
 const ALERT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3.5M8 11v.5"/></svg>"#;
@@ -65,12 +57,6 @@ const STOP_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" h
 const FAILED_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>"#;
 /// Show projects: a tree.
 const TREE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 2.5h5M4.5 2.5v11M4.5 8h9M4.5 13.5h9"/></svg>"#;
-/// The footer's Settings.
-const GEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg>"#;
-/// The footer's Running now.
-const PULSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>"#;
-/// The footer's Agents.
-const PEOPLE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="6" r="2.5"/><path d="M1.5 14c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/><path d="M11 4a2 2 0 1 1 0 4M12.5 10.5c1.3.5 2 1.6 2 3.5" stroke-linecap="round"/></svg>"#;
 
 /// What a thread is grouped by.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,11 +96,24 @@ pub(crate) fn group_threads(mut threads: Vec<ThreadInfo>, now: i64) -> ThreadGro
     groups
 }
 
+/// A project's badge: its letters and its tint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Badge {
+    pub(crate) letters: String,
+    pub(crate) tint: usize,
+}
+
 /// Each project's two-letter badge: the first letters of its first two
 /// words, else its first two letters, else its first and last, else its
 /// first and another, so no two badges are the same while that can be.
-/// Names of more than one word go first.
-pub(crate) fn badges(projects: &[(ProjectId, &str)]) -> HashMap<ProjectId, String> {
+/// Names of more than one word go first. `projects` come in the order
+/// they were added, which hands out the tints in turn.
+pub(crate) fn badges(projects: &[(ProjectId, &str)]) -> HashMap<ProjectId, Badge> {
+    let tints: HashMap<ProjectId, usize> = projects
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i % TINTS))
+        .collect();
     let mut order: Vec<&(ProjectId, &str)> = projects.iter().collect();
     order.sort_by_key(|(_, name)| usize::from(words(name).len() < 2));
     let mut taken: HashSet<String> = HashSet::new();
@@ -128,7 +127,14 @@ pub(crate) fn badges(projects: &[(ProjectId, &str)]) -> HashMap<ProjectId, Strin
             .cloned()
             .unwrap_or_default();
         taken.insert(pick.clone());
-        out.insert(*id, pick);
+        let tint = tints[id];
+        out.insert(
+            *id,
+            Badge {
+                letters: pick,
+                tint,
+            },
+        );
     }
     out
 }
@@ -161,21 +167,20 @@ fn badge_candidates(name: &str) -> Vec<String> {
     out
 }
 
-/// A badge's colours, the same for a project every time.
-pub(crate) fn badge_tint(project: ProjectId) -> (Hsla, Hsla) {
-    let n = project
-        .0
-        .as_bytes()
-        .iter()
-        .map(|b| u32::from(*b))
-        .sum::<u32>()
-        % 4;
-    match n {
+/// The tints badges take in turn, in the order projects were added:
+/// blue, green, purple, cyan, then neutral.
+const TINTS: usize = 5;
+
+/// The colours of badge tint `tint`: a 15% wash and the text on it.
+pub(crate) fn badge_tint(tint: usize) -> (Hsla, Hsla) {
+    let (wash, text) = match tint % TINTS {
         0 => (color("info-subtle"), color("accent-blue")),
         1 => (color("success-subtle"), color("success")),
         2 => (color("accent-purple").opacity(0.15), color("accent-purple")),
+        3 => (color("brand-cyan").opacity(0.15), color("brand-cyan")),
         _ => (color("surface-300"), color("text-primary")),
-    }
+    };
+    (wash, text)
 }
 
 /// `45s`, `22m` or `1h 3m`: how long agents worked, roughly.
@@ -205,7 +210,7 @@ pub(crate) fn wants(
     }
 }
 
-fn plural(n: impl Into<u64>, one: &str, many: &str) -> String {
+pub(super) fn plural(n: impl Into<u64>, one: &str, many: &str) -> String {
     let n = n.into();
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -260,6 +265,7 @@ struct ThreadsKey {
     channel: Option<ChannelId>,
     show: crate::prefs::ShowProjects,
     settled_open: bool,
+    settled_found_open: bool,
     open: Option<ThreadId>,
     minute: i64,
 }
@@ -276,33 +282,28 @@ pub(crate) struct ThreadsSidebar {
     pub(crate) order: Vec<ThreadId>,
     built: Option<ThreadsKey>,
     pub(super) facts: HashMap<ThreadId, ThreadFacts>,
-    pub(super) badges: HashMap<ProjectId, String>,
+    pub(super) badges: HashMap<ProjectId, Badge>,
     pub(crate) settled_open: bool,
+    /// Settled is open among search results: it starts open for each
+    /// new search, and can be closed.
+    settled_found_open: bool,
     /// The project the switcher picked, if one.
     pub(crate) project: Option<ProjectId>,
     /// The channel chip picked, if one.
     pub(crate) channel: Option<ChannelId>,
     pub(super) switcher: super::switcher::Switcher,
     /// What crewd last said about each thread.
-    pub(super) summaries: HashMap<ThreadId, ThreadSummary>,
-    /// Moves whenever `summaries` changes.
-    summaries_gen: u64,
-    fetch: Option<Task<()>>,
-    refetch: Option<Task<()>>,
-    fallback: Option<Task<()>>,
-    retry: Option<Task<()>>,
-    failures: u32,
-    loaded: bool,
-    /// Something changed since the summaries were asked for.
-    dirty: bool,
+    pub(super) summaries: super::summaries::Summaries,
     /// Threads whose messages hold the query, as crewd last said.
     remote: Option<(String, HashSet<ThreadId>)>,
     remote_gen: u64,
     search_task: Option<Task<()>>,
     /// The thread whose popover shows, and its row.
     pub(crate) hovered: Option<(ThreadId, usize)>,
-    popover_hovered: bool,
-    linger: Option<Task<()>>,
+    pub(super) popover_hovered: bool,
+    /// The list's own focus, for its keys.
+    pub(crate) list_focus: FocusHandle,
+    pub(super) linger: Option<Task<()>>,
     /// The open thread the list last made visible.
     revealed: Option<ThreadId>,
     /// The time grouping uses in place of now, as tests set it.
@@ -326,23 +327,17 @@ impl ThreadsSidebar {
             facts: HashMap::new(),
             badges: HashMap::new(),
             settled_open: false,
+            settled_found_open: true,
             project: None,
             channel: None,
             switcher: super::switcher::Switcher::new(window, cx),
-            summaries: HashMap::new(),
-            summaries_gen: 0,
-            fetch: None,
-            refetch: None,
-            fallback: None,
-            retry: None,
-            failures: 0,
-            loaded: false,
-            dirty: false,
+            summaries: Default::default(),
             remote: None,
             remote_gen: 0,
             search_task: None,
             hovered: None,
             popover_hovered: false,
+            list_focus: cx.focus_handle(),
             linger: None,
             revealed: None,
             #[cfg(test)]
@@ -356,10 +351,7 @@ impl ThreadsSidebar {
     pub(super) fn shown_again(&mut self) {
         self.revealed = None;
         self.built = None;
-        if self.dirty && self.fetch.is_none() {
-            self.loaded = false;
-            self.refetch = None;
-        }
+        self.summaries.shown_again();
     }
 }
 
@@ -380,102 +372,12 @@ impl Workspace {
         cx.notify();
     }
 
-    fn threads_now(&self) -> i64 {
+    pub(super) fn threads_now(&self) -> i64 {
         #[cfg(test)]
         if let Some(now) = self.sidebar.threads.now {
             return now;
         }
         now_ms()
-    }
-
-    /// Notes changes crewd reported, so the summaries are asked for
-    /// again.
-    pub(crate) fn threads_touched(&mut self, touched: bool) {
-        if touched {
-            self.sidebar.threads.dirty = true;
-        }
-    }
-
-    /// Asks crewd for every thread's summary when the threads sidebar
-    /// shows first, and again [`REFETCH_AFTER`] a change.
-    pub(crate) fn sync_thread_summaries(&mut self, cx: &mut Context<Self>) {
-        if sidebar_mode(cx) != SidebarMode::Threads {
-            return;
-        }
-        let t = &mut self.sidebar.threads;
-        if t.fetch.is_some() || t.retry.is_some() {
-            return;
-        }
-        if !t.loaded {
-            self.fetch_thread_summaries(cx);
-        } else if t.dirty && t.refetch.is_none() {
-            t.refetch = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(REFETCH_AFTER).await;
-                this.update(cx, |this, cx| {
-                    this.sidebar.threads.refetch = None;
-                    if this.sidebar.threads.fetch.is_none() {
-                        this.fetch_thread_summaries(cx);
-                    }
-                })
-                .ok();
-            }));
-        }
-    }
-
-    fn fetch_thread_summaries(&mut self, cx: &mut Context<Self>) {
-        let t = &mut self.sidebar.threads;
-        t.dirty = false;
-        t.refetch = None;
-        t.fallback = None;
-        let answer = self
-            .client
-            .request(Request::ThreadSummaries { project: None });
-        self.sidebar.threads.fetch = Some(cx.spawn(async move |this, cx| {
-            let got = answer.await.and_then(|v| {
-                serde_json::from_value::<Vec<ThreadSummary>>(v).map_err(|e| e.to_string())
-            });
-            this.update(cx, |this, cx| {
-                let t = &mut this.sidebar.threads;
-                t.fetch = None;
-                match got {
-                    Ok(summaries) => {
-                        t.loaded = true;
-                        t.failures = 0;
-                        let counting = summaries.iter().any(|s| s.counting);
-                        t.summaries = summaries.into_iter().map(|s| (s.thread, s)).collect();
-                        t.summaries_gen += 1;
-                        if counting {
-                            t.fallback = Some(cx.spawn(async move |this, cx| {
-                                cx.background_executor().timer(COUNTING_FALLBACK).await;
-                                this.update(cx, |this, cx| {
-                                    this.sidebar.threads.fallback = None;
-                                    this.sidebar.threads.dirty = true;
-                                    this.sync_thread_summaries(cx);
-                                })
-                                .ok();
-                            }));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("crew: couldn't load the threads: {e}");
-                        t.failures += 1;
-                        let wait = retry_after(t.failures);
-                        t.retry = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor().timer(wait).await;
-                            this.update(cx, |this, cx| {
-                                this.sidebar.threads.retry = None;
-                                this.sidebar.threads.loaded = false;
-                                this.sync_thread_summaries(cx);
-                            })
-                            .ok();
-                        }));
-                    }
-                }
-                this.sync_thread_summaries(cx);
-                cx.notify();
-            })
-            .ok();
-        }));
     }
 
     /// The search field changed: the list shows what it finds, and crewd
@@ -496,6 +398,7 @@ impl Workspace {
         }
         let t = &mut self.sidebar.threads;
         t.query = query.clone();
+        t.settled_found_open = true;
         t.cursor = None;
         t.list.scroll_to(ListOffset::default());
         let query = query.trim().to_string();
@@ -546,13 +449,14 @@ impl Workspace {
         let open = self.nav.thread;
         let key = ThreadsKey {
             revision: self.state().revision(),
-            summaries: self.sidebar.threads.summaries_gen,
+            summaries: self.sidebar.threads.summaries.generation,
             query: self.sidebar.threads.query.trim().to_lowercase(),
             remote: self.sidebar.threads.remote_gen,
             project: self.sidebar.threads.project,
             channel: self.sidebar.threads.channel,
             show: self.sidebar.prefs.show,
             settled_open: self.sidebar.threads.settled_open,
+            settled_found_open: self.sidebar.threads.settled_found_open,
             open,
             minute: now / 60_000,
         };
@@ -577,7 +481,11 @@ impl Workspace {
             }
         }
         let searching = !key.query.is_empty();
-        let settled_open = self.sidebar.threads.settled_open || searching;
+        let settled_open = if searching {
+            self.sidebar.threads.settled_found_open
+        } else {
+            self.sidebar.threads.settled_open
+        };
         let mut rows = Vec::new();
         let mut order = Vec::new();
         for (group, ids) in [
@@ -640,16 +548,10 @@ impl Workspace {
         }
     }
 
-    /// The threads to list, grouped: not archived, in the projects shown
-    /// and the picked project and channel, matching the search.
-    fn thread_groups(
-        &self,
-        facts: &HashMap<ThreadId, ThreadFacts>,
-        query: &str,
-        now: i64,
-    ) -> ThreadGroups {
+    /// The projects whose threads list, as Show has it; the open
+    /// thread's project always does.
+    pub(super) fn shown_projects(&self, now: i64) -> HashSet<ProjectId> {
         let state = self.state();
-        let t = &self.sidebar.threads;
         let open_project = self.nav.thread.and_then(|o| state.thread_project(o));
         let project_facts = state.project_facts();
         let infos = state
@@ -664,12 +566,25 @@ impl Workspace {
             now,
             open_project,
         );
-        let shown: HashSet<ProjectId> = shown
+        shown
             .pinned
             .into_iter()
             .chain(shown.active)
             .chain(shown.other)
-            .collect();
+            .collect()
+    }
+
+    /// The threads to list, grouped: not archived, in the projects shown
+    /// and the picked project and channel, matching the search.
+    fn thread_groups(
+        &self,
+        facts: &HashMap<ThreadId, ThreadFacts>,
+        query: &str,
+        now: i64,
+    ) -> ThreadGroups {
+        let state = self.state();
+        let t = &self.sidebar.threads;
+        let shown = self.shown_projects(now);
         let remote = t
             .remote
             .as_ref()
@@ -703,6 +618,7 @@ impl Workspace {
                     let f = facts.get(&thread.id);
                     let summary = t
                         .summaries
+                        .by_thread
                         .get(&thread.id)
                         .map_or(0, |s| s.last_activity_at);
                     items.push(ThreadInfo {
@@ -724,6 +640,7 @@ impl Workspace {
         let status = facts.map_or(ThreadStatus::Idle, |f| f.status);
         let summary_last = t
             .summaries
+            .by_thread
             .get(&thread)
             .and_then(|s| s.runs.last())
             .map(|r| r.status.clone());
@@ -761,18 +678,41 @@ impl Workspace {
         cx.notify();
     }
 
-    /// ↵ in the search: opens the highlighted thread. Typing goes on in
-    /// the search.
+    /// ↓ or ↑ in the search: the list takes the keys from there.
+    fn move_into_list(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_thread_cursor(by, cx);
+        if self.sidebar.threads.cursor.is_some() {
+            self.sidebar.threads.list_focus.focus(window, cx);
+        }
+    }
+
+    /// ↵ in the search or the list: opens the highlighted thread. The
+    /// keys stay where they were, so you can go on.
     fn open_thread_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let t = &self.sidebar.threads;
         let Some(thread) = t.cursor.and_then(|c| t.order.get(c)).copied() else {
             return;
         };
+        let in_list = t.list_focus.is_focused(window);
         self.open_place(Place::Thread(thread), window, cx);
+        if in_list {
+            self.sidebar.threads.list_focus.focus(window, cx);
+        } else {
+            self.sidebar
+                .threads
+                .search
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    /// Esc in the list: back to the search.
+    fn back_to_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.threads.cursor = None;
         self.sidebar
             .threads
             .search
             .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
     }
 
     /// Esc in the search: empties it, or leaves it when it is empty.
@@ -820,8 +760,30 @@ impl Workspace {
             .child(
                 div()
                     .id("threads-list")
+                    .key_context("ThreadsList")
+                    .track_focus(&t.list_focus)
                     .flex_1()
                     .min_h_0()
+                    .on_action(
+                        cx.listener(|this, _: &ThreadsDown, _, cx| this.move_thread_cursor(1, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &ThreadsUp, _, cx| this.move_thread_cursor(-1, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &ThreadsOpen, window, cx| {
+                        this.open_thread_cursor(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &ThreadsBack, window, cx| {
+                        this.back_to_search(window, cx)
+                    }))
+                    // A press in the list gives it the keys; a row's click
+                    // may then take them for what it opens.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.sidebar.threads.list_focus.focus(window, cx);
+                        }),
+                    )
                     .when(self.sidebar.menu_open, |list| list.opacity(0.4))
                     .child(
                         list(
@@ -838,6 +800,9 @@ impl Workspace {
             })
             .when(self.sidebar.menu_open, |sidebar| {
                 sidebar.child(deferred(self.render_filter_menu(true, cx)).with_priority(1))
+            })
+            .when(self.sidebar.switch_hovered, |sidebar| {
+                sidebar.child(super::filter::switch_tip("Show projects"))
             })
             .children(
                 t.hovered
@@ -866,12 +831,12 @@ impl Workspace {
                     .key_context("ThreadsSearch")
                     .flex_1()
                     .min_w_0()
-                    .on_action(
-                        cx.listener(|this, _: &ThreadsDown, _, cx| this.move_thread_cursor(1, cx)),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &ThreadsUp, _, cx| this.move_thread_cursor(-1, cx)),
-                    )
+                    .on_action(cx.listener(|this, _: &ThreadsDown, window, cx| {
+                        this.move_into_list(1, window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &ThreadsUp, window, cx| {
+                        this.move_into_list(-1, window, cx)
+                    }))
                     .on_action(cx.listener(|this, _: &ThreadsOpen, window, cx| {
                         this.open_thread_cursor(window, cx)
                     }))
@@ -1017,7 +982,7 @@ impl Workspace {
         let place = format!("{} · #{}", project.name, channel.name);
         let query = t.query.trim();
         let range = match_range(&stored.title, query);
-        let summary = t.summaries.get(&thread);
+        let summary = t.summaries.by_thread.get(&thread);
         let status = self.thread_card_status(thread);
         let runtime = t
             .facts
@@ -1041,11 +1006,16 @@ impl Workspace {
             .py(scale::row(8.))
             .rounded(ui_px(6.))
             .cursor_pointer()
-            .when(open || cursor, |row| row.bg(color("surface-300")))
-            .when(hovered && !open && !cursor, |row| {
-                row.bg(color("surface-100"))
+            // The open thread is filled; the keys' row is outlined.
+            .border_1()
+            .border_color(if cursor {
+                color("accent-blue")
+            } else {
+                transparent_black()
             })
-            .hover(|row| row.bg(color("surface-100")))
+            .when(open, |row| row.bg(color("surface-300")))
+            .when(hovered && !open, |row| row.bg(color("surface-100")))
+            .when(!open, |row| row.hover(|row| row.bg(color("surface-100"))))
             .aria_label(stored.title.clone())
             .aria_selected(open || cursor)
             .child(
@@ -1058,10 +1028,7 @@ impl Workspace {
                     .line_height(scale::line(16.))
                     .text_color(color("text-tertiary"))
                     .whitespace_nowrap()
-                    .child(project_badge(
-                        project.id,
-                        t.badges.get(&project.id).cloned().unwrap_or_default(),
-                    ))
+                    .children(t.badges.get(&project.id).map(project_badge))
                     .child(
                         div()
                             .id(SharedString::from(format!("thread-row-place-{id}")))
@@ -1111,7 +1078,12 @@ impl Workspace {
                         }),
                     )
                     .when(
-                        branch.is_none() && changes.is_none() && status != CardStatus::Idle,
+                        branch.is_none()
+                            && changes.is_none()
+                            && matches!(
+                                status,
+                                CardStatus::Done | CardStatus::Stopped | CardStatus::Failed
+                            ),
                         |l3| {
                             l3.child(
                                 div()
@@ -1192,401 +1164,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn thread_row_hovered(
-        &mut self,
-        thread: ThreadId,
-        ix: usize,
-        hovered: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let t = &mut self.sidebar.threads;
-        if hovered {
-            t.linger = None;
-            if t.hovered != Some((thread, ix)) {
-                t.hovered = Some((thread, ix));
-                cx.notify();
-            }
-            return;
-        }
-        if t.hovered.is_some_and(|(h, _)| h == thread) {
-            self.close_popover_later(cx);
-        }
-    }
-
-    /// Closes the popover after [`POPOVER_LINGER`], unless the pointer
-    /// went into it or onto another row.
-    fn close_popover_later(&mut self, cx: &mut Context<Self>) {
-        let shown = self.sidebar.threads.hovered;
-        self.sidebar.threads.linger = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(POPOVER_LINGER).await;
-            this.update(cx, |this, cx| {
-                let t = &mut this.sidebar.threads;
-                t.linger = None;
-                if !t.popover_hovered && t.hovered == shown {
-                    t.hovered = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-    }
-
-    /// The hovered thread at a glance, beside its row.
-    fn render_thread_popover(
-        &self,
-        thread: ThreadId,
-        ix: usize,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let state = self.state();
-        let t = &self.sidebar.threads;
-        let stored = state.thread(thread)?;
-        let channel = state.channel(stored.channel)?;
-        let project = state.project(channel.project)?;
-        let row = t.list.bounds_for_item(ix)?;
-        let summary = t.summaries.get(&thread);
-        let status = self.thread_card_status(thread);
-        let now = now_ms();
-        let name_of = |a| {
-            state
-                .agent(a)
-                .map_or_else(|| "An agent".to_string(), |a| a.spec.name.clone())
-        };
-        let (line, token) = match status {
-            CardStatus::NeedsYou => {
-                let ask: Option<&StoredApproval> = state.pending_approvals(thread).last().copied();
-                let text = ask.map_or_else(
-                    || "Needs you".to_string(),
-                    |a| {
-                        let who = state
-                            .run(a.run)
-                            .map_or_else(|| "An agent".to_string(), |r| name_of(r.agent));
-                        format!("Needs you · {who} {}", wants(&a.kind, name_of))
-                    },
-                );
-                (text, "warning")
-            }
-            CardStatus::Working => {
-                let since = t
-                    .facts
-                    .get(&thread)
-                    .and_then(|f| f.working_since)
-                    .unwrap_or(now);
-                let who: Vec<String> = state
-                    .live_runs(thread)
-                    .into_iter()
-                    .filter(|r| r.status == RunStatus::Working)
-                    .map(|r| name_of(r.agent))
-                    .collect();
-                (
-                    format!("Working · {} · {}", who.join(", "), elapsed(now - since)),
-                    "accent-blue",
-                )
-            }
-            CardStatus::Done => ("Done".into(), "success"),
-            CardStatus::Stopped => ("Stopped".into(), "text-secondary"),
-            CardStatus::Failed => ("Failed".into(), "danger"),
-            CardStatus::Queued => ("Queued".into(), "text-tertiary"),
-            CardStatus::Idle => ("No runs yet".into(), "text-tertiary"),
-        };
-        let files = summary.map_or(0, |s| s.files);
-        let (added, removed) = summary.map_or((0, 0), |s| (s.added, s.removed));
-        let tree = summary.map_or(WorktreeState::None, |s| s.worktree);
-        let changes_text = if files == 0 && added == 0 && removed == 0 {
-            "No changes".to_string()
-        } else {
-            let state_word = match tree {
-                WorktreeState::Uncommitted { .. } => Some("uncommitted"),
-                WorktreeState::Committed => Some("committed"),
-                WorktreeState::Clean | WorktreeState::None => None,
-            };
-            let mut text = format!("{} · +{added} −{removed}", plural(files, "file", "files"));
-            if let Some(word) = state_word {
-                text.push_str(&format!(" · {word}"));
-            }
-            text
-        };
-        let agents: Vec<(String, String)> = summary
-            .map(|s| s.participants.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|a| state.agent(a))
-            .map(|a| (a.spec.name.clone(), runtime_chip(&a.spec)))
-            .collect();
-        let activity = summary.map_or_else(String::new, |s| {
-            format!(
-                "{} · {} · {}",
-                plural(s.messages, "message", "messages"),
-                plural(s.runs.len() as u64, "run", "runs"),
-                span(s.agent_ms)
-            )
-        });
-        let last = t
-            .facts
-            .get(&thread)
-            .map(|f| f.activity)
-            .unwrap_or(stored.created_at)
-            .max(summary.map_or(0, |s| s.last_activity_at));
-        let reviewable = stored.worktree.is_some() && files > 0;
-        let x = self.sidebar_width() + ui_px(8.);
-        let kv = |key: &'static str, id: &'static str, label: String, value: AnyElement| {
-            div()
-                .flex()
-                .gap(ui_px(12.))
-                .px(ui_px(12.))
-                .py(scale::row(4.))
-                .text_size(scale::text(12.))
-                .line_height(scale::line(18.))
-                .child(
-                    div()
-                        .w(ui_px(72.))
-                        .flex_none()
-                        .text_color(color("text-tertiary"))
-                        .child(key),
-                )
-                .child(
-                    div()
-                        .id(id)
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(color("text-primary"))
-                        .aria_label(label)
-                        .child(value)
-                        .test_support(),
-                )
-        };
-        let place = format!("{} · #{}", project.name, channel.name);
-        let branch = stored.worktree.as_ref().map(|w| w.branch.clone());
-        let pop = div()
-            .id("thread-popover")
-            .w(ui_px(POPOVER_WIDTH))
-            .bg(color("surface-raised"))
-            .border_1()
-            .border_color(color("border-200"))
-            .rounded(ui_px(8.))
-            .shadow_lg()
-            .occlude()
-            .aria_label(stored.title.clone())
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.sidebar.threads.popover_hovered = *hovered;
-                if *hovered {
-                    this.sidebar.threads.linger = None;
-                } else {
-                    this.close_popover_later(cx);
-                }
-            }))
-            .child(
-                div()
-                    .px(ui_px(12.))
-                    .pt(scale::row(12.))
-                    .pb(scale::row(8.))
-                    .border_b_1()
-                    .border_color(color("border-100"))
-                    .child(
-                        div()
-                            .font_weight(weight(FontWeight::SEMIBOLD))
-                            .line_height(scale::line(20.))
-                            .child(stored.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("thread-popover-status")
-                            .mt(scale::row(2.))
-                            .text_size(scale::text(12.))
-                            .text_color(color(token))
-                            .aria_label(line.clone())
-                            .child(line)
-                            .test_support(),
-                    ),
-            )
-            .child(
-                div()
-                    .py(scale::row(8.))
-                    .child(kv(
-                        "Project",
-                        "thread-popover-project",
-                        place.clone(),
-                        place.into_any_element(),
-                    ))
-                    .children(branch.map(|b| {
-                        kv(
-                            "Branch",
-                            "thread-popover-branch",
-                            b.clone(),
-                            div()
-                                .font_family(code_family())
-                                .text_size(scale::mono(11.))
-                                .truncate()
-                                .child(b)
-                                .into_any_element(),
-                        )
-                    }))
-                    .child(kv(
-                        "Changes",
-                        "thread-popover-changes",
-                        changes_text.clone(),
-                        changes_value(files, added, removed, tree).into_any_element(),
-                    ))
-                    .when(!agents.is_empty(), |list| {
-                        let label = agents
-                            .iter()
-                            .map(|(n, c)| format!("{n} {c}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        list.child(kv(
-                            "Agents",
-                            "thread-popover-agents",
-                            label,
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(ui_px(6.))
-                                .children(agents.into_iter().map(|(name, chip)| {
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(ui_px(4.))
-                                        .child(name)
-                                        .child(super::super::common::chip(chip))
-                                }))
-                                .into_any_element(),
-                        ))
-                    })
-                    .when(!activity.is_empty(), |list| {
-                        list.child(kv(
-                            "Activity",
-                            "thread-popover-activity",
-                            activity.clone(),
-                            activity.clone().into_any_element(),
-                        ))
-                    })
-                    .child({
-                        let last = ago(last, now);
-                        kv(
-                            "Last",
-                            "thread-popover-last",
-                            last.clone(),
-                            last.into_any_element(),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(ui_px(6.))
-                    .px(ui_px(12.))
-                    .py(scale::row(8.))
-                    .border_t_1()
-                    .border_color(color("border-100"))
-                    .child(
-                        small_button("thread-popover-open", "Open", false)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.sidebar.threads.hovered = None;
-                                this.open_place(Place::Thread(thread), window, cx);
-                            }))
-                            .test_support(),
-                    )
-                    .when(reviewable, |bar| {
-                        bar.child(
-                            small_button("thread-popover-review", "Review changes", true)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.sidebar.threads.hovered = None;
-                                    this.leave_pages(cx);
-                                    this.open_review(thread, window, cx);
-                                }))
-                                .test_support(),
-                        )
-                    }),
-            )
-            .test_support();
-        Some(
-            deferred(
-                anchored()
-                    .position(point(x, row.origin.y))
-                    .snap_to_window_with_margin(ui_px(8.))
-                    .child(pop),
-            )
-            .with_priority(2)
-            .into_any_element(),
-        )
-    }
-
-    /// Settings, Running now with its count, Agents and the palette's
-    /// shortcut.
-    fn render_threads_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.state().working_runs().len();
-        let label = format!("Running now, {running} running");
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(ui_px(2.))
-            .p(ui_px(8.))
-            .border_t_1()
-            .border_color(color("border-100"))
-            .child(
-                footer_button("threads-footer-settings", GEAR_SVG, "Settings")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(Page::General, window, cx)
-                    }))
-                    .test_support(),
-            )
-            .child(
-                div()
-                    .id("threads-footer-running")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(ui_px(6.))
-                    .h(ui_px(28.))
-                    .px(ui_px(8.))
-                    .rounded(ui_px(6.))
-                    .cursor_pointer()
-                    .text_size(scale::text(12.))
-                    .font_weight(weight(FontWeight::MEDIUM))
-                    .text_color(color("text-secondary"))
-                    .hover(|b| b.bg(color("surface-300")))
-                    .aria_label(label)
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new("Running now").build(window, cx)
-                    })
-                    .child(Icon::default().data(PULSE_SVG).size(ui_px(14.)))
-                    .child(
-                        div()
-                            .text_color(color(if running > 0 {
-                                "accent-blue"
-                            } else {
-                                "text-tertiary"
-                            }))
-                            .child(running.to_string()),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx)))
-                    .test_support(),
-            )
-            .child(
-                footer_button("threads-footer-agents", PEOPLE_SVG, "Agents")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(Page::Agents, window, cx)
-                    }))
-                    .test_support(),
-            )
-            .child(
-                div()
-                    .ml_auto()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .pr(ui_px(4.))
-                    .flex()
-                    .gap(ui_px(4.))
-                    .whitespace_nowrap()
-                    .text_size(scale::text(11.))
-                    .text_color(color("text-tertiary"))
-                    .child(div().flex_none().font_family(code_family()).child("⌘K"))
-                    .child(div().min_w_0().truncate().child("projects, channels")),
-            )
-    }
-
     /// Picks a channel chip, or drops it when it is the one picked.
     pub(super) fn pick_chip(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         let t = &mut self.sidebar.threads;
@@ -1617,15 +1194,14 @@ impl Workspace {
                     .flex_none()
                     .px(ui_px(6.))
                     .rounded(ui_px(4.))
-                    .border_1()
                     .cursor_pointer()
                     .font_family(code_family())
                     .text_size(scale::mono(11.))
                     .line_height(scale::line(16.))
-                    .border_color(color(if on { "border-200" } else { "border-100" }))
-                    .bg(color(if on { "surface-300" } else { "bg-100" }))
+                    // The board's chip; the picked one reads brighter.
+                    .bg(color(if on { "border-200" } else { "surface-300" }))
                     .text_color(color(if on { "text-primary" } else { "text-secondary" }))
-                    .hover(|c| c.bg(color("surface-300")))
+                    .hover(|c| c.text_color(color("text-primary")))
                     .aria_label(name.clone())
                     .aria_selected(on)
                     .child(name)
@@ -1649,84 +1225,55 @@ impl Workspace {
     }
 }
 
-/// A project's two-letter badge in its tint.
-pub(super) fn project_badge(project: ProjectId, letters: String) -> Div {
-    let (bg, fg) = badge_tint(project);
+/// A project's two-letter badge in its tint, 16 px at the default text
+/// size and growing with it.
+pub(super) fn project_badge(badge: &Badge) -> Div {
+    let (bg, fg) = badge_tint(badge.tint);
     div()
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .size(ui_px(16.))
+        .size(scale::text(16.))
         .rounded(ui_px(4.))
         .bg(bg)
         .text_color(fg)
         .text_size(scale::text(9.))
         .font_weight(weight(FontWeight::SEMIBOLD))
-        .child(letters)
+        .child(badge.letters.clone())
 }
 
 /// `+88 −51`, in their colours; a side that is 0 is left out unless
 /// both are.
 fn diff_counts(id: String, added: u32, removed: u32) -> impl IntoElement {
-    let label = match (added, removed) {
-        (a, 0) => format!("+{a}"),
-        (0, r) => format!("−{r}"),
-        (a, r) => format!("+{a} −{r}"),
+    let green = HighlightStyle {
+        color: Some(color("success")),
+        ..Default::default()
+    };
+    let red = HighlightStyle {
+        color: Some(color("danger")),
+        ..Default::default()
+    };
+    let plus = format!("+{added}");
+    let minus = format!("−{removed}");
+    let (text, marks) = match (added, removed) {
+        (_, 0) => (plus.clone(), vec![(0..plus.len(), green)]),
+        (0, _) => (minus.clone(), vec![(0..minus.len(), red)]),
+        _ => {
+            let text = format!("{plus} {minus}");
+            let start = plus.len() + 1;
+            let marks = vec![(0..plus.len(), green), (start..text.len(), red)];
+            (text, marks)
+        }
     };
     div()
         .id(SharedString::from(id))
-        .flex()
         .flex_none()
-        .gap(ui_px(4.))
         .font_family(code_family())
         .text_size(scale::mono(11.))
-        .aria_label(label)
-        .when(added > 0 || removed == 0, |d| {
-            d.child(
-                div()
-                    .text_color(color("success"))
-                    .child(format!("+{added}")),
-            )
-        })
-        .when(removed > 0, |d| {
-            d.child(
-                div()
-                    .text_color(color("danger"))
-                    .child(format!("−{removed}")),
-            )
-        })
+        .aria_label(text.clone())
+        .child(StyledText::new(text).with_highlights(marks))
         .test_support()
-}
-
-/// "4 files · +88 −51 · uncommitted", the counts in their colours.
-fn changes_value(files: u32, added: u32, removed: u32, tree: WorktreeState) -> Div {
-    if files == 0 && added == 0 && removed == 0 {
-        return div().child("No changes");
-    }
-    let word = match tree {
-        WorktreeState::Uncommitted { .. } => Some("uncommitted"),
-        WorktreeState::Committed => Some("committed"),
-        WorktreeState::Clean | WorktreeState::None => None,
-    };
-    div()
-        .flex()
-        .flex_wrap()
-        .gap(ui_px(4.))
-        .child(format!("{} ·", plural(files, "file", "files")))
-        .child(
-            div()
-                .font_family(code_family())
-                .text_color(color("success"))
-                .child(format!("+{added}")),
-        )
-        .child(
-            div()
-                .font_family(code_family())
-                .text_color(color("danger"))
-                .child(format!("−{removed}")),
-        )
-        .children(word.map(|w| format!("· {w}")))
 }
 
 /// "Needs you · 1", with its dot, or "Recent · 4".
@@ -1783,58 +1330,14 @@ fn render_settled(count: usize, open: bool, cx: &mut Context<Workspace>) -> impl
         .child(text)
         .on_click(cx.listener(|this, _, _, cx| {
             let t = &mut this.sidebar.threads;
-            t.settled_open = !t.settled_open;
+            if t.query.trim().is_empty() {
+                t.settled_open = !t.settled_open;
+            } else {
+                t.settled_found_open = !t.settled_found_open;
+            }
             cx.notify();
         }))
         .test_support()
-}
-
-/// A 28 px icon button of the footer.
-fn footer_button(id: &'static str, svg: &'static [u8], label: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(ui_px(28.))
-        .rounded(ui_px(6.))
-        .cursor_pointer()
-        .text_color(color("text-secondary"))
-        .hover(|b| b.bg(color("surface-300")).text_color(color("text-primary")))
-        .aria_label(label)
-        .tooltip(move |window, cx| {
-            gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
-        })
-        .child(Icon::default().data(svg).size(ui_px(15.)))
-}
-
-/// The popover's 24 px button, outlined or ghost.
-fn small_button(id: &'static str, label: &'static str, ghost: bool) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .h(ui_px(24.))
-        .px(ui_px(8.))
-        .rounded(ui_px(6.))
-        .border_1()
-        .cursor_pointer()
-        .whitespace_nowrap()
-        .text_size(scale::text(12.))
-        .font_weight(weight(FontWeight::MEDIUM))
-        .when(ghost, |b| {
-            b.border_color(transparent_black())
-                .text_color(color("text-secondary"))
-        })
-        .when(!ghost, |b| {
-            b.border_color(color("border-200"))
-                .bg(color("bg-100"))
-                .text_color(color("text-primary"))
-        })
-        .hover(|b| b.bg(color("surface-300")))
-        .aria_label(label)
-        .child(label)
 }
 
 #[cfg(test)]
@@ -1893,11 +1396,14 @@ mod tests {
         let names = ["crew", "curl-runner", "supa-app", "api", "web", "x"];
         let list: Vec<(ProjectId, &str)> = ids.iter().copied().zip(names).collect();
         let got = badges(&list);
-        let of = |i: usize| got[&ids[i]].as_str();
+        let of = |i: usize| got[&ids[i]].letters.as_str();
         assert_eq!(
             [of(0), of(1), of(2), of(3), of(4), of(5)],
             ["CW", "CR", "SA", "AP", "WE", "X"]
         );
+        // Tints go in turn, in the order the projects were added.
+        let tints: Vec<usize> = ids.iter().map(|id| got[id].tint).collect();
+        assert_eq!(tints, [0, 1, 2, 3, 4, 0]);
     }
 
     #[test]

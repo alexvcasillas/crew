@@ -15,12 +15,12 @@ use super::diff_tests::repo_with_readme;
 use super::inspector_tests::run_of;
 use super::settings::Page;
 use super::sidebar::row_probe::row_of;
-use super::test_ui::{click, has, label_of, open, press, type_text, wait_until};
+use super::test_ui::{bounds_of, click, has, label_of, open, press, type_text, wait_until};
 use super::thread_tests::{World, agent, open_thread, world};
 use super::workspace::Workspace;
 use crate::client::ClientHandle;
 use crate::prefs::{Appearance, SidebarMode};
-use crate::test_support::{Daemon, fake_claude, short_home};
+use crate::test_support::{Daemon, fake_claude, recording_proxy, short_home};
 use crate::theme::scale;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -147,6 +147,13 @@ fn focus_search(cx: &mut TestAppContext, window: AnyWindowHandle, ws: &Entity<Wo
     cx.run_until_parked();
 }
 
+fn list_focused(cx: &mut TestAppContext, window: AnyWindowHandle, ws: &Entity<Workspace>) -> bool {
+    cx.update_window(window, |_, window, cx| {
+        ws.read(cx).sidebar.threads.list_focus.is_focused(window)
+    })
+    .unwrap()
+}
+
 fn search_focused(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -173,8 +180,22 @@ fn the_switch_and_appearance_change_the_sidebar_and_keep_it(cx: &mut TestAppCont
     let (window, ws) = open(cx, home.path());
     wait_until(cx, "the project", |cx| has(cx, window, row_of(w.channel)));
 
+    // The switch's tip sits under it, as on the board.
+    hover(cx, window, "sidebar-switch".into());
+    assert_eq!(
+        label_of(cx, window, "sidebar-switch-tip").as_deref(),
+        Some("Show threads · switch sidebar")
+    );
+    let tip = bounds_of(cx, window, "sidebar-switch-tip").unwrap();
+    let button = bounds_of(cx, window, "sidebar-switch").unwrap();
+    assert!(tip.origin.y >= button.origin.y + button.size.height);
     to_threads(cx, window);
     assert_eq!(mode(cx), SidebarMode::Threads);
+    hover(cx, window, "sidebar-switch".into());
+    assert_eq!(
+        label_of(cx, window, "sidebar-switch-tip").as_deref(),
+        Some("Show projects · switch sidebar")
+    );
     assert!(!has(cx, window, "sidebar-filter"), "the projects are gone");
     assert_eq!(
         label_of(cx, window, "sidebar-switch").as_deref(),
@@ -324,6 +345,13 @@ fn threads_group_into_needs_you_working_recent_and_settled(cx: &mut TestAppConte
     // The popover sums the thread up and opens it or its changes.
     hover(cx, window, row(edited));
     wait_has(cx, window, "thread-popover".into());
+    // Level with the group heading above the row, as on the board.
+    let pop_top = f32::from(bounds_of(cx, window, "thread-popover").unwrap().origin.y);
+    let row_top = f32::from(bounds_of(cx, window, row(edited)).unwrap().origin.y);
+    assert!(
+        (row_top - pop_top - 27.).abs() < 1.,
+        "{row_top} vs {pop_top}"
+    );
     let pop =
         |cx: &mut TestAppContext, key: &str| label_of(cx, window, format!("thread-popover-{key}"));
     assert_eq!(pop(cx, "status").as_deref(), Some("Done"));
@@ -367,6 +395,22 @@ fn threads_group_into_needs_you_working_recent_and_settled(cx: &mut TestAppConte
     assert!(has(cx, window, row(b.needs)));
     click(cx, window, "threads-settled");
     assert!(has(cx, window, row(edited)));
+    assert!(has(cx, window, row(b.answered)));
+    click(cx, window, "threads-settled");
+    assert!(!has(cx, window, row(edited)));
+
+    // Searching opens Settled; it still closes.
+    focus_search(cx, window, &ws);
+    type_text(cx, window, "login");
+    assert!(has(cx, window, row(edited)));
+    click(cx, window, "threads-settled");
+    assert!(!has(cx, window, row(edited)));
+    click(cx, window, "threads-settled");
+    assert!(has(cx, window, row(edited)));
+    focus_search(cx, window, &ws);
+    press(cx, window, "escape");
+    assert!(!has(cx, window, row(edited)), "closed as you left it");
+    click(cx, window, "threads-settled");
     assert!(has(cx, window, row(b.answered)));
 
     // Archived threads leave the list.
@@ -419,6 +463,21 @@ fn the_project_switcher_picks_a_project_and_its_channels(cx: &mut TestAppContext
     wait_has(cx, window, row(cart));
     assert!(has(cx, window, row(w.thread)));
     assert!(!has(cx, window, "threads-chips"));
+
+    // The count follows Show, as the list does.
+    click(cx, window, "sidebar-filter-options");
+    click(cx, window, "sidebar-show-pinned");
+    press(cx, window, "escape");
+    assert!(!has(cx, window, row(w.thread)));
+    click(cx, window, "threads-switcher");
+    assert_eq!(
+        label_of(cx, window, "threads-switcher-count").as_deref(),
+        Some("2 threads")
+    );
+    press(cx, window, "escape");
+    click(cx, window, "sidebar-filter-options");
+    click(cx, window, "sidebar-show-all");
+    press(cx, window, "escape");
 
     click(cx, window, "threads-switcher");
     assert!(has(cx, window, "threads-switcher-menu"));
@@ -510,19 +569,33 @@ fn keys_move_through_the_threads_and_the_selection_survives_the_switch(cx: &mut 
     click(cx, window, "sidebar-switch");
     wait_has(cx, window, row(docs));
 
-    // ↓ and ↑ move from the open thread, ↵ opens.
+    // ↓ from the search moves into the list, from the open thread; there
+    // ↑/↓ move and ↵ opens, keeping the keys in the list.
     focus_search(cx, window, &ws);
     let order = ws.read_with(cx, |ws, _| ws.sidebar.threads.order.clone());
     assert_eq!(order.len(), 3);
     let at = order.iter().position(|t| *t == w.thread).unwrap();
-    let next = order[(at + 1).min(2)];
-    press(cx, window, "down");
-    assert!(is_selected(cx, window, row(next)));
+    let (there, back, to) = if at > 0 {
+        ("up", "down", at - 1)
+    } else {
+        ("down", "up", at + 1)
+    };
+    press(cx, window, there);
+    assert!(list_focused(cx, window, &ws));
+    assert!(is_selected(cx, window, row(order[to])));
+    press(cx, window, back);
+    assert!(!is_selected(cx, window, row(order[to])));
+    press(cx, window, there);
+    assert!(is_selected(cx, window, row(order[to])));
     press(cx, window, "enter");
-    assert_eq!(ws.read_with(cx, |ws, _| ws.nav.thread), Some(next));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.nav.thread), Some(order[to]));
+    assert!(list_focused(cx, window, &ws));
+    // Esc goes back to the search.
+    press(cx, window, "escape");
     assert!(search_focused(cx, window, &ws));
 
-    // Typing finds threads by title; the first is highlighted.
+    // Typing finds threads by title; the first is highlighted and ↵ in
+    // the search opens it.
     type_text(cx, window, "DEPS");
     assert!(has(cx, window, row(deps)));
     assert!(!has(cx, window, row(docs)));
@@ -545,4 +618,73 @@ fn keys_move_through_the_threads_and_the_selection_survives_the_switch(cx: &mut 
     // The footer opens Running now and settings.
     click(cx, window, "threads-footer-running");
     assert!(ws.read_with(cx, |ws, _| ws.running.is_some()));
+}
+
+#[gpui_kit::test]
+fn changes_ask_again_for_their_channels_only_once_they_pause(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let crewd_home = short_home();
+    let _daemon = Daemon::start(crewd_home.path().to_path_buf());
+    let home = short_home();
+    let seen = recording_proxy(
+        &home.path().join("crewd.sock"),
+        crewd_home.path().join("crewd.sock"),
+    );
+    let w = world(crewd_home.path(), &tmp.path().join("repo"), &[]);
+    let bugs: ChannelId = w.ask(Request::CreateChannel {
+        project: w.project,
+        name: "bugs".into(),
+    });
+    let crash = thread(&w, bugs, "fix the crash");
+    let (window, ws) = open(cx, home.path());
+    wait_until(cx, "the project", |cx| has(cx, window, row_of(w.channel)));
+    to_threads(cx, window);
+    wait_has(cx, window, row(crash));
+    let asked = || -> Vec<Option<Vec<ChannelId>>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                Request::ThreadSummaries { channels, .. } => Some(channels.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    wait_until(cx, "the first summaries", |_| !asked().is_empty());
+    assert_eq!(asked(), [None], "everything, once");
+
+    // Each change pushes the wait back.
+    let rename = |cx: &mut TestAppContext, title: &str| {
+        let _: serde_json::Value = w.ask(Request::RenameThread {
+            thread: w.thread,
+            title: title.into(),
+        });
+        let title = title.to_string();
+        wait_until(cx, "the new title", |cx| {
+            ws.read_with(cx, |ws, _| {
+                ws.state().thread(w.thread).map(|t| t.title.clone()) == Some(title.clone())
+            })
+        });
+    };
+    rename(cx, "one");
+    cx.executor().advance_clock(Duration::from_millis(300));
+    rename(cx, "two");
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(asked().len(), 1, "still settling");
+    cx.executor().advance_clock(Duration::from_millis(300));
+    wait_until(cx, "the changed channel", |_| asked().len() == 2);
+    assert_eq!(
+        asked()[1],
+        Some(vec![w.channel]),
+        "only the changed channel"
+    );
+
+    // Changes that never pause still go out within 2 s.
+    for n in 0..6 {
+        rename(cx, &format!("again {n}"));
+        cx.executor().advance_clock(Duration::from_millis(400));
+    }
+    wait_until(cx, "a capped wait", |_| asked().len() >= 3);
 }

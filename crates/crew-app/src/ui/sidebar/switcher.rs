@@ -311,9 +311,12 @@ impl Workspace {
         let state = self.state();
         let s = &self.sidebar.threads.switcher;
         let picked = self.sidebar.threads.project;
+        // As many as All projects lists, Show counted.
+        let shown = self.shown_projects(self.threads_now());
         let threads: usize = state
             .projects()
             .into_iter()
+            .filter(|p| shown.contains(&p.id))
             .flat_map(|p| state.channels(p.id))
             .map(|c| state.threads(c.id).len())
             .sum();
@@ -369,13 +372,7 @@ impl Workspace {
                             }),
                         Choice::Project(p) => {
                             let name = state.project(p).map(|p| p.name.clone()).unwrap_or_default();
-                            let badge = self
-                                .sidebar
-                                .threads
-                                .badges
-                                .get(&p)
-                                .cloned()
-                                .unwrap_or_default();
+                            let badge = self.sidebar.threads.badges.get(&p);
                             let status = match state.project_status(p) {
                                 ThreadStatus::NeedsYou => Some(("warning", "Needs you")),
                                 ThreadStatus::Working => Some(("accent-blue", "Agent working")),
@@ -383,7 +380,7 @@ impl Workspace {
                             };
                             row.aria_label(name.clone())
                                 .aria_selected(picked == Some(p))
-                                .child(project_badge(p, badge))
+                                .children(badge.map(project_badge))
                                 .child(div().flex_1().min_w_0().truncate().child(name))
                                 .children(status.map(|(token, word)| {
                                     div()

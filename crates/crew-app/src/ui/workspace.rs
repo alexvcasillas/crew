@@ -552,7 +552,7 @@ impl Workspace {
             self.refresh_usage(cx);
             self.refresh_history(cx);
         }
-        self.threads_touched(snapshot || !touched.is_empty() || !stale.is_empty());
+        self.threads_touched(&touched, &stale, snapshot, cx);
         self.channel_touched(&touched, &stale, snapshot);
         if !removed.is_empty() {
             self.leave_removed(&removed, window, cx);

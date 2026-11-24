@@ -496,7 +496,9 @@ impl Service {
                 json(made)
             }
             Request::ChannelOverview { channel } => self.channel_overview(channel).await,
-            Request::ThreadSummaries { project } => self.thread_summaries(project).await,
+            Request::ThreadSummaries { project, channels } => {
+                self.thread_summaries(project, channels).await
+            }
             Request::Runtimes => self.runtimes().await,
             Request::Search {
                 query,

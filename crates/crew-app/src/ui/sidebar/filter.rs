@@ -34,7 +34,7 @@ actions!(
 /// menus'.
 pub(crate) fn bindings() -> Vec<KeyBinding> {
     use super::switcher::{SwitcherClose, SwitcherDown, SwitcherPick, SwitcherUp};
-    use super::threads::{ThreadsClear, ThreadsDown, ThreadsOpen, ThreadsUp};
+    use super::threads::{ThreadsBack, ThreadsClear, ThreadsDown, ThreadsOpen, ThreadsUp};
     let field = Some("SidebarFilter > Input");
     let search = Some("ThreadsSearch > Input");
     let find = Some("ProjectSwitcher > Input");
@@ -48,6 +48,10 @@ pub(crate) fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("up", ThreadsUp, search),
         KeyBinding::new("enter", ThreadsOpen, search),
         KeyBinding::new("escape", ThreadsClear, search),
+        KeyBinding::new("down", ThreadsDown, Some("ThreadsList")),
+        KeyBinding::new("up", ThreadsUp, Some("ThreadsList")),
+        KeyBinding::new("enter", ThreadsOpen, Some("ThreadsList")),
+        KeyBinding::new("escape", ThreadsBack, Some("ThreadsList")),
         KeyBinding::new("down", SwitcherDown, find),
         KeyBinding::new("up", SwitcherUp, find),
         KeyBinding::new("enter", SwitcherPick, find),
@@ -481,8 +485,8 @@ pub(super) fn icon_button(
         .child(Icon::default().data(svg).size(ui_px(14.)))
 }
 
-/// The switch to the other sidebar, last in the bar, with the board's
-/// tooltip: "Show threads · switch sidebar" or "Show projects · …".
+/// The switch to the other sidebar, last in the bar. Hovered, its tip
+/// shows under it (see [`switch_tip`]).
 pub(super) fn switch_button(
     label: &'static str,
     svg: &'static [u8],
@@ -500,23 +504,45 @@ pub(super) fn switch_button(
         .text_color(color("text-secondary"))
         .hover(|b| b.bg(color("surface-300")).text_color(color("text-primary")))
         .aria_label(label)
-        .tooltip(move |window, cx| {
-            Tooltip::element(move |_, _| {
-                div()
-                    .flex()
-                    .gap(ui_px(8.))
-                    .text_size(scale::text(12.))
-                    .child(div().text_color(color("text-primary")).child(label))
-                    .child(
-                        div()
-                            .text_color(color("text-tertiary"))
-                            .child("· switch sidebar"),
-                    )
-            })
-            .build(window, cx)
-        })
         .child(Icon::default().data(svg).size(ui_px(14.)))
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if this.sidebar.switch_hovered != *hovered {
+                this.sidebar.switch_hovered = *hovered;
+                cx.notify();
+            }
+        }))
         .on_click(cx.listener(|this, _, _, cx| this.switch_sidebar(cx)))
+        .test_support()
+}
+
+/// The switch's tip, as the board has it: under the button, against
+/// the sidebar's right edge, "Show threads · switch sidebar".
+pub(super) fn switch_tip(label: &'static str) -> impl IntoElement {
+    div()
+        .id("sidebar-switch-tip")
+        .absolute()
+        .right(ui_px(4.))
+        .top(scale::row(44.))
+        .flex()
+        .items_center()
+        .gap(ui_px(8.))
+        .h(scale::row(26.))
+        .px(ui_px(8.))
+        .bg(color("surface-300"))
+        .border_1()
+        .border_color(color("border-200"))
+        .rounded(ui_px(6.))
+        .shadow_md()
+        .whitespace_nowrap()
+        .text_size(scale::text(12.))
+        .text_color(color("text-primary"))
+        .aria_label(format!("{label} · switch sidebar"))
+        .child(label)
+        .child(
+            div()
+                .text_color(color("text-tertiary"))
+                .child("· switch sidebar"),
+        )
         .test_support()
 }
 
