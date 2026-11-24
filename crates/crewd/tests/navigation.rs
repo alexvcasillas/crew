@@ -9,7 +9,7 @@ use std::time::Duration;
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
-use crew_core::store::{Author, Limits, StoredRun};
+use crew_core::store::{ApprovalStatus, Author, Limits, StoredRun};
 use crew_proto::{
     AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, SearchResults,
     ServerMsg, SetupFileSize, ThreadState, read_frame, write_frame,
@@ -477,8 +477,10 @@ async fn project_overview_sums_up_the_project() {
     let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
     assert!(o.root.exists);
     assert_eq!(o.root.branch.as_deref(), Some("main"));
-    // src/lib.rs, plus .env and certs that git doesn't ignore here.
-    assert_eq!(o.root.uncommitted, 3);
+    // src/lib.rs, plus .env and the two files in certs, which git
+    // doesn't ignore here.
+    assert!(o.root.is_repo);
+    assert_eq!(o.root.uncommitted, 4);
     assert_eq!(
         o.root.remote_url.as_deref(),
         Some("https://example.com/demo.git")
@@ -643,9 +645,9 @@ async fn projects_may_not_share_a_folder() {
         .await
         .unwrap_err();
     assert_eq!(again, "demo already uses this folder.");
-    // Once removed, the folder is free again.
+    // Once removed, adding the folder brings the same project back.
     c.call(Request::RemoveProject { project: p }).await.unwrap();
-    c.project("again", &root).await;
+    assert_eq!(c.project("again", &root).await, p);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -737,7 +739,12 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
             limit: 50,
         })
         .await;
-    assert!(history.is_empty());
+    // The stopped run stays in the history; the queued one never started.
+    assert_eq!(
+        history.iter().map(|r| r.thread).collect::<Vec<_>>(),
+        [busy],
+        "runs stay for history"
+    );
     assert!(c.search("waiting", None).await.threads.is_empty());
     assert!(root.join("a.txt").exists());
     assert!(worktree.path.is_dir(), "the worktree stays");
@@ -746,4 +753,71 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         "the branch stays"
     );
     assert!(c.call(Request::RemoveProject { project: p }).await.is_err());
+}
+
+/// A fake claude that edits like `writing_claude` and replies asking
+/// Scout to check its work, which asks you first.
+fn mentioning_claude(dir: &Path) -> PathBuf {
+    let fixture_text = std::fs::read_to_string(fixture("edit_and_test.jsonl"))
+        .unwrap()
+        .replace("\"Fixed.\"", "\"Fixed. @Scout please check it.\"");
+    let path = dir.join("mentions.jsonl");
+    std::fs::write(&path, fixture_text).unwrap();
+    script(
+        &dir.join("claude-mentions.sh"),
+        &format!(
+            "exec '{}' '{}'\n",
+            fake("claude_ok.sh").display(),
+            path.display()
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back() {
+    let bins = tempfile::tempdir().unwrap();
+    let d = Daemon::start(mentioning_claude(bins.path())).await;
+    let root = d.path("demo");
+    repo(&root, &["a.txt"]);
+    let mut c = d.client().await;
+    let p = c.project("demo", &root).await;
+    let general = c.channel(p, "general").await;
+    let t = c.thread(general, "Fix it").await;
+    c.agent("Forge", PermissionMode::Auto).await;
+    c.agent("Scout", PermissionMode::ReadOnly).await;
+    c.call(Request::SubscribeAll).await.unwrap();
+    c.call(Request::Subscribe { thread: t }).await.unwrap();
+    c.post(t, "@Forge go").await;
+    c.run_reaches(t, RunStatus::Done).await;
+    c.until(|m| matches!(m, ServerMsg::Approval { approval, .. } if approval.status == ApprovalStatus::Pending))
+        .await;
+
+    c.call(Request::RemoveProject { project: p }).await.unwrap();
+    let seen = c
+        .until(|m| matches!(m, ServerMsg::ProjectRemoved { project } if *project == p))
+        .await;
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        ServerMsg::Approval { approval, .. } if approval.status == ApprovalStatus::Cancelled
+    )));
+    assert!(seen.iter().any(|m| matches!(
+        m,
+        ServerMsg::Message { message, .. }
+            if message.body == "Closed because the project was removed."
+    )));
+    let pending: Vec<serde_json::Value> = c.ok(Request::ListApprovals { thread: None }).await;
+    assert!(pending.is_empty(), "nothing waits for you any more");
+    assert!(
+        c.call(Request::ProjectOverview { project: p })
+            .await
+            .is_err()
+    );
+
+    // Adding the folder again brings the project back as it was.
+    assert_eq!(c.project("demo again", &root).await, p);
+    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    assert_eq!(o.channels[0].channel, general);
+    assert_eq!(o.recent_threads[0].thread, t);
+    let r = c.search("fix it", Some(p)).await;
+    assert_eq!(r.threads[0].thread, t);
 }

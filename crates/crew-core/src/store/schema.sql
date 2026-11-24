@@ -5,7 +5,8 @@ CREATE TABLE projects (
     main_branch TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     setup_command TEXT,
-    copy_files TEXT NOT NULL DEFAULT '[]'
+    copy_files TEXT NOT NULL DEFAULT '[]',
+    removed_at INTEGER
 );
 
 CREATE TABLE channels (

@@ -353,6 +353,22 @@ impl Store {
         Ok(Store { conn })
     }
 
+    /// A second, read-only connection to the same database file, for
+    /// reads that may take a while without holding up writers: the
+    /// database is in WAL mode, so readers and a writer go side by side.
+    /// `None` for an in-memory database.
+    pub fn open_reader(&self) -> Result<Option<Store>> {
+        let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
+            return Ok(None);
+        };
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Some(Store { conn }))
+    }
+
     fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -491,7 +507,7 @@ impl Store {
 
     pub fn rename_project(&self, p: ProjectId, name: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            "UPDATE projects SET name = ?2 WHERE id = ?1 AND removed_at IS NULL",
             params![p.to_string(), name],
         )?;
         if changed == 0 {
@@ -500,37 +516,54 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the project with its channels, threads, messages, runs,
-    /// events and approvals. Nothing on disk is touched.
+    /// Marks the project removed. It drops out of [`Self::projects`] and
+    /// [`Self::project`], and its threads out of the thread searches, but
+    /// its channels, threads and runs stay for history.
     pub fn remove_project(&self, p: ProjectId) -> Result<()> {
-        const THREADS: &str = "SELECT t.id FROM threads t JOIN channels c ON c.id = t.channel_id
-             WHERE c.project_id = ?1";
-        let tx = self.conn.unchecked_transaction()?;
-        let id = p.to_string();
-        for sql in [
-            format!("DELETE FROM messages WHERE thread_id IN ({THREADS})"),
-            format!("DELETE FROM approvals WHERE thread_id IN ({THREADS})"),
-            format!(
-                "DELETE FROM events WHERE run_id IN
-                 (SELECT id FROM runs WHERE thread_id IN ({THREADS}))"
-            ),
-            format!("DELETE FROM runs WHERE thread_id IN ({THREADS})"),
-            "DELETE FROM threads WHERE channel_id IN
-             (SELECT id FROM channels WHERE project_id = ?1)"
-                .to_string(),
-            "DELETE FROM channels WHERE project_id = ?1".to_string(),
-        ] {
-            tx.execute(&sql, [&id])?;
-        }
-        let changed = tx.execute("DELETE FROM projects WHERE id = ?1", [&id])?;
+        let changed = self.conn.execute(
+            "UPDATE projects SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+            params![p.to_string(), now_ms()],
+        )?;
         if changed == 0 {
             return Err(StoreError::NotFound("project"));
         }
-        tx.commit()?;
         Ok(())
     }
 
-    pub fn projects(&self) -> Result<Vec<StoredProject>> {
+    /// Removed projects, the most recently removed first.
+    pub fn removed_projects(&self) -> Result<Vec<StoredProject>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{PROJECT_COLUMNS} WHERE p.removed_at IS NOT NULL
+             ORDER BY p.removed_at DESC, p.rowid DESC"
+        ))?;
+        let rows = stmt.query_map([], read_project)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Brings a removed project back under `name`, with its channels and
+    /// threads.
+    pub fn restore_project(&self, p: ProjectId, name: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE projects SET removed_at = NULL, name = ?2
+             WHERE id = ?1 AND removed_at IS NOT NULL",
+            params![p.to_string(), name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("removed project"));
+        }
+        Ok(())
+    }
+
+    /// Runs `f` in one transaction: all of its writes are saved, or none.
+    pub fn in_transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Every project, removed ones included, in the order they were made.
+    pub fn all_projects(&self) -> Result<Vec<StoredProject>> {
         let mut stmt = self
             .conn
             .prepare(&format!("{PROJECT_COLUMNS} ORDER BY p.created_at, p.rowid"))?;
@@ -538,11 +571,21 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
+    /// Projects that aren't removed.
+    pub fn projects(&self) -> Result<Vec<StoredProject>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{PROJECT_COLUMNS} WHERE p.removed_at IS NULL ORDER BY p.created_at, p.rowid"
+        ))?;
+        let rows = stmt.query_map([], read_project)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// A project that isn't removed.
     pub fn project(&self, p: ProjectId) -> Result<StoredProject> {
         let row = self
             .conn
             .query_row(
-                &format!("{PROJECT_COLUMNS} WHERE p.id = ?1"),
+                &format!("{PROJECT_COLUMNS} WHERE p.id = ?1 AND p.removed_at IS NULL"),
                 [p.to_string()],
                 read_project,
             )
@@ -711,10 +754,10 @@ impl Store {
     }
 
     /// Threads that aren't archived, of one project or of all of them.
+    /// Removed projects are left out.
     pub fn open_threads(&self, p: Option<ProjectId>) -> Result<Vec<StoredThread>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{THREAD_COLUMNS} WHERE archived_at IS NULL AND (?1 IS NULL OR channel_id IN
-               (SELECT id FROM channels WHERE project_id = ?1))
+            "{THREAD_COLUMNS} WHERE archived_at IS NULL AND channel_id IN ({OPEN_CHANNELS})
              ORDER BY created_at, rowid"
         ))?;
         let rows = stmt.query_map([p.map(|p| p.to_string())], read_thread)?;
@@ -731,21 +774,36 @@ impl Store {
         rows.map(|r| r?).collect()
     }
 
-    /// Threads that aren't archived with a message from you or an agent
-    /// holding `needle`, which must be lowercase. Matching is ASCII case
-    /// insensitive.
-    pub fn threads_mentioning(&self, needle: &str, p: Option<ProjectId>) -> Result<Vec<ThreadId>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT m.thread_id FROM messages m JOIN threads t ON t.id = m.thread_id
+    /// Threads that aren't archived, of projects that aren't removed,
+    /// with a message from you or an agent holding `needle`, which must be
+    /// lowercase. Only the newest `cap` such messages are read, so the
+    /// cost stays bounded however long the history is. Matching folds case
+    /// for any script.
+    pub fn threads_mentioning(
+        &self,
+        needle: &str,
+        p: Option<ProjectId>,
+        cap: u32,
+    ) -> Result<Vec<ThreadId>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT m.thread_id, m.body FROM messages m JOIN threads t ON t.id = m.thread_id
              WHERE t.archived_at IS NULL AND m.author_kind <> 'system'
-               AND (?2 IS NULL OR t.channel_id IN
-                 (SELECT id FROM channels WHERE project_id = ?2))
-               AND instr(lower(m.body), ?1) > 0",
-        )?;
-        let rows = stmt.query_map(params![needle, p.map(|p| p.to_string())], |r| {
-            Ok(ThreadId(uuid_col(r, 0)?))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+               AND t.channel_id IN ({OPEN_CHANNELS})
+             ORDER BY m.rowid DESC LIMIT ?2"
+        ))?;
+        let mut rows = stmt.query(params![p.map(|p| p.to_string()), cap])?;
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(row) = rows.next()? {
+            let body = row.get_ref(1)?.as_str().unwrap_or_default();
+            if body.to_lowercase().contains(needle) {
+                let thread = ThreadId(uuid_col(row, 0)?);
+                if seen.insert(thread) {
+                    found.push(thread);
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub fn rename_thread(&self, t: ThreadId, title: &str) -> Result<()> {
@@ -1200,10 +1258,15 @@ impl Store {
     }
 
     /// Runs that are queued or working, plus those that ended at or after
-    /// `ended_since` (Unix ms), in order.
+    /// `ended_since` (Unix ms), in order. Runs of removed projects are left
+    /// out.
     pub fn recent_runs(&self, ended_since: i64) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{RUN_COLUMNS} WHERE status IN (?1, ?2) OR ended_at >= ?3 ORDER BY ord"
+            "{RUN_COLUMNS} WHERE (status IN (?1, ?2) OR ended_at >= ?3)
+             AND thread_id NOT IN (SELECT t.id FROM threads t
+               JOIN channels c ON c.id = t.channel_id
+               JOIN projects p ON p.id = c.project_id WHERE p.removed_at IS NOT NULL)
+             ORDER BY ord"
         ))?;
         let rows = stmt.query_map(
             params![
@@ -1297,6 +1360,11 @@ fn read_agent(r: &Row) -> rusqlite::Result<Result<StoredAgent>> {
         })
         .map_err(StoreError::from))
 }
+
+/// Channels of projects that aren't removed, narrowed to project `?1`
+/// when it is set.
+const OPEN_CHANNELS: &str = "SELECT c.id FROM channels c JOIN projects p ON p.id = c.project_id
+     WHERE p.removed_at IS NULL AND (?1 IS NULL OR p.id = ?1)";
 
 const PROJECT_COLUMNS: &str = "SELECT p.id, p.name, p.root, p.main_branch, p.created_at,
      p.setup_command, p.copy_files FROM projects p";

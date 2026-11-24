@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
+use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, Limits, RunFilter, Store, StoreError, ThreadWorktree,
@@ -1400,7 +1401,7 @@ fn handoff_runs_remember_who_brought_them_in() {
 }
 
 #[test]
-fn a_project_is_renamed_and_removed_with_all_it_holds() {
+fn a_removed_project_leaves_the_lists_but_keeps_its_history() {
     let store = Store::open_in_memory().unwrap();
     let p = store
         .create_project("demo", Path::new("/work/demo"), "main")
@@ -1411,34 +1412,14 @@ fn a_project_is_renamed_and_removed_with_all_it_holds() {
     store.rename_project(p, "Demo app").unwrap();
     assert_eq!(store.project(p).unwrap().name, "Demo app");
     let a = store.create_agent(&spec("Ada")).unwrap();
-    let keep = {
-        let c = store.create_channel(other, "general").unwrap();
-        let t = store.create_thread(c, "kept").unwrap();
-        let r = store.create_run(t, a).unwrap();
-        store.add_message(t, Author::You, "hi", None).unwrap();
-        (c, t, r)
-    };
+    let kept = store
+        .create_thread(store.create_channel(other, "general").unwrap(), "kept")
+        .unwrap();
     let c = store.create_channel(p, "general").unwrap();
     let t = store.create_thread(c, "gone").unwrap();
     let r = store.create_run(t, a).unwrap();
     store
-        .append_event(r, &Event::Message { text: "x".into() })
-        .unwrap();
-    let handed = store.create_handoff_run(t, a, r).unwrap();
-    let approval = store
-        .create_approval(
-            t,
-            r,
-            &ApprovalKind::Permission {
-                tool: "Bash".into(),
-                input: serde_json::json!({}),
-                tool_use_id: None,
-            },
-        )
-        .unwrap();
-    store.add_approval_message(t, "ask", r, approval).unwrap();
-    store
-        .add_message(t, Author::Agent(a), "done", Some(r))
+        .add_message(t, Author::You, "gone for good", None)
         .unwrap();
 
     store.remove_project(p).unwrap();
@@ -1446,17 +1427,29 @@ fn a_project_is_renamed_and_removed_with_all_it_holds() {
         store.project(p),
         Err(StoreError::NotFound("project"))
     ));
-    assert!(store.channel(c).is_err());
-    assert!(store.thread(t).is_err());
-    assert!(store.run(r).is_err());
-    assert!(store.run(handed).is_err());
-    assert!(store.pending_approvals(None).unwrap().is_empty());
-    // The other project and the agent stay.
-    assert_eq!(store.projects().unwrap().len(), 1);
-    assert_eq!(store.thread(keep.1).unwrap().channel, keep.0);
-    assert!(store.run(keep.2).is_ok());
-    assert_eq!(store.messages(keep.1).unwrap().len(), 1);
-    assert!(store.agent(a).is_ok());
+    let ids = |v: Vec<crew_core::store::StoredProject>| v.iter().map(|p| p.id).collect::<Vec<_>>();
+    assert_eq!(ids(store.projects().unwrap()), [other]);
+    assert_eq!(ids(store.all_projects().unwrap()), [p, other]);
+    assert_eq!(ids(store.removed_projects().unwrap()), [p]);
+    // Its threads leave the searches and the snapshot's runs, but stay.
+    let open: Vec<_> = store
+        .open_threads(None)
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(open, [kept]);
+    assert!(store.open_threads(Some(p)).unwrap().is_empty());
+    assert!(
+        store
+            .threads_mentioning("gone", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.recent_runs(0).unwrap().is_empty());
+    assert_eq!(store.thread(t).unwrap().channel, c);
+    assert_eq!(store.run(r).unwrap().thread, t);
+    assert_eq!(store.project_of_thread(t).unwrap().id, p);
     assert!(matches!(
         store.remove_project(p),
         Err(StoreError::NotFound("project"))
@@ -1465,6 +1458,77 @@ fn a_project_is_renamed_and_removed_with_all_it_holds() {
         store.rename_project(p, "x"),
         Err(StoreError::NotFound("project"))
     ));
+
+    // Restored, it comes back with what it held.
+    store.restore_project(p, "demo").unwrap();
+    assert_eq!(store.project(p).unwrap().name, "demo");
+    assert_eq!(store.open_threads(Some(p)).unwrap()[0].id, t);
+    assert!(store.removed_projects().unwrap().is_empty());
+    assert!(store.restore_project(p, "demo").is_err());
+}
+
+#[test]
+fn a_transaction_keeps_all_or_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let failed = store.in_transaction(|s| {
+        s.rename_project(p, "renamed")?;
+        s.remove_project(ProjectId::new())
+    });
+    assert!(failed.is_err());
+    assert_eq!(store.project(p).unwrap().name, "demo");
+    store
+        .in_transaction(|s| s.rename_project(p, "renamed"))
+        .unwrap();
+    assert_eq!(store.project(p).unwrap().name, "renamed");
+}
+
+#[test]
+fn message_search_reads_only_the_newest_messages_and_folds_any_case() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let old = store.create_thread(c, "old").unwrap();
+    let new = store.create_thread(c, "new").unwrap();
+    store
+        .add_message(old, Author::You, "the needle", None)
+        .unwrap();
+    store
+        .add_message(new, Author::You, "École rules", None)
+        .unwrap();
+    store.add_message(new, Author::You, "filler", None).unwrap();
+    assert_eq!(store.threads_mentioning("needle", None, 3).unwrap(), [old]);
+    // Past the cap, the older message isn't read.
+    assert!(
+        store
+            .threads_mentioning("needle", None, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.threads_mentioning("école", None, 2).unwrap(), [new]);
+}
+
+#[test]
+fn a_reader_sees_what_the_store_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("crew.db")).unwrap();
+    let reader = store.open_reader().unwrap().expect("a file database");
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    assert_eq!(reader.project(p).unwrap().name, "demo");
+    assert!(reader.rename_project(p, "x").is_err(), "read only");
+    assert!(
+        Store::open_in_memory()
+            .unwrap()
+            .open_reader()
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1496,13 +1560,21 @@ fn open_threads_and_message_matches_leave_archived_ones_out() {
     assert_eq!(ids(store.open_threads(None).unwrap()), [open, elsewhere]);
     assert_eq!(ids(store.project_threads(p).unwrap()), [open, archived]);
 
-    assert_eq!(store.threads_mentioning("parser", Some(p)).unwrap(), [open]);
-    let mut all = store.threads_mentioning("parser", None).unwrap();
+    assert_eq!(
+        store.threads_mentioning("parser", Some(p), 100).unwrap(),
+        [open]
+    );
+    let mut all = store.threads_mentioning("parser", None, 100).unwrap();
     all.sort_by_key(|t| t.to_string());
     let mut want = vec![open, elsewhere];
     want.sort_by_key(|t| t.to_string());
     assert_eq!(all, want);
-    assert!(store.threads_mentioning("note", None).unwrap().is_empty());
+    assert!(
+        store
+            .threads_mentioning("note", None, 100)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

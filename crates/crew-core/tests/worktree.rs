@@ -361,4 +361,38 @@ fn root_info_reads_branch_changes_and_remote() {
     let gone = worktree::root_info(&tmp.path().join("gone"));
     assert!(!gone.exists);
     assert_eq!(gone.branch, None);
+
+    let plain = tmp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let info = worktree::root_info(&plain);
+    assert!(info.exists);
+    assert!(!info.is_repo);
+    // An older answer without the field reads as a repo.
+    let old: worktree::RootInfo = serde_json::from_str(r#"{"exists":true}"#).unwrap();
+    assert!(old.is_repo);
+}
+
+#[test]
+fn a_root_inside_a_repo_lists_and_counts_only_its_own_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("root");
+    repo(&repo_dir);
+    let app = repo_dir.join("app");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(app.join("main.rs"), "m").unwrap();
+    git(&repo_dir, &["add", "-A"]);
+    git(&repo_dir, &["commit", "-q", "-m", "app"]);
+    fs::write(app.join("main.rs"), "edited").unwrap();
+    fs::write(app.join("src/new.rs"), "n").unwrap();
+    fs::write(repo_dir.join("a.txt"), "outside").unwrap();
+
+    let mut list = worktree::list_files(&app).unwrap();
+    list.files.sort();
+    assert_eq!(list.files, ["main.rs", "src/new.rs"]);
+    let mut changed: Vec<&String> = list.changed.iter().collect();
+    changed.sort();
+    assert_eq!(changed, ["main.rs", "src/new.rs"]);
+    let info = worktree::root_info(&app);
+    assert!(info.is_repo);
+    assert_eq!(info.uncommitted, 2, "the edit outside app doesn't count");
 }

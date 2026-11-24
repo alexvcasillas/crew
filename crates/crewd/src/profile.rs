@@ -284,9 +284,22 @@ impl Service {
         let mut threads = Vec::new();
         {
             let db = self.db();
+            let open: HashSet<ProjectId> = db
+                .store
+                .projects()
+                .map_err(err)?
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
             for (&thread, &at) in &latest {
                 let row = db.store.thread(thread).map_err(err)?;
-                projects.insert(db.store.channel(row.channel).map_err(err)?.project);
+                let project = db.store.channel(row.channel).map_err(err)?.project;
+                // Runs in removed projects stay in the history, but the
+                // project and its threads are no longer listed.
+                if !open.contains(&project) {
+                    continue;
+                }
+                projects.insert(project);
                 if row.archived_at.is_none() {
                     threads.push((at, thread));
                 }

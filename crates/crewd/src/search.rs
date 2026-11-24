@@ -24,6 +24,8 @@ use crate::service::{Reply, Service, blocking, json, log};
 const STALE: Duration = Duration::from_secs(30);
 /// Checkouts listed at once when a search finds them missing.
 const LIST_AT_ONCE: usize = 8;
+/// Newest messages read when matching message text.
+const MESSAGE_CAP: u32 = 20_000;
 /// Most results per section.
 const MAX_LIMIT: u32 = 200;
 
@@ -188,98 +190,96 @@ impl Service {
         let mut out = SearchResults::default();
         let mut totals = SearchTotals::default();
 
-        let db = self.db();
-        let err = |e: crew_core::store::StoreError| e.to_string();
-        let projects: Vec<StoredProject> = match project {
-            Some(p) => vec![db.store.project(p).map_err(err)?],
-            None => db.store.projects().map_err(err)?,
-        };
+        // Read on the search connection, so writers never wait for it.
+        let (projects, threads, project_of) = self.with_reader(|store| {
+            let err = |e: crew_core::store::StoreError| e.to_string();
+            let projects: Vec<StoredProject> = match project {
+                Some(p) => vec![store.project(p).map_err(err)?],
+                None => store.projects().map_err(err)?,
+            };
 
-        // Threads: title matches, then message matches.
-        let threads = db.store.open_threads(project).map_err(err)?;
-        let mut hits: Vec<(u8, i64, usize)> = threads
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                rank(&t.title.to_lowercase(), &needle).map(|r| (r, -t.created_at, i))
-            })
-            .collect();
-        let titled: HashSet<ThreadId> = hits.iter().map(|(_, _, i)| threads[*i].id).collect();
-        let mentioned: HashSet<ThreadId> = db
-            .store
-            .threads_mentioning(&needle, project)
-            .map_err(err)?
-            .into_iter()
-            .filter(|t| !titled.contains(t))
-            .collect();
-        hits.extend(
-            threads
+            // Threads: title matches, then message matches.
+            let threads = store.open_threads(project).map_err(err)?;
+            let mut hits: Vec<(u8, i64, usize)> = threads
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| mentioned.contains(&t.id))
-                .map(|(i, t)| (3, -t.created_at, i)),
-        );
-        hits.sort();
-        totals.threads = count(hits.len());
-        hits.truncate(limit);
-        let waiting: HashSet<ThreadId> = db
-            .store
-            .pending_approvals(None)
-            .map_err(err)?
-            .into_iter()
-            .map(|a| a.thread)
-            .collect();
-        for (_, _, i) in hits {
-            let t = &threads[i];
-            let runs = db
-                .store
-                .runs(RunFilter {
-                    status: None,
-                    thread: Some(t.id),
+                .filter_map(|(i, t)| {
+                    rank(&t.title.to_lowercase(), &needle).map(|r| (r, -t.created_at, i))
                 })
-                .map_err(err)?;
-            out.threads.push(ThreadHit {
-                thread: t.id,
-                title: t.title.clone(),
-                channel: t.channel,
-                state: thread_state(&runs, waiting.contains(&t.id)),
-            });
-        }
+                .collect();
+            let titled: HashSet<ThreadId> = hits.iter().map(|(_, _, i)| threads[*i].id).collect();
+            let mentioned: HashSet<ThreadId> = store
+                .threads_mentioning(&needle, project, MESSAGE_CAP)
+                .map_err(err)?
+                .into_iter()
+                .filter(|t| !titled.contains(t))
+                .collect();
+            hits.extend(
+                threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| mentioned.contains(&t.id))
+                    .map(|(i, t)| (3, -t.created_at, i)),
+            );
+            hits.sort();
+            totals.threads = count(hits.len());
+            hits.truncate(limit);
+            let waiting: HashSet<ThreadId> = store
+                .pending_approvals(None)
+                .map_err(err)?
+                .into_iter()
+                .map(|a| a.thread)
+                .collect();
+            for (_, _, i) in hits {
+                let t = &threads[i];
+                let runs = store
+                    .runs(RunFilter {
+                        status: None,
+                        thread: Some(t.id),
+                    })
+                    .map_err(err)?;
+                out.threads.push(ThreadHit {
+                    thread: t.id,
+                    title: t.title.clone(),
+                    channel: t.channel,
+                    state: thread_state(&runs, waiting.contains(&t.id)),
+                });
+            }
 
-        // Channels of the projects searched.
-        let mut channels = Vec::new();
-        let mut project_of = HashMap::new();
-        for p in &projects {
-            for c in db.store.channels(p.id).map_err(err)? {
-                project_of.insert(c.id, p.id);
-                if let Some(r) = rank(&c.name.to_lowercase(), &needle) {
-                    channels.push((r, c.name.len(), c.name, c.id));
+            // Channels of the projects searched.
+            let mut channels = Vec::new();
+            let mut project_of = HashMap::new();
+            for p in &projects {
+                for c in store.channels(p.id).map_err(err)? {
+                    project_of.insert(c.id, p.id);
+                    if let Some(r) = rank(&c.name.to_lowercase(), &needle) {
+                        channels.push((r, c.name.len(), c.name, c.id));
+                    }
                 }
             }
-        }
-        channels.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
-        totals.channels = count(channels.len());
-        out.channels = channels
-            .into_iter()
-            .take(limit)
-            .map(|(.., id)| id)
-            .collect();
+            channels.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+            totals.channels = count(channels.len());
+            out.channels = channels
+                .into_iter()
+                .take(limit)
+                .map(|(.., id)| id)
+                .collect();
 
-        // Agents that aren't deleted, wherever they work.
-        let mut agents: Vec<_> = db
-            .store
-            .agents()
-            .map_err(err)?
-            .into_iter()
-            .filter_map(|(id, spec)| {
-                rank(&spec.name.to_lowercase(), &needle)
-                    .map(|r| (r, spec.name.len(), spec.name, id))
-            })
-            .collect();
-        agents.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
-        totals.agents = count(agents.len());
-        out.agents = agents.into_iter().take(limit).map(|(.., id)| id).collect();
-        drop(db);
+            // Agents that aren't deleted, wherever they work.
+            let mut agents: Vec<_> = store
+                .agents()
+                .map_err(err)?
+                .into_iter()
+                .filter_map(|(id, spec)| {
+                    rank(&spec.name.to_lowercase(), &needle)
+                        .map(|r| (r, spec.name.len(), spec.name, id))
+                })
+                .collect();
+            agents.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+            totals.agents = count(agents.len());
+            out.agents = agents.into_iter().take(limit).map(|(.., id)| id).collect();
+            Ok::<_, String>((projects, threads, project_of))
+        })?;
 
         // Files: each root first, so a worktree's unchanged copy of a root
         // file is left out.
@@ -305,7 +305,10 @@ impl Service {
                 }
             }
         }
-        checkouts.retain(|c| c.dir.is_dir());
+        // Projects that share a folder (made before that was refused) list
+        // it once.
+        let mut dirs = HashSet::new();
+        checkouts.retain(|c| c.dir.is_dir() && dirs.insert(c.dir.clone()));
         let lists = self.file_lists(&checkouts);
         let mut files: Vec<(u8, bool, usize, &str, FileHit)> = Vec::new();
         let mut seen: HashSet<(ProjectId, &str)> = HashSet::new();

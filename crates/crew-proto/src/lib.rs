@@ -38,6 +38,8 @@ pub enum Request {
     Hello {
         version: u32,
     },
+    /// Answered with the project's id. Refused if another project uses
+    /// the folder; a removed one with the folder comes back instead.
     CreateProject {
         name: String,
         root: String,
@@ -241,6 +243,7 @@ pub enum Request {
         query: String,
         #[serde(default)]
         project: Option<ProjectId>,
+        #[serde(default = "default_search_limit")]
         limit: u32,
     },
     /// Answered with a [`ProjectOverview`].
@@ -256,13 +259,20 @@ pub enum Request {
         project: ProjectId,
         name: String,
     },
-    /// Forgets the project and everything Crew kept about it. Its folder,
-    /// branches and worktrees stay on disk. Refused while one of its runs
-    /// is live; queued ones are dropped. Answered with null; every client
-    /// gets a [`ServerMsg::ProjectRemoved`].
+    /// Removes the project from Crew. It leaves the snapshot, search and
+    /// overviews; its runs stay in the run history. Its folder, branches
+    /// and worktrees stay on disk. Refused while one of its runs is live;
+    /// queued ones are dropped and pending approvals closed, each with a
+    /// note. Adding its folder again brings it back with its channels and
+    /// threads. Answered with null; every client gets a
+    /// [`ServerMsg::ProjectRemoved`].
     RemoveProject {
         project: ProjectId,
     },
+}
+
+fn default_search_limit() -> u32 {
+    50
 }
 
 /// Where a thread stands, for a row or a status pill.
@@ -415,11 +425,13 @@ pub enum SetupFileSize {
 #[serde(default)]
 pub struct AgentProfile {
     pub stats: AgentStats,
-    /// Projects it has runs in.
+    /// Projects it has runs in, removed ones left out.
     pub projects: u32,
-    /// Its 20 latest runs that started, newest first.
+    /// Its 20 latest runs that started, newest first. Runs in removed
+    /// projects stay here.
     pub recent_runs: Vec<RunRow>,
-    /// Threads it has runs in that aren't archived, latest activity first.
+    /// Threads it has runs in that aren't archived, of projects that
+    /// aren't removed, latest activity first.
     pub threads: Vec<ThreadId>,
 }
 
@@ -700,7 +712,8 @@ pub enum ServerMsg {
     },
     /// A project was created or its settings changed.
     ProjectChanged { project: StoredProject },
-    /// A project was removed from Crew, with its channels and threads.
+    /// A project was removed from Crew: drop it with its channels and
+    /// threads.
     ProjectRemoved { project: ProjectId },
     /// A channel was created or its settings changed.
     ChannelChanged { channel: StoredChannel },
@@ -972,6 +985,8 @@ mod tests {
         let req: Request =
             serde_json::from_str(r#"{"type":"search","query":"x","limit":3}"#).unwrap();
         assert!(matches!(req, Request::Search { project: None, .. }));
+        let req: Request = serde_json::from_str(r#"{"type":"search","query":"x"}"#).unwrap();
+        assert!(matches!(req, Request::Search { limit: 50, .. }));
 
         let overview = ProjectOverview {
             setup_files: vec![SetupFile {
