@@ -124,26 +124,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(
-                sidebar_row(format!("project-{id}"))
-                    .gap(ui_px(6.))
-                    .aria_label(project.name.clone())
-                    .child(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(ui_px(14.))
-                        .text_color(color("text-tertiary")),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_weight(weight(FontWeight::MEDIUM))
-                            .child(project.name.clone()),
-                    )
+                project_row(format!("project-{id}"), project.name.clone(), open)
                     .when_some(status_dot(status), |row, dot| row.child(dot))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_project(id, cx)))
                     .test_support(),
@@ -155,37 +136,17 @@ impl Workspace {
         let id = channel.id;
         let selected = self.nav.channel == Some(id);
         let badge = self.channel_badge(id);
-        let name = format!("#{}", channel.name);
-        sidebar_row(format!("channel-{id}"))
-            .pl(ui_px(28.))
-            .gap(ui_px(4.))
-            .when(selected, |row| row.bg(color("surface-300")))
-            .text_color(color(if selected {
-                "text-primary"
-            } else {
-                "text-secondary"
-            }))
-            .aria_label(name)
-            .child(
-                div()
-                    .font_family(code_family())
-                    .text_size(scale::mono(13.))
-                    .text_color(color("text-tertiary"))
-                    .child("#"),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(channel.name.clone())
-                    .map(|label| with_font_probe(label, || format!("channel-label-{id}"))),
-            )
-            .child(render_badge(id, &badge))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_channel(id, window, cx);
-            }))
-            .test_support()
+        channel_row(
+            format!("channel-{id}"),
+            channel.name.clone(),
+            selected,
+            format!("channel-label-{id}"),
+        )
+        .child(render_badge(id, &badge))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.select_channel(id, window, cx);
+        }))
+        .test_support()
     }
 
     /// "In terminal · N" under a project with terminal sessions, and the
@@ -348,6 +309,65 @@ impl Workspace {
         self.sync_terminal_ticker(cx);
         cx.notify();
     }
+}
+
+/// A project's row: a chevron, open or closed, and its name.
+pub(super) fn project_row(id: String, name: String, open: bool) -> Stateful<Div> {
+    sidebar_row(id)
+        .gap(ui_px(6.))
+        .aria_label(name.clone())
+        .child(
+            Icon::new(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(ui_px(14.))
+            .text_color(color("text-tertiary")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_weight(weight(FontWeight::MEDIUM))
+                .child(name),
+        )
+}
+
+/// A channel's row under its project: `#` and its name. Tests read the
+/// name's text size under `probe`.
+pub(super) fn channel_row(
+    id: String,
+    name: String,
+    selected: bool,
+    probe: String,
+) -> Stateful<Div> {
+    sidebar_row(id)
+        .pl(ui_px(28.))
+        .gap(ui_px(4.))
+        .when(selected, |row| row.bg(color("surface-300")))
+        .text_color(color(if selected {
+            "text-primary"
+        } else {
+            "text-secondary"
+        }))
+        .aria_label(format!("#{name}"))
+        .child(
+            div()
+                .font_family(code_family())
+                .text_size(scale::mono(13.))
+                .text_color(color("text-tertiary"))
+                .child("#"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(name)
+                .map(|label| with_font_probe(label, || probe)),
+        )
 }
 
 /// A 28 px sidebar row.

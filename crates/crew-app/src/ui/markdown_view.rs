@@ -71,25 +71,9 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
             .text_size(scale::text(14.))
             .child(rich_text(text, names, &key, FontWeight::SEMIBOLD))
             .into_any_element(),
-        Block::Code(code) => div()
-            .flex()
-            .flex_col()
+        Block::Code(code) => code_block()
             .px(ui_px(10.))
-            .py(scale::row(8.))
-            .bg(color("surface-100"))
-            .border_1()
-            .border_color(color("border-100"))
-            .rounded(ui_px(6.))
-            .overflow_hidden()
-            .font_family(code_family())
-            .text_size(scale::mono(12.))
-            .line_height(scale::mono_line(18.))
-            .text_color(color("text-primary"))
-            .children(code.split('\n').map(|line| {
-                div()
-                    .whitespace_nowrap()
-                    .child(if line.is_empty() { " " } else { line }.to_string())
-            }))
+            .children(code.split('\n').map(code_line))
             .into_any_element(),
         Block::List { start, items } => div()
             .flex()
@@ -120,6 +104,30 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
             .into_any_element(),
         Block::Table { aligns, head, rows } => table(aligns, head, rows, names, &key),
     }
+}
+
+/// The box a code block's lines sit in.
+pub fn code_block() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .py(scale::row(8.))
+        .bg(color("surface-100"))
+        .border_1()
+        .border_color(color("border-100"))
+        .rounded(ui_px(6.))
+        .overflow_hidden()
+        .font_family(code_family())
+        .text_size(scale::mono(12.))
+        .line_height(scale::mono_line(18.))
+        .text_color(color("text-primary"))
+}
+
+/// One line of a code block, kept on one line.
+pub fn code_line(line: &str) -> Div {
+    div()
+        .whitespace_nowrap()
+        .child(if line.is_empty() { " " } else { line }.to_string())
 }
 
 /// A table in a bordered box as wide as the space it has. Columns share

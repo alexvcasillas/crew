@@ -1,7 +1,8 @@
-//! Settings, in place of the body: General, Agents, Runtimes, Handoffs
-//! and limits, Projects and Shortcuts.
+//! Settings, in place of the body: General, Appearance, Agents, Runtimes,
+//! Handoffs and limits, Projects and Shortcuts.
 
 pub mod agents;
+pub mod appearance;
 pub mod limits;
 pub mod projects;
 pub mod runtimes;
@@ -20,6 +21,7 @@ use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub use agents::AgentsPage;
+pub use appearance::AppearancePage;
 pub use projects::ProjectsPage;
 
 actions!(
@@ -49,6 +51,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     General,
+    Appearance,
     Agents,
     Runtimes,
     Limits,
@@ -56,8 +59,9 @@ pub enum Page {
     Shortcuts,
 }
 
-const PAGES: [(Page, &str, &str); 6] = [
+const PAGES: [(Page, &str, &str); 7] = [
     (Page::General, "settings-nav-general", "General"),
+    (Page::Appearance, "settings-nav-appearance", "Appearance"),
     (Page::Agents, "settings-nav-agents", "Agents"),
     (Page::Runtimes, "settings-nav-runtimes", "Runtimes"),
     (Page::Limits, "settings-nav-limits", "Handoffs and limits"),
@@ -71,6 +75,8 @@ pub struct SettingsView {
     pub(super) focus: FocusHandle,
     pub agents: AgentsPage,
     pub projects: ProjectsPage,
+    /// The appearance page's controls, made when it first opens.
+    pub appearance: Option<AppearancePage>,
 }
 
 impl SettingsView {
@@ -80,6 +86,7 @@ impl SettingsView {
             focus,
             agents: AgentsPage::default(),
             projects: ProjectsPage::default(),
+            appearance: None,
         }
     }
 }
@@ -176,6 +183,7 @@ impl Workspace {
         match page {
             Page::Agents => self.agents_page_opened(window, cx),
             Page::Projects => self.projects_page_opened(window, cx),
+            Page::Appearance => self.appearance_page_opened(window, cx),
             _ => {}
         }
     }
@@ -223,6 +231,7 @@ impl Workspace {
         };
         let page = match view.page {
             Page::General => self.render_general().into_any_element(),
+            Page::Appearance => self.render_appearance_page(cx),
             Page::Agents => self.render_agents_page(cx),
             Page::Projects => self.render_projects_page(cx),
             Page::Runtimes => self.render_runtimes_page(cx),

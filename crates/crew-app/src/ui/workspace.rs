@@ -222,8 +222,9 @@ pub(super) type EditorSelect = SelectState<Vec<SharedString>>;
 
 impl Workspace {
     pub fn new(conn: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let appearance = cx.observe_global_in::<Appearance>(window, |this, _, cx| {
+        let appearance = cx.observe_global_in::<Appearance>(window, |this, window, cx| {
             this.remeasure_lists();
+            this.sync_font_selects(window, cx);
             cx.notify();
         });
         let (client, events) = client::spawn(conn.clone());

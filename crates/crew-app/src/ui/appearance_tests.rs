@@ -268,3 +268,364 @@ fn big_text_and_zoom_fit_the_smallest_window(cx: &mut TestAppContext) {
         "{sidebar:?} {composer:?}"
     );
 }
+
+/// Settings › Appearance, open over a thread with one message of yours.
+fn appearance_page(
+    cx: &mut TestAppContext,
+    home: &std::path::Path,
+    repo: &std::path::Path,
+) -> (AnyWindowHandle, Entity<Workspace>, MessageId) {
+    let (_w, window, ws, message) = thread_with_message(cx, home, repo);
+    open_page(cx, window);
+    (window, ws, message)
+}
+
+fn open_page(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    super::test_ui::click(cx, window, "title-settings");
+    super::test_ui::click(cx, window, "settings-nav-appearance");
+    wait_until(cx, "the appearance page", |cx| {
+        super::test_ui::has(cx, window, "settings-appearance")
+    });
+}
+
+fn label(cx: &mut TestAppContext, window: AnyWindowHandle, id: &str) -> String {
+    super::test_ui::label_of(cx, window, id.to_string()).unwrap_or_else(|| panic!("no {id}"))
+}
+
+/// What the Interface and Code font selects show.
+fn font_selects(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> (String, String) {
+    ws.read_with(cx, |ws, cx| {
+        let page = ws.appearance_page().expect("the appearance page");
+        let shown = |s: &Entity<super::settings::appearance::FontSelect>| {
+            s.read(cx)
+                .selected_value()
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        };
+        (shown(&page.ui_font), shown(&page.code_font))
+    })
+}
+
+fn current(cx: &mut TestAppContext) -> Appearance {
+    cx.update(|cx| scale::appearance(cx))
+}
+
+#[gpui_kit::test]
+fn the_appearance_page_shows_every_row_with_the_defaults(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (window, ws, _) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+
+    // Appearance comes second in the nav.
+    let nav: Vec<f32> = [
+        "settings-nav-general",
+        "settings-nav-appearance",
+        "settings-nav-agents",
+    ]
+    .into_iter()
+    .map(|id| f32::from(bounds(cx, window, id.into()).origin.y))
+    .collect();
+    assert!(nav[0] < nav[1] && nav[1] < nav[2], "{nav:?}");
+    assert!(!super::test_ui::has(
+        cx,
+        window,
+        "settings-nav-notifications"
+    ));
+
+    for row in [
+        "Interface text size",
+        "Code text size",
+        "Fonts",
+        "Line height",
+        "Text rendering",
+        "Density",
+        "Sidebar",
+        "Zoom",
+    ] {
+        assert!(super::test_ui::shows(cx, window, row), "{row}");
+    }
+    // The rows in the board's order.
+    let ys: Vec<f32> = [
+        "ui-size",
+        "code-size",
+        "fonts",
+        "line-height",
+        "rendering",
+        "density",
+        "sidebar",
+        "zoom",
+    ]
+    .into_iter()
+    .map(|key| f32::from(bounds(cx, window, format!("appearance-row-{key}")).origin.y))
+    .collect();
+    assert!(ys.windows(2).all(|p| p[0] < p[1]), "{ys:?}");
+
+    assert_eq!(label(cx, window, "appearance-ui-size-13"), "13 (selected)");
+    assert_eq!(label(cx, window, "appearance-ui-size-16"), "16");
+    assert_eq!(
+        label(cx, window, "appearance-code-size-12"),
+        "12 (selected)"
+    );
+    assert_eq!(
+        label(cx, window, "appearance-line-comfortable"),
+        "Comfortable (selected)"
+    );
+    assert_eq!(
+        label(cx, window, "appearance-render-standard"),
+        "Standard (selected)"
+    );
+    assert_eq!(
+        label(cx, window, "appearance-density-comfortable"),
+        "Comfortable (selected)"
+    );
+    assert_eq!(
+        label(cx, window, "appearance-sidebar-projects"),
+        "Projects (selected)"
+    );
+    assert_eq!(label(cx, window, "appearance-zoom-value"), "100%");
+    assert_eq!(
+        font_selects(cx, &ws),
+        ("Geist".to_string(), "Geist Mono".to_string())
+    );
+    assert_eq!(
+        label(cx, window, "appearance-preview-caption"),
+        "13 · 12 mono · standard"
+    );
+
+    // Threads isn't built yet: it stays off.
+    super::test_ui::click(cx, window, "appearance-sidebar-threads");
+    assert_eq!(
+        current(cx).sidebar_mode,
+        crate::prefs::SidebarMode::Projects
+    );
+    assert_eq!(crate::prefs::read(home.path(), APPEARANCE_KEY), None);
+}
+
+#[gpui_kit::test]
+fn picking_16_changes_the_preview_and_thread_messages(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (window, _ws, message) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+    assert_eq!(
+        font_probe::size_of("message-body-preview"),
+        Some(gpui_kit::px(13.))
+    );
+
+    super::test_ui::click(cx, window, "appearance-ui-size-16");
+    assert_eq!(label(cx, window, "appearance-ui-size-16"), "16 (selected)");
+    assert_eq!(
+        label(cx, window, "appearance-preview-caption"),
+        "16 · 12 mono · standard"
+    );
+    assert_eq!(
+        font_probe::size_of("message-body-preview"),
+        Some(gpui_kit::px(16.))
+    );
+    super::test_ui::click(cx, window, "appearance-code-size-14");
+    assert_eq!(
+        label(cx, window, "appearance-preview-caption"),
+        "16 · 14 mono · standard"
+    );
+    wait_until(cx, "the settings saved", |_| {
+        let saved = Appearance::load(home.path());
+        saved.ui_size == 16 && saved.code_size == 14
+    });
+
+    press(cx, window, "escape");
+    let body = format!("message-body-{message}");
+    wait_until(cx, "the thread", |cx| {
+        super::test_ui::has(cx, window, body.clone())
+    });
+    assert_eq!(font_probe::size_of(&body), Some(gpui_kit::px(16.)));
+}
+
+#[gpui_kit::test]
+fn bolder_text_makes_every_weight_heavier(cx: &mut TestAppContext) {
+    use gpui_kit::FontWeight;
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (window, _ws, message) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+    assert_eq!(
+        font_probe::weight_of("message-body-preview"),
+        Some(FontWeight::NORMAL)
+    );
+
+    super::test_ui::click(cx, window, "appearance-render-bolder");
+    assert_eq!(
+        label(cx, window, "appearance-render-bolder"),
+        "Bolder text (selected)"
+    );
+    assert!(super::test_ui::shows(
+        cx,
+        window,
+        "Heavier strokes, easier to read on external displays."
+    ));
+    assert_eq!(
+        label(cx, window, "appearance-preview-caption"),
+        "13 · 12 mono · bolder"
+    );
+    assert_eq!(
+        font_probe::weight_of("message-body-preview"),
+        Some(FontWeight::MEDIUM)
+    );
+    assert!(current(cx).bolder);
+
+    press(cx, window, "escape");
+    let body = format!("message-body-{message}");
+    wait_until(cx, "the thread", |cx| {
+        super::test_ui::has(cx, window, body.clone())
+    });
+    assert_eq!(font_probe::weight_of(&body), Some(FontWeight::MEDIUM));
+}
+
+#[gpui_kit::test]
+fn other_installed_font_lists_the_fonts_and_applies_one(cx: &mut TestAppContext) {
+    use super::settings::appearance::{FontSlot, OTHER_FONT};
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (window, ws, _) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+    cx.update(|cx| {
+        scale::set_installed_fonts(
+            vec!["Avenir Next".into(), "Helvetica".into(), "Menlo".into()],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.pick_font(FontSlot::Interface, OTHER_FONT, window, cx)
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    wait_until(cx, "the font list", |cx| {
+        super::test_ui::has(cx, window, "font-picker")
+    });
+    for name in ["Avenir Next", "Helvetica", "Menlo"] {
+        assert!(super::test_ui::shows(cx, window, name), "{name}");
+    }
+    // Picking Other doesn't change the font yet.
+    assert_eq!(current(cx).ui_font, "Geist");
+    assert_eq!(font_selects(cx, &ws).0, "Geist");
+
+    super::test_ui::type_text(cx, window, "helv");
+    assert!(!super::test_ui::shows(cx, window, "Avenir Next"));
+    assert_eq!(label(cx, window, "font-option-0"), "Helvetica");
+    super::test_ui::click(cx, window, "font-option-0");
+
+    assert!(!super::test_ui::has(cx, window, "font-picker"), "closed");
+    assert_eq!(current(cx).ui_font, "Helvetica");
+    assert_eq!(cx.update(|_| scale::ui_family()), "Helvetica");
+    assert_eq!(font_selects(cx, &ws).0, "Helvetica");
+    wait_until(cx, "the font saved", |_| {
+        Appearance::load(home.path()).ui_font == "Helvetica"
+    });
+
+    // A code font from the presets applies at once.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.pick_font(FontSlot::Code, "Menlo", window, cx)
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(current(cx).code_font, "Menlo");
+    assert_eq!(cx.update(|_| scale::code_family()), "Menlo");
+    assert_eq!(font_selects(cx, &ws).1, "Menlo");
+}
+
+#[gpui_kit::test]
+fn reset_puts_back_the_defaults(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    // Tall enough for every row at 120%.
+    let (window, ws) = super::test_ui::open_tall(cx, home.path());
+    open_page(cx, window);
+
+    // From the bottom up, so each control is still on screen.
+    super::test_ui::click(cx, window, "appearance-zoom-in");
+    super::test_ui::click(cx, window, "appearance-zoom-in");
+    assert_eq!(label(cx, window, "appearance-zoom-value"), "120%");
+    super::test_ui::click(cx, window, "appearance-zoom-out");
+    assert_eq!(label(cx, window, "appearance-zoom-value"), "110%");
+    for id in [
+        "appearance-density-compact",
+        "appearance-render-bolder",
+        "appearance-line-roomy",
+        "appearance-code-size-15",
+        "appearance-ui-size-18",
+    ] {
+        super::test_ui::click(cx, window, id);
+    }
+    let changed = current(cx);
+    assert_eq!(
+        (changed.ui_size, changed.code_size, changed.zoom),
+        (18, 15, 110)
+    );
+    assert!(changed.bolder);
+    assert_eq!(changed.line_height, crate::prefs::LineHeight::Roomy);
+    assert_eq!(changed.density, crate::prefs::Density::Compact);
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.pick_font(
+                super::settings::appearance::FontSlot::Code,
+                "Menlo",
+                window,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    super::test_ui::click(cx, window, "appearance-reset");
+    assert_eq!(current(cx), Appearance::default());
+    assert_eq!(label(cx, window, "appearance-ui-size-13"), "13 (selected)");
+    assert_eq!(label(cx, window, "appearance-zoom-value"), "100%");
+    assert_eq!(
+        font_selects(cx, &ws),
+        ("Geist".to_string(), "Geist Mono".to_string())
+    );
+    wait_until(cx, "the defaults saved", |_| {
+        Appearance::load(home.path()) == Appearance::default()
+    });
+}
+
+#[gpui_kit::test]
+fn a_font_no_longer_installed_says_so_and_falls_back(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let (_window, ws, _) = appearance_page(cx, home.path(), &tmp.path().join("repo"));
+    cx.update(|cx| {
+        scale::set_installed_fonts(vec!["Helvetica".into()], cx);
+        scale::set_appearance(
+            Appearance {
+                ui_font: "Gone Sans".into(),
+                code_font: "Gone Mono".into(),
+                ..Appearance::default()
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        font_selects(cx, &ws),
+        (
+            "Gone Sans (not installed)".to_string(),
+            "Gone Mono (not installed)".to_string()
+        )
+    );
+    assert_eq!(cx.update(|_| scale::ui_family()), crate::fonts::ui_font());
+    assert_eq!(
+        cx.update(|_| scale::code_family()),
+        crate::fonts::mono_font()
+    );
+}

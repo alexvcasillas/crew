@@ -420,8 +420,9 @@ mod tests {
     }
 }
 
-/// Adds a probe that records the text size `el` draws at under `key`, in
-/// tests only, so they can check what the appearance settings did.
+/// Adds a probe that records the text size and weight `el` draws with
+/// under `key`, in tests only, so they can check what the appearance
+/// settings did.
 pub fn with_font_probe<E: ParentElement>(el: E, key: impl FnOnce() -> String) -> E {
     #[cfg(test)]
     {
@@ -447,19 +448,25 @@ pub mod font_probe {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use gpui_kit::{Pixels, Window};
+    use gpui_kit::{FontWeight, Pixels, Window};
 
     thread_local! {
-        static SIZES: RefCell<HashMap<String, Pixels>> = RefCell::new(HashMap::new());
+        static DRAWN: RefCell<HashMap<String, (Pixels, FontWeight)>> = RefCell::new(HashMap::new());
     }
 
     pub(super) fn record(key: String, window: &Window) {
-        let size = window.text_style().font_size.to_pixels(window.rem_size());
-        SIZES.with(|s| s.borrow_mut().insert(key, size));
+        let style = window.text_style();
+        let size = style.font_size.to_pixels(window.rem_size());
+        DRAWN.with(|s| s.borrow_mut().insert(key, (size, style.font_weight)));
     }
 
     /// The text size the element probed as `key` last drew at.
     pub fn size_of(key: &str) -> Option<Pixels> {
-        SIZES.with(|s| s.borrow().get(key).copied())
+        DRAWN.with(|s| s.borrow().get(key).map(|d| d.0))
+    }
+
+    /// The weight the element probed as `key` last drew its text with.
+    pub fn weight_of(key: &str) -> Option<FontWeight> {
+        DRAWN.with(|s| s.borrow().get(key).map(|d| d.1))
     }
 }

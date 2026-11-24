@@ -167,6 +167,20 @@ fn kit_mono_size() -> Pixels {
     mono(KIT_BASE)
 }
 
+/// The system's own fonts the settings offer by name. They aren't listed
+/// as installed families, so they're drawn through the system's names.
+pub const SF_PRO: &str = "SF Pro";
+pub const SF_MONO: &str = "SF Mono";
+
+/// The family a chosen font is drawn with.
+fn family_name(chosen: &str) -> &str {
+    match chosen {
+        SF_PRO => ".SystemUIFont",
+        SF_MONO => ".AppleSystemUIFontMonospaced",
+        other => other,
+    }
+}
+
 /// `chosen` if it is installed, else the slot's default family. GPUI
 /// panics on a family it can't find, so never name a missing one.
 fn resolve_family(
@@ -174,11 +188,24 @@ fn resolve_family(
     default_name: &str,
     installed: impl FnOnce(&str) -> bool,
 ) -> Option<SharedString> {
-    if chosen == default_name || !installed(chosen) {
+    if chosen == default_name || !(is_system_font(chosen) || installed(chosen)) {
         None
     } else {
-        Some(SharedString::from(chosen.to_string()))
+        Some(SharedString::from(family_name(chosen).to_string()))
     }
+}
+
+fn is_system_font(name: &str) -> bool {
+    name == SF_PRO || name == SF_MONO
+}
+
+/// Whether the font `name` can be drawn. A font of your own counts as
+/// installed until the list of installed fonts is in.
+pub fn font_installed(name: &str, cx: &App) -> bool {
+    if name == DEFAULT_UI_FONT || name == DEFAULT_CODE_FONT || is_system_font(name) {
+        return true;
+    }
+    installed_fonts(cx).is_none_or(|names| names.iter().any(|f| f == name))
 }
 
 /// Where the settings are saved, and the save in flight.
@@ -235,6 +262,22 @@ pub fn load(crew_home: PathBuf, cx: &mut App) {
 /// The installed font families, once listed.
 pub fn installed_fonts(cx: &App) -> Option<Arc<Vec<String>>> {
     cx.try_global::<Fonts>().and_then(|f| f.names.clone())
+}
+
+/// Replaces the list of installed fonts, as tests do, and applies the
+/// settings again.
+#[cfg(test)]
+pub fn set_installed_fonts(names: Vec<String>, cx: &mut App) {
+    if cx.try_global::<Fonts>().is_none() {
+        cx.set_global(Fonts {
+            names: None,
+            _listing: None,
+        });
+    }
+    let fonts = cx.global_mut::<Fonts>();
+    fonts.names = Some(Arc::new(names));
+    fonts._listing = None;
+    apply(appearance(cx), cx);
 }
 
 /// The settings in use.
@@ -425,5 +468,17 @@ mod tests {
         ));
         assert_eq!(ui_family(), "Helvetica");
         assert_eq!(code_family(), "Menlo");
+    }
+
+    #[test]
+    fn system_fonts_draw_through_the_system_names() {
+        assert_eq!(
+            resolve_family("SF Pro", "Geist", |_| false),
+            Some(SharedString::from(".SystemUIFont"))
+        );
+        assert_eq!(
+            resolve_family("SF Mono", "Geist Mono", |_| false),
+            Some(SharedString::from(".AppleSystemUIFontMonospaced"))
+        );
     }
 }

@@ -249,60 +249,23 @@ impl Workspace {
             }
             _ => ("You".to_string(), you_avatar(), None),
         };
-        div()
-            .id(format!("message-{id}"))
-            .flex()
-            .gap(ui_px(12.))
-            .px(scale::chrome(24.))
-            .py(scale::row(8.))
-            .child(avatar)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(ui_px(2.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_px(8.))
-                            .child(div().font_weight(weight(FontWeight::SEMIBOLD)).child(name))
-                            .when_some(runtime, |row, (badge, text)| {
-                                row.child(
-                                    badge
-                                        .id(format!("message-chip-{id}"))
-                                        .aria_label(text)
-                                        .test_support(),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(scale::text(12.))
-                                    .text_color(color("text-tertiary"))
-                                    .child(time),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(format!("message-body-{id}"))
-                            .line_height(scale::line(20.))
-                            .aria_label(message.body.clone())
-                            .map(|body| {
-                                if matches!(message.author, Author::Agent(_)) {
-                                    let doc = self.docs.get(DocKey::Message(id), &message.body);
-                                    body.child(render_doc(&doc, names, &format!("md-{id}")))
-                                } else {
-                                    body.child(styled_body(&message.body, names))
-                                }
-                            })
-                            .map(|body| with_font_probe(body, || format!("message-body-{id}")))
-                            .test_support(),
-                    ),
-            )
-            .test_support()
-            .into_any_element()
+        let body = if matches!(message.author, Author::Agent(_)) {
+            let doc = self.docs.get(DocKey::Message(id), &message.body);
+            render_doc(&doc, names, &format!("md-{id}")).into_any_element()
+        } else {
+            styled_body(&message.body, names).into_any_element()
+        };
+        message_row(
+            id.to_string(),
+            avatar,
+            name,
+            runtime,
+            time,
+            message.body.clone(),
+            body,
+        )
+        .test_support()
+        .into_any_element()
     }
 
     /// An agent at work: its avatar, ringed in blue and pulsing while
@@ -421,6 +384,65 @@ fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
                     .test_support(),
             ))
         })
+}
+
+/// A message: its avatar, then its author, runtime chip and time over its
+/// body. `key` names its elements (`message-{key}`, `message-body-{key}`)
+/// and `label` is the body's accessible text.
+pub(super) fn message_row(
+    key: String,
+    avatar: Div,
+    name: String,
+    runtime: Option<(Div, String)>,
+    time: String,
+    label: String,
+    body: AnyElement,
+) -> Stateful<Div> {
+    div()
+        .id(format!("message-{key}"))
+        .flex()
+        .gap(ui_px(12.))
+        .px(scale::chrome(24.))
+        .py(scale::row(8.))
+        .child(avatar)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(ui_px(2.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(8.))
+                        .child(div().font_weight(weight(FontWeight::SEMIBOLD)).child(name))
+                        .when_some(runtime, |row, (badge, text)| {
+                            row.child(
+                                badge
+                                    .id(format!("message-chip-{key}"))
+                                    .aria_label(text)
+                                    .test_support(),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(scale::text(12.))
+                                .text_color(color("text-tertiary"))
+                                .child(time),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(format!("message-body-{key}"))
+                        .line_height(scale::line(20.))
+                        .aria_label(label)
+                        .child(body)
+                        .map(|body| with_font_probe(body, || format!("message-body-{key}")))
+                        .test_support(),
+                ),
+        )
 }
 
 /// Lines up with a message's text, past the avatar.
