@@ -886,6 +886,7 @@ impl Service {
             }
             let dropped = state.scheduler.clear();
             state.pending.clear();
+            state.retry_rules.clear();
             if let Err(e) = self.note_dropped(&dropped, RunStatus::Interrupted) {
                 log(format!("couldn't record the queued runs: {e}"));
             }
@@ -1518,6 +1519,8 @@ impl Service {
         let mut state = self.state();
         // The process is gone, so dropping the handle does nothing more.
         Self::end_live(&mut state, run);
+        // A run that ended in its worktree setup never used its rule.
+        state.retry_rules.remove(&run);
         let limit = state.timed_out.remove(&run);
         let handed = state.handed.remove(&run).unwrap_or_default();
         state.scheduler.finished(thread);
@@ -1784,6 +1787,13 @@ fn with_asked_runs(
     Ok(runs)
 }
 
+/// Now, in Unix ms.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::with_asked_runs;
@@ -1820,6 +1830,113 @@ mod tests {
         }
     }
 
+    fn git_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_never_launches_forgets_its_rule() {
+        use super::{CliBins, Service};
+        use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
+        use crew_core::scheduler::Job;
+        use crew_core::store::Store;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        git_repo(&root);
+        let svc = Service::new(
+            Store::open_in_memory().unwrap(),
+            2,
+            CliBins {
+                claude: Some("/usr/bin/false".into()),
+                ..Default::default()
+            },
+            tmp.path().join("worktrees"),
+            None,
+            Duration::from_secs(60),
+            64,
+        );
+        let (thread, agent) = {
+            let db = svc.db();
+            let p = db.store.create_project("demo", &root, "main").unwrap();
+            // The worktree's setup fails, so the run never starts.
+            db.store.set_project_setup(p, Some("exit 1"), &[]).unwrap();
+            let c = db.store.create_channel(p, "general").unwrap();
+            let t = db.store.create_thread(c, "work").unwrap();
+            let a = db
+                .store
+                .create_agent(&AgentSpec {
+                    name: "Forge".into(),
+                    role: String::new(),
+                    runtime: Runtime::ClaudeCode,
+                    model: "sonnet".into(),
+                    instructions: String::new(),
+                    permission_mode: PermissionMode::Auto,
+                    allowed_tools: vec![],
+                    handoff_policy: None,
+                    handoff_budget: None,
+                    max_run_minutes: 0,
+                })
+                .unwrap();
+            (t, a)
+        };
+        let queue = |svc: &Service| {
+            let run = svc.db().store.create_run(thread, agent).unwrap();
+            let mut state = svc.state();
+            state.scheduler.enqueue(Job {
+                run,
+                thread,
+                agent,
+                prompt: "go".into(),
+            });
+            state.retry_rules.insert(run, vec!["Bash(ls)".into()]);
+            run
+        };
+
+        // Stopped while still queued.
+        let stopped = queue(&svc);
+        svc.stop_run(stopped).unwrap();
+        assert!(svc.state().retry_rules.is_empty());
+
+        // Its worktree setup failed.
+        let failed = queue(&svc);
+        svc.start_ready();
+        let started = Instant::now();
+        while svc.db().store.run(failed).unwrap().status != RunStatus::Failed {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the run never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(svc.state().retry_rules.is_empty());
+    }
+
     #[test]
     fn the_snapshot_brings_the_runs_approvals_point_to() {
         let recent = run(RunStatus::Working);
@@ -1837,11 +1954,4 @@ mod tests {
         .unwrap();
         assert_eq!(runs, [recent, old], "each run once");
     }
-}
-
-/// Now, in Unix ms.
-pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
