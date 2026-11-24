@@ -5,7 +5,7 @@ use std::time::Duration;
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, ThreadId};
-use crew_core::store::StoredRun;
+use crew_core::store::{RuntimeUsage, StoredRun};
 use crew_proto::{ClientMsg, Limits, PROTO_VERSION, Request, ServerMsg, read_frame, write_frame};
 use crewd::{ServeOptions, serve_until};
 use tokio::net::UnixStream;
@@ -271,6 +271,14 @@ async fn limits_survive_a_restart_and_beat_the_seed() {
         unreachable!()
     };
     assert_eq!(*got, limits);
+
+    // Still paused after the restart: a new run waits in the queue.
+    let (_, threads) = setup(&mut c, tmp.path(), 1).await;
+    say(&mut c, threads[0], "@Forge go").await;
+    c.until(|m| is_status(m, RunStatus::Queued)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(c.runs(RunStatus::Queued).await.len(), 1);
+    assert!(c.runs(RunStatus::Done).await.is_empty());
     d.stop().await;
 }
 
@@ -363,5 +371,47 @@ async fn set_limits_rejects_values_out_of_range() {
     ] {
         assert_eq!(c.call(bad(limits)).await.unwrap_err(), want);
     }
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_and_usage_answer_over_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(&tmp.path().join("crew"), 4, fake_claude(tmp.path(), false)).await;
+    let mut c = d.client().await;
+    let (_, threads) = setup(&mut c, tmp.path(), 1).await;
+    for i in 0..3 {
+        say(&mut c, threads[0], &format!("@Forge go {i}")).await;
+        c.until(|m| is_status(m, RunStatus::Done)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let page: Vec<StoredRun> = c
+        .ok(Request::RunHistory {
+            before: None,
+            limit: 2,
+        })
+        .await;
+    assert_eq!(page.len(), 2);
+    assert!(page[0].ended_at >= page[1].ended_at);
+    let rest: Vec<StoredRun> = c
+        .ok(Request::RunHistory {
+            before: page[1].ended_at,
+            limit: 2,
+        })
+        .await;
+    assert_eq!(rest.len(), 1);
+    assert!(rest[0].ended_at < page[1].ended_at);
+
+    let usage: Vec<RuntimeUsage> = c.ok(Request::UsageSince { since_ms: 0 }).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
+    assert_eq!(usage[0].runs, 3);
+    let none: Vec<RuntimeUsage> = c
+        .ok(Request::UsageSince {
+            since_ms: i64::MAX / 2,
+        })
+        .await;
+    assert!(none.is_empty());
     d.stop().await;
 }

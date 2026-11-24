@@ -985,3 +985,131 @@ fn max_runs_seed_only_fills_a_missing_row() {
     store.seed_max_runs(7).unwrap();
     assert_eq!(store.limits().unwrap().max_runs, 2);
 }
+
+/// Starts a run on `runtime` and ends it with `status`, waiting a little
+/// first so end times differ.
+fn finish_run(
+    store: &Store,
+    t: crew_core::ids::ThreadId,
+    a: crew_core::ids::AgentId,
+    runtime: &Runtime,
+    status: RunStatus,
+) -> crew_core::ids::RunId {
+    let r = store.create_run(t, a).unwrap();
+    store.start_run(r, runtime, "s").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.set_run_status(r, status).unwrap();
+    r
+}
+
+#[test]
+fn run_history_pages_newest_first_by_end_time() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let ids: Vec<_> = [
+        RunStatus::Done,
+        RunStatus::Failed,
+        RunStatus::Stopped,
+        RunStatus::Interrupted,
+        RunStatus::Done,
+    ]
+    .into_iter()
+    .map(|s| finish_run(&store, t, a, &Runtime::ClaudeCode, s))
+    .collect();
+    // Live and queued runs are not history.
+    let live = store.create_run(t, a).unwrap();
+    store.start_run(live, &Runtime::ClaudeCode, "s").unwrap();
+    store.create_run(t, a).unwrap();
+
+    let page = store.run_history(None, 3).unwrap();
+    let got: Vec<_> = page.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[4], ids[3], ids[2]]);
+    assert_eq!(page[1].status, RunStatus::Interrupted);
+
+    let before = page.last().unwrap().ended_at;
+    let rest = store.run_history(before, 3).unwrap();
+    let got: Vec<_> = rest.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[1], ids[0]]);
+    // The bound is exclusive.
+    assert!(
+        store
+            .run_history(rest.last().unwrap().ended_at, 3)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn run_history_clamps_the_page_size() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    for _ in 0..3 {
+        finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    }
+    assert_eq!(store.run_history(None, 0).unwrap().len(), 1);
+    assert_eq!(store.run_history(None, 5000).unwrap().len(), 3);
+}
+
+#[test]
+fn usage_sums_runs_per_runtime_and_counts_live_ones() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let mut codex = spec("Cody");
+    codex.runtime = Runtime::Codex;
+    let c = store.create_agent(&codex).unwrap();
+
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Failed);
+    let live = store.create_run(t, c).unwrap();
+    store.start_run(live, &Runtime::Codex, "s").unwrap();
+    // Queued runs never count.
+    store.create_run(t, c).unwrap();
+
+    let started = store.run(live).unwrap().started_at;
+    let now = started + 60_000;
+    let usage = store.usage_since(0, now).unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0].runtime, Runtime::ClaudeCode);
+    assert_eq!(usage[0].runs, 2);
+    assert!(usage[0].total_ms >= 10);
+    assert_eq!(usage[1].runtime, Runtime::Codex);
+    assert_eq!(usage[1].runs, 1);
+    assert_eq!(usage[1].total_ms, 60_000);
+}
+
+#[test]
+fn usage_counts_by_end_time_and_omits_empty_runtimes() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    let r = finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    let run = store.run(r).unwrap();
+    let ended = run.ended_at.unwrap();
+
+    // Ended before the cut: nothing. Ended at it: the full duration counts.
+    assert!(store.usage_since(ended + 1, ended + 1).unwrap().is_empty());
+    let usage = store.usage_since(ended, ended + 1).unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].total_ms, ended - run.started_at);
+}
+
+#[test]
+fn usage_still_counts_runs_of_a_deleted_agent() {
+    let store = Store::open_in_memory().unwrap();
+    let (t, a) = setup_run(&store);
+    finish_run(&store, t, a, &Runtime::ClaudeCode, RunStatus::Done);
+    store.delete_agent(a).unwrap();
+    assert_eq!(store.usage_since(0, i64::MAX / 2).unwrap().len(), 1);
+}
+
+#[test]
+fn set_limits_refuses_a_per_agent_policy() {
+    let store = Store::open_in_memory().unwrap();
+    let err = store
+        .set_limits(&Limits {
+            handoff_policy: HandoffPolicy::PerAgent,
+            ..Limits::default()
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(_)));
+    assert_eq!(store.limits().unwrap(), Limits::default());
+}

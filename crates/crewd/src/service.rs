@@ -395,6 +395,18 @@ impl Service {
                 self.set_limits(limits)?;
                 Ok(serde_json::Value::Null)
             }
+            Request::RunHistory { before, limit } => json(
+                self.db()
+                    .store
+                    .run_history(before, limit)
+                    .map_err(|e| e.to_string())?,
+            ),
+            Request::UsageSince { since_ms } => json(
+                self.db()
+                    .store
+                    .usage_since(since_ms, now_ms())
+                    .map_err(|e| e.to_string())?,
+            ),
             Request::ListRuns { status } => {
                 let filter = RunFilter {
                     status,

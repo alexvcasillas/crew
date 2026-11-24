@@ -9,7 +9,7 @@ use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
-pub use crew_core::store::Limits;
+pub use crew_core::store::{Limits, RuntimeUsage};
 use crew_core::store::{
     StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
     StoredThread,
@@ -90,6 +90,18 @@ pub enum Request {
     /// null; every client gets a [`ServerMsg::LimitsChanged`].
     SetLimits {
         limits: Limits,
+    },
+    /// Ended runs (any final status), newest first. `before` is an
+    /// exclusive `ended_at` in Unix ms; `limit` is clamped to 1..=200.
+    /// Answered with `Vec<StoredRun>`.
+    RunHistory {
+        before: Option<i64>,
+        limit: u32,
+    },
+    /// Runs per runtime that ended at or after `since_ms`, plus live runs
+    /// by their time so far. Answered with `Vec<RuntimeUsage>`.
+    UsageSince {
+        since_ms: i64,
     },
     ListRuns {
         status: Option<RunStatus>,

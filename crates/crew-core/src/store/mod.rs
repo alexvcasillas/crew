@@ -74,6 +74,14 @@ impl Limits {
     }
 }
 
+/// What one runtime did in a span: runs and their summed duration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeUsage {
+    pub runtime: Runtime,
+    pub runs: u32,
+    pub total_ms: i64,
+}
+
 /// Errors from the store.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -85,6 +93,8 @@ pub enum StoreError {
     NotFound(&'static str),
     #[error("an agent named {0:?} already exists")]
     DuplicateAgentName(String),
+    #[error("{0}")]
+    Invalid(String),
     #[error("This database was written by a newer Crew.")]
     NewerSchema,
     #[error("Upgrading the database left broken references. It was left as it was.")]
@@ -380,7 +390,12 @@ impl Store {
     pub fn set_limits(&self, limits: &Limits) -> Result<()> {
         let policy = match limits.handoff_policy {
             HandoffPolicy::Budget => "budget",
-            _ => "ask_first",
+            HandoffPolicy::AskFirst => "ask_first",
+            HandoffPolicy::PerAgent => {
+                return Err(StoreError::Invalid(
+                    "the global handoff policy is Ask first or Run with budget".into(),
+                ));
+            }
         };
         let tx = self.conn.unchecked_transaction()?;
         self.set_setting("max_runs", &limits.max_runs.to_string())?;
@@ -891,6 +906,54 @@ impl Store {
         ))?;
         let rows = stmt.query_map(params![status, thread], read_run)?;
         rows.map(|r| r?).collect()
+    }
+
+    /// Ended runs (any final status), newest `ended_at` first. `before` is an
+    /// exclusive `ended_at` in Unix ms; `limit` is clamped to 1..=200.
+    pub fn run_history(&self, before: Option<i64>, limit: u32) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE ended_at IS NOT NULL AND (?1 IS NULL OR ended_at < ?1)
+             ORDER BY ended_at DESC, ord DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![before, limit.clamp(1, 200)], read_run)?;
+        rows.map(|r| r?).collect()
+    }
+
+    /// Runs per runtime that ended at or after `since_ms`, counted by their
+    /// full duration, plus live runs counted by their time so far at `now_ms`.
+    /// Queued runs don't count. A runtime with no runs is left out.
+    pub fn usage_since(&self, since_ms: i64, now_ms: i64) -> Result<Vec<RuntimeUsage>> {
+        let runtimes: std::collections::HashMap<AgentId, Runtime> = self
+            .all_agents()?
+            .into_iter()
+            .map(|a| (a.id, a.spec.runtime))
+            .collect();
+        let mut stmt = self.conn.prepare(&format!(
+            "{RUN_COLUMNS} WHERE status = ?1 OR ended_at >= ?2 ORDER BY ord"
+        ))?;
+        let working = status_text(&RunStatus::Working)?;
+        let runs = stmt.query_map(params![working, since_ms], read_run)?;
+        let mut usage: Vec<RuntimeUsage> = Vec::new();
+        for run in runs {
+            let run = run??;
+            let Some(runtime) = runtimes.get(&run.agent) else {
+                continue;
+            };
+            let ms = (run.ended_at.unwrap_or(now_ms) - run.started_at).max(0);
+            match usage.iter_mut().find(|u| u.runtime == *runtime) {
+                Some(u) => {
+                    u.runs += 1;
+                    u.total_ms += ms;
+                }
+                None => usage.push(RuntimeUsage {
+                    runtime: runtime.clone(),
+                    runs: 1,
+                    total_ms: ms,
+                }),
+            }
+        }
+        usage.sort_by_key(|u| u.runtime != Runtime::ClaudeCode);
+        Ok(usage)
     }
 
     /// Runs that are queued or working, plus those that ended at or after
