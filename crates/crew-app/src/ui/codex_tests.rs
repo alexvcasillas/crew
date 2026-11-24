@@ -262,7 +262,8 @@ fn a_codex_run_shows_its_steps_and_asks_before_a_command(cx: &mut TestAppContext
     );
     assert_eq!(
         label_of(cx, window, format!("approval-input-{id}")).as_deref(),
-        Some("mkdir sub")
+        // Nova is read-only: an approved command runs without the sandbox.
+        Some("mkdir sub (runs outside the sandbox, in your folder)")
     );
     assert_eq!(
         label_of(cx, window, format!("approval-command-{id}")).as_deref(),

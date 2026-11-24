@@ -47,6 +47,8 @@ Optional top-level keys:
   "log": "/path"      Append every client message read, one per line,
                       including those read after the last step.
   "ignore_sigint": true   Ignore SIGINT, so only SIGTERM or SIGKILL end it.
+  "signal_log": "/path"   Append the name of each SIGINT or SIGTERM received,
+                          one per line, before acting on it.
 
 After the last step the fake reads stdin until it closes, then exits 0.
 Any mismatch prints a line to stderr and exits with code 3.
@@ -104,7 +106,20 @@ def main():
         scenario = json.load(f)
     global LOG
     LOG = scenario.get("log")
-    if scenario.get("ignore_sigint"):
+    ignore_sigint = scenario.get("ignore_sigint")
+    signal_log = scenario.get("signal_log")
+    if signal_log:
+
+        def on_signal(signum, _frame):
+            with open(signal_log, "a") as f:
+                f.write(signal.Signals(signum).name + "\n")
+            if signum == signal.SIGINT and ignore_sigint:
+                return
+            os._exit(128 + signum)
+
+        signal.signal(signal.SIGINT, on_signal)
+        signal.signal(signal.SIGTERM, on_signal)
+    elif ignore_sigint:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     seen = {}

@@ -20,6 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::approvals::stopped_answer;
+use crate::peer::{self, Peer};
 use crate::service::{Backlog, CliBins, Notice, Reply, Service};
 
 /// Socket file name inside the crew home.
@@ -55,8 +56,23 @@ pub struct ServeOptions {
     pub runtimes_wait: Option<Duration>,
     /// Claude Code's home, whose sessions are shown read-only as terminal
     /// sessions. `None` turns them off. The `crewd` binary uses
-    /// `CREW_CLAUDE_HOME`, else `~/.claude`.
+    /// [`claude_home_from`].
     pub claude_home: Option<PathBuf>,
+}
+
+/// Claude Code's home: `CREW_CLAUDE_HOME`, else `CLAUDE_CONFIG_DIR` (where
+/// Claude Code itself keeps it when set), else `~/.claude`. Empty values
+/// count as unset.
+pub fn claude_home_from(
+    crew_claude_home: Option<std::ffi::OsString>,
+    claude_config_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty());
+    set(crew_claude_home)
+        .or_else(|| set(claude_config_dir))
+        .map(PathBuf::from)
+        .or_else(|| set(home).map(|h| PathBuf::from(h).join(".claude")))
 }
 
 impl Default for ServeOptions {
@@ -254,9 +270,34 @@ async fn respond(
     write_frame(w, &ServerMsg::Response { id, result }).await
 }
 
+/// Said to a request an agent's connection may not make.
+pub const NOT_FROM_AGENTS: &str = "Not allowed from inside an agent run.";
+
+/// What a connection from inside an agent run may ask: hand off, and ask
+/// you for a permission. crew-mcp needs nothing else.
+fn agent_may(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Hello { .. } | Request::Handoff { .. } | Request::PermissionAsk { .. }
+    )
+}
+
+/// Whether the connecting process was started by a live run.
+async fn peer_of(service: &Service, pid: Option<i32>) -> Peer {
+    let runs = service.live_run_pids();
+    let fallback = if runs.is_empty() {
+        Peer::Client
+    } else {
+        Peer::Agent
+    };
+    tokio::task::spawn_blocking(move || peer::classify(pid, &runs, peer::proc_info))
+        .await
+        .unwrap_or(fallback)
+}
+
 async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
-    let uid = match stream.peer_cred() {
-        Ok(cred) => cred.uid(),
+    let (uid, pid) = match stream.peer_cred() {
+        Ok(cred) => (cred.uid(), cred.pid()),
         // The client already left, as an "is crewd running?" probe does.
         Err(e) if e.kind() == io::ErrorKind::NotConnected => return Ok(()),
         Err(e) => return Err(e),
@@ -282,6 +323,7 @@ async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
         }
         _ => return respond(&mut wr, id, Err("Send Hello first.".into())).await,
     }
+    let peer = peer_of(&service, pid).await;
 
     // Frames are read in their own task: `read_frame` is not safe to cancel
     // inside `select!`, a channel receive is.
@@ -302,7 +344,7 @@ async fn connection(service: Service, stream: UnixStream) -> io::Result<()> {
             }
         }
     });
-    let result = requests_and_notices(&service, &mut wr, req_rx).await;
+    let result = requests_and_notices(&service, &mut wr, req_rx, peer).await;
     reader.abort();
     result
 }
@@ -393,6 +435,11 @@ fn wanted(
         ServerMsg::TerminalEvent { ref session, .. } => {
             terminals.get(session).is_some_and(|seen| n.serial > *seen)
         }
+        // A session's own subscribers need these even without SubscribeAll.
+        ServerMsg::TerminalSessionReset { ref session }
+        | ServerMsg::TerminalSessionRemoved { id: ref session } => {
+            by_all || terminals.get(session).is_some_and(|seen| n.serial > *seen)
+        }
         _ => by_thread || by_all,
     }
 }
@@ -406,6 +453,7 @@ async fn requests_and_notices(
     service: &Service,
     wr: &mut OwnedWriteHalf,
     mut req_rx: mpsc::Receiver<ClientMsg>,
+    peer: Peer,
 ) -> io::Result<()> {
     // Thread -> serial already covered by that thread's backlog.
     let mut subscribed: HashMap<ThreadId, u64> = HashMap::new();
@@ -462,6 +510,10 @@ async fn requests_and_notices(
                 let Some(ClientMsg::Request { id, req }) = msg else {
                     return Ok(());
                 };
+                if peer == Peer::Agent && !agent_may(&req) {
+                    respond(wr, id, Err(NOT_FROM_AGENTS.into())).await?;
+                    continue;
+                }
                 match req {
                     Request::Subscribe { thread } => {
                         // Taken before the backlog is read, so nothing falls
@@ -581,6 +633,58 @@ async fn requests_and_notices(
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice(serial: u64, msg: ServerMsg) -> Notice {
+        Notice {
+            serial,
+            thread: None,
+            msg,
+        }
+    }
+
+    #[test]
+    fn claude_home_prefers_crew_then_claude_settings() {
+        let v = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(
+            claude_home_from(v("/work/a"), v("/work/b"), v("/work/h")),
+            Some(PathBuf::from("/work/a"))
+        );
+        assert_eq!(
+            claude_home_from(v(""), v("/work/b"), v("/work/h")),
+            Some(PathBuf::from("/work/b"))
+        );
+        assert_eq!(
+            claude_home_from(None, None, v("/work/h")),
+            Some(PathBuf::from("/work/h/.claude"))
+        );
+        assert_eq!(claude_home_from(None, v(""), None), None);
+    }
+
+    #[test]
+    fn terminal_subscribers_hear_resets_and_removals() {
+        let none: HashMap<ThreadId, u64> = HashMap::new();
+        let no_terminals: HashMap<String, u64> = HashMap::new();
+        let mut terminals = HashMap::new();
+        terminals.insert("s1".to_string(), 5u64);
+        for msg in [
+            ServerMsg::TerminalSessionReset {
+                session: "s1".into(),
+            },
+            ServerMsg::TerminalSessionRemoved { id: "s1".into() },
+        ] {
+            assert!(wanted(&notice(6, msg.clone()), None, &none, &terminals));
+            // Covered by its backlog already.
+            assert!(!wanted(&notice(5, msg.clone()), None, &none, &terminals));
+            // Not subscribed to that session.
+            assert!(!wanted(&notice(6, msg.clone()), None, &none, &no_terminals));
+            assert!(wanted(&notice(6, msg), Some(0), &none, &no_terminals));
         }
     }
 }

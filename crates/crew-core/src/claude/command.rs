@@ -9,11 +9,16 @@ use uuid::Uuid;
 use crate::agent::{AgentSpec, PermissionMode};
 use crate::ids::RunId;
 
+/// The name crew-mcp is registered under for a run, for both runtimes.
+/// Distinct from a plain `crew` so a server of the user's own never
+/// shares its name, settings or auto-accepted asks.
+pub const MCP_SERVER: &str = "crew_run";
+
 /// Name of the permission prompt tool crew-mcp serves.
-pub const APPROVE_TOOL: &str = "mcp__crew__approve";
+pub const APPROVE_TOOL: &str = "mcp__crew_run__approve";
 
 /// The handoff tool crew-mcp serves. Every wired agent may use it.
-pub const HANDOFF_TOOL: &str = "mcp__crew__handoff";
+pub const HANDOFF_TOOL: &str = "mcp__crew_run__handoff";
 
 /// Edits an `EditFiles` agent may make without asking when crew-mcp is
 /// wired: only under its working folder. Edits anywhere else ask.
@@ -49,6 +54,8 @@ struct McpConfig<'a> {
 
 #[derive(Serialize)]
 struct McpServers<'a> {
+    /// Keep in step with [`MCP_SERVER`].
+    #[serde(rename = "crew_run")]
     crew: StdioServer<'a>,
 }
 
@@ -68,7 +75,7 @@ struct CrewEnv {
 }
 
 impl McpWiring {
-    /// The `--mcp-config` value: one stdio server named `crew`.
+    /// The `--mcp-config` value: one stdio server named [`MCP_SERVER`].
     pub fn config_json(&self) -> String {
         let config = McpConfig {
             mcp_servers: McpServers {
@@ -117,7 +124,7 @@ impl CrewContext {
     /// tools by server and tool name.
     pub fn render_codex(&self, agent: &AgentSpec, wired: bool) -> String {
         let handoff = wired.then(|| {
-            "To bring in another agent, call the handoff tool of the crew MCP server with the agent's name and a short brief. Writing @Name in your final reply also works.".to_string()
+            "To bring in another agent, call the handoff tool of the crew_run MCP server with the agent's name and a short brief. Writing @Name in your final reply also works.".to_string()
         });
         self.render_with(agent, handoff)
     }
@@ -187,8 +194,8 @@ pub fn claude_bin_from(env: Option<OsString>) -> PathBuf {
 ///
 /// With `mcp`, the run gets crew-mcp as an MCP server. An `EditFiles`
 /// agent then runs in `default` mode and asks crewd through
-/// `mcp__crew__approve` before anything but file edits under its working
-/// folder. Every wired agent may use `mcp__crew__handoff` without asking.
+/// `mcp__crew_run__approve` before anything but file edits under its working
+/// folder. Every wired agent may use `mcp__crew_run__handoff` without asking.
 ///
 /// With `context`, the Crew block goes before the agent's own instructions
 /// in one `--append-system-prompt`.
@@ -391,9 +398,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_names_use_the_server_name() {
+        assert_eq!(APPROVE_TOOL, format!("mcp__{MCP_SERVER}__approve"));
+        assert_eq!(HANDOFF_TOOL, format!("mcp__{MCP_SERVER}__handoff"));
+    }
+
     fn expected_mcp_config(run: RunId) -> String {
         format!(
-            r#"{{"mcpServers":{{"crew":{{"type":"stdio","command":"/work/bin/crew-mcp","args":["--run","{run}"],"env":{{"CREW_HOME":"/work/crew \"home\""}}}}}}}}"#
+            r#"{{"mcpServers":{{"crew_run":{{"type":"stdio","command":"/work/bin/crew-mcp","args":["--run","{run}"],"env":{{"CREW_HOME":"/work/crew \"home\""}}}}}}}}"#
         )
     }
 
@@ -427,18 +440,18 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.",
                 "--allowedTools",
-                "Read,Write(./**),Grep,Edit(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff",
+                "Read,Write(./**),Grep,Edit(./**),MultiEdit(./**),NotebookEdit(./**),mcp__crew_run__handoff",
                 "--mcp-config",
                 &config,
                 "--permission-prompt-tool",
-                "mcp__crew__approve",
+                "mcp__crew_run__approve",
                 "--",
                 "go",
             ])
         );
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
         assert_eq!(
-            parsed["mcpServers"]["crew"]["env"]["CREW_HOME"],
+            parsed["mcpServers"]["crew_run"]["env"]["CREW_HOME"],
             "/work/crew \"home\""
         );
     }
@@ -473,7 +486,7 @@ mod tests {
                 "--append-system-prompt",
                 "Be brief.",
                 "--allowedTools",
-                "mcp__crew__handoff",
+                "mcp__crew_run__handoff",
                 "--mcp-config",
                 &config,
                 "--",
@@ -511,7 +524,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             allowed,
-            "Read,Edit(./**),Write(src/**),MultiEdit(./**),NotebookEdit(./**),mcp__crew__handoff"
+            "Read,Edit(./**),Write(src/**),MultiEdit(./**),NotebookEdit(./**),mcp__crew_run__handoff"
         );
 
         // Without wiring the agent's list is passed as it is.
@@ -573,7 +586,7 @@ mod tests {
                  Other agents here:\n\
                  - Forge (Builds features, edits files)\n\
                  - Scout (read-only)\n\
-                 To bring in another agent, call the mcp__crew__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
+                 To bring in another agent, call the mcp__crew_run__handoff tool with the agent's name and a short brief. Writing @Name in your final reply also works.\n\
                  \n\
                  Be brief."
             ]
@@ -615,7 +628,7 @@ mod tests {
              Other agents here:\n\
              - Forge (Builds features, edits files)\n\
              - Scout (read-only)\n\
-             To bring in another agent, call the handoff tool of the crew MCP server with the agent's name and a short brief. Writing @Name in your final reply also works."
+             To bring in another agent, call the handoff tool of the crew_run MCP server with the agent's name and a short brief. Writing @Name in your final reply also works."
         );
         let plain = context().render_codex(&a, false);
         assert!(!plain.contains("handoff"));

@@ -9,10 +9,11 @@ use crew_core::codex::proto::{
     ApprovalDecision, ApprovalResponse, ElicitationParams, ElicitationResponse, FileChange,
     ServerRequest,
 };
+use crew_core::store::OUTSIDE_SANDBOX;
 use serde_json::{Value, json};
 
 /// The MCP server crew-mcp is registered as.
-pub(crate) const CREW_SERVER: &str = "crew";
+pub(crate) const CREW_SERVER: &str = crew_core::claude::command::MCP_SERVER;
 
 /// What to do with one server request.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,34 +85,51 @@ impl ReplyKind {
     }
 }
 
-/// Maps a request. `files` holds the changes of started file change
-/// items; `crew_wired` says whether the `crew` MCP server is Crew's own;
-/// `cwd` is the thread's folder, the only place access can be granted.
-pub(crate) fn map_request(
-    method: &str,
-    params: &Value,
-    files: &HashMap<String, Vec<FileChange>>,
-    crew_wired: bool,
-    cwd: &Path,
-) -> Mapped {
+/// What a request is mapped against.
+pub(crate) struct Scope<'a> {
+    /// The changes of started file change items.
+    pub(crate) files: &'a HashMap<String, Vec<FileChange>>,
+    /// Whether the `crew_run` MCP server is Crew's own.
+    pub(crate) crew_wired: bool,
+    /// The thread's folder, the only place access can be granted.
+    pub(crate) cwd: &'a Path,
+    /// A `ReadOnly` agent: it is never granted writes.
+    pub(crate) read_only: bool,
+    /// The agent's name, for notes.
+    pub(crate) agent: &'a str,
+}
+
+/// Maps a request.
+pub(crate) fn map_request(method: &str, params: &Value, scope: &Scope) -> Mapped {
+    let crew_wired = scope.crew_wired;
+    let read_only_note = || format!("{} is read-only.", scope.agent);
     match ServerRequest::parse(method, params) {
         ServerRequest::CommandApproval(p) => {
             let command = p.command.unwrap_or_default();
             let mut input = json!({"command": command, "cwd": p.cwd.unwrap_or_default()});
-            // `command` is the full shell wrapper; the actions read better.
+            // `command` is the full shell wrapper; the actions read better,
+            // but only when they are all of it.
             let actions: Vec<&str> = p
                 .command_actions
                 .iter()
                 .map(|a| a.command.as_str())
                 .filter(|c| !c.trim().is_empty())
                 .collect();
-            if !actions.is_empty() {
-                input["label"] = json!(actions.join(" && "));
+            let label = command_label(&command, &actions);
+            if scope.read_only {
+                let base = label.unwrap_or_else(|| clean(&command));
+                input["label"] = json!(format!("{base}{OUTSIDE_SANDBOX}"));
+            } else if let Some(label) = label {
+                input["label"] = json!(label);
             }
             ask(ReplyKind::Approval, "Bash", input, Some(p.item_id))
         }
+        ServerRequest::FileChangeApproval(_) if scope.read_only => Mapped::Declined {
+            reply: ReplyKind::Approval.reply(Answer::No),
+            note: read_only_note(),
+        },
         ServerRequest::FileChangeApproval(p) => {
-            let changes = files.get(&p.item_id).map_or(&[][..], Vec::as_slice);
+            let changes = scope.files.get(&p.item_id).map_or(&[][..], Vec::as_slice);
             let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
             let listed: Vec<Value> = changes
                 .iter()
@@ -120,8 +138,16 @@ pub(crate) fn map_request(
             let input = json!({"path": paths.join(", "), "changes": listed});
             ask(ReplyKind::Approval, "Edit", input, Some(p.item_id))
         }
+        ServerRequest::PermissionsApproval(p)
+            if scope.read_only && writes_asked(&p.permissions) =>
+        {
+            Mapped::Declined {
+                reply: ReplyKind::Permissions(json!({})).reply(Answer::No),
+                note: read_only_note(),
+            }
+        }
         ServerRequest::PermissionsApproval(p) => {
-            let cwd = real_cwd(cwd);
+            let cwd = real_cwd(scope.cwd);
             let granted = clamp(&p.permissions, &cwd);
             if granted.as_object().is_none_or(|g| g.is_empty()) {
                 return Mapped::Declined {
@@ -159,6 +185,60 @@ pub(crate) fn map_request(
         // and requests about sign-in, which Crew never answers.
         ServerRequest::Raw(_) => Mapped::Refuse(format!("Crew doesn't handle {method}.")),
     }
+}
+
+/// Whether an access ask wants to write anywhere.
+fn writes_asked(asked: &Value) -> bool {
+    let fs = &asked["fileSystem"];
+    !strings(&fs["write"]).is_empty()
+        || fs["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["access"] == "write")
+}
+
+/// The command without its shell wrapper (`/bin/zsh -lc '...'`), if it
+/// has one Crew can read.
+fn inner_command(command: &str) -> Option<String> {
+    let words = shlex::split(command)?;
+    match words.as_slice() {
+        [shell, flag, inner]
+            if shell.rsplit('/').next().is_some_and(|s| s.ends_with("sh"))
+                && matches!(flag.as_str(), "-c" | "-lc") =>
+        {
+            Some(inner.clone())
+        }
+        _ => Some(command.to_string()),
+    }
+}
+
+/// A short label for a command ask: its actions, when they are the whole
+/// command, else the actions marked "(+ more)". `None` without actions.
+fn command_label(command: &str, actions: &[&str]) -> Option<String> {
+    if actions.is_empty() {
+        return None;
+    }
+    let joined = clean(&actions.join(" && "));
+    let covered = inner_command(command).is_some_and(|inner| {
+        let mut rest = inner.as_str();
+        for action in actions {
+            let Some(at) = rest.find(action) else {
+                return false;
+            };
+            let between = &rest[..at];
+            if !between.trim().is_empty() && between.trim() != "&&" {
+                return false;
+            }
+            rest = &rest[at + action.len()..];
+        }
+        rest.trim().is_empty()
+    });
+    Some(if covered {
+        joined
+    } else {
+        format!("{joined} (+ more)")
+    })
 }
 
 fn ask(kind: ReplyKind, tool: &str, input: Value, item: Option<String>) -> Mapped {
@@ -232,14 +312,9 @@ fn inside(path: &str, cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Text from the agent, safe to show on one line: no control characters
-/// and no marks that flip the reading direction.
+/// and nothing that hides or reorders what you read.
 fn clean(text: &str) -> String {
-    text.chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-        .collect()
+    crew_core::text::strip_hidden(text)
 }
 
 /// `text` cut to `max` characters, keeping its start and end.
@@ -294,24 +369,40 @@ fn network_asked(asked: &Value) -> bool {
     asked["network"]["enabled"] == json!(true)
 }
 
+/// Marks what an access ask wants but can't be granted.
+const NOT_GRANTED: &str = "(outside the worktree, not granted)";
+
 /// What an access ask wants, such as `network, write gen, /`, then the
-/// agent's reason. Network and writes come first and paths are short, so
-/// nothing that matters is ever cut off.
+/// agent's reason. Network and what may be granted come first, then what
+/// can't be, marked so; paths are short, so nothing that matters is ever
+/// cut off.
 fn describe(asked: &Value, reason: Option<&str>, cwd: &Path) -> String {
     let fs = &asked["fileSystem"];
-    let mut write: Vec<String> = strings(&fs["write"])
-        .iter()
-        .map(|p| shown(p, cwd))
-        .collect();
-    let mut read: Vec<String> = strings(&fs["read"]).iter().map(|p| shown(p, cwd)).collect();
+    // (shown, granted) for each access.
+    let mut write: Vec<(String, bool)> = Vec::new();
+    let mut read: Vec<(String, bool)> = Vec::new();
+    for (key, list) in [("write", &mut write), ("read", &mut read)] {
+        for p in strings(&fs[key]) {
+            list.push((shown(p, cwd), inside(p, cwd).is_some()));
+        }
+    }
     for entry in fs["entries"].as_array().into_iter().flatten() {
+        let granted = entry["path"]["type"] == "path"
+            && entry["path"]["path"]
+                .as_str()
+                .is_some_and(|p| inside(p, cwd).is_some());
         match entry["access"].as_str() {
-            Some("write") => write.push(entry_shown(entry, cwd)),
-            Some("read") => read.push(entry_shown(entry, cwd)),
+            Some("write") => write.push((entry_shown(entry, cwd), granted)),
+            Some("read") => read.push((entry_shown(entry, cwd), granted)),
             _ => {}
         }
     }
-    let list = |verb: &str, paths: Vec<String>| {
+    let list = |verb: &str, paths: &[(String, bool)], granted: bool| {
+        let paths: Vec<&str> = paths
+            .iter()
+            .filter(|(_, g)| *g == granted)
+            .map(|(p, _)| p.as_str())
+            .collect();
         if paths.is_empty() {
             return None;
         }
@@ -323,12 +414,17 @@ fn describe(asked: &Value, reason: Option<&str>, cwd: &Path) -> String {
         if more > 0 {
             text.push_str(&format!(" +{more} more"));
         }
+        if !granted {
+            text.push_str(&format!(" {NOT_GRANTED}"));
+        }
         Some(text)
     };
     let parts: Vec<String> = [
         network_asked(asked).then(|| "network".to_string()),
-        list("write", write),
-        list("read", read),
+        list("write", &write, true),
+        list("read", &read, true),
+        list("write", &write, false),
+        list("read", &read, false),
     ]
     .into_iter()
     .flatten()
@@ -401,13 +497,31 @@ fn clamp(asked: &Value, cwd: &Path) -> Value {
 mod tests {
     use super::*;
 
+    fn scope<'a>(
+        files: &'a HashMap<String, Vec<FileChange>>,
+        wired: bool,
+        cwd: &'a Path,
+        read_only: bool,
+    ) -> Scope<'a> {
+        Scope {
+            files,
+            crew_wired: wired,
+            cwd,
+            read_only,
+            agent: "Scout",
+        }
+    }
+
     fn map(method: &str, params: Value, wired: bool) -> Mapped {
+        map_as(method, params, wired, false)
+    }
+
+    fn map_as(method: &str, params: Value, wired: bool, read_only: bool) -> Mapped {
+        let files = HashMap::new();
         map_request(
             method,
             &params,
-            &HashMap::new(),
-            wired,
-            Path::new("/work/demo"),
+            &scope(&files, wired, Path::new("/work/demo"), read_only),
         )
     }
 
@@ -437,6 +551,112 @@ mod tests {
         assert_eq!(a.kind.reply(Answer::Cancel), json!({"decision": "cancel"}));
     }
 
+    fn command(command: &str, actions: &[&str]) -> Value {
+        let actions: Vec<Value> = actions
+            .iter()
+            .map(|a| json!({"type": "unknown", "command": a}))
+            .collect();
+        json!({"itemId": "exec-1", "command": command, "cwd": "/work/demo", "commandActions": actions})
+    }
+
+    #[test]
+    fn command_labels_never_hide_part_of_the_command() {
+        let label = |cmd: &str, actions: &[&str]| {
+            asked(map(
+                "item/commandExecution/requestApproval",
+                command(cmd, actions),
+                true,
+            ))
+            .input
+            .get("label")
+            .cloned()
+        };
+        assert_eq!(
+            label("/bin/zsh -lc 'ls && cat a.txt'", &["ls", "cat a.txt"]),
+            Some(json!("ls && cat a.txt"))
+        );
+        assert_eq!(
+            label("/bin/zsh -lc 'ls && rm -rf ~'", &["ls"]),
+            Some(json!("ls (+ more)"))
+        );
+        assert_eq!(
+            label("/bin/bash -c 'ls; rm -rf ~'", &["ls", "rm -rf ~"]),
+            Some(json!("ls && rm -rf ~ (+ more)"))
+        );
+        assert_eq!(
+            label("/bin/zsh -lc 'ls' extra", &["ls"]),
+            Some(json!("ls (+ more)"))
+        );
+        assert_eq!(label("ls -la", &["ls -la"]), Some(json!("ls -la")));
+        assert_eq!(label("/bin/zsh -lc 'ls'", &[]), None);
+    }
+
+    #[test]
+    fn read_only_agents_are_never_granted_writes() {
+        let files = HashMap::new();
+        let read_only = |method: &str, params: Value| {
+            map_request(
+                method,
+                &params,
+                &scope(&files, true, Path::new("/work/demo"), true),
+            )
+        };
+        let declined = |reply: Value| Mapped::Declined {
+            reply,
+            note: "Scout is read-only.".into(),
+        };
+        assert_eq!(
+            read_only(
+                "item/fileChange/requestApproval",
+                json!({"itemId": "exec-9"})
+            ),
+            declined(json!({"decision": "decline"}))
+        );
+        for asked_for in [
+            json!({"fileSystem": {"write": ["/work/demo/gen"]}}),
+            json!({"network": {"enabled": true}, "fileSystem": {"entries": [
+                {"path": {"type": "path", "path": "/work/demo/out"}, "access": "write"}]}}),
+        ] {
+            assert_eq!(
+                read_only(
+                    "item/permissions/requestApproval",
+                    json!({"itemId": "i1", "permissions": asked_for}),
+                ),
+                declined(json!({"permissions": {}, "scope": "turn"})),
+            );
+        }
+        // Network or reads in the worktree still ask.
+        let a = asked(read_only(
+            "item/permissions/requestApproval",
+            json!({"itemId": "i1", "permissions": {"network": {"enabled": true}}}),
+        ));
+        assert_eq!(a.input["label"], "network");
+        // Commands still ask, saying where they would run.
+        let a = asked(read_only(
+            "item/commandExecution/requestApproval",
+            command("/bin/zsh -lc 'mkdir sub'", &["mkdir sub"]),
+        ));
+        assert_eq!(
+            a.input["label"],
+            "mkdir sub (runs outside the sandbox, in your folder)"
+        );
+        let a = asked(read_only(
+            "item/commandExecution/requestApproval",
+            command("/bin/zsh -lc 'mkdir sub'", &[]),
+        ));
+        assert_eq!(
+            a.input["label"],
+            "/bin/zsh -lc 'mkdir sub' (runs outside the sandbox, in your folder)"
+        );
+        // An edit agent's commands carry no such note.
+        let a = asked(map(
+            "item/commandExecution/requestApproval",
+            command("/bin/zsh -lc 'mkdir sub'", &["mkdir sub"]),
+            true,
+        ));
+        assert_eq!(a.input["label"], "mkdir sub");
+    }
+
     #[test]
     fn file_changes_list_the_started_items_changes() {
         let mut files = HashMap::new();
@@ -458,9 +678,7 @@ mod tests {
         let m = map_request(
             "item/fileChange/requestApproval",
             &json!({"itemId": "exec-9"}),
-            &files,
-            true,
-            Path::new("/work/demo"),
+            &scope(&files, true, Path::new("/work/demo"), false),
         );
         let a = asked(m);
         assert_eq!(a.tool, "Edit");
@@ -470,18 +688,18 @@ mod tests {
 
     #[test]
     fn crew_elicitations_pass_only_when_crew_is_wired() {
-        let params = json!({"serverName": "crew", "mode": "form",
-                            "message": "Allow the crew MCP server to run tool \"handoff\"?"});
+        let params = json!({"serverName": "crew_run", "mode": "form",
+                            "message": "Allow the crew_run MCP server to run tool \"handoff\"?"});
         assert_eq!(
             map("mcpServer/elicitation/request", params.clone(), true),
             Mapped::Reply(json!({"action": "accept", "content": {}, "_meta": null}))
         );
-        // Without wiring, a server named crew is the user's own.
+        // Without wiring, a server with that name is the user's own.
         let a = asked(map("mcpServer/elicitation/request", params, false));
-        assert_eq!(a.tool, "mcp__crew__handoff");
+        assert_eq!(a.tool, "mcp__crew_run__handoff");
         assert_eq!(
             a.input,
-            json!({"message": "Allow the crew MCP server to run tool \"handoff\"?"})
+            json!({"message": "Allow the crew_run MCP server to run tool \"handoff\"?"})
         );
         assert_eq!(
             a.kind.reply(Answer::No),
@@ -524,7 +742,7 @@ mod tests {
         assert_eq!(a.tool, "Permissions");
         assert_eq!(
             a.input["label"],
-            "network, write gen, /, /work/etc · build output"
+            "network, write gen, write /, /work/etc (outside the worktree, not granted) · build output"
         );
         assert_eq!(
             a.kind.reply(Answer::Yes),
@@ -587,7 +805,11 @@ mod tests {
             ]}}),
             None,
         ));
-        assert_eq!(a.input["label"], "write out, **/*.rs, read tmpdir");
+        assert_eq!(
+            a.input["label"],
+            "write out, write **/*.rs (outside the worktree, not granted), \
+             read tmpdir (outside the worktree, not granted)"
+        );
         assert_eq!(
             a.kind.reply(Answer::Yes)["permissions"],
             json!({"fileSystem": {"entries": [
@@ -642,9 +864,7 @@ mod tests {
             map_request(
                 "item/permissions/requestApproval",
                 &json!({"itemId": "i", "permissions": {"fileSystem": {"write": write}}}),
-                &HashMap::new(),
-                true,
-                &cwd,
+                &scope(&HashMap::new(), true, &cwd, false),
             )
         };
         for escaping in [
@@ -658,7 +878,10 @@ mod tests {
             );
         }
         let a = asked(ask(json!(["gen/out", "escape/crew-none"])));
-        assert_eq!(a.input["label"], "write gen/out, /crew-none");
+        assert_eq!(
+            a.input["label"],
+            "write gen/out, write /crew-none (outside the worktree, not granted)"
+        );
         assert_eq!(
             a.kind.reply(Answer::Yes)["permissions"]["fileSystem"]["write"],
             json!([cwd.join("gen/out")])

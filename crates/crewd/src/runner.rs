@@ -7,7 +7,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crew_core::claude::{ClaudeInvocation, StreamParser};
@@ -51,14 +51,26 @@ pub enum RunOutcome {
 /// Dropping the handle stops the run, the same as calling [`RunHandle::stop`].
 /// Keep it alive for as long as the run should go on.
 pub struct RunHandle {
-    pid: Option<u32>,
+    pid: PidSlot,
     stop_tx: watch::Sender<bool>,
 }
 
+/// Where a run's process id goes once its process starts. The process is
+/// its own process group.
+pub type PidSlot = Arc<OnceLock<u32>>;
+
 impl RunHandle {
-    /// The process id, or `None` if the process never started.
+    /// The process id, or `None` if the process didn't start (yet).
     pub fn pid(&self) -> Option<u32> {
-        self.pid
+        self.pid.get().copied()
+    }
+
+    /// Like [`RunHandle::idle`], with the slot its process id goes in
+    /// once it starts.
+    pub fn starting() -> (RunHandle, watch::Receiver<bool>, PidSlot) {
+        let (handle, stop_rx) = RunHandle::idle();
+        let slot = handle.pid.clone();
+        (handle, stop_rx, slot)
     }
 
     /// Asks the run to stop. Safe to call more than once or after exit.
@@ -75,7 +87,13 @@ impl RunHandle {
     /// receiver sees a stop, and also the handle being dropped.
     pub fn idle() -> (RunHandle, watch::Receiver<bool>) {
         let (stop_tx, stop_rx) = watch::channel(false);
-        (RunHandle { pid: None, stop_tx }, stop_rx)
+        (
+            RunHandle {
+                pid: PidSlot::default(),
+                stop_tx,
+            },
+            stop_rx,
+        )
     }
 }
 
@@ -193,7 +211,10 @@ pub fn spawn_run(
 
     if !inv.cwd.is_dir() {
         let msg = format!("Working folder {} doesn't exist.", inv.cwd.display());
-        let handle = RunHandle { pid: None, stop_tx };
+        let handle = RunHandle {
+            pid: PidSlot::default(),
+            stop_tx,
+        };
         return (handle, rx, tokio::spawn(async { RunOutcome::Failed(msg) }));
     }
 
@@ -214,7 +235,10 @@ pub fn spawn_run(
             } else {
                 format!("Couldn't start `claude`: {e}")
             };
-            let handle = RunHandle { pid: None, stop_tx };
+            let handle = RunHandle {
+                pid: PidSlot::default(),
+                stop_tx,
+            };
             return (handle, rx, tokio::spawn(async { RunOutcome::Failed(msg) }));
         }
     };
@@ -232,7 +256,11 @@ pub fn spawn_run(
     };
     let join = tokio::spawn(supervise(child, pid, stop_rx, readers));
 
-    (RunHandle { pid, stop_tx }, rx, join)
+    let slot = PidSlot::default();
+    if let Some(pid) = pid {
+        let _ = slot.set(pid);
+    }
+    (RunHandle { pid: slot, stop_tx }, rx, join)
 }
 
 /// The output readers and what they found so far. The findings live

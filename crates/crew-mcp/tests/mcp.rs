@@ -353,7 +353,7 @@ async fn approve_allows_crew_tools_without_asking() {
         .call(
             1,
             "approve",
-            json!({"tool_name": "mcp__crew__handoff", "input": input}),
+            json!({"tool_name": "mcp__crew_run__handoff", "input": input}),
         )
         .await;
     assert!(!is_error);
