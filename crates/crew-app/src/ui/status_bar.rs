@@ -9,7 +9,7 @@ use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::dot;
+use super::common::{dot, spinner};
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
@@ -124,7 +124,18 @@ impl Workspace {
                 bar.child(item("status-connection", token, text.to_string()))
             })
             .when_some(working, |bar, text| {
-                bar.child(item("status-working", "accent-blue", text))
+                bar.child(
+                    div()
+                        .id("status-working")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .aria_label(text.clone())
+                        .child(spinner("status-working-spinner", 12., "accent-blue"))
+                        .child(text)
+                        .test_support(),
+                )
             })
             .when_some(needs, |bar, text| {
                 bar.child(item("status-needs", "warning", text))

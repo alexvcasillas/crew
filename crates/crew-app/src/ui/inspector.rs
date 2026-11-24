@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::activity::{ActivityRow, activity_rows};
-use super::common::{clock, elapsed, monogram, now_ms};
+use super::common::{clock, elapsed, monogram, now_ms, rolling_text};
 use super::run_card::{FileChange, summarize};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -429,7 +429,24 @@ impl Workspace {
                     .text_size(px(12.))
                     .text_color(color(token))
                     .aria_label(word.clone())
-                    .child(word)
+                    .map(|state| {
+                        if run.status == RunStatus::Working {
+                            // `Working ·` stays still while the time rolls.
+                            let ms = now_ms() - run.started_at;
+                            state
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child("Working ·")
+                                .child(rolling_text(
+                                    "inspector-elapsed",
+                                    &elapsed(ms - 1000),
+                                    &elapsed(ms),
+                                ))
+                        } else {
+                            state.child(word)
+                        }
+                    })
                     .test_support(),
             )
             .when(live, |header| {

@@ -10,7 +10,7 @@ use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::clean_line;
+use super::common::{clean_line, spinner};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{StepState, relative};
 use super::workspace::Workspace;
@@ -77,7 +77,6 @@ pub enum ActivityRow {
         input: String,
     },
     Error(String),
-    Raw(String),
     /// The run's end, with its event's number and the agent's summary.
     Finished {
         ok: bool,
@@ -95,6 +94,8 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
     for logged in events.iter().filter(|e| e.run == run) {
         match &logged.event {
             Event::SessionStarted { cwd: dir, .. } => cwd = dir.clone(),
+            // Empty thinking says nothing.
+            Event::Thinking { text } if text.trim().is_empty() => {}
             Event::Thinking { text } => rows.push(ActivityRow::Thinking(text.clone())),
             Event::Message { text } => rows.push(ActivityRow::Said {
                 seq: logged.seq,
@@ -145,7 +146,9 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
                 input: short_input(input),
             }),
             Event::Error { message } => rows.push(ActivityRow::Error(message.clone())),
-            Event::Raw { line } => rows.push(ActivityRow::Raw(line.clone())),
+            // Lines the parser didn't know, such as stream-json system
+            // notes, stay in the store but aren't shown.
+            Event::Raw { .. } => {}
             Event::TurnEnd { ok, summary, .. } => rows.push(ActivityRow::Finished {
                 ok: *ok,
                 seq: logged.seq,
@@ -284,7 +287,9 @@ impl Workspace {
                             .text_color(color("text-secondary"))
                             .child(format!("Not allowed: {tool}")),
                     )
-                    .child(code(input.clone()))
+                    .when(!input.trim().is_empty(), |row| {
+                        row.child(code(input.clone()))
+                    })
                     .into_any_element(),
             ),
             ActivityRow::Error(message) => (
@@ -293,16 +298,6 @@ impl Workspace {
                 div()
                     .text_color(color("danger"))
                     .child(message.clone())
-                    .into_any_element(),
-            ),
-            ActivityRow::Raw(line) => (
-                IconName::Ellipsis,
-                "text-tertiary",
-                div()
-                    .font_family(mono_font())
-                    .text_size(px(11.5))
-                    .text_color(color("text-tertiary"))
-                    .child(line.clone())
                     .into_any_element(),
             ),
             ActivityRow::Finished { ok, seq, summary } => (
@@ -335,13 +330,16 @@ impl Workspace {
             .text_size(px(12.))
             .line_height(px(18.))
             .aria_label(row_label(row))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(16.))
-                    .pt(px(2.))
-                    .child(Icon::new(icon).size(px(14.)).text_color(color(token))),
-            )
+            .child(div().flex_none().w(px(16.)).pt(px(2.)).child(
+                if matches!(row, ActivityRow::Tool(t) if t.state == StepState::Running) {
+                    spinner(("activity-spinner", ix), 14., token).into_any_element()
+                } else {
+                    Icon::new(icon)
+                        .size(px(14.))
+                        .text_color(color(token))
+                        .into_any_element()
+                },
+            ))
             .child(div().flex_1().min_w_0().child(content))
             .test_support()
             .into_any_element()
@@ -373,7 +371,9 @@ impl Workspace {
                     .text_color(color("text-secondary"))
                     .child(tool.verb.clone()),
             )
-            .child(code(tool.target.clone()));
+            .when(!tool.target.trim().is_empty(), |head| {
+                head.child(code(tool.target.clone()))
+            });
         if let (Some((added, removed)), StepState::Done) = (tool.lines, tool.state) {
             head = head
                 .child(
@@ -615,16 +615,24 @@ pub fn row_label(row: &ActivityRow) -> String {
     match row {
         ActivityRow::Thinking(text) => format!("Thinking {text}"),
         ActivityRow::Said { text, .. } => format!("Said {text}"),
-        ActivityRow::Tool(tool) => format!("{} {}", tool.verb, tool.target),
-        ActivityRow::Denied { tool, input } => format!("Not allowed: {tool} {input}"),
+        ActivityRow::Tool(tool) => join_words(&tool.verb, &tool.target),
+        ActivityRow::Denied { tool, input } => join_words(&format!("Not allowed: {tool}"), input),
         ActivityRow::Error(message) => message.clone(),
-        ActivityRow::Raw(line) => line.clone(),
         ActivityRow::Finished {
             ok: true, summary, ..
         } => format!("Finished {summary}"),
         ActivityRow::Finished {
             ok: false, summary, ..
         } => format!("Failed {summary}"),
+    }
+}
+
+/// `head rest`, or just `head` when there is no rest.
+fn join_words(head: &str, rest: &str) -> String {
+    if rest.trim().is_empty() {
+        head.to_string()
+    } else {
+        format!("{head} {rest}")
     }
 }
 
@@ -749,7 +757,7 @@ mod tests {
             ),
         ];
         let rows = activity_rows(&events, run);
-        assert_eq!(rows.len(), 7, "{rows:?}");
+        assert_eq!(rows.len(), 6, "raw lines aren't rows: {rows:?}");
         assert_eq!(rows[0], ActivityRow::Thinking("hmm".into()));
         let ActivityRow::Tool(read) = &rows[1] else {
             panic!("a read row")
@@ -782,10 +790,9 @@ mod tests {
         };
         assert_eq!(bash.state, StepState::Running);
         assert_eq!(bash.output, None);
-        assert_eq!(rows[4], ActivityRow::Raw("not json".into()));
-        assert_eq!(rows[5], ActivityRow::Error("boom".into()));
+        assert_eq!(rows[4], ActivityRow::Error("boom".into()));
         assert_eq!(
-            rows[6],
+            rows[5],
             ActivityRow::Denied {
                 tool: "Bash".into(),
                 input: "rm -rf x".into()
@@ -801,6 +808,44 @@ mod tests {
         };
         assert_eq!(bash.state, StepState::Failed);
         assert_eq!(bash.output.as_deref(), Some("test failed"));
+    }
+
+    #[test]
+    fn system_lines_and_empty_thinking_are_not_shown() {
+        let run = RunId::new();
+        let events = vec![
+            at(
+                run,
+                1,
+                Event::Raw {
+                    line: r#"{"type":"system","subtype":"task_started"}"#.into(),
+                },
+            ),
+            at(
+                run,
+                2,
+                Event::Thinking {
+                    text: "  \n".into(),
+                },
+            ),
+            at(
+                run,
+                3,
+                call("ToolSearch", "t1", None, serde_json::json!({})),
+            ),
+        ];
+        let rows = activity_rows(&events, run);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let ActivityRow::Tool(tool) = &rows[0] else {
+            panic!("a tool row")
+        };
+        assert_eq!(tool.verb, "ToolSearch");
+        assert_eq!(super::row_label(&rows[0]), "ToolSearch");
+        let denied = ActivityRow::Denied {
+            tool: "Bash".into(),
+            input: String::new(),
+        };
+        assert_eq!(super::row_label(&denied), "Not allowed: Bash");
     }
 
     #[test]
