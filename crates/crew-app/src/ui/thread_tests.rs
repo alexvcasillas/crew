@@ -10,7 +10,7 @@ use crew_core::store::Author;
 use crew_proto::Request;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Role, TestAppContext};
 use serde::de::DeserializeOwned;
 
 use super::mention_menu::NO_AGENTS;
@@ -219,6 +219,82 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
         label_of(cx, window, format!("message-chip-{reply}")).as_deref(),
         Some("claude · haiku"),
         "the reply carries the agent's runtime"
+    );
+    wait_until(cx, "the run to end", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().live_runs(w.thread).is_empty())
+    });
+}
+
+#[gpui_kit::test]
+fn agent_replies_render_markdown_here_and_in_the_activity(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let reply = "**The change:** made it fast\\n\\n- first item\\n- second for @Forge";
+    let session = "\"session_id\":\"00000000-0000-4000-8000-000000000001\"";
+    let script = tmp.path().join("reply.jsonl");
+    std::fs::write(
+        &script,
+        format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"model\":\"claude-haiku-4-5\",\"tools\":[],{session}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{reply}\"}}]}},{session}}}\n\
+             {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{reply}\",\"duration_ms\":10,\"num_turns\":1,\"permission_denials\":[],{session}}}\n"
+        ),
+    )
+    .unwrap();
+    let claude = fake_claude(tmp.path(), &format!("cat '{}'", script.display()));
+    let home = short_home();
+    let _daemon = Daemon::start_with(home.path().to_path_buf(), claude);
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    w.post("@Forge make it **fast**");
+    wait_until(cx, "the reply", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(w.thread)
+                .iter()
+                .any(|m| matches!(m.author, Author::Agent(_)))
+        })
+    });
+    let reply = ws.read_with(cx, |ws, _| {
+        ws.state()
+            .messages(w.thread)
+            .iter()
+            .find(|m| matches!(m.author, Author::Agent(_)))
+            .map(|m| m.id)
+            .unwrap()
+    });
+    let body = format!("message-body-{reply}");
+    wait_until(cx, "the bold run", |cx| {
+        shows_within(cx, window, body.clone(), "bold The change:")
+    });
+    assert!(shows_within(cx, window, body.clone(), "first item"));
+    assert!(shows_within(cx, window, body.clone(), "second for @Forge"));
+    let items = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .within(body.clone())
+                .find_all_by_role(Role::ListItem)
+                .len()
+        })
+        .unwrap();
+    assert_eq!(items, 2, "one row per list item");
+    assert!(
+        !shows(cx, window, "bold fast"),
+        "your own message stays plain"
+    );
+
+    // The same text in the Activity tab, parsed once per message.
+    click(cx, window, "inspector-tab-activity");
+    wait_until(cx, "the activity", |cx| {
+        shows_within(cx, window, "inspector", "bold The change:")
+    });
+    let parsed = ws.read_with(cx, |ws, _| ws.docs.len());
+    assert!(shows_within(cx, window, "inspector", "first item"));
+    assert_eq!(
+        ws.read_with(cx, |ws, _| ws.docs.len()),
+        parsed,
+        "no new parses on redraw"
     );
     wait_until(cx, "the run to end", |cx| {
         ws.read_with(cx, |ws, _| ws.state().live_runs(w.thread).is_empty())

@@ -10,6 +10,7 @@ publish = false
 crew-core = { path = "../crew-core" }
 crew-proto = { path = "../crew-proto" }
 futures = { workspace = true }
+pulldown-cmark = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time", "sync"] }

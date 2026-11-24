@@ -10,6 +10,7 @@ use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{StepState, changed_lines, relative};
 use super::workspace::Workspace;
 use crate::fonts::mono_font;
@@ -50,12 +51,22 @@ pub struct ToolRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivityRow {
     Thinking(String),
-    Said(String),
+    /// What the agent said, with its event's number in the run.
+    Said {
+        seq: u64,
+        text: String,
+    },
     Tool(ToolRow),
-    Denied { tool: String, input: String },
+    Denied {
+        tool: String,
+        input: String,
+    },
     Error(String),
     Raw(String),
-    Finished { ok: bool, summary: String },
+    Finished {
+        ok: bool,
+        summary: String,
+    },
 }
 
 /// The rows for `run`'s events, in order. A tool's result fills in the
@@ -68,7 +79,10 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
         match &logged.event {
             Event::SessionStarted { cwd: dir, .. } => cwd = dir.clone(),
             Event::Thinking { text } => rows.push(ActivityRow::Thinking(text.clone())),
-            Event::Message { text } => rows.push(ActivityRow::Said(text.clone())),
+            Event::Message { text } => rows.push(ActivityRow::Said {
+                seq: logged.seq,
+                text: text.clone(),
+            }),
             Event::ToolCall {
                 id,
                 name,
@@ -202,14 +216,22 @@ impl Workspace {
                     )
                     .into_any_element(),
             ),
-            ActivityRow::Said(text) => (
-                IconName::Bot,
-                "text-secondary",
-                div()
-                    .text_color(color("text-primary"))
-                    .child(text.clone())
-                    .into_any_element(),
-            ),
+            ActivityRow::Said { seq, text } => {
+                let content = match self.inspector.rows_from {
+                    Some((run, _)) => {
+                        let doc = self.docs.get(DocKey::Event(run, *seq), text);
+                        let names: Vec<String> = self
+                            .state()
+                            .agents()
+                            .iter()
+                            .map(|a| a.spec.name.clone())
+                            .collect();
+                        render_doc(&doc, &names, &format!("md-activity-{ix}")).into_any_element()
+                    }
+                    None => div().child(text.clone()).into_any_element(),
+                };
+                (IconName::Bot, "text-secondary", content)
+            }
             ActivityRow::Tool(tool) => {
                 let (icon, token) = tool_icon(tool);
                 (
@@ -459,7 +481,7 @@ fn tool_icon(tool: &ToolRow) -> (IconName, &'static str) {
 pub fn row_label(row: &ActivityRow) -> String {
     match row {
         ActivityRow::Thinking(text) => format!("Thinking {text}"),
-        ActivityRow::Said(text) => format!("Said {text}"),
+        ActivityRow::Said { text, .. } => format!("Said {text}"),
         ActivityRow::Tool(tool) => format!("{} {}", tool.verb, tool.target),
         ActivityRow::Denied { tool, input } => format!("Not allowed: {tool} {input}"),
         ActivityRow::Error(message) => message.clone(),

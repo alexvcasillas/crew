@@ -13,10 +13,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{chip, clock, elapsed, monogram, runtime_chip};
+use super::markdown_view::{DocKey, render_doc};
 use super::run_card::summarize;
 use super::thread_settings::policy_name;
 use super::workspace::Workspace;
 use crate::fonts::{mono_font, ui_font};
+use crate::markdown::mention_spans;
 use crate::theme::color;
 
 impl Workspace {
@@ -314,7 +316,14 @@ impl Workspace {
                             .id(format!("message-body-{id}"))
                             .line_height(px(20.))
                             .aria_label(message.body.clone())
-                            .child(styled_body(&message.body, names))
+                            .map(|body| {
+                                if matches!(message.author, Author::Agent(_)) {
+                                    let doc = self.docs.get(DocKey::Message(id), &message.body);
+                                    body.child(render_doc(&doc, names, &format!("md-{id}")))
+                                } else {
+                                    body.child(styled_body(&message.body, names))
+                                }
+                            })
                             .test_support(),
                     ),
             )
@@ -499,28 +508,10 @@ fn code_spans(body: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Byte ranges of `@Name` for known agent names.
-fn mention_spans(body: &str, names: &[String]) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    for (at, _) in body.match_indices('@') {
-        let starts = body[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| c.is_whitespace() || c == '(');
-        let word_len = body[at + 1..]
-            .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(body.len() - at - 1);
-        let word = &body[at + 1..at + 1 + word_len];
-        if starts && names.iter().any(|n| n.eq_ignore_ascii_case(word)) {
-            spans.push(at..at + 1 + word_len);
-        }
-    }
-    spans
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Span, body_spans, code_spans, mention_spans};
+    use super::{Span, body_spans, code_spans};
+    use crate::markdown::mention_spans;
 
     #[test]
     fn known_mentions_and_code_are_found() {
