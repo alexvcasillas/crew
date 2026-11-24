@@ -28,6 +28,13 @@ const QUIET: &[&str] = &[
     "remoteControl/status/changed",
     "mcpServer/startupStatus/updated",
     "serverRequest/resolved",
+    // Streamed pieces; the whole item arrives on `item/completed`.
+    "item/commandExecution/outputDelta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta",
+    "item/plan/delta",
+    "turn/plan/updated",
 ];
 
 /// Translates one Codex thread's messages. Create one per run.
@@ -141,6 +148,8 @@ impl CodexTranslator {
             }
             ThreadItem::Other(v) => match v.get("type").and_then(Value::as_str) {
                 Some("userMessage") => vec![],
+                Some("reasoning") => thinking(reasoning_summary(v)),
+                Some("plan") => thinking(v.get("text").and_then(Value::as_str).unwrap_or("")),
                 _ => vec![Event::Raw {
                     line: v.to_string(),
                 }],
@@ -236,6 +245,27 @@ impl CodexTranslator {
     fn close_item(&mut self, id: &str) {
         self.open.retain(|(open, _)| open != id);
     }
+}
+
+/// The reasoning summary parts, joined. The raw `content` is not shown.
+fn reasoning_summary(v: &Value) -> String {
+    v.get("summary")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn thinking(text: impl AsRef<str>) -> Vec<Event> {
+    let text = text.as_ref().trim();
+    if text.is_empty() {
+        return vec![];
+    }
+    vec![Event::Thinking { text: text.into() }]
 }
 
 fn result(id: String, is_error: bool, output: String) -> Event {

@@ -385,3 +385,32 @@ fn mcp_declined_or_failed_without_error_says_declined() {
         );
     }
 }
+
+#[test]
+fn reasoning_and_plan_become_thinking() {
+    let mut t = CodexTranslator::new();
+    let events = translate(&mut t, &fixture("reasoning_and_plan.jsonl"));
+    assert_eq!(
+        events,
+        vec![
+            Event::Thinking {
+                text: "Looking at the cart code.\n\nTotals live in cart.py.".into()
+            },
+            Event::Thinking {
+                text: "1. Read cart.py\n2. Fix the total".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn empty_reasoning_and_plan_give_nothing() {
+    let mut t = CodexTranslator::new();
+    for it in [
+        json!({"type": "reasoning", "id": "r", "summary": ["  ", ""], "content": ["x"]}),
+        json!({"type": "reasoning", "id": "r2"}),
+        json!({"type": "plan", "id": "p", "text": " \n"}),
+    ] {
+        assert!(t.on(&item("item/completed", it)).is_empty());
+    }
+}
