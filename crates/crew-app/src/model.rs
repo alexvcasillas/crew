@@ -178,6 +178,9 @@ struct TerminalLog {
     items: BTreeMap<u64, TranscriptItem>,
     /// Counts changes, so views redo their rows only when it moves.
     version: u64,
+    /// Counts clears. After one, crewd may number items from 0 again,
+    /// so a seq can hold other text than before.
+    generation: u64,
 }
 
 impl TerminalLog {
@@ -205,6 +208,7 @@ impl TerminalLog {
     fn clear(&mut self) {
         self.items.clear();
         self.version += 1;
+        self.generation += 1;
     }
 }
 
@@ -449,6 +453,14 @@ impl State {
     /// Moves whenever the watched session's items change.
     pub fn terminal_version(&self, session: &str) -> u64 {
         self.terminal_logs.get(session).map_or(0, |log| log.version)
+    }
+
+    /// Moves whenever the watched session's items are dropped for a new
+    /// backlog, after which a seq may name another item.
+    pub fn terminal_generation(&self, session: &str) -> u64 {
+        self.terminal_logs
+            .get(session)
+            .map_or(0, |log| log.generation)
     }
 
     /// Projects, oldest first.
@@ -1687,6 +1699,7 @@ mod tests {
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"));
+        assert_eq!(state.terminal_generation("s1"), 1);
         state.apply(said("s1", 7, "after"));
         assert_eq!(terminal_texts(&state, "s1"), [(7, "after".to_string())]);
 
@@ -1701,6 +1714,7 @@ mod tests {
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");
+        assert_eq!(state.terminal_generation("s1"), 2);
         state.apply(said("s1", 7, "after"));
         assert_eq!(terminal_texts(&state, "s1").len(), 1);
     }

@@ -284,6 +284,7 @@ impl Workspace {
         if !self.nav.terminal_groups.remove(&project) {
             self.nav.terminal_groups.insert(project);
         }
+        self.sync_terminal_ticker(cx);
         cx.notify();
     }
 
@@ -342,6 +343,7 @@ impl Workspace {
         if !self.nav.collapsed.remove(&project) {
             self.nav.collapsed.insert(project);
         }
+        self.sync_terminal_ticker(cx);
         cx.notify();
     }
 }

@@ -14,7 +14,7 @@
 //! falls behind (`Resync`). Only the stream is reopened then, so requests
 //! still waiting for an answer, such as a commit, keep waiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -368,6 +368,21 @@ struct Stream {
     side: Side,
     wr: OwnedWriteHalf,
     _reader: Reader,
+    /// Terminal sessions asked for and not answered yet, by request id.
+    terminal_asks: HashMap<u64, String>,
+    /// Watched terminal sessions crewd refused, as when it has not found
+    /// them yet after starting. Asked for again once crewd lists them.
+    refused: HashSet<String>,
+}
+
+impl Stream {
+    /// Sends `req`, noting which terminal session it subscribes to.
+    async fn send(&mut self, next_id: &mut u64, req: Request) -> io::Result<()> {
+        if let Request::SubscribeTerminal { session } = &req {
+            self.terminal_asks.insert(*next_id, session.clone());
+        }
+        send(&mut self.wr, next_id, req).await
+    }
 }
 
 /// Opens a stream and subscribes to everything, each watched thread and
@@ -379,19 +394,23 @@ async fn open_stream(
     watched: &Watched,
     next_id: &mut u64,
 ) -> Result<Stream, Refused> {
-    let (rd, mut wr) = open(socket).await?.into_split();
+    let (rd, wr) = open(socket).await?.into_split();
     let side = Side::Stream(number);
     let reader = Reader(tokio::spawn(read_into(rd, side, frames.clone())));
-    for req in watched.requests() {
-        send(&mut wr, next_id, req)
-            .await
-            .map_err(|e| Refused::Other(e.to_string()))?;
-    }
-    Ok(Stream {
+    let mut stream = Stream {
         side,
         wr,
         _reader: reader,
-    })
+        terminal_asks: HashMap::new(),
+        refused: HashSet::new(),
+    };
+    for req in watched.requests() {
+        stream
+            .send(next_id, req)
+            .await
+            .map_err(|e| Refused::Other(e.to_string()))?;
+    }
+    Ok(stream)
 }
 
 /// Opens the control connection and a stream, then forwards notices and
@@ -444,8 +463,11 @@ async fn session(
                 Some(Command::Reconnect) => {}
                 Some(command) => {
                     if let Some(req) = watched.take(command) {
+                        if let Request::UnsubscribeTerminal { session } = &req {
+                            stream.refused.remove(session);
+                        }
                         // A failed write shows up as the stream ending.
-                        let _ = send(&mut stream.wr, &mut next_id, req).await;
+                        let _ = stream.send(&mut next_id, req).await;
                     }
                 }
             },
@@ -464,11 +486,30 @@ async fn session(
                     (Side::Control, Err(e)) => return Ended::Lost(e.to_string()),
                     // From a stream already replaced.
                     (side, _) if side != stream.side => None,
-                    (_, Ok(Some(ServerMsg::Response { result: Err(e), .. }))) => {
-                        eprintln!("crew: crewd refused a subscription: {e}");
+                    (_, Ok(Some(ServerMsg::Response { id, result }))) => {
+                        let session = stream.terminal_asks.remove(&id);
+                        if let Err(e) = result {
+                            eprintln!("crew: crewd refused a subscription: {e}");
+                            if let Some(session) = session
+                                && watched.terminals.contains(&session)
+                            {
+                                stream.refused.insert(session);
+                            }
+                        }
                         None
                     }
-                    (_, Ok(Some(ServerMsg::Response { .. }))) => None,
+                    (_, Ok(Some(ServerMsg::TerminalSessionChanged { session })))
+                        if stream.refused.contains(&session.id) =>
+                    {
+                        let id = session.id.clone();
+                        stream.refused.remove(&id);
+                        if !status.send(ClientEvent::Msg(ServerMsg::TerminalSessionChanged { session })) {
+                            return Ended::Shutdown;
+                        }
+                        let req = Request::SubscribeTerminal { session: id };
+                        let _ = stream.send(&mut next_id, req).await;
+                        None
+                    }
                     (_, Ok(Some(ServerMsg::Resync))) => Some("crewd asked to catch up.".to_string()),
                     (_, Ok(Some(ServerMsg::TerminalSessionReset { session })))
                         if watched.terminals.contains(&session) =>
@@ -481,7 +522,7 @@ async fn session(
                         }
                         // Its new backlog follows the reset.
                         let req = Request::SubscribeTerminal { session };
-                        let _ = send(&mut stream.wr, &mut next_id, req).await;
+                        let _ = stream.send(&mut next_id, req).await;
                         None
                     }
                     (_, Ok(Some(msg))) => {
