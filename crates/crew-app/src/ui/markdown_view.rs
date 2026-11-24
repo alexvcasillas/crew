@@ -9,7 +9,7 @@ use crew_core::ids::{MessageId, RunId};
 use gpui_kit::*;
 
 use crate::fonts::{mono_font, ui_font};
-use crate::markdown::{Block, Doc, Text, opens, parse, with_mentions};
+use crate::markdown::{Block, Doc, Text, opens, parse, with_code_gaps, with_mentions};
 use crate::theme::color;
 
 /// What a cached parse belongs to.
@@ -124,11 +124,12 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
 /// mentions and links in blue. Clicking a web link opens it.
 fn rich_text(text: &Text, names: &[String], id: &str, weight: FontWeight) -> Div {
     let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-    let runs: Vec<TextRun> = with_mentions(text, names)
+    let runs: Vec<TextRun> = with_code_gaps(&text.text, with_mentions(text, names))
         .into_iter()
-        .map(|span| {
+        .map(|(span, gap)| {
             let style = span.style;
-            let mut run_font = font(if style.code { mono_font() } else { ui_font() });
+            let mono = style.code || gap;
+            let mut run_font = font(if mono { mono_font() } else { ui_font() });
             run_font.weight = if style.bold {
                 FontWeight::BOLD
             } else if style.mention && weight.0 < FontWeight::MEDIUM.0 {
@@ -159,6 +160,8 @@ fn rich_text(text: &Text, names: &[String], id: &str, weight: FontWeight) -> Div
         .collect();
     #[cfg(test)]
     let markers = bold_markers(&text.text, &runs, id);
+    #[cfg(test)]
+    drawn::record(&text.text, &runs);
     let styled = StyledText::new(text.text.clone()).with_runs(runs);
     let element = if links.is_empty() {
         styled.into_any_element()
@@ -210,4 +213,54 @@ fn plain_text(blocks: &[Block]) -> String {
         }
     }
     words.join(" ")
+}
+
+/// How each drawn text was split into runs, so window tests can check
+/// what was drawn in which font.
+#[cfg(test)]
+pub mod drawn {
+    use std::cell::RefCell;
+
+    use gpui_kit::TextRun;
+
+    use crate::fonts::mono_font;
+
+    /// A stretch of drawn text, whether in the code font, and whether on
+    /// the code background.
+    pub type Part = (String, bool, bool);
+
+    thread_local! {
+        static DRAWN: RefCell<Vec<(String, Vec<Part>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(text: &str, runs: &[TextRun]) {
+        let mut at = 0;
+        let parts = runs
+            .iter()
+            .map(|r| {
+                let part = text[at..at + r.len].to_string();
+                at += r.len;
+                (
+                    part,
+                    r.font.family == mono_font(),
+                    r.background_color.is_some(),
+                )
+            })
+            .collect();
+        DRAWN.with(|d| {
+            let mut d = d.borrow_mut();
+            d.retain(|(t, _)| t != text);
+            d.push((text.to_string(), parts));
+        });
+    }
+
+    /// The runs `text` was last drawn in, if it was.
+    pub fn parts(text: &str) -> Option<Vec<Part>> {
+        DRAWN.with(|d| {
+            d.borrow()
+                .iter()
+                .find(|(t, _)| t == text)
+                .map(|(_, p)| p.clone())
+        })
+    }
 }

@@ -299,6 +299,58 @@ pub fn with_mentions(text: &Text, names: &[String]) -> Vec<Span> {
     spans
 }
 
+/// `spans` of `text` with the whitespace right next to inline code split
+/// off and marked `true`. Views draw it in the code font: the interface
+/// font's space is so narrow beside a code background that it reads as
+/// no space at all.
+pub fn with_code_gaps(text: &str, spans: Vec<Span>) -> Vec<(Span, bool)> {
+    let code: Vec<bool> = spans.iter().map(|s| s.style.code).collect();
+    let mut out = Vec::new();
+    for (ix, span) in spans.into_iter().enumerate() {
+        if span.style.code {
+            out.push((span, false));
+            continue;
+        }
+        let part = &text[span.range.clone()];
+        let after_code = ix > 0 && code[ix - 1];
+        let before_code = code.get(ix + 1).copied().unwrap_or(false);
+        let lead = if after_code {
+            part.len() - part.trim_start_matches(' ').len()
+        } else {
+            0
+        };
+        let trail = if before_code {
+            part.len() - part.trim_end_matches(' ').len()
+        } else {
+            0
+        };
+        let (start, end) = (span.range.start, span.range.end);
+        if lead + trail >= part.len() {
+            // Only spaces between two code runs.
+            let gap = lead > 0 || trail > 0;
+            out.push((span, gap));
+            continue;
+        }
+        let piece = |range: std::ops::Range<usize>, gap: bool| {
+            (
+                Span {
+                    range,
+                    style: span.style.clone(),
+                },
+                gap,
+            )
+        };
+        if lead > 0 {
+            out.push(piece(start..start + lead, true));
+        }
+        out.push(piece(start + lead..end - trail, false));
+        if trail > 0 {
+            out.push(piece(end - trail..end, true));
+        }
+    }
+    out
+}
+
 /// Byte ranges of `@Name` for known agent names.
 pub fn mention_spans(body: &str, names: &[String]) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
@@ -326,7 +378,9 @@ pub fn opens(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, Doc, Span, Style, Text, mention_spans, opens, parse, with_mentions};
+    use super::{
+        Block, Doc, Span, Style, Text, mention_spans, opens, parse, with_code_gaps, with_mentions,
+    };
 
     /// Each stretch of `text` with a short tag for its style.
     fn styled(text: &Text) -> Vec<(&str, &'static str)> {
@@ -380,6 +434,65 @@ mod tests {
                 ("fast", "code"),
                 (" and ", "plain"),
                 ("both", "bold italic"),
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_between_code_runs_stay() {
+        for source in [
+            "- Returns `(total, percent)` to `cart.py`.",
+            "Returns `(total, percent)` to `cart.py`.",
+        ] {
+            let doc = parse(source);
+            let text = match &doc.blocks[0] {
+                Block::Paragraph(text) => text,
+                Block::List { items, .. } => match &items[0][0] {
+                    Block::Paragraph(text) => text,
+                    other => panic!("item text, got {other:?}"),
+                },
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                text.text, "Returns (total, percent) to cart.py.",
+                "{source}"
+            );
+            assert_eq!(
+                styled(text),
+                [
+                    ("Returns ", "plain"),
+                    ("(total, percent)", "code"),
+                    (" to ", "plain"),
+                    ("cart.py", "code"),
+                    (".", "plain"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn spaces_next_to_code_are_marked() {
+        let doc = parse("Returns `(total, percent)` to `cart.py`. and `a` `b`");
+        let text = paragraph(&doc, 0);
+        let parts: Vec<(&str, bool)> = with_code_gaps(&text.text, text.spans.clone())
+            .into_iter()
+            .map(|(s, gap)| (&text.text[s.range], gap))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("Returns", false),
+                (" ", true),
+                ("(total, percent)", false),
+                (" ", true),
+                ("to", false),
+                (" ", true),
+                ("cart.py", false),
+                (". and", false),
+                (" ", true),
+                ("a", false),
+                (" ", true),
+                ("b", false),
             ]
         );
     }
