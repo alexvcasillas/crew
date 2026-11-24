@@ -909,12 +909,14 @@ impl Store {
     }
 
     /// Ended runs that started (any final status), newest `ended_at` first.
-    /// `before` is an exclusive `ended_at` in Unix ms; `limit` is clamped to
-    /// 1..=200. A run stopped while still queued never started and is left out.
+    /// `before` is an inclusive `ended_at` in Unix ms, so runs that share the
+    /// last end time of a page come again on the next one and none is lost;
+    /// callers drop repeats by id. `limit` is clamped to 1..=200. A run
+    /// stopped while still queued never started and is left out.
     pub fn run_history(&self, before: Option<i64>, limit: u32) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
             "{RUN_COLUMNS} WHERE ended_at IS NOT NULL AND session_id <> ''
-             AND (?1 IS NULL OR ended_at < ?1)
+             AND (?1 IS NULL OR ended_at <= ?1)
              ORDER BY ended_at DESC, ord DESC LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![before, limit.clamp(1, 200)], read_run)?;

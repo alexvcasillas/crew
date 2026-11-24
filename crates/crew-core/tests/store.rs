@@ -1026,17 +1026,14 @@ fn run_history_pages_newest_first_by_end_time() {
     assert_eq!(got, vec![ids[4], ids[3], ids[2]]);
     assert_eq!(page[1].status, RunStatus::Interrupted);
 
+    // The bound is inclusive: the page's last run comes again first.
     let before = page.last().unwrap().ended_at;
     let rest = store.run_history(before, 3).unwrap();
     let got: Vec<_> = rest.iter().map(|r| r.id).collect();
-    assert_eq!(got, vec![ids[1], ids[0]]);
-    // The bound is exclusive.
-    assert!(
-        store
-            .run_history(rest.last().unwrap().ended_at, 3)
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(got, vec![ids[2], ids[1], ids[0]]);
+    let last = store.run_history(rest.last().unwrap().ended_at, 3).unwrap();
+    let got: Vec<_> = last.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[0]]);
 }
 
 #[test]

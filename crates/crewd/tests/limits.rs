@@ -400,8 +400,10 @@ async fn history_and_usage_answer_over_the_socket() {
             limit: 2,
         })
         .await;
-    assert_eq!(rest.len(), 1);
-    assert!(rest[0].ended_at < page[1].ended_at);
+    // Inclusive: the page's last run comes again, then the older one.
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest[0].id, page[1].id);
+    assert!(rest[1].ended_at < page[1].ended_at);
 
     let usage: Vec<RuntimeUsage> = c.ok(Request::UsageSince { since_ms: 0 }).await;
     assert_eq!(usage.len(), 1);

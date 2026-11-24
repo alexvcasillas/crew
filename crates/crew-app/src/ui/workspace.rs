@@ -375,6 +375,7 @@ impl Workspace {
         let mut connected = false;
         let mut snapshot = false;
         let mut terminal_gone = false;
+        let mut run_ended = false;
         for event in events {
             // Only crewd saying so closes the open session: a snapshot
             // just after crewd starts may not list it yet.
@@ -382,6 +383,9 @@ impl Workspace {
                 && self.terminal.as_ref().is_some_and(|t| t.session == *id)
             {
                 terminal_gone = true;
+            }
+            if let ClientEvent::Msg(crew_proto::ServerMsg::RunStatus { status, .. }) = &event {
+                run_ended |= !matches!(status, RunStatus::Queued | RunStatus::Working);
             }
             connected |= event == ClientEvent::Connected;
             snapshot |= matches!(
@@ -412,6 +416,10 @@ impl Workspace {
                 self.first_launch = Some(FirstLaunch::default());
             }
             self.page_opened(window, cx);
+        }
+        // Today's runs change when one ends, and may have while away.
+        if run_ended || snapshot {
+            self.refresh_usage(cx);
         }
         self.sync_settings(window, cx);
         self.sync(cx);

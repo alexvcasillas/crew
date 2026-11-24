@@ -91,8 +91,9 @@ pub enum Request {
     SetLimits {
         limits: Limits,
     },
-    /// Ended runs (any final status), newest first. `before` is an
-    /// exclusive `ended_at` in Unix ms; `limit` is clamped to 1..=200.
+    /// Ended runs that started (any final status), newest first. `before`
+    /// is an inclusive `ended_at` in Unix ms, so a page repeats the runs
+    /// that end at its bound; drop them by id. `limit` is clamped to 1..=200.
     /// Answered with `Vec<StoredRun>`.
     RunHistory {
         before: Option<i64>,
