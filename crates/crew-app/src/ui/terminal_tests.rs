@@ -557,3 +557,41 @@ fn inline_code_keeps_the_spaces_around_it(cx: &mut TestAppContext) {
         ]
     );
 }
+
+/// A Markdown table draws as a table with one row per line, header
+/// included, inside the width it is given.
+#[gpui_kit::test]
+fn a_markdown_table_draws_as_a_table(cx: &mut TestAppContext) {
+    use super::markdown_view::drawn::parts;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, Role};
+    let home = short_home();
+    let s = Setup::new(home.path());
+    s.write(
+        "s-table",
+        "List MRs",
+        "| MR | Author | Status |\n|---|---|---|\n| !12 | sam | `open` |\n| !13 | kim |\n",
+    );
+    let (window, _ws) = open_session(cx, home.path(), &s, "s-table");
+    wait_until(cx, "the table", |_| parts("Author").is_some());
+    let (tables, rows, table, view) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let view = window.within("terminal-view");
+            let tables = view.find_all_by_role(Role::Table);
+            let rows = view.find_all_by_role(Role::Row);
+            (
+                tables.len(),
+                rows.len(),
+                tables[0].bounds(),
+                window.find("terminal-view").bounds(),
+            )
+        })
+        .unwrap();
+    assert_eq!(tables, 1);
+    assert_eq!(rows, 3, "the header and two rows");
+    assert!(shows(cx, window, "MR Author Status"));
+    assert!(shows(cx, window, "!13 kim "), "a short row is padded");
+    assert_eq!(parts("open").unwrap(), vec![("open".into(), true, true)]);
+    assert!(table.size.width <= view.size.width, "it fits its column");
+}
