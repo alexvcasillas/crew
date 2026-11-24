@@ -67,6 +67,97 @@ pub struct LoggedEvent {
     pub run: RunId,
     pub seq: u64,
     pub event: Event,
+    /// Lines an edit or a new file adds and removes, counted once here
+    /// rather than on every redraw.
+    pub lines: Option<(u32, u32)>,
+}
+
+impl LoggedEvent {
+    pub fn new(run: RunId, seq: u64, event: Event) -> Self {
+        let lines = match &event {
+            Event::ToolCall { kind, input, .. } => changed_lines(kind, input),
+            _ => None,
+        };
+        Self {
+            run,
+            seq,
+            event,
+            lines,
+        }
+    }
+}
+
+/// Lines an edit or a new file adds and removes.
+pub fn changed_lines(kind: &ToolKind, input: &serde_json::Value) -> Option<(u32, u32)> {
+    let lines = |v: &serde_json::Value| {
+        v.as_str()
+            .map_or(0, |s| u32::try_from(s.lines().count()).unwrap_or(u32::MAX))
+    };
+    // Codex gives a unified diff instead of old and new text.
+    if let Some(diff) = input.get("diff").and_then(|d| d.as_str()) {
+        return match kind {
+            ToolKind::Edit => Some(patch_lines(diff)),
+            ToolKind::Create => Some((lines(&input["diff"]), 0)),
+            _ => None,
+        };
+    }
+    match kind {
+        ToolKind::Edit => {
+            let edits = match input.get("edits").and_then(|e| e.as_array()) {
+                Some(edits) => edits.iter().collect(),
+                None => vec![input],
+            };
+            Some(edits.iter().fold((0, 0), |(a, r), e| {
+                (a + lines(&e["new_string"]), r + lines(&e["old_string"]))
+            }))
+        }
+        ToolKind::Create => Some((lines(&input["content"]), 0)),
+        _ => None,
+    }
+}
+
+/// What a unified diff line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchMark {
+    Added,
+    Removed,
+    /// File headers, hunk heads and context.
+    Plain,
+}
+
+/// Marks each line of a unified diff. `---` and `+++` are file headers
+/// only before the first `@@`; inside a hunk they are changed lines.
+pub fn patch_marks(diff: &str) -> impl Iterator<Item = (&str, PatchMark)> {
+    let mut in_hunk = false;
+    diff.lines().map(move |line| {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        }
+        let header = !in_hunk && (line.starts_with("---") || line.starts_with("+++"));
+        let mark = if header {
+            PatchMark::Plain
+        } else if line.starts_with('+') {
+            PatchMark::Added
+        } else if line.starts_with('-') {
+            PatchMark::Removed
+        } else {
+            PatchMark::Plain
+        };
+        (line, mark)
+    })
+}
+
+/// Lines a unified diff adds and removes.
+pub fn patch_lines(diff: &str) -> (u32, u32) {
+    let (mut added, mut removed) = (0u32, 0u32);
+    for (_, mark) in patch_marks(diff) {
+        match mark {
+            PatchMark::Added => added = added.saturating_add(1),
+            PatchMark::Removed => removed = removed.saturating_add(1),
+            PatchMark::Plain => {}
+        }
+    }
+    (added, removed)
 }
 
 /// The events of one watched thread, each `(run, seq)` once.
@@ -154,7 +245,7 @@ impl State {
                 if let Some(log) = self.logs.get_mut(&thread)
                     && log.seen.insert((run, seq))
                 {
-                    log.events.push(LoggedEvent { run, seq, event });
+                    log.events.push(LoggedEvent::new(run, seq, event));
                 }
             }
             // The workspace keeps the runtimes.
@@ -1307,5 +1398,30 @@ mod tests {
         later.handoff_budget = Some(9);
         state.apply(ServerMsg::ThreadChanged { thread: later });
         assert_eq!(state.thread_handoff(t.id), (None, Some(9)));
+    }
+
+    #[test]
+    fn edit_lines_are_counted_once_per_event() {
+        let call = |input: serde_json::Value| {
+            LoggedEvent::new(
+                crew_core::ids::RunId::new(),
+                0,
+                crew_core::event::Event::ToolCall {
+                    id: "t".into(),
+                    name: "Edit".into(),
+                    kind: crew_core::event::ToolKind::Edit,
+                    target: None,
+                    input,
+                },
+            )
+        };
+        let claude = call(serde_json::json!({"old_string": "a", "new_string": "b\nc"}));
+        assert_eq!(claude.lines, Some((2, 1)));
+        // Headers only count as headers before the first hunk.
+        let codex = call(
+            serde_json::json!({"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n--- note\n+++ more\n-y\n"}),
+        );
+        assert_eq!(codex.lines, Some((1, 2)));
+        assert_eq!(patch_lines("-a\n+b\n"), (1, 1), "no headers at all");
     }
 }

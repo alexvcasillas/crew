@@ -8,9 +8,10 @@ use crew_core::event::RunStatus;
 use crew_core::ids::AgentId;
 use crew_core::store::ApprovalStatus;
 use crew_proto::Request;
-use gpui_kit::TestAppContext;
+use gpui_kit::{AppContext as _, TestAppContext};
 use serde_json::{Value, json};
 
+use super::common::runtime_chip;
 use super::inspector_tests::run_of;
 use super::settings::agents::CODEX_LOGIN;
 use super::test_ui::{
@@ -24,15 +25,24 @@ const TID: &str = "00000000-0000-7000-8000-000000000001";
 
 /// crewd's model listing: two models, Luna second.
 fn models(dir: &Path) {
+    list_models(
+        dir,
+        &[("gpt-6.1-sol", "GPT-6.1-Sol"), ("gpt-6-luna", "GPT-6-Luna")],
+    );
+}
+
+/// crewd's model listing: these `(id, label)` models.
+fn list_models(dir: &Path, models: &[(&str, &str)]) {
+    let data: Vec<Value> = models
+        .iter()
+        .map(|(id, label)| json!({"id": id, "model": id, "displayName": label, "hidden": false}))
+        .collect();
     let steps = json!([
         {"expect": "initialize", "as": "init"},
         {"respond": "init", "result": {}},
         {"expect": "initialized"},
         {"expect": "model/list", "as": "list"},
-        {"respond": "list", "result": {"data": [
-            {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol", "hidden": false, "isDefault": true},
-            {"id": "gpt-6-luna", "model": "gpt-6-luna", "displayName": "GPT-6-Luna", "hidden": false}
-        ], "nextCursor": null}}
+        {"respond": "list", "result": {"data": data, "nextCursor": null}}
     ]);
     std::fs::write(dir.join("models.json"), json!({"steps": steps}).to_string()).unwrap();
 }
@@ -122,7 +132,14 @@ fn a_codex_agent_is_made_in_settings(cx: &mut TestAppContext) {
     click(cx, window, "settings-nav-agents");
     wait_to_show(cx, window, "Codex Signed in");
     assert!(shows(cx, window, "Opus"), "Claude's models first");
+    assert!(shows(cx, window, "Claude Code Signed in (selected)"));
     click(cx, window, "runtime-codex");
+    assert!(shows(cx, window, "Codex Signed in (selected)"));
+    assert!(shows(cx, window, "Claude Code Signed in"));
+    assert!(
+        !has(cx, window, "agent-tools"),
+        "Codex has no tools to allow"
+    );
     assert!(
         shows(cx, window, "GPT-6-Luna (selected)"),
         "Luna is the default"
@@ -151,6 +168,7 @@ fn a_codex_agent_is_made_in_settings(cx: &mut TestAppContext) {
     // Back to Claude Code: its models again, Sonnet first.
     click(cx, window, "runtime-claude");
     assert!(shows(cx, window, "Sonnet (selected)"));
+    assert!(has(cx, window, "agent-tools"));
     assert!(!has(cx, window, "agent-model-gpt-6-luna"));
 }
 
@@ -296,4 +314,63 @@ fn a_codex_run_shows_its_steps_and_asks_before_a_command(cx: &mut TestAppContext
     click(cx, window, ("activity-patch-all", edit));
     let shown = label_of(cx, window, ("activity-patch", edit)).unwrap();
     assert_eq!(shown, diff.trim_end());
+}
+
+#[gpui_kit::test]
+fn many_codex_models_go_in_a_menu(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    let home = short_home();
+    let _daemon = codex_daemon(home.path(), tmp.path(), &root, 0);
+    list_models(
+        tmp.path(),
+        &[
+            ("gpt-6.1-sol", "GPT-6.1-Sol"),
+            ("gpt-6.1-terra", "GPT-6.1 Terra"),
+            ("gpt-6-astra", "GPT-6-Astra"),
+            ("gpt-6-sol", "GPT-6-Sol"),
+            ("gpt-6-luna", "GPT-6-Luna"),
+        ],
+    );
+    let _w = world(home.path(), &root, &[]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "five Codex models", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.runtimes
+                .iter()
+                .any(|r| r.runtime == Runtime::Codex && r.models.len() == 5)
+        })
+    });
+
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-agents");
+    click(cx, window, "runtime-codex");
+    assert!(has(cx, window, "agent-model-menu"), "a menu, not segments");
+    assert!(!has(cx, window, "agent-model-gpt-6-luna"));
+    assert!(
+        shows(cx, window, "GPT-6-Luna"),
+        "the default shows on the button"
+    );
+    click(cx, window, "agent-model-menu");
+    assert!(shows(cx, window, "GPT-6.1 Terra"), "the menu");
+    cx.update_window(window, |_, window, cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        window.render_frame(cx);
+        window.within("popup-menu").click(1usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    ws.read_with(cx, |ws, _| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        assert_eq!(form.model, "gpt-6.1-terra");
+    });
+    click(cx, window, "agent-name");
+    type_text(cx, window, "Nova");
+    click(cx, window, "agent-save");
+    wait_to_show(cx, window, "Saved");
+    ws.read_with(cx, |ws, _| {
+        let spec = &ws.state().agents()[0].spec;
+        assert_eq!(spec.model, "gpt-6.1-terra");
+        assert_eq!(runtime_chip(spec), "codex · terra");
+    });
 }

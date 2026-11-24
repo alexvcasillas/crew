@@ -34,20 +34,34 @@ pub fn starter_spec() -> AgentSpec {
 /// The starter for the CLIs crewd found: Claude Code unless it isn't
 /// installed and Codex is, then Codex on its default model.
 pub fn starter_for(runtimes: &[RuntimeInfo]) -> AgentSpec {
-    let installed = |runtime: Runtime| {
-        runtimes
-            .iter()
-            .find(|r| r.runtime == runtime)
-            .map(|r| r.installed)
-    };
-    match (installed(Runtime::ClaudeCode), installed(Runtime::Codex)) {
-        (Some(false), Some(true)) => AgentSpec {
+    match only_codex(runtimes) {
+        Some(true) => AgentSpec {
             runtime: Runtime::Codex,
             model: default_codex_model(models_of(runtimes, &Runtime::Codex)),
             ..starter_spec()
         },
         _ => starter_spec(),
     }
+}
+
+pub const CODEX_LOGIN_FIRST: &str = "Run `codex login` in a terminal, then come back.";
+
+/// With Claude Code known to be missing and Codex installed, whether
+/// Codex can run the starter (it isn't known to be signed out). `None`
+/// otherwise.
+fn only_codex(runtimes: &[RuntimeInfo]) -> Option<bool> {
+    let find = |runtime: Runtime| runtimes.iter().find(|r| r.runtime == runtime);
+    match (find(Runtime::ClaudeCode), find(Runtime::Codex)) {
+        (Some(claude), Some(codex)) if !claude.installed && codex.installed => {
+            Some(codex.signed_in != Some(false))
+        }
+        _ => None,
+    }
+}
+
+/// What to do first when the only CLI is a signed-out Codex.
+pub fn starter_note(runtimes: &[RuntimeInfo]) -> Option<&'static str> {
+    (only_codex(runtimes) == Some(false)).then_some(CODEX_LOGIN_FIRST)
 }
 
 /// Step 3's line about the starter.
@@ -277,6 +291,7 @@ impl Workspace {
                 .iter()
                 .any(|r| r.runtime == Runtime::ClaudeCode && !r.installed);
         let about = starter_about(&starter, &self.runtimes);
+        let note = starter_note(&self.runtimes);
 
         div()
             .id("first-launch")
@@ -343,16 +358,32 @@ impl Workspace {
                         3,
                         "Create a starter agent",
                         about,
-                        div().flex().child(
-                            Button::new("first-launch-starter")
-                                .primary()
-                                .small()
-                                .label("Create Forge and start")
-                                .disabled(first.project.is_none() || first.busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.create_starter(window, cx);
-                                })),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .when_some(note, |col, note| {
+                                col.child(
+                                    div()
+                                        .id("first-launch-starter-note")
+                                        .text_color(color("warning"))
+                                        .aria_label(note)
+                                        .child(note)
+                                        .test_support(),
+                                )
+                            })
+                            .child(
+                                div().flex().child(
+                                    Button::new("first-launch-starter")
+                                        .primary()
+                                        .small()
+                                        .label("Create Forge and start")
+                                        .disabled(first.project.is_none() || first.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.create_starter(window, cx);
+                                        })),
+                                ),
+                            ),
                     ))
                     .child(
                         div()
@@ -424,7 +455,7 @@ fn step(
 
 #[cfg(test)]
 mod tests {
-    use super::{starter_for, starter_spec};
+    use super::{CODEX_LOGIN_FIRST, starter_for, starter_note, starter_spec};
     use crew_core::agent::{PermissionMode, Runtime};
     use crew_proto::{ModelInfo, RuntimeInfo};
 
@@ -471,5 +502,13 @@ mod tests {
             info(Runtime::Codex, false),
         ];
         assert_eq!(starter_for(&neither), starter_spec());
+        assert_eq!(starter_note(&neither), None);
+        // A signed-out Codex can't run the starter: say how to sign in.
+        let mut signed_out = codex_only.clone();
+        signed_out[1].signed_in = Some(false);
+        assert_eq!(starter_for(&signed_out), starter_spec());
+        assert_eq!(starter_note(&signed_out), Some(CODEX_LOGIN_FIRST));
+        assert_eq!(starter_note(&codex_only), None);
+        assert_eq!(starter_note(&both), None);
     }
 }

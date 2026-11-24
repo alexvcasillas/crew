@@ -19,7 +19,7 @@ use crew_core::store::{
     StoredProject, StoredRun, StoredThread, handoff_ask_text, paused_text, permission_text,
 };
 use crew_core::worktree::Diff;
-use crew_proto::{Request, ServerMsg};
+use crew_proto::{Request, RuntimeInfo, ServerMsg};
 
 #[derive(Parser)]
 #[command(name = "crew", version, about = "Talk to crewd from the terminal")]
@@ -145,8 +145,14 @@ struct HandoffSetting {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Add an agent that runs the installed `claude`.
+    /// Add an agent that runs the installed `claude` or `codex`.
     Add(AgentAdd),
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum RuntimeArg {
+    Claude,
+    Codex,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -169,8 +175,13 @@ impl From<PolicyArg> for HandoffPolicy {
 #[derive(Args)]
 struct AgentAdd {
     name: String,
+    /// The CLI that runs the agent.
+    #[arg(long, value_enum, default_value = "claude")]
+    runtime: RuntimeArg,
+    /// The model. Needed for Claude Code; for Codex, defaults to the one
+    /// Codex lists first, preferring Luna.
     #[arg(long)]
-    model: String,
+    model: Option<String>,
     #[arg(long)]
     role: String,
     /// Let the agent edit files. Without it the agent is read-only.
@@ -843,11 +854,23 @@ async fn run(cli: Cli) -> Result<()> {
             if a.budget.is_some() && a.policy != Some(PolicyArg::Budget) {
                 bail!("--budget needs --policy budget.");
             }
+            let (runtime, model) = match (a.runtime, a.model) {
+                (RuntimeArg::Claude, Some(model)) => (Runtime::ClaudeCode, model),
+                (RuntimeArg::Claude, None) => {
+                    bail!("A Claude Code agent needs --model, such as --model sonnet.")
+                }
+                (RuntimeArg::Codex, Some(model)) => (Runtime::Codex, model),
+                (RuntimeArg::Codex, None) => {
+                    let model = default_codex_model(&mut c).await?;
+                    println!("{} uses {} ({}).", a.name, model.id, model.label);
+                    (Runtime::Codex, model.id)
+                }
+            };
             let spec = AgentSpec {
                 name: a.name,
                 role: a.role,
-                runtime: Runtime::ClaudeCode,
-                model: a.model,
+                runtime,
+                model,
                 instructions: a.instructions,
                 permission_mode: if a.edit {
                     PermissionMode::EditFiles
@@ -862,6 +885,24 @@ async fn run(cli: Cli) -> Result<()> {
             let _: AgentId = c.ask(Request::CreateAgent { spec }).await?;
             Ok(())
         }
+    }
+}
+
+/// The model a new Codex agent starts on, from the models crewd lists.
+async fn default_codex_model(c: &mut Client) -> Result<crew_proto::ModelInfo> {
+    let runtimes: Vec<RuntimeInfo> = c.ask(Request::Runtimes).await?;
+    let codex = runtimes.iter().find(|r| r.runtime == Runtime::Codex);
+    match codex {
+        Some(r) if !r.installed => {
+            bail!("Codex isn't installed. Install it, or use --runtime claude.")
+        }
+        Some(r) if r.signed_in == Some(false) => {
+            bail!("Codex isn't signed in. Run `codex login` in a terminal, then try again.")
+        }
+        Some(r) => crew_proto::default_codex_model(&r.models)
+            .cloned()
+            .context("Codex listed no models. Pass one with --model, or try again in a moment."),
+        None => bail!("crewd doesn't know Codex. Pass a model with --model."),
     }
 }
 

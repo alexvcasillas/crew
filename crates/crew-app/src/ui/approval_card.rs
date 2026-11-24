@@ -12,7 +12,7 @@ use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{chip, clock, monogram, runtime_chip};
+use super::common::{chip, clean_line, clean_lines, clock, monogram, runtime_chip};
 use super::thread_settings::effective;
 use super::thread_view::indented;
 use super::workspace::Workspace;
@@ -21,6 +21,8 @@ use crate::theme::color;
 
 /// Input lines a permission card shows until you ask for all of it.
 const INPUT_LINES: usize = 6;
+/// Lines of the full command under a labelled ask.
+const COMMAND_LINES: usize = 4;
 /// How many more handoffs "Allow 3 more" lets run.
 pub const MORE_HANDOFFS: u32 = 3;
 
@@ -33,6 +35,10 @@ pub(super) struct BriefEditor {
 /// The text a tool's input shows as: the files of a change list, else
 /// crewd's label, else its command, else its JSON, pretty.
 pub fn input_text(input: &serde_json::Value) -> String {
+    clean_lines(&raw_input_text(input))
+}
+
+fn raw_input_text(input: &serde_json::Value) -> String {
     let files: Vec<&str> = input
         .get("changes")
         .and_then(|c| c.as_array())
@@ -52,10 +58,22 @@ pub fn input_text(input: &serde_json::Value) -> String {
     }
 }
 
-/// The full command behind a labelled ask, when the label shows less.
-pub fn full_command(input: &serde_json::Value) -> Option<&str> {
+/// The full command behind a labelled ask, when the label shows less:
+/// cleaned, and at most [`COMMAND_LINES`] lines, "…" marking a cut.
+pub fn full_command(input: &serde_json::Value) -> Option<String> {
     let label = text_field(input, "label")?;
-    text_field(input, "command").filter(|c| *c != label)
+    let command = text_field(input, "command").filter(|c| *c != label)?;
+    let lines: Vec<String> = command.lines().map(clean_line).collect();
+    let mut shown = lines
+        .iter()
+        .take(COMMAND_LINES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > COMMAND_LINES {
+        shown.push('…');
+    }
+    Some(shown)
 }
 
 fn text_field<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -381,7 +399,7 @@ impl Workspace {
                 .join("\n")
         };
         let more = lines.saturating_sub(INPUT_LINES);
-        let command = full_command(input).map(str::to_string);
+        let command = full_command(input);
         needs_you_card(id, &wants)
             .child(mono_box(format!("approval-input-{id}"), shown))
             .when_some(command, |card, command| {
@@ -632,16 +650,32 @@ mod tests {
     fn codex_asks_show_their_label_or_files() {
         let bash = serde_json::json!({"command": "/bin/zsh -lc 'mkdir sub'", "cwd": "/work/demo", "label": "mkdir sub"});
         assert_eq!(input_text(&bash), "mkdir sub");
-        assert_eq!(full_command(&bash), Some("/bin/zsh -lc 'mkdir sub'"));
+        assert_eq!(
+            full_command(&bash).as_deref(),
+            Some("/bin/zsh -lc 'mkdir sub'")
+        );
         let plain = serde_json::json!({"command": "ls", "cwd": "/work/demo"});
         assert_eq!(input_text(&plain), "ls");
-        assert_eq!(full_command(&plain), None);
+        assert_eq!(full_command(&plain).as_deref(), None);
         let access = serde_json::json!({"label": "network, write /work/demo/out", "cwd": "/work/demo", "permissions": {}});
         assert_eq!(input_text(&access), "network, write /work/demo/out");
-        assert_eq!(full_command(&access), None);
+        assert_eq!(full_command(&access).as_deref(), None);
         let edit = serde_json::json!({"path": "/work/demo/a.md, /work/demo/b.md", "changes": [
             {"path": "/work/demo/a.md", "diff": "x"}, {"path": "/work/demo/b.md", "diff": "y"}]});
         assert_eq!(input_text(&edit), "/work/demo/a.md\n/work/demo/b.md");
+    }
+
+    #[test]
+    fn untrusted_ask_text_is_cleaned_and_clamped() {
+        let sneaky = serde_json::json!({
+            "command": "a\u{202e}b\r\nc\td\u{1b}[2J\nl3\nl4\nl5\nl6",
+            "label": "x\u{2066}y\u{85}z",
+        });
+        assert_eq!(input_text(&sneaky), "xyz");
+        assert_eq!(
+            full_command(&sneaky).as_deref(),
+            Some("ab\nc d[2J\nl3\nl4…")
+        );
     }
 
     #[test]

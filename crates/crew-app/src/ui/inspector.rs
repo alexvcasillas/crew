@@ -707,12 +707,14 @@ mod tests {
             [file("a.rs", 1, 2), file("b.rs", 4, 1)]
         );
         let (r1, r2) = (RunId::new(), RunId::new());
-        let at = |run, seq| LoggedEvent {
-            run,
-            seq,
-            event: Event::Raw {
-                line: String::new(),
-            },
+        let at = |run, seq| {
+            LoggedEvent::new(
+                run,
+                seq,
+                Event::Raw {
+                    line: String::new(),
+                },
+            )
         };
         let events = [at(r1, 1), at(r2, 1), at(r1, 2)];
         assert_eq!(events_per_run(&events), [(r1, 2), (r2, 1)]);
