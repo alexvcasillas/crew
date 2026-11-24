@@ -111,7 +111,9 @@ pub fn save_choice(crew_home: &Path, choice: &str) -> std::io::Result<()> {
         .unwrap_or_else(|| serde_json::json!({}));
     value["editor"] = choice.into();
     std::fs::create_dir_all(crew_home)?;
-    std::fs::write(path, value.to_string())
+    let temp = crew_home.join(format!("{PREFS_FILE}.tmp"));
+    std::fs::write(&temp, value.to_string())?;
+    std::fs::rename(&temp, path)
 }
 
 #[cfg(test)]
@@ -202,5 +204,19 @@ mod tests {
         assert_eq!(load_choice(home.path()), Some(FINDER.into()));
         std::fs::write(home.path().join("app-prefs.json"), "not json").unwrap();
         assert_eq!(load_choice(home.path()), None);
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_and_keeps_other_keys() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("app-prefs.json"), r#"{"other":1}"#).unwrap();
+        save_choice(home.path(), "Zed").unwrap();
+        let names: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["app-prefs.json"]);
+        let text = std::fs::read_to_string(home.path().join("app-prefs.json")).unwrap();
+        assert!(text.contains("\"other\""));
     }
 }

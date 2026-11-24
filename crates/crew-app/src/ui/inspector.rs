@@ -816,6 +816,7 @@ mod tests {
     use crate::model::LoggedEvent;
     use crate::ui::run_card::FileChange;
     use crew_core::event::Event;
+    use crew_core::ids::RunId;
 
     #[test]
     fn changes_merge_by_path_and_events_count_per_run() {
@@ -843,8 +844,6 @@ mod tests {
         let events = [at(r1, 1), at(r2, 1), at(r1, 2)];
         assert_eq!(events_per_run(&events), [(r1, 2), (r2, 1)]);
     }
-    use crew_core::ids::RunId;
-
     #[test]
     fn context_label_reads_the_latest_usage_of_the_run() {
         let (r1, r2) = (RunId::new(), RunId::new());

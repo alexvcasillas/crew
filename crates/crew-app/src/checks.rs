@@ -58,6 +58,17 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
+/// What follows the earliest `&&` or `;` in `text`.
+fn after_first_separator(text: &str) -> Option<&str> {
+    let and = text.find("&&").map(|i| (i, 2));
+    let semi = text.find(';').map(|i| (i, 1));
+    let (at, len) = match (and, semi) {
+        (Some(a), Some(s)) => a.min(s),
+        (a, s) => a.or(s)?,
+    };
+    Some(&text[at + len..])
+}
+
 /// The command that does the work: shell wrappers, `cd <dir> &&` (or
 /// `;`) prefixes and leading `NAME=value` assignments dropped.
 fn core_command(command: &str) -> &str {
@@ -65,7 +76,7 @@ fn core_command(command: &str) -> &str {
     loop {
         let trimmed = command.trim_start();
         if let Some(rest) = trimmed.strip_prefix("cd ")
-            && let Some((_, after)) = rest.split_once("&&").or_else(|| rest.split_once(';'))
+            && let Some(after) = after_first_separator(rest)
         {
             command = unwrap_shell(after);
             continue;
@@ -216,6 +227,7 @@ mod tests {
             "cd crates/app && cargo test",
             "cd a && cd b && npm run lint",
             "cd x; cargo test",
+            "cd x; cargo test && echo ok",
             "FOO=1 cargo test",
             "CI=1 NODE_ENV=test npm test",
             "cd x && RUST_LOG=debug cargo clippy",

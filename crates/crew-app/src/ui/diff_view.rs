@@ -114,8 +114,13 @@ pub(super) struct Review {
     busy: bool,
     /// Why the last read failed, shown in place of the diff.
     failed: Option<String>,
-    /// The file you last picked in the list, by index.
-    current_file: Option<usize>,
+    /// The file you last picked in the list, by path.
+    current_file: Option<String>,
+    /// The checks the agent ran, read again when the thread's activity
+    /// changes.
+    checks: Vec<Check>,
+    /// What the comments and checks were read from.
+    synced: Option<(usize, usize, usize, usize)>,
     /// Why Open in editor failed, shown above the diff.
     open_error: Option<String>,
     focus: FocusHandle,
@@ -356,6 +361,8 @@ impl Workspace {
             busy: false,
             failed: None,
             current_file: None,
+            checks: Vec::new(),
+            synced: None,
             open_error: None,
             focus,
         });
@@ -438,25 +445,50 @@ impl Workspace {
             return;
         };
         let state = self.state();
+        let key = (
+            state.events(thread).len(),
+            state.messages(thread).len(),
+            state.thread_runs(thread).len(),
+            state.live_runs(thread).len(),
+        );
+        if self.review.as_ref().is_some_and(|r| r.synced == Some(key)) {
+            return;
+        }
         let root = state
             .thread(thread)
             .and_then(|t| t.worktree.as_ref())
             .map(|wt| wt.path.to_string_lossy().into_owned())
             .unwrap_or_default();
         let replies = reviewer_replies(state, thread);
-        let found = comments(state, &replies, &root);
-        let left = replies.last().and_then(|last| {
-            let n = comments(state, std::slice::from_ref(last), &root).len();
-            let name = state.agent(last.0)?.spec.name.clone();
-            (n > 0).then_some((name, n))
-        });
+        let mut found = Vec::new();
+        let mut left = None;
+        for (i, reply) in replies.iter().enumerate() {
+            let own = comments(state, std::slice::from_ref(reply), &root);
+            if i + 1 == replies.len()
+                && !own.is_empty()
+                && let Some(agent) = state.agent(reply.0)
+            {
+                left = Some((agent.spec.name.clone(), own.len()));
+            }
+            found.extend(own);
+        }
+        let checks = self.review_checks(thread);
         let Some(review) = &mut self.review else {
             return;
         };
+        review.synced = Some(key);
         review.left = left;
+        let mut changed = false;
+        if checks != review.checks {
+            review.checks = checks;
+            changed = true;
+        }
         if found != review.comments {
             review.comments = found;
             rebuild_rows(review);
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -616,6 +648,13 @@ impl Workspace {
                             review
                                 .shown
                                 .retain(|p| review.files.iter().any(|f| &f.path == p));
+                            if review
+                                .current_file
+                                .as_ref()
+                                .is_some_and(|p| !review.files.iter().any(|f| &f.path == p))
+                            {
+                                review.current_file = None;
+                            }
                             rebuild_rows_from(review, kept);
                         }
                         this.inspector.diff = Some(diff);
@@ -666,7 +705,7 @@ impl Workspace {
         if let Some(review) = &mut self.review
             && let Some(&row) = review.file_rows.get(file)
         {
-            review.current_file = Some(file);
+            review.current_file = review.files.get(file).map(|f| f.path.clone());
             review.list.scroll_to(ListOffset {
                 item_ix: row,
                 offset_in_item: px(0.),
@@ -911,14 +950,16 @@ impl Workspace {
         review.open_error = None;
         let file = review
             .current_file
-            .and_then(|ix| review.files.get(ix))
+            .as_ref()
+            .and_then(|path| review.files.iter().find(|f| &f.path == path))
             .filter(|f| !matches!(f.kind, FileKind::Deleted))
             .map(|f| worktree.join(&f.path));
         let args = crate::editor::open_args(app.as_deref(), &worktree, file.as_deref());
         let opener = self.opener.clone();
         let opened = cx.background_executor().spawn(async move { opener(args) });
         self.spawn_request(window, cx, async move |this, cx| {
-            if opened.await.is_err() {
+            if let Err(e) = opened.await {
+                eprintln!("crew: open failed: {e}");
                 this.update_in(cx, |this, _, cx| {
                     if let Some(review) = this.review.as_mut() {
                         review.open_error = Some(crate::editor::open_failed(app.as_deref()));
@@ -1129,7 +1170,7 @@ impl Workspace {
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .when(!review.split, |card| card.max_w(px(720.)))
+                            .max_w(px(720.))
                             .px(px(12.))
                             .py(px(10.))
                             .bg(color("surface-raised"))
@@ -1332,7 +1373,7 @@ impl Workspace {
         let n = files.len();
         let summary = format!("{n} {} changed · +{added} −{removed}", files_word(n));
         let ran = review
-            .map(|r| (r.thread, self.review_checks(r.thread)))
+            .map(|r| (r.thread, r.checks.clone()))
             .filter(|(_, c)| !c.is_empty());
         let ran = ran.and_then(|(thread, list)| Some((self.review_agent(thread)?, list)));
         div()

@@ -774,6 +774,32 @@ fn open_in_editor_launches_the_chosen_editor_or_finder(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn the_picked_file_stays_the_same_file_after_the_diff_reloads(cx: &mut TestAppContext) {
+    let s = setup("printf 'hello\\nthere\\n' > README.md\nprintf 'one\\ntwo\\n' > new.txt");
+    let (window, ws) = open_thread(cx, s._home.path(), &s.w);
+    let launches = fake_editors(cx, window, &ws, &["Zed"], false);
+    s.w.post("@Forge fix it");
+    run_of(cx, &ws, s.w.thread, s.forge, RunStatus::Done);
+    wait_for_changes(cx, &ws, 2);
+    let wt = worktree(cx, &ws, s.w.thread).unwrap();
+    review_from_inspector(cx, window);
+    wait_to_show(cx, window, "· 2 + there");
+
+    // Pick new.txt, the second file, then a file sorting first appears.
+    click(cx, window, ("review-file", 1usize));
+    std::fs::write(wt.join("aaa.txt"), "a\n").unwrap();
+    click(cx, window, "review-refresh");
+    wait_to_show(cx, window, "aaa.txt");
+
+    click(cx, window, "review-open-editor");
+    let sent = wait_for_launches(cx, &launches, 1);
+    assert_eq!(
+        sent[0].last().unwrap(),
+        &wt.join("new.txt").display().to_string()
+    );
+}
+
+#[gpui_kit::test]
 fn a_failed_launch_says_so_under_the_review_title(cx: &mut TestAppContext) {
     let s = setup("printf 'hello\\nthere\\n' > README.md");
     let (window, ws) = open_thread(cx, s._home.path(), &s.w);
@@ -798,6 +824,7 @@ fn general_offers_finder_and_the_detected_editors(cx: &mut TestAppContext) {
     click(cx, window, "title-settings");
     click(cx, window, "settings-nav-general");
     wait_until(cx, "the Editor row", |cx| has(cx, window, "general-editor"));
+    assert!(!has(cx, window, "general-max-runs"));
     // The default is the first detected editor.
     let shown = |cx: &mut TestAppContext| {
         ws.read_with(cx, |ws, cx| {
