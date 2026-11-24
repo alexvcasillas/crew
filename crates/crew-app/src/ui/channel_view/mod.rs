@@ -582,6 +582,15 @@ impl ChannelView {
         self.to_top = true;
     }
 
+    /// Whether `thread`'s card is in the rows drawn now: not hidden by the
+    /// filter, the search or a folded section.
+    pub(super) fn card_in_view(&self, thread: ThreadId) -> bool {
+        self.rows.iter().any(|row| match row {
+            Row::Cards(left, right) => *left == thread || *right == Some(thread),
+            _ => false,
+        })
+    }
+
     /// Where the worktree of `thread`'s card stands, as last counted.
     pub(super) fn card_worktree(&self, thread: ThreadId) -> Option<WorktreeState> {
         self.cards.get(&thread).map(|c| c.summary.worktree)

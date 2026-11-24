@@ -195,7 +195,7 @@ impl Workspace {
     }
 
     /// Brings an archived thread back.
-    pub(super) fn unarchive_thread(
+    pub(crate) fn unarchive_thread(
         &mut self,
         thread: ThreadId,
         window: &mut Window,

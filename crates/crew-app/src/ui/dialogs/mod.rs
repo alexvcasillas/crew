@@ -199,13 +199,15 @@ impl Workspace {
                 name,
                 description,
                 ..
-            } => crew_core::slug::channel_name(&name.read(cx).value())
-                .map(|name| Request::UpdateChannel {
-                    channel: *channel,
-                    name,
-                    description: description.read(cx).value().trim().to_string(),
-                })
-                .map_err(str::to_string),
+            } => checked_channel_name(
+                &name.read(cx).value(),
+                self.state().channel(*channel).map(|c| c.name.as_str()),
+            )
+            .map(|name| Request::UpdateChannel {
+                channel: *channel,
+                name,
+                description: description.read(cx).value().trim().to_string(),
+            }),
         };
         let request = match checked {
             Ok(request) => request,
@@ -272,7 +274,7 @@ impl Workspace {
         [view.selected, view.hovered]
             .into_iter()
             .flatten()
-            .find(|t| view.card_worktree(*t).is_some())
+            .find(|t| view.card_in_view(*t))
     }
 
     /// ⌘R: renames the selected card's thread.
@@ -282,7 +284,8 @@ impl Workspace {
         }
     }
 
-    /// ⌘⌫: archives the selected card's thread.
+    /// ⌘⌫: archives the selected card's thread, or brings back an
+    /// archived one.
     pub(super) fn archive_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.shortcut_card(window, cx) else {
             return;
@@ -291,9 +294,23 @@ impl Workspace {
             .state()
             .thread(thread)
             .is_some_and(|t| t.archived_at.is_some());
-        if !archived {
+        if archived {
+            self.unarchive_thread(thread, window, cx);
+        } else {
             self.open_archive_dialog(thread, window, cx);
         }
+    }
+}
+
+/// The name a channel is saved with: the one it has when you left it
+/// as it is, even one from before the rules, as crewd allows, else a
+/// new name by the rules.
+fn checked_channel_name(typed: &str, stored: Option<&str>) -> Result<String, String> {
+    let trimmed = typed.trim();
+    let bare = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    match stored {
+        Some(stored) if bare == stored => Ok(stored.to_string()),
+        _ => crew_core::slug::channel_name(typed).map_err(str::to_string),
     }
 }
 
@@ -342,7 +359,24 @@ fn heading(id: &'static str, title: String, body: Option<AnyElement>, label: Str
 #[cfg(test)]
 mod tests {
     use super::archive::{archive_body, uncommitted_note};
+    use super::checked_channel_name;
     use super::discard::{discard_label, more_files};
+
+    #[test]
+    fn an_unchanged_old_name_skips_the_rules() {
+        assert_eq!(
+            checked_channel_name(" #Bugs ", Some("Bugs")).unwrap(),
+            "Bugs"
+        );
+        assert_eq!(
+            checked_channel_name("#bugs-2", Some("Bugs")).unwrap(),
+            "bugs-2"
+        );
+        assert_eq!(
+            checked_channel_name("Bugs Two", Some("Bugs")).unwrap_err(),
+            "Use lowercase letters, numbers and dashes."
+        );
+    }
 
     #[test]
     fn archive_copy_names_the_thread_and_its_files() {

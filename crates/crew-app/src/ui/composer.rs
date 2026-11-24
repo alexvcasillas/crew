@@ -135,6 +135,9 @@ pub struct Composer {
     /// another.
     dismissed: Option<usize>,
     busy: bool,
+    /// Where the composer's top was last drawn, in window px, so the
+    /// mention menu knows if it fits above.
+    pub(super) top: std::rc::Rc<std::cell::Cell<Option<f32>>>,
     _input_events: Subscription,
 }
 
@@ -166,6 +169,7 @@ impl Composer {
             mention: None,
             dismissed: None,
             busy: false,
+            top: Default::default(),
             _input_events: events,
         }
     }
@@ -413,6 +417,15 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &MentionClose, _, cx| this.close_menu(cx)))
             .on_action(cx.listener(|this, _: &CancelNewThread, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &StartThread, window, cx| this.send(window, cx)))
+            .child({
+                let top = self.top.clone();
+                canvas(
+                    move |bounds, _, _| top.set(Some(bounds.origin.y.as_f32())),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             .when(new_thread, |c| c.child(self.render_with(cx)))
             .child(
                 div()
@@ -601,7 +614,7 @@ impl Composer {
                     .primary()
                     .small()
                     .label("Start thread")
-                    .child(keys("⌘↵"))
+                    .child(keys("↵"))
                     .disabled(self.busy)
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             )

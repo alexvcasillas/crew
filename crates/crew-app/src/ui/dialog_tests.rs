@@ -13,7 +13,9 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::diff_tests::repo_with_readme;
 use super::inspector_tests::run_of;
-use super::test_ui::{click, has, label_of, open, press, type_text, wait_to_show, wait_until};
+use super::test_ui::{
+    bounds_of, click, has, label_of, open, press, type_text, wait_to_show, wait_until,
+};
 use super::thread_tests::{World, agent, ask, go_to, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, fixture, short_home};
@@ -172,9 +174,16 @@ fn cmd_n_opens_the_composer_and_previews_the_branch(cx: &mut TestAppContext) {
     press(cx, window, "cmd-n");
     assert_eq!(composer_text(cx, &ws), "");
 
-    // ⌘↵ starts the thread and opens it.
+    // The @ menu opens below: there is no room above.
+    type_text(cx, window, "@");
+    let menu = bounds_of(cx, window, "mention-menu").expect("the @ menu");
+    let composer = bounds_of(cx, window, "new-thread-composer").unwrap();
+    assert!(menu.origin.y > composer.origin.y, "{menu:?} {composer:?}");
+    press(cx, window, "escape backspace");
+
+    // ↵ starts the thread and opens it.
     type_text(cx, window, "Write the changelog");
-    press(cx, window, "cmd-enter");
+    press(cx, window, "enter");
     let mut created = None;
     wait_until(cx, "the new thread to open", |cx| {
         created = ws.read_with(cx, |ws, _| ws.open_thread_id());
@@ -466,4 +475,83 @@ fn channel_settings_saves_a_description_and_rejects_bad_names(cx: &mut TestAppCo
     press(cx, window, "enter");
     wait_dialog_closed(cx, window, &ws);
     wait_label(cx, window, "channel-title", "#chores");
+}
+
+/// A channel named before the rules keeps its name and still saves.
+#[gpui_kit::test]
+fn a_channel_with_an_old_name_still_saves_its_description(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let legacy: ChannelId = w.ask(Request::CreateChannel {
+        project: w.project,
+        name: "Bugs".into(),
+    });
+    let (window, ws) = open(cx, home.path());
+    go_to_channel(cx, window, legacy);
+    click(cx, window, "channel-add-description");
+    wait_until(cx, "the dialog", |cx| {
+        has(cx, window, "channel-settings-heading")
+    });
+    type_text(cx, window, "Things that broke");
+    press(cx, window, "enter");
+    wait_dialog_closed(cx, window, &ws);
+    wait_label(cx, window, "channel-description", "Things that broke");
+    wait_label(cx, window, "channel-title", "#Bugs");
+}
+
+#[gpui_kit::test]
+fn shortcuts_act_only_on_cards_in_view_and_unarchive_archived_ones(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let tmp = tempfile::tempdir().unwrap();
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    select_card(cx, window, &ws, &w, w.thread);
+
+    // A search hides the selected card: ⌘R leaves it alone.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.channel_view
+                .search
+                .update(cx, |search, cx| search.set_value("zzz", window, cx));
+        });
+    })
+    .unwrap();
+    wait_until(cx, "the card to hide", |cx| {
+        !has(cx, window, card(w.thread))
+    });
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.focus_window(window, cx));
+    })
+    .unwrap();
+    press(cx, window, "cmd-r");
+    assert!(!dialog_shown(cx, window), "no dialog for a hidden card");
+
+    // Archived, under Archived: ⌘⌫ brings it back.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.channel_view
+                .search
+                .update(cx, |search, cx| search.set_value("", window, cx));
+        });
+    })
+    .unwrap();
+    let () = w.ask(Request::ArchiveThread {
+        thread: w.thread,
+        archived: true,
+    });
+    wait_label(cx, window, "channel-filter-archived", "Archived 1");
+    click(cx, window, "channel-filter-archived");
+    wait_until(cx, "the archived card", |cx| {
+        has(cx, window, card(w.thread))
+    });
+    press(cx, window, "cmd-backspace");
+    assert!(!dialog_shown(cx, window), "unarchiving doesn't ask");
+    wait_until(cx, "the card to come back", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().thread(w.thread).unwrap().archived_at.is_none()
+        })
+    });
 }

@@ -12,6 +12,28 @@ use crate::theme::color;
 
 pub const MENU_WIDTH: f32 = 420.;
 pub const NO_AGENTS: &str = "No agents yet. Add one in Settings.";
+/// Space between the menu and the composer.
+const MENU_GAP: f32 = 6.;
+/// One agent's row.
+const ROW_HEIGHT: f32 = 44.;
+
+/// About how tall the menu is with `rows` agents listed, or with none
+/// to list when `any_agents` is false.
+pub fn menu_height(rows: usize, any_agents: bool) -> f32 {
+    // Padding and border, then the caption and key hints.
+    let frame = 14.;
+    if !any_agents {
+        return frame + 40.;
+    }
+    // "No agent matches" takes a row's place.
+    frame + 24. + 29. + ROW_HEIGHT * rows.max(1) as f32
+}
+
+/// Whether the menu opens below a composer whose top is at `top` (window
+/// px): when above it would run under the title bar.
+pub fn opens_below(top: f32, height: f32) -> bool {
+    top - MENU_GAP - height < super::title_bar::TITLE_BAR_HEIGHT
+}
 
 /// An agent as the menu shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,7 +76,8 @@ pub fn matching<'a>(agents: &'a [MentionAgent], query: &str) -> Vec<&'a MentionA
 }
 
 impl Composer {
-    /// The open menu, drawn above the composer.
+    /// The open menu, drawn above the composer, or below it when there
+    /// isn't room above.
     pub(super) fn render_mention_menu(
         &self,
         query: &str,
@@ -63,12 +86,19 @@ impl Composer {
     ) -> impl IntoElement + use<> {
         let agents = matching(&self.agents, query);
         let caption = format!("Agents in {}", self.project).to_uppercase();
+        let height = menu_height(agents.len(), !self.agents.is_empty());
+        let below = self.top.get().is_some_and(|top| opens_below(top, height));
         let mut menu = div()
             .id("mention-menu")
             .absolute()
-            .bottom_full()
+            .map(|menu| {
+                if below {
+                    menu.top_full().mt(px(MENU_GAP))
+                } else {
+                    menu.bottom_full().mb(px(MENU_GAP))
+                }
+            })
             .left_0()
-            .mb(px(6.))
             .w(px(MENU_WIDTH))
             .flex()
             .flex_col()
@@ -221,7 +251,7 @@ fn hint(keys: &'static str, what: &'static str) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{MentionAgent, matching, mention_at};
+    use super::{MentionAgent, matching, mention_at, menu_height, opens_below};
     use crate::model::ThreadStatus;
     use crew_core::agent::Runtime;
 
@@ -246,6 +276,15 @@ mod tests {
         assert_eq!(mention_at("no at", 5), None);
         assert_eq!(mention_at("é @", 4), Some((3, "")));
         assert_eq!(mention_at("é@", 3), None);
+    }
+
+    #[test]
+    fn the_menu_opens_below_without_room_above() {
+        let tall = menu_height(4, true);
+        assert!(tall > 4. * 44.);
+        assert!(opens_below(120., tall), "near the top of the window");
+        assert!(!opens_below(800., tall), "a reply composer at the bottom");
+        assert!(menu_height(0, false) < menu_height(0, true));
     }
 
     #[test]
