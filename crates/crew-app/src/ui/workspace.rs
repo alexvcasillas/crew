@@ -20,6 +20,7 @@ use super::composer::{Composer, ComposerEvent};
 use super::diff_view::{Review, SavedMessage};
 use super::first_launch::FirstLaunch;
 use super::inspector::Inspector;
+use super::markdown_view::DocCache;
 use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
 use super::service_control::ServiceAction;
@@ -107,6 +108,8 @@ pub struct Workspace {
     /// The last error shown as a notification.
     pub(super) last_error: Option<SharedString>,
     pub(super) inspector: Inspector,
+    /// Agent messages read as Markdown, by message or event.
+    pub(super) docs: DocCache,
     /// The handoff brief you are editing, if any.
     pub(super) editing: Option<BriefEditor>,
     /// Permission asks whose whole input is shown.
@@ -213,6 +216,7 @@ impl Workspace {
             auto_restarted: false,
             last_error: None,
             inspector: Inspector::default(),
+            docs: DocCache::default(),
             editing: None,
             open_inputs: HashSet::new(),
             deciding: HashSet::new(),

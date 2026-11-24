@@ -10,6 +10,7 @@ mod dev_hooks;
 pub mod diff_view;
 mod first_launch;
 mod inspector;
+mod markdown_view;
 mod mention_menu;
 mod run_card;
 pub mod running_view;
