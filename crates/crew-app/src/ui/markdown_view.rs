@@ -9,9 +9,9 @@ use crew_core::ids::{MessageId, RunId};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::fonts::{mono_font, ui_font};
 use crate::markdown::{Align, Block, Doc, Text, opens, parse, with_code_gaps, with_mentions};
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_family, ui_px};
 
 /// What a cached parse belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +56,7 @@ fn blocks(blocks: &[Block], names: &[String], id: &str, next: &mut usize) -> Div
         .flex()
         .flex_col()
         .min_w_0()
-        .gap(px(6.))
+        .gap(ui_px(6.))
         .children(blocks.iter().map(|b| block(b, names, id, next)))
 }
 
@@ -68,33 +68,17 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
             rich_text(text, names, &key, FontWeight::NORMAL).into_any_element()
         }
         Block::Heading(text) => div()
-            .text_size(px(14.))
+            .text_size(scale::text(14.))
             .child(rich_text(text, names, &key, FontWeight::SEMIBOLD))
             .into_any_element(),
-        Block::Code(code) => div()
-            .flex()
-            .flex_col()
-            .px(px(10.))
-            .py(px(8.))
-            .bg(color("surface-100"))
-            .border_1()
-            .border_color(color("border-100"))
-            .rounded(px(6.))
-            .overflow_hidden()
-            .font_family(mono_font())
-            .text_size(px(12.))
-            .line_height(px(18.))
-            .text_color(color("text-primary"))
-            .children(code.split('\n').map(|line| {
-                div()
-                    .whitespace_nowrap()
-                    .child(if line.is_empty() { " " } else { line }.to_string())
-            }))
+        Block::Code(code) => code_block()
+            .px(ui_px(10.))
+            .children(code.split('\n').map(code_line))
             .into_any_element(),
         Block::List { start, items } => div()
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .children(items.iter().enumerate().map(|(ix, item)| {
                 let marker = match start {
                     Some(n) => format!("{}.", n + ix as u64),
@@ -104,13 +88,13 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
                 div()
                     .id(SharedString::from(format!("{id}-{next}")))
                     .flex()
-                    .gap(px(6.))
+                    .gap(ui_px(6.))
                     .role(Role::ListItem)
                     .aria_label(plain_text(item))
                     .child(
                         div()
                             .flex_none()
-                            .min_w(px(14.))
+                            .min_w(ui_px(14.))
                             .text_color(color("text-secondary"))
                             .child(marker),
                     )
@@ -120,6 +104,30 @@ fn block(block: &Block, names: &[String], id: &str, next: &mut usize) -> AnyElem
             .into_any_element(),
         Block::Table { aligns, head, rows } => table(aligns, head, rows, names, &key),
     }
+}
+
+/// The box a code block's lines sit in.
+pub fn code_block() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .py(scale::row(8.))
+        .bg(color("surface-100"))
+        .border_1()
+        .border_color(color("border-100"))
+        .rounded(ui_px(6.))
+        .overflow_hidden()
+        .font_family(code_family())
+        .text_size(scale::mono(12.))
+        .line_height(scale::mono_line(18.))
+        .text_color(color("text-primary"))
+}
+
+/// One line of a code block, kept on one line.
+pub fn code_line(line: &str) -> Div {
+    div()
+        .whitespace_nowrap()
+        .child(if line.is_empty() { " " } else { line }.to_string())
 }
 
 /// A table in a bordered box as wide as the space it has. Columns share
@@ -160,11 +168,11 @@ fn table(
                 div()
                     .flex_basis(relative(0.))
                     .flex_grow(weights.get(col).copied().unwrap_or(6.))
-                    .min_w(px(mins.get(col).copied().unwrap_or(0.)))
-                    .px(px(10.))
-                    .py(px(6.))
-                    .text_size(px(size))
-                    .line_height(px(line))
+                    .min_w(scale::text(mins.get(col).copied().unwrap_or(0.)))
+                    .px(ui_px(10.))
+                    .py(scale::row(6.))
+                    .text_size(scale::text(size))
+                    .line_height(scale::line(line))
                     .when(align == Align::Center, |d| d.text_center())
                     .when(align == Align::Right, |d| d.text_right())
                     .child(rich_text_in(cell, names, &cell_id, weight, token))
@@ -179,7 +187,7 @@ fn table(
         .max_w_full()
         .border_1()
         .border_color(color("border-100"))
-        .rounded(px(8.))
+        .rounded(ui_px(8.))
         .overflow_hidden()
         .role(Role::Table)
         .child(row(head, 0, true))
@@ -266,14 +274,14 @@ fn rich_text_in(text: &Text, names: &[String], id: &str, weight: FontWeight, tok
         .map(|(span, gap)| {
             let style = span.style;
             let mono = style.code || gap;
-            let mut run_font = font(if mono { mono_font() } else { ui_font() });
-            run_font.weight = if style.bold {
+            let mut run_font = font(if mono { code_family() } else { ui_family() });
+            run_font.weight = scale::weight(if style.bold {
                 FontWeight::BOLD
             } else if style.mention && weight.0 < FontWeight::MEDIUM.0 {
                 FontWeight::MEDIUM
             } else {
                 weight
-            };
+            });
             if style.italic {
                 run_font.style = FontStyle::Italic;
             }
@@ -325,7 +333,8 @@ fn bold_markers(text: &str, runs: &[TextRun], id: &str) -> Vec<AnyElement> {
     let mut at = 0;
     let mut markers = Vec::new();
     for run in runs {
-        if run.font.weight == FontWeight::BOLD {
+        // Bold as drawn with the settings in use, Bolder text or not.
+        if run.font.weight == scale::weight(FontWeight::BOLD) {
             markers.push(
                 div()
                     .id(SharedString::from(format!("{id}-bold-{at}")))
@@ -366,7 +375,7 @@ pub mod drawn {
 
     use gpui_kit::TextRun;
 
-    use crate::fonts::mono_font;
+    use crate::theme::scale::code_family;
 
     /// A stretch of drawn text, whether in the code font, and whether on
     /// the code background.
@@ -385,7 +394,7 @@ pub mod drawn {
                 at += r.len;
                 (
                     part,
-                    r.font.family == mono_font(),
+                    r.font.family == code_family(),
                     r.background_color.is_some(),
                 )
             })

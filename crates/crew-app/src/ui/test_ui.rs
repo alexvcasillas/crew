@@ -36,7 +36,7 @@ pub fn open_tall(cx: &mut TestAppContext, home: &Path) -> (AnyWindowHandle, Enti
     open_sized_tall(cx, home, 1440., 1800.)
 }
 
-fn open_sized_tall(
+pub fn open_sized_tall(
     cx: &mut TestAppContext,
     home: &Path,
     width: f32,
@@ -48,7 +48,7 @@ fn open_sized_tall(
     };
     let (window, ws) = cx.update(|cx| {
         gpui_kit::init(cx);
-        crate::app::init(cx);
+        crate::app::init(home, cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Point::default(),

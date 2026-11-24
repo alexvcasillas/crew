@@ -16,9 +16,9 @@ use super::approval_card::outside_sandbox;
 use super::common::{elapsed, now_ms, rolling_text, spinner};
 use super::inspector::NOTHING_TO_REVIEW;
 use super::workspace::Workspace;
-use crate::fonts::mono_font;
 use crate::model::LoggedEvent;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// How many of the latest steps a card lists.
 const STEPS_SHOWN: usize = 6;
@@ -379,10 +379,10 @@ impl Workspace {
         let mut header = div()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .h(px(36.))
-            .px(px(12.))
-            .text_size(px(12.))
+            .gap(ui_px(8.))
+            .h(scale::row(36.))
+            .px(ui_px(12.))
+            .text_size(scale::text(12.))
             .when(!queued, |header| {
                 header.child(spinner(
                     SharedString::from(format!("run-spinner-{id}")),
@@ -393,7 +393,7 @@ impl Workspace {
             .child(
                 div()
                     .id(format!("run-state-{id}"))
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color(token))
                     .aria_label(word)
                     .child(word)
@@ -404,7 +404,7 @@ impl Workspace {
             let prev = elapsed(ms - 1000);
             header = header.child(
                 rolling_text(format!("run-elapsed-{id}"), &prev, &time)
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .text_color(color("text-secondary"))
                     .aria_label(time.clone())
                     .test_support(),
@@ -441,8 +441,8 @@ impl Workspace {
                     div()
                         .flex()
                         .flex_col()
-                        .px(px(12.))
-                        .pb(px(8.))
+                        .px(ui_px(12.))
+                        .pb(scale::row(8.))
                         .children(summary.steps.iter().enumerate().map(step_row)),
                 )
             })
@@ -464,18 +464,18 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .h(px(36.))
-                    .px(px(12.))
-                    .text_size(px(12.))
+                    .gap(ui_px(8.))
+                    .h(scale::row(36.))
+                    .px(ui_px(12.))
+                    .text_size(scale::text(12.))
                     .child(
                         Icon::new(IconName::CircleCheck)
-                            .size(px(14.))
+                            .size(ui_px(14.))
                             .text_color(color("success")),
                     )
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(weight(FontWeight::MEDIUM))
                             .text_color(color("success"))
                             .child("Done"),
                     )
@@ -495,26 +495,31 @@ impl Workspace {
                             })),
                     ),
             )
-            .child(div().flex().flex_col().px(px(12.)).pb(px(8.)).children(
-                summary.files.iter().map(|f| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .h(px(24.))
-                        .font_family(mono_font())
-                        .text_size(px(12.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(color("text-secondary"))
-                                .child(f.path.clone()),
-                        )
-                        .child(plus_minus(f.added, f.removed))
-                }),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px(ui_px(12.))
+                    .pb(scale::row(8.))
+                    .children(summary.files.iter().map(|f| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(ui_px(8.))
+                            .h(scale::row(24.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(color("text-secondary"))
+                                    .child(f.path.clone()),
+                            )
+                            .child(plus_minus(f.added, f.removed))
+                    })),
+            )
             .test_support()
     }
 }
@@ -524,11 +529,11 @@ fn card(run: RunId, kind: &str) -> Stateful<Div> {
         .id(format!("{kind}-{run}"))
         .flex()
         .flex_col()
-        .mt(px(8.))
-        .max_w(px(560.))
+        .mt(ui_px(8.))
+        .max_w(ui_px(560.))
         .border_1()
         .border_color(color("border-100"))
-        .rounded(px(8.))
+        .rounded(ui_px(8.))
         .bg(color("bg-100"))
 }
 
@@ -539,7 +544,7 @@ fn counts_line(run: RunId, summary: &RunSummary, counts: String) -> impl IntoEle
         .id(format!("run-counts-{run}"))
         .flex()
         .items_center()
-        .gap(px(4.))
+        .gap(ui_px(4.))
         .text_color(color("text-secondary"))
         .aria_label(counts)
         .child(format!("· {n} {} ·", if n == 1 { "file" } else { "files" }))
@@ -551,8 +556,8 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
     div()
         .flex()
         .flex_none()
-        .gap(px(4.))
-        .font_family(mono_font())
+        .gap(ui_px(4.))
+        .font_family(code_family())
         .child(
             div()
                 .text_color(color("success"))
@@ -568,18 +573,18 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
 pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
     let icon = match step.state {
         StepState::Done => Icon::new(IconName::Check)
-            .size(px(12.))
+            .size(ui_px(12.))
             .text_color(color("success"))
             .into_any_element(),
         StepState::Running => {
             spinner(("run-step-spinner", ix), 12., "accent-blue").into_any_element()
         }
         StepState::Failed => Icon::new(IconName::CircleX)
-            .size(px(12.))
+            .size(ui_px(12.))
             .text_color(color("danger"))
             .into_any_element(),
         StepState::Blocked => Icon::new(IconName::Ban)
-            .size(px(12.))
+            .size(ui_px(12.))
             .text_color(color("danger"))
             .into_any_element(),
     };
@@ -600,9 +605,9 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
         .id(("run-step", ix))
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(24.))
-        .text_size(px(12.))
+        .gap(ui_px(8.))
+        .h(scale::row(24.))
+        .text_size(scale::text(12.))
         .text_color(color("text-secondary"))
         .aria_label(text)
         .when_some(step.raw.clone(), |row, raw| {
@@ -631,10 +636,10 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
                 div()
                     .min_w_0()
                     .truncate()
-                    .px(px(4.))
-                    .rounded(px(4.))
+                    .px(ui_px(4.))
+                    .rounded(ui_px(4.))
                     .bg(color("surface-300"))
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .text_color(color("text-primary"))
                     .child(step.target.clone()),
             )
@@ -646,7 +651,7 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
             row.child(
                 div()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("text-tertiary"))
                     .child(answer.text()),
             )
@@ -655,7 +660,7 @@ pub(super) fn step_row((ix, step): (usize, &Step)) -> impl IntoElement {
             row.child(
                 div()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(scale::text(11.))
                     .text_color(color("danger"))
                     .child(OUTSIDE_TAG),
             )

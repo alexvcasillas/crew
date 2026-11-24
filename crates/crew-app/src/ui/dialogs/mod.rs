@@ -21,6 +21,7 @@ use gpui_kit::*;
 use super::workspace::Workspace;
 use crate::theme::color;
 
+use crate::theme::scale::{self, ui_px, weight};
 use discard::discard_label;
 
 /// The dialogs' width.
@@ -72,7 +73,7 @@ impl Workspace {
             let closed = this.clone();
             let confirmed = this.clone();
             let dialog = dialog
-                .w(px(WIDTH))
+                .w(ui_px(WIDTH))
                 // ↵ confirms. The dialog closes once crewd says it's done.
                 .on_ok(move |_, window, cx| {
                     confirmed
@@ -126,12 +127,12 @@ impl Workspace {
                     .id("dialog-body")
                     .flex()
                     .flex_col()
-                    .gap(px(14.))
+                    .gap(ui_px(14.))
                     .child(body)
                     .children(open.error.clone().map(|error| {
                         div()
                             .id("dialog-error")
-                            .text_size(px(12.))
+                            .text_size(scale::text(12.))
                             .text_color(color("danger"))
                             .aria_label(error.clone())
                             .child(error)
@@ -318,8 +319,8 @@ fn checked_channel_name(typed: &str, stored: Option<&str>) -> Result<String, Str
 /// A field's label above it.
 fn field_label(text: &'static str) -> Div {
     div()
-        .text_size(px(12.))
-        .font_weight(FontWeight::MEDIUM)
+        .text_size(scale::text(12.))
+        .font_weight(weight(FontWeight::MEDIUM))
         .text_color(color("text-secondary"))
         .child(text)
 }
@@ -327,8 +328,8 @@ fn field_label(text: &'static str) -> Div {
 /// Small grey text under a field.
 fn hint() -> Div {
     div()
-        .text_size(px(12.))
-        .line_height(px(18.))
+        .text_size(scale::text(12.))
+        .line_height(scale::line(18.))
         .text_color(color("text-tertiary"))
 }
 
@@ -338,18 +339,18 @@ fn heading(id: &'static str, title: String, body: Option<AnyElement>, label: Str
         .id(id)
         .flex()
         .flex_col()
-        .gap(px(4.))
+        .gap(ui_px(4.))
         .aria_label(label)
         .child(
             div()
-                .text_size(px(15.))
-                .line_height(px(22.))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(scale::text(15.))
+                .line_height(scale::line(22.))
+                .font_weight(weight(FontWeight::SEMIBOLD))
                 .child(title),
         )
         .children(body.map(|body| {
             div()
-                .line_height(px(20.))
+                .line_height(scale::line(20.))
                 .text_color(color("text-secondary"))
                 .child(body)
         }))

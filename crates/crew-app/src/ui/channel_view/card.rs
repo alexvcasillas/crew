@@ -16,8 +16,8 @@ use super::super::workspace::Workspace;
 use super::{
     Card, CardStatus, card_time, counts_line, stop_label, strip_layout, working_line, worktree_word,
 };
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// The selected card's outline, between border-200 and the text.
 const SELECTED_BORDER: u32 = 0x3a3a3a;
@@ -44,7 +44,7 @@ fn pill(thread: ThreadId, status: CardStatus) -> impl IntoElement {
     let (text, fill, border) = pill_tokens(status);
     let icon = |name: IconName| {
         Icon::new(name)
-            .size(px(11.))
+            .size(ui_px(11.))
             .text_color(color(text))
             .into_any_element()
     };
@@ -64,15 +64,15 @@ fn pill(thread: ThreadId, status: CardStatus) -> impl IntoElement {
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(5.))
-        .h(px(20.))
-        .px(px(7.))
+        .gap(ui_px(5.))
+        .h(scale::row(20.))
+        .px(ui_px(7.))
         .rounded_full()
         .border_1()
         .border_color(color(border))
         .when_some(fill, |pill, fill| pill.bg(color(fill)))
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
+        .text_size(scale::text(11.))
+        .font_weight(weight(FontWeight::MEDIUM))
         .text_color(color(text))
         .aria_label(status.word())
         .children(mark)
@@ -98,13 +98,13 @@ fn menu_row(label: &'static str, keys: Option<&'static str>, danger: bool) -> Po
             .flex()
             .items_center()
             .w_full()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .when(danger, |row| row.text_color(color("danger")))
             .child(div().flex_1().child(label))
             .children(keys.map(|keys| {
                 div()
-                    .font_family(mono_font())
-                    .text_size(px(11.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(11.))
                     .text_color(color("text-tertiary"))
                     .child(keys)
             }))
@@ -266,7 +266,7 @@ impl Workspace {
             div()
                 .id(SharedString::from(format!("thread-time-{id}")))
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-tertiary"))
                 .aria_label(time.clone())
                 .child(time)
@@ -286,11 +286,11 @@ impl Workspace {
             .id(SharedString::from(format!("thread-{id}")))
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .px(px(14.))
-            .py(px(12.))
+            .gap(ui_px(10.))
+            .px(ui_px(14.))
+            .py(scale::row(12.))
             .border_1()
-            .rounded(px(8.))
+            .rounded(ui_px(8.))
             .map(|card| {
                 if selected {
                     card.bg(color("surface-200"))
@@ -318,8 +318,8 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .h(px(24.))
+                    .gap(ui_px(8.))
+                    .h(scale::row(24.))
                     .child(pill(id, card.status))
                     .child(
                         div()
@@ -327,9 +327,9 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(14.))
-                            .line_height(px(20.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(scale::text(14.))
+                            .line_height(scale::line(20.))
+                            .font_weight(weight(FontWeight::SEMIBOLD))
                             .aria_label(card.title.clone())
                             .child(card.title.clone())
                             .test_support(),
@@ -339,8 +339,8 @@ impl Workspace {
             .child(
                 div()
                     .id(SharedString::from(format!("thread-excerpt-{id}")))
-                    .h(px(40.))
-                    .line_height(px(20.))
+                    .h(scale::row(40.))
+                    .line_height(scale::line(20.))
                     .overflow_hidden()
                     .text_color(color("text-secondary"))
                     .aria_label(excerpt.clone())
@@ -352,11 +352,11 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(14.))
-                    .pt(px(10.))
+                    .gap(ui_px(14.))
+                    .pt(scale::row(10.))
                     .border_t_1()
                     .border_color(color("border-100"))
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .whitespace_nowrap()
                     .child(
@@ -400,7 +400,7 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             // A click on an action, the menu button included, isn't a
             // click on the card.
             .on_click(|_, _, cx| cx.stop_propagation())
@@ -486,7 +486,7 @@ impl Workspace {
             }
         }
         chips.truncate(CHIPS_MAX);
-        let avatar = |el: Div| el.size(px(22.)).border_color(color("bg-100"));
+        let avatar = |el: Div| el.size(ui_px(22.)).border_color(color("bg-100"));
         let stack = std::iter::once(
             avatar(monogram("You", 22.))
                 .rounded_full()
@@ -496,7 +496,7 @@ impl Workspace {
         .chain(agents.iter().map(|a| {
             let live = working == Some(a.id);
             avatar(monogram(&a.spec.name, 22.))
-                .ml(px(-6.))
+                .ml(ui_px(-6.))
                 .when(live, |el| el.border_color(color("accent-blue")))
                 .into_any_element()
         }));
@@ -508,7 +508,7 @@ impl Workspace {
         div()
             .flex()
             .items_center()
-            .gap(px(10.))
+            .gap(ui_px(10.))
             .child(
                 div()
                     .id(SharedString::from(format!("thread-people-{id}")))
@@ -530,12 +530,12 @@ impl Workspace {
                     .flex_shrink(1.)
                     .min_w_0()
                     .truncate()
-                    .px(px(6.))
-                    .rounded(px(4.))
+                    .px(ui_px(6.))
+                    .rounded(ui_px(4.))
                     .bg(color("surface-300"))
-                    .font_family(mono_font())
-                    .text_size(px(11.))
-                    .line_height(px(16.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(11.))
+                    .line_height(scale::mono_line(16.))
                     .text_color(color("text-secondary"))
                     .aria_label(branch.clone())
                     .child(branch)
@@ -547,8 +547,8 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(5.))
-                    .text_size(px(11.))
+                    .gap(ui_px(5.))
+                    .text_size(scale::text(11.))
                     .text_color(color(token))
                     .aria_label(word.clone())
                     .when(uncommitted, |row| row.child(dot("text-secondary")))
@@ -595,9 +595,9 @@ impl Workspace {
                 };
                 let bar = div()
                     .flex_none()
-                    .w(px(width))
-                    .h(px(4.))
-                    .rounded(px(1.))
+                    .w(ui_px(width))
+                    .h(ui_px(4.))
+                    .rounded(ui_px(1.))
                     .bg(color(token));
                 if run.status == RunStatus::Working && !waiting {
                     pulsing(SharedString::from(format!("strip-{id}-{ix}")), bar).into_any_element()
@@ -610,11 +610,11 @@ impl Workspace {
             .id(SharedString::from(format!("thread-strip-{id}")))
             .flex()
             .flex_none()
-            .gap(px(STRIP_GAP))
-            .w(px(STRIP_WIDTH))
-            .h(px(4.))
+            .gap(ui_px(STRIP_GAP))
+            .w(ui_px(STRIP_WIDTH))
+            .h(ui_px(4.))
             .overflow_hidden()
-            .rounded(px(1.))
+            .rounded(ui_px(1.))
             .bg(color("border-100"))
             .aria_label(if n == 1 {
                 "1 run".to_string()
@@ -635,10 +635,10 @@ fn render_counts(card: &Card, running: Option<String>) -> impl IntoElement {
         div()
             .flex()
             .flex_none()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color("text-primary"))
                     .child(super::thousands(n)),
             )
@@ -648,13 +648,13 @@ fn render_counts(card: &Card, running: Option<String>) -> impl IntoElement {
         files
             .child(
                 div()
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .text_color(color("success"))
                     .child(format!("+{}", super::thousands(s.added))),
             )
             .child(
                 div()
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .text_color(color("danger"))
                     .child(format!("−{}", super::thousands(s.removed))),
             )
@@ -663,17 +663,17 @@ fn render_counts(card: &Card, running: Option<String>) -> impl IntoElement {
         Some(elapsed) => div()
             .flex()
             .flex_none()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .text_color(color("accent-blue"))
             .child("running")
-            .child(div().font_family(mono_font()).child(elapsed)),
+            .child(div().font_family(code_family()).child(elapsed)),
         None => div()
             .flex()
             .flex_none()
-            .gap(px(4.))
+            .gap(ui_px(4.))
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color("text-primary"))
                     .child(super::super::running_view::usage_time(s.agent_ms)),
             )
@@ -682,7 +682,7 @@ fn render_counts(card: &Card, running: Option<String>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap(px(14.))
+        .gap(ui_px(14.))
         .overflow_hidden()
         .child(part(s.messages, "message", "messages"))
         .child(part(runs, "run", "runs"))

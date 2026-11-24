@@ -8,6 +8,7 @@ use super::service_control::ServiceAction;
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
+use crate::theme::scale::{self, ui_px, weight};
 
 /// What the screen says and offers for `state`.
 struct Wording {
@@ -53,16 +54,16 @@ impl Workspace {
             .justify_center()
             .child(
                 div()
-                    .w(px(400.))
+                    .w(ui_px(400.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .child(
                         div()
                             .id("connect-title")
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(scale::text(15.))
+                            .font_weight(weight(FontWeight::SEMIBOLD))
                             .aria_label(wording.title)
                             .child(wording.title)
                             .test_support(),
@@ -74,7 +75,7 @@ impl Workspace {
                             .child(wording.body),
                     )
                     .child(
-                        div().pt(px(8.)).child(
+                        div().pt(scale::row(8.)).child(
                             Button::new(wording.button_id)
                                 .primary()
                                 .label(wording.button)

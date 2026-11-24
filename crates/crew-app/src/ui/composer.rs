@@ -13,8 +13,8 @@ use gpui_kit::*;
 use super::common::{monogram, provider_icon};
 use super::mention_menu::{MentionAgent, matching, mention_at};
 use super::workspace::thread_title;
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px};
 
 actions!(
     composer,
@@ -409,7 +409,7 @@ impl Render for Composer {
             } else {
                 "border-200"
             }))
-            .rounded(px(8.))
+            .rounded(ui_px(8.))
             .bg(color("bg-100"))
             .key_context(context)
             .on_action(cx.listener(|this, _: &MentionUp, _, cx| this.move_selection(-1, cx)))
@@ -431,9 +431,12 @@ impl Render for Composer {
                 div()
                     .id("composer-input")
                     .map(|area| match self.mode {
-                        ComposerMode::Reply => area.px(px(4.)).pt(px(4.)),
-                        ComposerMode::NewThread => area.px(px(8.)).pt(px(6.)),
-                        ComposerMode::Empty => area.px(px(12.)).pt(px(10.)).text_size(px(15.)),
+                        ComposerMode::Reply => area.px(ui_px(4.)).pt(scale::row(4.)),
+                        ComposerMode::NewThread => area.px(ui_px(8.)).pt(scale::row(6.)),
+                        ComposerMode::Empty => area
+                            .px(ui_px(12.))
+                            .pt(scale::row(10.))
+                            .text_size(scale::text(15.)),
                     })
                     .child(Textarea::new(&self.input).appearance(false))
                     .test_support(),
@@ -450,7 +453,7 @@ impl Composer {
         Button::new("composer-at")
             .ghost()
             .small()
-            .w(px(FOOTER_BUTTON))
+            .w(ui_px(FOOTER_BUTTON))
             .label("@")
             .tooltip("Mention an agent")
             .on_click(cx.listener(|this, _, window, cx| {
@@ -462,9 +465,9 @@ impl Composer {
         div()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .px(px(8.))
-            .pb(px(8.))
+            .gap(ui_px(8.))
+            .px(ui_px(8.))
+            .pb(scale::row(8.))
             .child(self.render_at(cx))
             .child(
                 // Same size and colour as @. Not disabled, which would
@@ -472,8 +475,8 @@ impl Composer {
                 Button::new("composer-attach")
                     .ghost()
                     .small()
-                    .w(px(FOOTER_BUTTON))
-                    .icon(Icon::default().data(PAPERCLIP).size(px(14.)))
+                    .w(ui_px(FOOTER_BUTTON))
+                    .icon(Icon::default().data(PAPERCLIP).size(ui_px(14.)))
                     .tooltip("Attachments are coming soon."),
             )
             .child(
@@ -482,7 +485,7 @@ impl Composer {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .when_some(self.hint.clone(), |hint, text| {
                         hint.aria_label(text.clone()).child(text)
@@ -507,7 +510,7 @@ impl Composer {
         let label = format!("With {}", names.join(", ")).trim_end().to_string();
         let quiet = |text: &'static str| {
             div()
-                .text_size(px(12.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-secondary"))
                 .child(text)
         };
@@ -516,10 +519,10 @@ impl Composer {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(8.))
-            .px(px(12.))
-            .pt(px(10.))
-            .min_h(px(36.))
+            .gap(ui_px(8.))
+            .px(ui_px(12.))
+            .pt(scale::row(10.))
+            .min_h(scale::row(36.))
             .aria_label(label)
             .child(quiet("New thread"))
             .child(div().text_color(color("border-200")).child("·"))
@@ -532,24 +535,24 @@ impl Composer {
                     )))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(26.))
-                    .px(px(6.))
+                    .gap(ui_px(6.))
+                    .h(scale::row(26.))
+                    .px(ui_px(6.))
                     .border_1()
                     .border_color(color("border-200"))
-                    .rounded(px(6.))
+                    .rounded(ui_px(6.))
                     .bg(color("surface-100"))
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .aria_label(agent.name.clone())
-                    .child(monogram(&agent.name, 18.).rounded(px(4.)))
+                    .child(monogram(&agent.name, 18.).rounded(ui_px(4.)))
                     .child(agent.name.clone())
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.))
-                            .font_family(mono_font())
-                            .text_size(px(11.))
+                            .gap(ui_px(4.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(11.))
                             .text_color(color("text-secondary"))
                             .child(provider_icon(&agent.runtime, 12.))
                             .child(model_short(&agent.chip).to_string()),
@@ -568,17 +571,18 @@ impl Composer {
         );
         let mono = |text: String| {
             div()
-                .font_family(mono_font())
+                .font_family(code_family())
+                .text_size(scale::mono(12.))
                 .text_color(color("text-secondary"))
                 .child(text)
         };
         div()
             .flex()
             .items_center()
-            .gap(px(4.))
-            .px(px(8.))
-            .pt(px(6.))
-            .pb(px(8.))
+            .gap(ui_px(4.))
+            .px(ui_px(8.))
+            .pt(scale::row(6.))
+            .pb(scale::row(8.))
             .border_t_1()
             .border_color(color("border-100"))
             .child(self.render_at(cx))
@@ -588,11 +592,11 @@ impl Composer {
                     .flex()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(4.))
-                    .ml(px(6.))
+                    .gap(ui_px(4.))
+                    .ml(ui_px(6.))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(line)
                     .child("Starts in a new worktree on branch")
@@ -626,11 +630,11 @@ impl Composer {
         div()
             .flex()
             .items_center()
-            .gap(px(4.))
-            .pl(px(10.))
-            .pr(px(8.))
-            .pt(px(6.))
-            .pb(px(8.))
+            .gap(ui_px(4.))
+            .pl(ui_px(10.))
+            .pr(ui_px(8.))
+            .pt(scale::row(6.))
+            .pb(scale::row(8.))
             .child(self.render_at(cx))
             .child(
                 div()
@@ -638,15 +642,20 @@ impl Composer {
                     .flex()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(4.))
-                    .ml(px(4.))
+                    .gap(ui_px(4.))
+                    .ml(ui_px(4.))
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(line)
                     .child("Starts in a new worktree off")
-                    .child(div().font_family(mono_font()).child(self.base.clone()))
+                    .child(
+                        div()
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
+                            .child(self.base.clone()),
+                    )
                     .test_support(),
             )
             .child(
@@ -664,8 +673,8 @@ impl Composer {
 /// A shortcut after a button's label.
 fn keys(text: &'static str) -> impl IntoElement {
     div()
-        .font_family(mono_font())
-        .text_size(px(11.))
+        .font_family(code_family())
+        .text_size(scale::mono(11.))
         .opacity(0.6)
         .child(text)
 }

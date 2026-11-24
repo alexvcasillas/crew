@@ -17,12 +17,12 @@ use gpui_kit::*;
 
 use super::{control, field, form_error, help, segment, segmented};
 use crate::client::ClientHandle;
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 use crate::ui::common::chip;
 use crate::ui::thread_settings::policy_name;
 use crate::ui::title_bar::home_relative;
-use crate::ui::workspace::{SIDEBAR_WIDTH, Workspace};
+use crate::ui::workspace::Workspace;
 
 pub const NOT_GIT: &str = "Crew needs a git repository. Run `git init` there first.";
 const NO_BRANCH: &str = "Crew couldn't tell the main branch. Check out a branch there first.";
@@ -499,7 +499,7 @@ impl Workspace {
             }) => self.render_project_form(form, cx).into_any_element(),
             _ => div()
                 .flex_1()
-                .p(px(32.))
+                .p(ui_px(32.))
                 .child(help(
                     "Add a project to give your agents a repository to work in.",
                 ))
@@ -534,9 +534,9 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .h(px(44.))
-                    .px(px(8.))
-                    .rounded(px(6.))
+                    .h(scale::row(44.))
+                    .px(ui_px(8.))
+                    .rounded(ui_px(6.))
                     .cursor_pointer()
                     .when(selected == Some(id), |row| row.bg(color("surface-300")))
                     .hover(|row| row.bg(color("surface-200")))
@@ -544,14 +544,14 @@ impl Workspace {
                     .child(
                         div()
                             .truncate()
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(weight(FontWeight::MEDIUM))
                             .child(p.name.clone()),
                     )
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.))
-                            .font_family(mono_font())
+                            .text_size(scale::mono(11.))
+                            .font_family(code_family())
                             .text_color(color("text-tertiary"))
                             .child(home_relative(&p.root)),
                     )
@@ -567,10 +567,10 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
-            .px(px(8.))
-            .py(px(12.))
+            .px(ui_px(8.))
+            .py(scale::row(12.))
             .border_r_1()
             .border_color(color("border-100"))
             .overflow_y_scroll()
@@ -578,14 +578,14 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(28.))
-                    .pl(px(8.))
-                    .mb(px(4.))
+                    .h(scale::row(28.))
+                    .pl(ui_px(8.))
+                    .mb(ui_px(4.))
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(scale::text(12.))
+                            .font_weight(weight(FontWeight::MEDIUM))
                             .text_color(color("text-secondary"))
                             .child(count),
                     )
@@ -604,8 +604,8 @@ impl Workspace {
             .when_some(folder_error, |list, error| {
                 list.child(
                     div()
-                        .px(px(8.))
-                        .pb(px(8.))
+                        .px(ui_px(8.))
+                        .pb(scale::row(8.))
                         .child(form_error("project-folder-error", error)),
                 )
             })
@@ -622,24 +622,24 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
-            .px(px(32.))
-            .py(px(24.))
+            .px(ui_px(32.))
+            .py(ui_px(24.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(px(760.))
+                    .max_w(ui_px(760.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .pb(px(16.))
+                            .gap(ui_px(8.))
+                            .pb(scale::row(16.))
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(20.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(scale::text(20.))
+                                    .font_weight(weight(FontWeight::SEMIBOLD))
                                     .child("Add project"),
                             )
                             .child(
@@ -675,8 +675,8 @@ impl Workspace {
                         Some("New threads branch from here."),
                         div()
                             .id("project-add-branch")
-                            .font_family(mono_font())
-                            .text_size(px(12.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
                             .aria_label(adding.repo.branch.clone())
                             .child(adding.repo.branch.clone())
                             .test_support(),
@@ -708,19 +708,19 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
-            .px(px(32.))
-            .py(px(24.))
+            .px(ui_px(32.))
+            .py(ui_px(24.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(px(760.))
+                    .max_w(ui_px(760.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(12.))
-                            .pb(px(16.))
+                            .gap(ui_px(12.))
+                            .pb(scale::row(16.))
                             .child(
                                 div()
                                     .flex()
@@ -730,9 +730,9 @@ impl Workspace {
                                     .child(
                                         div()
                                             .id("project-form-title")
-                                            .text_size(px(24.))
-                                            .line_height(px(32.))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(scale::text(24.))
+                                            .line_height(scale::line(32.))
+                                            .font_weight(weight(FontWeight::SEMIBOLD))
                                             .aria_label(project.name.clone())
                                             .child(project.name.clone())
                                             .test_support(),
@@ -747,7 +747,7 @@ impl Workspace {
                                 row.child(
                                     div()
                                         .id("project-saved")
-                                        .text_size(px(12.))
+                                        .text_size(scale::text(12.))
                                         .text_color(color("success"))
                                         .aria_label("Saved")
                                         .child("Saved")
@@ -774,12 +774,12 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
+                            .gap(ui_px(8.))
                             .children(channels)
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(8.))
+                                    .gap(ui_px(8.))
                                     .child(div().flex_1().child(control(
                                         "project-new-channel",
                                         Input::new(&form.new_channel),
@@ -808,7 +808,7 @@ impl Workspace {
                         "Files to copy",
                         Some("One path per line, relative to the project. Copied into each new worktree, such as .env."),
                         div()
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .child(control("project-copy-files", Textarea::new(&form.copy_files))),
                     )),
             )
@@ -860,14 +860,14 @@ impl Workspace {
             .id(SharedString::from(format!("channel-settings-{id}")))
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .aria_label(format!("#{}", channel.name))
             .child(
                 div()
-                    .w(px(96.))
+                    .w(ui_px(96.))
                     .flex_none()
                     .truncate()
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .child(format!("#{}", channel.name)),
             )
             .child(div().flex_1().child(segmented(segments)))
@@ -884,9 +884,9 @@ impl Workspace {
             .child(
                 div()
                     .id(SharedString::from(format!("channel-budget-{id}")))
-                    .min_w(px(24.))
+                    .min_w(ui_px(24.))
                     .text_center()
-                    .font_family(mono_font())
+                    .font_family(code_family())
                     .aria_label(budget.to_string())
                     .child(budget.to_string())
                     .test_support(),

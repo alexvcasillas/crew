@@ -14,14 +14,16 @@ use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::common::{clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip};
+use super::common::{
+    clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip, with_font_probe,
+};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
 use super::workspace::Workspace;
-use crate::fonts::{mono_font, ui_font};
 use crate::markdown::mention_spans;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_family, ui_px, weight};
 
 impl Workspace {
     pub(super) fn render_thread(
@@ -100,39 +102,40 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(12.))
-                    .h(px(44.))
-                    .pl(px(24.))
-                    .pr(px(16.))
+                    .gap(ui_px(12.))
+                    .h(scale::row(44.))
+                    .pl(scale::chrome(24.))
+                    .pr(scale::chrome(16.))
                     .border_b_1()
                     .border_color(color("border-100"))
                     .child(
                         // Title and channel share one line, as on the board.
-                        // A long title is cut with an ellipsis; the channel
-                        // label always shows in full.
+                        // A long title is cut with an ellipsis first; the
+                        // channel label is cut only when big text leaves no
+                        // room at all.
                         div()
                             .flex()
                             .items_baseline()
-                            .gap(px(10.))
+                            .gap(ui_px(10.))
                             .flex_1()
                             .min_w_0()
                             .child(
                                 div()
                                     .id("thread-title")
-                                    .flex_shrink(1.)
+                                    .flex_shrink(GIVES_WAY_FIRST)
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(scale::text(14.))
+                                    .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label(t.title.clone())
                                     .child(t.title.clone())
                                     .test_support(),
                             )
                             .child(
                                 div()
-                                    .flex_none()
-                                    .whitespace_nowrap()
-                                    .text_size(px(12.))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-tertiary"))
                                     .child(format!("Thread in #{channel_name}")),
                             ),
@@ -159,8 +162,9 @@ impl Workspace {
                         );
                         div()
                             .id("thread-handoffs")
-                            .flex_none()
-                            .text_size(px(12.))
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::text(12.))
                             .text_color(color("text-secondary"))
                             .aria_label(handoffs.clone())
                             .child(handoffs)
@@ -176,8 +180,8 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.nav.scroll)
-                    .py(px(12.))
-                    .gap(px(12.))
+                    .py(scale::row(12.))
+                    .gap(ui_px(12.))
                     .children(items)
                     .test_support(),
             )
@@ -190,9 +194,9 @@ impl Workspace {
     fn render_composer_area(&self) -> impl IntoElement + use<> {
         div()
             .flex_none()
-            .px(px(24.))
-            .pb(px(16.))
-            .pt(px(4.))
+            .px(scale::chrome(24.))
+            .pb(scale::row(16.))
+            .pt(scale::row(4.))
             .child(self.composer.clone())
     }
 
@@ -214,14 +218,14 @@ impl Workspace {
                 .id(format!("message-{id}"))
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .px(px(24.))
-                .pl(px(24. + 32. + 12.))
-                .text_size(px(12.))
+                .gap(ui_px(8.))
+                .px(scale::chrome(24.))
+                .pl(scale::chrome(24.) + ui_px(32. + 12.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-tertiary"))
                 .child(
                     Icon::new(IconName::Info)
-                        .size(px(12.))
+                        .size(ui_px(12.))
                         .text_color(color("text-tertiary")),
                 )
                 .child(
@@ -245,59 +249,23 @@ impl Workspace {
             }
             _ => ("You".to_string(), you_avatar(), None),
         };
-        div()
-            .id(format!("message-{id}"))
-            .flex()
-            .gap(px(12.))
-            .px(px(24.))
-            .py(px(8.))
-            .child(avatar)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-                            .when_some(runtime, |row, (badge, text)| {
-                                row.child(
-                                    badge
-                                        .id(format!("message-chip-{id}"))
-                                        .aria_label(text)
-                                        .test_support(),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(color("text-tertiary"))
-                                    .child(time),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(format!("message-body-{id}"))
-                            .line_height(px(20.))
-                            .aria_label(message.body.clone())
-                            .map(|body| {
-                                if matches!(message.author, Author::Agent(_)) {
-                                    let doc = self.docs.get(DocKey::Message(id), &message.body);
-                                    body.child(render_doc(&doc, names, &format!("md-{id}")))
-                                } else {
-                                    body.child(styled_body(&message.body, names))
-                                }
-                            })
-                            .test_support(),
-                    ),
-            )
-            .test_support()
-            .into_any_element()
+        let body = if matches!(message.author, Author::Agent(_)) {
+            let doc = self.docs.get(DocKey::Message(id), &message.body);
+            render_doc(&doc, names, &format!("md-{id}")).into_any_element()
+        } else {
+            styled_body(&message.body, names).into_any_element()
+        };
+        message_row(
+            id.to_string(),
+            avatar,
+            name,
+            runtime,
+            time,
+            message.body.clone(),
+            body,
+        )
+        .test_support()
+        .into_any_element()
     }
 
     /// An agent at work: its avatar, ringed in blue and pulsing while
@@ -313,9 +281,9 @@ impl Workspace {
         div()
             .id(format!("live-{id}"))
             .flex()
-            .gap(px(12.))
-            .px(px(24.))
-            .py(px(8.))
+            .gap(ui_px(12.))
+            .px(scale::chrome(24.))
+            .py(scale::row(8.))
             .bg(color("surface-100"))
             .child(live_avatar(
                 &name,
@@ -331,8 +299,8 @@ impl Workspace {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                            .gap(ui_px(8.))
+                            .child(div().font_weight(weight(FontWeight::SEMIBOLD)).child(name))
                             .when_some(runtime, |row, (badge, text)| {
                                 row.child(
                                     badge
@@ -374,13 +342,16 @@ impl Workspace {
                     .unwrap_or_default();
                 monogram(&name, 22.)
                     .border_color(color("bg-100"))
-                    .when(ix > 0, |m| m.ml(px(-6.)))
+                    .when(ix > 0, |m| m.ml(ui_px(-6.)))
             }))
     }
 }
 
 /// Size of a message avatar.
 const AVATAR: f32 = 32.;
+/// A flex shrink so much bigger than the rest's that the element shrinks
+/// to nothing before they shrink at all.
+const GIVES_WAY_FIRST: f32 = 1000.;
 /// Space between an avatar and its ring, and the ring's width.
 const RING_GAP: f32 = 2.;
 const RING_WIDTH: f32 = 2.;
@@ -394,7 +365,7 @@ fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
         .relative()
         .flex_none()
         .self_start()
-        .size(px(AVATAR))
+        .size(ui_px(AVATAR))
         .child(monogram(name, AVATAR))
         .when_some(ring, |slot, ring| {
             slot.child(pulsing(
@@ -402,12 +373,12 @@ fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
                 div()
                     .id(SharedString::from(ring))
                     .absolute()
-                    .top(px(-out))
-                    .left(px(-out))
-                    .size(px(AVATAR + 2. * out))
+                    .top(ui_px(-out))
+                    .left(ui_px(-out))
+                    .size(ui_px(AVATAR + 2. * out))
                     // The monogram's 6 px corner plus the gap, at the
                     // ring's inner edge.
-                    .rounded(px(6. + RING_GAP + RING_WIDTH))
+                    .rounded(ui_px(6. + RING_GAP + RING_WIDTH))
                     .border_2()
                     .border_color(color("accent-blue"))
                     .test_support(),
@@ -415,9 +386,71 @@ fn live_avatar(name: &str, ring: Option<String>) -> impl IntoElement {
         })
 }
 
+/// A message: its avatar, then its author, runtime chip and time over its
+/// body. `key` names its elements (`message-{key}`, `message-body-{key}`)
+/// and `label` is the body's accessible text.
+pub(super) fn message_row(
+    key: String,
+    avatar: Div,
+    name: String,
+    runtime: Option<(Div, String)>,
+    time: String,
+    label: String,
+    body: AnyElement,
+) -> Stateful<Div> {
+    div()
+        .id(format!("message-{key}"))
+        .flex()
+        .gap(ui_px(12.))
+        .px(scale::chrome(24.))
+        .py(scale::row(8.))
+        .child(avatar)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(ui_px(2.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(8.))
+                        .child(div().font_weight(weight(FontWeight::SEMIBOLD)).child(name))
+                        .when_some(runtime, |row, (badge, text)| {
+                            row.child(
+                                badge
+                                    .id(format!("message-chip-{key}"))
+                                    .aria_label(text)
+                                    .test_support(),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(scale::text(12.))
+                                .text_color(color("text-tertiary"))
+                                .child(time),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(format!("message-body-{key}"))
+                        .line_height(scale::line(20.))
+                        .aria_label(label)
+                        .child(body)
+                        .map(|body| with_font_probe(body, || format!("message-body-{key}")))
+                        .test_support(),
+                ),
+        )
+}
+
 /// Lines up with a message's text, past the avatar.
 pub(super) fn indented(child: impl IntoElement) -> Div {
-    div().pl(px(24. + 32. + 12.)).pr(px(24.)).child(child)
+    div()
+        .pl(scale::chrome(24.) + ui_px(32. + 12.))
+        .pr(scale::chrome(24.))
+        .child(child)
 }
 
 fn you_avatar() -> Div {
@@ -426,11 +459,11 @@ fn you_avatar() -> Div {
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(32.))
+        .size(ui_px(32.))
         .rounded_full()
         .bg(color("border-200"))
-        .text_size(px(13.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(scale::text(13.))
+        .font_weight(weight(FontWeight::SEMIBOLD))
         .child("Y")
 }
 
@@ -480,17 +513,19 @@ fn styled_body(body: &str, names: &[String]) -> StyledText {
         .into_iter()
         .map(|(range, span)| {
             let (mut font, text, background) = match span {
-                Span::Plain => (font(ui_font()), "text-primary", None),
-                Span::Mention => (font(ui_font()), "accent-blue", None),
+                Span::Plain => (font(ui_family()), "text-primary", None),
+                Span::Mention => (font(ui_family()), "accent-blue", None),
                 Span::Code => (
-                    font(mono_font()),
+                    font(code_family()),
                     "text-primary",
                     Some(color("surface-300")),
                 ),
             };
-            if span == Span::Mention {
-                font.weight = FontWeight::MEDIUM;
-            }
+            font.weight = scale::weight(if span == Span::Mention {
+                FontWeight::MEDIUM
+            } else {
+                FontWeight::NORMAL
+            });
             TextRun {
                 len: range.len(),
                 font,

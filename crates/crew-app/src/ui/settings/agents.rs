@@ -17,10 +17,10 @@ use gpui_kit::*;
 
 use super::runtimes::runtime_state;
 use super::{control, field, form_error, help, segment, segmented};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 use crate::ui::common::{monogram, provider_icon, runtime_badge, runtime_chip};
-use crate::ui::workspace::{SIDEBAR_WIDTH, Workspace};
+use crate::ui::workspace::Workspace;
 
 /// The models the segmented control offers, by the names `claude` takes.
 pub const MODELS: [(&str, &str); 3] = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
@@ -654,7 +654,7 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm = this.clone();
             dialog
-                .w(px(420.))
+                .w(ui_px(420.))
                 .title("Delete agent")
                 .child(
                     div()
@@ -714,7 +714,7 @@ impl Workspace {
                 Some(form) => self.render_agent_form(form, cx).into_any_element(),
                 None => div()
                     .flex_1()
-                    .p(px(32.))
+                    .p(ui_px(32.))
                     .child(help("Pick an agent, or make a new one."))
                     .into_any_element(),
             })
@@ -739,10 +739,10 @@ impl Workspace {
                     .id(SharedString::from(format!("settings-agent-{id}")))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .h(px(44.))
-                    .px(px(8.))
-                    .rounded(px(6.))
+                    .gap(ui_px(10.))
+                    .h(scale::row(44.))
+                    .px(ui_px(8.))
+                    .rounded(ui_px(6.))
                     .cursor_pointer()
                     .when(selected == Some(id), |row| row.bg(color("surface-300")))
                     .hover(|row| row.bg(color("surface-200")))
@@ -757,13 +757,13 @@ impl Workspace {
                             .child(
                                 div()
                                     .truncate()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(weight(FontWeight::MEDIUM))
                                     .child(a.spec.name.clone()),
                             )
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(scale::text(12.))
                                     .text_color(color("text-secondary"))
                                     .child(a.spec.role.clone()),
                             ),
@@ -787,10 +787,10 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
-            .px(px(8.))
-            .py(px(12.))
+            .px(ui_px(8.))
+            .py(scale::row(12.))
             .border_r_1()
             .border_color(color("border-100"))
             .overflow_y_scroll()
@@ -798,14 +798,14 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(28.))
-                    .pl(px(8.))
-                    .mb(px(4.))
+                    .h(scale::row(28.))
+                    .pl(ui_px(8.))
+                    .mb(ui_px(4.))
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(scale::text(12.))
+                            .font_weight(weight(FontWeight::MEDIUM))
                             .text_color(color("text-secondary"))
                             .child(count),
                     )
@@ -919,19 +919,19 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
-            .px(px(32.))
-            .py(px(24.))
+            .px(ui_px(32.))
+            .py(ui_px(24.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(px(760.))
+                    .max_w(ui_px(760.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(12.))
-                            .pb(px(16.))
+                            .gap(ui_px(12.))
+                            .pb(scale::row(16.))
                             .child(monogram(if title.is_empty() { "?" } else { &title }, 40.))
                             .child(
                                 div()
@@ -943,9 +943,9 @@ impl Workspace {
                                         div()
                                             .id("agent-form-title")
                                             .truncate()
-                                            .text_size(px(24.))
-                                            .line_height(px(32.))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(scale::text(24.))
+                                            .line_height(scale::line(32.))
+                                            .font_weight(weight(FontWeight::SEMIBOLD))
                                             .aria_label(title.clone())
                                             .child(title.clone())
                                             .test_support(),
@@ -956,7 +956,7 @@ impl Workspace {
                                 row.child(
                                     div()
                                         .id("agent-saved")
-                                        .text_size(px(12.))
+                                        .text_size(scale::text(12.))
                                         .text_color(color("success"))
                                         .aria_label("Saved")
                                         .child("Saved")
@@ -986,14 +986,18 @@ impl Workspace {
                             ),
                     )
                     .when_some(form.error.clone(), |col, error| {
-                        col.child(div().pb(px(8.)).child(form_error("agent-error", error)))
+                        col.child(
+                            div()
+                                .pb(scale::row(8.))
+                                .child(form_error("agent-error", error)),
+                        )
                     })
                     .child(field(
                         "Name and role",
                         Some("You @mention the agent by its name."),
                         div()
                             .flex()
-                            .gap(px(8.))
+                            .gap(ui_px(8.))
                             .child(
                                 div()
                                     .flex_1()
@@ -1016,14 +1020,14 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(ui_px(6.))
                             .child(models)
                             .child(control("agent-other-model", Input::new(&form.other_model))),
                     ))
                     .child(field(
                         "Instructions",
                         Some(INSTRUCTIONS_HELP),
-                        div().font_family(mono_font()).child(control(
+                        div().font_family(code_family()).child(control(
                             "agent-instructions",
                             Textarea::new(&form.instructions),
                         )),
@@ -1034,7 +1038,7 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(ui_px(6.))
                             .child(div().flex().child(permission))
                             .when(!auto_ok, |col| {
                                 col.child(
@@ -1060,18 +1064,18 @@ impl Workspace {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
+                            .gap(ui_px(8.))
                             .child(segmented(policies))
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(8.))
+                                    .gap(ui_px(8.))
                                     .child(
                                         div()
                                             .flex()
                                             .flex_col()
                                             .flex_1()
-                                            .gap(px(4.))
+                                            .gap(ui_px(4.))
                                             .child(help("Handoffs per thread"))
                                             .child(control(
                                                 "agent-budget",
@@ -1083,7 +1087,7 @@ impl Workspace {
                                             .flex()
                                             .flex_col()
                                             .flex_1()
-                                            .gap(px(4.))
+                                            .gap(ui_px(4.))
                                             .child(help("Longest run"))
                                             .child(
                                                 div()
@@ -1099,13 +1103,13 @@ impl Workspace {
                     .child(
                         div()
                             .id("agent-credentials")
-                            .mt(px(16.))
-                            .p(px(12.))
-                            .rounded(px(8.))
+                            .mt(ui_px(16.))
+                            .p(ui_px(12.))
+                            .rounded(ui_px(8.))
                             .border_1()
                             .border_color(color("accent-blue"))
                             .bg(color("surface-100"))
-                            .text_size(px(12.))
+                            .text_size(scale::text(12.))
                             .text_color(color("text-secondary"))
                             .aria_label(CREDENTIALS)
                             .child(CREDENTIALS)
@@ -1113,7 +1117,7 @@ impl Workspace {
                     )
                     .when(form.editing.is_some(), |col| {
                         col.child(
-                            div().mt(px(24.)).child(
+                            div().mt(ui_px(24.)).child(
                                 Button::new("agent-delete")
                                     .outline()
                                     .small()
@@ -1210,7 +1214,12 @@ impl Workspace {
             runtime_card(SharedString::from(format!("runtime-{key}")), false, false)
                 .aria_label(format!("{name} Coming soon"))
                 .child(div().flex_1().child(*name))
-                .child(div().flex_none().text_size(px(12.)).child(COMING_SOON))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(scale::text(12.))
+                        .child(COMING_SOON),
+                )
                 .tooltip(|window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(COMING_SOON).build(window, cx)
                 })
@@ -1219,7 +1228,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(ui_px(6.))
             .child(claude)
             .child(codex)
             .children(coming)
@@ -1290,14 +1299,14 @@ impl Workspace {
                 .flex_col()
                 .flex_1()
                 .min_w_0()
-                .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                .child(div().font_weight(weight(FontWeight::MEDIUM)).child(name))
                 .when(!detail.is_empty(), |col| {
                     col.child(
                         div()
                             .id(SharedString::from(format!("runtime-{key}-detail")))
-                            .text_size(px(12.))
+                            .text_size(scale::mono(12.))
                             .text_color(color("text-tertiary"))
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .aria_label(detail.clone())
                             .child(detail.clone())
                             .test_support(),
@@ -1307,7 +1316,7 @@ impl Workspace {
         .child(
             div()
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(scale::text(12.))
                 .text_color(color(token))
                 .child(status),
         )
@@ -1322,11 +1331,11 @@ fn runtime_card(id: impl Into<SharedString>, selected: bool, enabled: bool) -> S
         .id(ElementId::Name(id.into()))
         .flex()
         .items_center()
-        .gap(px(10.))
-        .min_h(px(44.))
-        .px(px(12.))
-        .py(px(8.))
-        .rounded(px(8.))
+        .gap(ui_px(10.))
+        .min_h(scale::row(44.))
+        .px(ui_px(12.))
+        .py(scale::row(8.))
+        .rounded(ui_px(8.))
         .border_1()
         .border_color(color(if selected {
             "accent-blue"
@@ -1338,7 +1347,7 @@ fn runtime_card(id: impl Into<SharedString>, selected: bool, enabled: bool) -> S
         .child(
             div()
                 .flex_none()
-                .size(px(14.))
+                .size(ui_px(14.))
                 .rounded_full()
                 .border_1()
                 .border_color(color(if selected {
@@ -1347,10 +1356,12 @@ fn runtime_card(id: impl Into<SharedString>, selected: bool, enabled: bool) -> S
                     "border-200"
                 }))
                 .when(selected, |dot| {
-                    dot.flex()
-                        .items_center()
-                        .justify_center()
-                        .child(div().size(px(6.)).rounded_full().bg(color("accent-blue")))
+                    dot.flex().items_center().justify_center().child(
+                        div()
+                            .size(ui_px(6.))
+                            .rounded_full()
+                            .bg(color("accent-blue")),
+                    )
                 }),
         )
 }

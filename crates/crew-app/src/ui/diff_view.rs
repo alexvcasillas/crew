@@ -21,12 +21,12 @@ use gpui_kit::*;
 use super::common::{dot, spinner};
 use super::inspector::INSPECTOR_WIDTH;
 use super::markdown_view::render_doc;
-use super::workspace::{SIDEBAR_WIDTH, Workspace};
+use super::workspace::Workspace;
 use crate::checks::{Check, CheckState, checks};
 use crate::comments::{Comment, comments, place, reviewer_replies};
 use crate::diff_parse::{FileDiff, FileKind, Line, LineKind, parse, split_pairs};
-use crate::fonts::mono_font;
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 actions!(
     review,
@@ -126,6 +126,13 @@ pub(super) struct Review {
     /// Why Open in editor failed, shown above the diff.
     open_error: Option<String>,
     focus: FocusHandle,
+}
+
+impl Review {
+    /// Measures every row again, as after a text size change.
+    pub(super) fn remeasure(&self) {
+        self.list.remeasure();
+    }
 }
 
 /// A commit message from an agent's reply: its first line, at most
@@ -562,7 +569,7 @@ impl Workspace {
         if let Some(review) = &self.review {
             review.list.scroll_to(ListOffset {
                 item_ix: ix,
-                offset_in_item: px(0.),
+                offset_in_item: ui_px(0.),
             });
         }
     }
@@ -686,7 +693,7 @@ impl Workspace {
                                 review.current_file = Some(path);
                                 review.list.scroll_to(ListOffset {
                                     item_ix: row,
-                                    offset_in_item: px(0.),
+                                    offset_in_item: ui_px(0.),
                                 });
                             }
                         }
@@ -741,7 +748,7 @@ impl Workspace {
             review.current_file = review.files.get(file).map(|f| f.path.clone());
             review.list.scroll_to(ListOffset {
                 item_ix: row,
-                offset_in_item: px(0.),
+                offset_in_item: ui_px(0.),
             });
             cx.notify();
         }
@@ -869,7 +876,7 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm = this.clone();
             dialog
-                .w(px(420.))
+                .w(ui_px(420.))
                 .title("Discard changes")
                 .child(
                     div()
@@ -1030,16 +1037,16 @@ impl Workspace {
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .h(px(40.))
-                    .px(px(16.))
-                    .when(f > 0, |row| row.mt(px(16.)))
+                    .gap(ui_px(8.))
+                    .h(scale::row(40.))
+                    .px(ui_px(16.))
+                    .when(f > 0, |row| row.mt(ui_px(16.)))
                     .border_t_1()
                     .border_b_1()
                     .border_color(color("border-100"))
                     .bg(color("bg-100"))
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .aria_label(file.path.clone())
                     .child(
                         div()
@@ -1069,13 +1076,13 @@ impl Workspace {
                     .w_full()
                     .flex()
                     .items_center()
-                    .h(px(28.))
-                    .pl(px(GUTTER * 2. + 16.))
+                    .h(scale::row(28.))
+                    .pl(scale::mono(GUTTER * 2. + 16.))
                     .bg(color("surface-100"))
                     .border_b_1()
                     .border_color(color("border-100"))
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .text_color(color("text-tertiary"))
                     .whitespace_nowrap()
                     .overflow_hidden()
@@ -1102,8 +1109,8 @@ impl Workspace {
                 let gutter = |n: Option<u32>| {
                     div()
                         .flex_none()
-                        .w(px(GUTTER))
-                        .pr(px(8.))
+                        .w(scale::mono(GUTTER))
+                        .pr(ui_px(8.))
                         .flex()
                         .justify_end()
                         .text_color(color("text-gutter"))
@@ -1113,11 +1120,11 @@ impl Workspace {
                     .id(("diff-row", ix))
                     .w_full()
                     .flex()
-                    .h(px(LINE_HEIGHT))
+                    .h(scale::mono_line(LINE_HEIGHT))
                     .items_center()
                     .when_some(tint, |row, tint| row.bg(color(tint)))
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .aria_label(label)
@@ -1126,7 +1133,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex_none()
-                            .w(px(16.))
+                            .w(scale::mono(16.))
                             .text_color(color(match line.kind {
                                 LineKind::Added => "success",
                                 LineKind::Removed => "danger",
@@ -1154,10 +1161,10 @@ impl Workspace {
                     .id(("diff-row", ix))
                     .w_full()
                     .flex()
-                    .h(px(LINE_HEIGHT))
+                    .h(scale::mono_line(LINE_HEIGHT))
                     .items_center()
-                    .font_family(mono_font())
-                    .text_size(px(12.))
+                    .font_family(code_family())
+                    .text_size(scale::mono(12.))
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .aria_label(label)
@@ -1171,9 +1178,9 @@ impl Workspace {
                 div()
                     .id(("diff-row", ix))
                     .w_full()
-                    .px(px(16.))
-                    .py(px(10.))
-                    .text_size(px(12.))
+                    .px(ui_px(16.))
+                    .py(scale::row(10.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(note.clone())
                     .child(note)
@@ -1185,9 +1192,9 @@ impl Workspace {
                 .w_full()
                 .flex()
                 .items_center()
-                .h(px(40.))
-                .px(px(16.))
-                .text_size(px(12.))
+                .h(scale::row(40.))
+                .px(ui_px(16.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-secondary"))
                 .aria_label(OUTSIDE_TITLE)
                 .child(OUTSIDE_TITLE)
@@ -1202,27 +1209,27 @@ impl Workspace {
                 div()
                     .id(("diff-row", ix))
                     .w_full()
-                    .py(px(6.))
-                    .pl(px(GUTTER * gutters + 16.))
-                    .pr(px(16.))
+                    .py(scale::row(6.))
+                    .pl(scale::mono(GUTTER * gutters + 16.))
+                    .pr(ui_px(16.))
                     .child(
                         div()
                             .id(("review-comment", c))
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
-                            .max_w(px(720.))
-                            .px(px(12.))
-                            .py(px(10.))
+                            .gap(ui_px(4.))
+                            .max_w(ui_px(720.))
+                            .px(ui_px(12.))
+                            .py(scale::row(10.))
                             .bg(color("surface-raised"))
                             .border_1()
                             .border_color(color("border-200"))
-                            .rounded(px(8.))
+                            .rounded(ui_px(8.))
                             .aria_label(header.clone())
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(scale::text(12.))
+                                    .font_weight(weight(FontWeight::MEDIUM))
                                     .text_color(color("text-secondary"))
                                     .child(header),
                             )
@@ -1246,10 +1253,10 @@ impl Workspace {
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap(px(12.))
-                    .px(px(16.))
-                    .py(px(10.))
-                    .text_size(px(12.))
+                    .gap(ui_px(12.))
+                    .px(ui_px(16.))
+                    .py(scale::row(10.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .child(
                         div()
@@ -1293,7 +1300,7 @@ impl Workspace {
         let left = div()
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(ui_px(12.))
             .min_w_0()
             .child(
                 Button::new("review-back")
@@ -1306,7 +1313,7 @@ impl Workspace {
                 div()
                     .id("review-title")
                     .flex_none()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .aria_label(heading.clone())
                     .child(heading)
                     .test_support(),
@@ -1316,7 +1323,7 @@ impl Workspace {
                     .id("review-where")
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(where_.clone())
                     .child(where_)
@@ -1326,7 +1333,7 @@ impl Workspace {
         let right = div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .child(
                 Button::new("review-refresh")
                     .ghost()
@@ -1339,11 +1346,11 @@ impl Workspace {
             .child(
                 div()
                     .flex()
-                    .p(px(2.))
-                    .gap(px(2.))
+                    .p(ui_px(2.))
+                    .gap(ui_px(2.))
                     .border_1()
                     .border_color(color("border-200"))
-                    .rounded(px(6.))
+                    .rounded(ui_px(6.))
                     .child(
                         Button::new("review-unified")
                             .ghost()
@@ -1422,7 +1429,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
             .border_r_1()
             .border_color(color("border-100"))
@@ -1432,10 +1439,10 @@ impl Workspace {
                     .id("review-summary")
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .h(px(40.))
-                    .px(px(16.))
-                    .text_size(px(12.))
+                    .gap(ui_px(8.))
+                    .h(scale::row(40.))
+                    .px(ui_px(16.))
+                    .text_size(scale::text(12.))
                     .aria_label(summary)
                     .child(
                         div()
@@ -1456,20 +1463,20 @@ impl Workspace {
                             .id(("review-file", ix))
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .h(px(28.))
-                            .px(px(16.))
+                            .gap(ui_px(8.))
+                            .h(scale::row(28.))
+                            .px(ui_px(16.))
                             .cursor_pointer()
                             .hover(|s| s.bg(color("surface-100")))
-                            .font_family(mono_font())
-                            .text_size(px(12.))
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
                             .aria_label(format!("{} {path} +{added} −{removed}", kind.letter()))
                             .child(
                                 div()
                                     .flex_none()
-                                    .w(px(10.))
-                                    .text_size(px(10.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .w(scale::mono(10.))
+                                    .text_size(scale::mono(10.))
+                                    .font_weight(weight(FontWeight::MEDIUM))
                                     .text_color(color(letter_colour(&kind)))
                                     .child(kind.letter().to_string()),
                             )
@@ -1499,17 +1506,17 @@ impl Workspace {
                         .id("review-checks")
                         .flex()
                         .flex_col()
-                        .mt(px(8.))
+                        .mt(ui_px(8.))
                         .child(
                             div()
                                 .id("review-checks-title")
                                 .aria_label(format!("Checks {agent} ran"))
                                 .test_support()
-                                .h(px(32.))
-                                .px(px(16.))
+                                .h(scale::row(32.))
+                                .px(ui_px(16.))
                                 .flex()
                                 .items_center()
-                                .text_size(px(12.))
+                                .text_size(scale::text(12.))
                                 .text_color(color("text-secondary"))
                                 .child(format!("Checks {agent} ran")),
                         )
@@ -1525,11 +1532,11 @@ impl Workspace {
                                         .into_any_element()
                                 }
                                 CheckState::Passed => Icon::new(IconName::Check)
-                                    .size(px(12.))
+                                    .size(ui_px(12.))
                                     .text_color(color("success"))
                                     .into_any_element(),
                                 CheckState::Failed => Icon::new(IconName::CircleX)
-                                    .size(px(12.))
+                                    .size(ui_px(12.))
                                     .text_color(color("danger"))
                                     .into_any_element(),
                             };
@@ -1537,9 +1544,9 @@ impl Workspace {
                                 .id(("review-check", ix))
                                 .flex()
                                 .items_center()
-                                .gap(px(8.))
-                                .h(px(28.))
-                                .px(px(16.))
+                                .gap(ui_px(8.))
+                                .h(scale::row(28.))
+                                .px(ui_px(16.))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(color("surface-100")))
                                 .aria_label(format!("{word} {}", check.command))
@@ -1549,8 +1556,8 @@ impl Workspace {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .font_family(mono_font())
-                                        .text_size(px(12.))
+                                        .font_family(code_family())
+                                        .text_size(scale::mono(12.))
                                         .text_color(color("text-primary"))
                                         .child(check.command.clone()),
                                 )
@@ -1614,8 +1621,8 @@ impl Workspace {
             .when_some(open_error, |col, error| {
                 col.child(
                     div()
-                        .px(px(16.))
-                        .py(px(8.))
+                        .px(ui_px(16.))
+                        .py(scale::row(8.))
                         .child(super::settings::form_error("review-open-error", error)),
                 )
             })
@@ -1650,11 +1657,11 @@ impl Workspace {
             div()
                 .flex()
                 .items_center()
-                .h(px(28.))
-                .text_size(px(12.))
+                .h(scale::row(28.))
+                .text_size(scale::text(12.))
                 .child(
                     div()
-                        .w(px(64.))
+                        .w(ui_px(64.))
                         .text_color(color("text-tertiary"))
                         .child(label),
                 )
@@ -1663,7 +1670,8 @@ impl Workspace {
                         .id(id)
                         .min_w_0()
                         .truncate()
-                        .font_family(mono_font())
+                        .font_family(code_family())
+                        .text_size(scale::mono(12.))
                         .aria_label(value.clone())
                         .child(value)
                         .test_support(),
@@ -1674,17 +1682,17 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .gap(px(12.))
-            .w(px(INSPECTOR_WIDTH))
+            .gap(ui_px(12.))
+            .w(scale::chrome(INSPECTOR_WIDTH))
             .h_full()
-            .p(px(16.))
+            .p(ui_px(16.))
             .border_l_1()
             .border_color(color("border-100"))
             .overflow_y_scroll()
             .child(
                 div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(scale::text(14.))
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .child("What next"),
             )
             .when_some(review.left.clone(), |col, (agent, n)| {
@@ -1695,13 +1703,13 @@ impl Workspace {
                 col.child(
                     div()
                         .id("review-callout")
-                        .px(px(12.))
-                        .py(px(10.))
+                        .px(ui_px(12.))
+                        .py(scale::row(10.))
                         .bg(color("surface-100"))
                         .border_1()
                         .border_color(color("border-200"))
-                        .rounded(px(8.))
-                        .text_size(px(13.))
+                        .rounded(ui_px(8.))
+                        .text_size(scale::text(13.))
                         .text_color(color("text-primary"))
                         .aria_label(text.clone())
                         .child(text)
@@ -1712,11 +1720,11 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(ui_px(6.))
                     .child(
                         div()
                             .id("review-message-caption")
-                            .text_size(px(12.))
+                            .text_size(scale::text(12.))
                             .text_color(color("text-secondary"))
                             .aria_label(caption.clone())
                             .child(caption)
@@ -1731,7 +1739,7 @@ impl Workspace {
                                     review.focus.focus(window, cx);
                                 }
                             }))
-                            .font_family(mono_font())
+                            .font_family(code_family())
                             .child(Textarea::new(&review.message).aria_label("Commit message"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(review) = &this.review {
@@ -1752,7 +1760,7 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
+                    .gap(ui_px(8.))
                     .child(
                         Button::new("review-commit")
                             .primary()
@@ -1788,8 +1796,8 @@ impl Workspace {
             )
             .child(
                 div()
-                    .text_size(px(12.))
-                    .line_height(px(18.))
+                    .text_size(scale::text(12.))
+                    .line_height(scale::line(18.))
                     .text_color(color("text-tertiary"))
                     .child(NOTE),
             )
@@ -1803,7 +1811,11 @@ fn keep_scroll(review: &Review) -> Kept {
     let on_card = matches!(review.rows.get(top.item_ix), Some(Row::Comment(_)));
     Kept {
         anchor: anchor_at(&review.rows, &review.files, top.item_ix),
-        offset: if on_card { px(0.) } else { top.offset_in_item },
+        offset: if on_card {
+            ui_px(0.)
+        } else {
+            top.offset_in_item
+        },
         ix: top.item_ix,
     }
 }
@@ -1824,7 +1836,7 @@ fn rebuild_rows_from(review: &mut Review, kept: Kept) {
             .and_then(|a| find_anchor(&rows, &review.files, a))
             .or_else(|| kept.ix.min(rows.len().saturating_sub(1)).into());
         review.list.reset(rows.len());
-        if let Some(item_ix) = top.filter(|&ix| ix > 0 || kept.offset > px(0.)) {
+        if let Some(item_ix) = top.filter(|&ix| ix > 0 || kept.offset > ui_px(0.)) {
             review.list.scroll_to(ListOffset {
                 item_ix,
                 offset_in_item: kept.offset,
@@ -1884,8 +1896,8 @@ fn split_side(id: (&'static str, usize), line: Option<&Line>, left: bool) -> imp
         .child(
             div()
                 .flex_none()
-                .w(px(GUTTER))
-                .pr(px(8.))
+                .w(scale::mono(GUTTER))
+                .pr(ui_px(8.))
                 .flex()
                 .justify_end()
                 .text_color(color("text-gutter"))
@@ -1894,7 +1906,7 @@ fn split_side(id: (&'static str, usize), line: Option<&Line>, left: bool) -> imp
         .child(
             div()
                 .flex_none()
-                .w(px(16.))
+                .w(ui_px(16.))
                 .text_color(color(sign_colour))
                 .child(if no_newline { "" } else { sign }),
         )
@@ -1920,9 +1932,9 @@ fn plus_minus(added: u32, removed: u32) -> impl IntoElement {
     div()
         .flex()
         .flex_none()
-        .gap(px(4.))
-        .font_family(mono_font())
-        .text_size(px(12.))
+        .gap(ui_px(4.))
+        .font_family(code_family())
+        .text_size(scale::mono(12.))
         .child(
             div()
                 .text_color(color("success"))

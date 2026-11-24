@@ -24,10 +24,10 @@ use super::common::{
 };
 use super::inspector::run_state;
 use super::run_card::summarize;
-use super::workspace::{SIDEBAR_WIDTH, Workspace};
-use crate::fonts::mono_font;
+use super::workspace::Workspace;
 use crate::model::{RunningNow, ThreadStatus};
 use crate::theme::color;
+use crate::theme::scale::{self, code_family, ui_px, weight};
 
 actions!(
     running,
@@ -533,11 +533,11 @@ impl Workspace {
         let left = div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             .child(
                 div()
                     .flex_none()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .child("Crew"),
             )
             .child(div().flex_none().text_color(rgb(0x3a3a3a)).child("/"))
@@ -545,7 +545,7 @@ impl Workspace {
                 div()
                     .id("running-title")
                     .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .aria_label("Running now")
                     .child("Running now")
                     .test_support(),
@@ -554,7 +554,7 @@ impl Workspace {
         let right = div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(ui_px(8.))
             // Like the status bar's, only while connected.
             .children(self.connected().then(|| {
                 let label = if self.state().limits().paused {
@@ -635,10 +635,10 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .w(self.sidebar_width())
             .h_full()
-            .px(px(8.))
-            .py(px(12.))
+            .px(ui_px(8.))
+            .py(scale::row(12.))
             .border_r_1()
             .border_color(color("border-100"))
             .overflow_y_scroll()
@@ -677,11 +677,11 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(28.))
-                    .mt(px(16.))
-                    .pl(px(8.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
+                    .h(scale::row(28.))
+                    .mt(ui_px(16.))
+                    .pl(ui_px(8.))
+                    .text_size(scale::text(12.))
+                    .font_weight(weight(FontWeight::MEDIUM))
                     .text_color(color("text-secondary"))
                     .child("Projects"),
             )
@@ -698,7 +698,7 @@ impl Workspace {
                     .test_support(),
             )
             .children(projects)
-            .child(div().flex_1().min_h(px(16.)))
+            .child(div().flex_1().min_h(scale::row(16.)))
             .child(render_usage(view.usage.as_deref()))
     }
 
@@ -729,19 +729,19 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
-            .px(px(32.))
-            .py(px(24.))
+            .px(ui_px(32.))
+            .py(ui_px(24.))
             .child(
                 div()
-                    .text_size(px(20.))
-                    .line_height(px(28.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(scale::text(20.))
+                    .line_height(scale::line(28.))
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .child("Running now"),
             )
             .child(
                 div()
                     .id("running-summary")
-                    .mt(px(4.))
+                    .mt(ui_px(4.))
                     .text_color(color("text-secondary"))
                     .aria_label(summary.clone())
                     .child(summary)
@@ -751,14 +751,14 @@ impl Workspace {
                 main.child(
                     div()
                         .id("running-paused")
-                        .mt(px(2.))
+                        .mt(ui_px(2.))
                         .text_color(color("text-secondary"))
                         .aria_label(line.clone())
                         .child(line)
                         .test_support(),
                 )
             })
-            .child(div().h(px(16.)));
+            .child(div().h(scale::row(16.)));
         let [needs, working, queued, finished] = rows;
         let shown: [(&str, &str, &str, Vec<Row>); 4] = [
             ("needs", "NEEDS YOU", "warning", needs),
@@ -836,21 +836,21 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
-            .px(px(32.))
-            .py(px(24.))
+            .px(ui_px(32.))
+            .py(ui_px(24.))
             .child(
                 div()
-                    .mb(px(16.))
-                    .text_size(px(20.))
-                    .line_height(px(28.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .mb(ui_px(16.))
+                    .text_size(scale::text(20.))
+                    .line_height(scale::line(28.))
+                    .font_weight(weight(FontWeight::SEMIBOLD))
                     .child("History"),
             )
             .when_some(error, |main, error| {
                 main.child(
                     div()
                         .id("history-error")
-                        .mb(px(12.))
+                        .mb(ui_px(12.))
                         .text_color(color("danger"))
                         .aria_label(error.clone())
                         .child(error)
@@ -870,7 +870,7 @@ impl Workspace {
             .children(rows)
             .when(view.history_more, |main| {
                 main.child(
-                    div().pt(px(12.)).child(
+                    div().pt(scale::row(12.)).child(
                         Button::new("history-older")
                             .ghost()
                             .small()
@@ -1066,10 +1066,10 @@ fn nav_row(id: String, selected: bool) -> Stateful<Div> {
         .id(SharedString::from(id))
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(28.))
-        .px(px(8.))
-        .rounded(px(6.))
+        .gap(ui_px(8.))
+        .h(scale::row(28.))
+        .px(ui_px(8.))
+        .rounded(ui_px(6.))
         .cursor_pointer()
         .when(selected, |row| row.bg(color("surface-300")))
         .text_color(color(if selected {
@@ -1083,8 +1083,8 @@ fn nav_row(id: String, selected: bool) -> Stateful<Div> {
 fn count(text: String, token: &str) -> impl IntoElement {
     div()
         .flex_none()
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
+        .text_size(scale::text(11.))
+        .font_weight(weight(FontWeight::MEDIUM))
         .text_color(color(token))
         .child(text)
 }
@@ -1103,13 +1103,13 @@ fn group_header(key: &str, title: &str, token: &str, n: usize) -> impl IntoEleme
         .id(SharedString::from(format!("running-group-{key}")))
         .flex()
         .items_center()
-        .gap(px(8.))
-        .h(px(36.))
-        .mt(px(8.))
+        .gap(ui_px(8.))
+        .h(scale::row(36.))
+        .mt(ui_px(8.))
         .border_b_1()
         .border_color(color("border-100"))
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
+        .text_size(scale::text(11.))
+        .font_weight(weight(FontWeight::MEDIUM))
         .text_color(color("text-tertiary"))
         .aria_label(text.clone())
         .child(dot(token))
@@ -1157,10 +1157,10 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
         .id(SharedString::from(row_id))
         .flex()
         .items_center()
-        .gap(px(12.))
-        .min_h(px(ROW_MIN_HEIGHT))
-        .px(px(12.))
-        .py(px(8.))
+        .gap(ui_px(12.))
+        .min_h(scale::row(ROW_MIN_HEIGHT))
+        .px(ui_px(12.))
+        .py(scale::row(8.))
         .border_b_1()
         .border_color(color("border-100"))
         .when(ask, |row| row.bg(color("warning-subtle")))
@@ -1178,8 +1178,8 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(10.))
-                .w(px(AGENT_COL))
+                .gap(ui_px(10.))
+                .w(ui_px(AGENT_COL))
                 .child(monogram(&row.agent, 24.))
                 .child(
                     div()
@@ -1189,13 +1189,13 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                         .child(
                             div()
                                 .truncate()
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(weight(FontWeight::MEDIUM))
                                 .child(row.agent),
                         )
                         .child(
                             div()
                                 .truncate()
-                                .text_size(px(12.))
+                                .text_size(scale::text(12.))
                                 .text_color(color("text-tertiary"))
                                 .child(place),
                         ),
@@ -1212,9 +1212,11 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                     div()
                         .id(SharedString::from(now_id))
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-secondary"))
-                        .when(row.now_mono, |el| el.font_family(mono_font()))
+                        .when(row.now_mono, |el| {
+                            el.font_family(code_family()).text_size(scale::mono(12.))
+                        })
                         .aria_label(row.now.clone())
                         .child(row.now)
                         .test_support(),
@@ -1227,7 +1229,7 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                 }),
         )
         .child(
-            div().flex_none().w(px(RUNTIME_COL)).child(
+            div().flex_none().w(ui_px(RUNTIME_COL)).child(
                 match &row.runtime {
                     Some(runtime) => runtime_badge_for(runtime, row.chip.clone()),
                     None => chip(row.chip.clone()),
@@ -1243,12 +1245,14 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(6.))
-                .w(px(STATUS_COL))
+                .gap(ui_px(6.))
+                .w(ui_px(STATUS_COL))
                 .overflow_hidden()
-                .text_size(px(12.))
+                .text_size(scale::text(12.))
                 .text_color(color(row.state_token))
-                .when(row.state_mono, |el| el.font_family(mono_font()))
+                .when(row.state_mono, |el| {
+                    el.font_family(code_family()).text_size(scale::mono(12.))
+                })
                 .aria_label(row.state.clone())
                 .map(|el| match row.rolling_from {
                     Some(from) => el
@@ -1271,8 +1275,8 @@ fn render_row(row: Row, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex()
                 .flex_none()
                 .justify_end()
-                .gap(px(6.))
-                .w(px(ACTIONS_COL))
+                .gap(ui_px(6.))
+                .w(ui_px(ACTIONS_COL))
                 .children(actions),
         )
         .test_support()
@@ -1296,10 +1300,10 @@ fn render_terminal_row(
         .id(SharedString::from(format!("running-terminal-{id}")))
         .flex()
         .items_center()
-        .gap(px(12.))
-        .min_h(px(ROW_MIN_HEIGHT))
-        .px(px(12.))
-        .py(px(8.))
+        .gap(ui_px(12.))
+        .min_h(scale::row(ROW_MIN_HEIGHT))
+        .px(ui_px(12.))
+        .py(scale::row(8.))
         .border_b_1()
         .border_color(color("border-100"))
         .aria_label(format!("{project} · {title}"))
@@ -1308,8 +1312,8 @@ fn render_terminal_row(
                 .flex()
                 .flex_none()
                 .items_center()
-                .gap(px(10.))
-                .w(px(AGENT_COL))
+                .gap(ui_px(10.))
+                .w(ui_px(AGENT_COL))
                 .child(monogram("Claude", 24.))
                 .child(
                     div()
@@ -1319,14 +1323,14 @@ fn render_terminal_row(
                         .child(
                             div()
                                 .truncate()
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(weight(FontWeight::MEDIUM))
                                 .child(project),
                         )
                         .child(
                             div()
                                 .truncate()
-                                .font_family(mono_font())
-                                .text_size(px(12.))
+                                .font_family(code_family())
+                                .text_size(scale::mono(12.))
                                 .text_color(color("text-tertiary"))
                                 .child(place),
                         ),
@@ -1342,18 +1346,23 @@ fn render_terminal_row(
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(scale::text(12.))
                         .text_color(color("text-secondary"))
                         .child("Claude Code in your terminal"),
                 ),
         )
-        .child(div().flex_none().w(px(RUNTIME_COL)).child(chip("terminal")))
+        .child(
+            div()
+                .flex_none()
+                .w(ui_px(RUNTIME_COL))
+                .child(chip("terminal")),
+        )
         .child(
             div()
                 .id(SharedString::from(format!("running-terminal-state-{id}")))
                 .flex_none()
-                .w(px(STATUS_COL))
-                .text_size(px(12.))
+                .w(ui_px(STATUS_COL))
+                .text_size(scale::text(12.))
                 .text_color(color("accent-blue"))
                 .aria_label("live")
                 .child("live")
@@ -1364,7 +1373,7 @@ fn render_terminal_row(
                 .flex()
                 .flex_none()
                 .justify_end()
-                .w(px(ACTIONS_COL))
+                .w(ui_px(ACTIONS_COL))
                 .child(
                     Button::new(SharedString::from(format!("running-terminal-open-{id}")))
                         .ghost()
@@ -1488,8 +1497,8 @@ fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
                 .id(SharedString::from(format!("running-usage-{key}")))
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .h(px(24.))
+                .gap(ui_px(8.))
+                .h(scale::row(24.))
                 .aria_label(name)
                 .child(
                     div()
@@ -1503,8 +1512,8 @@ fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
                     div()
                         .id(SharedString::from(format!("running-usage-{key}-count")))
                         .flex_none()
-                        .font_family(mono_font())
-                        .text_size(px(12.))
+                        .font_family(code_family())
+                        .text_size(scale::mono(12.))
                         .text_color(color("text-tertiary"))
                         .aria_label(line.clone())
                         .child(line)
@@ -1520,17 +1529,17 @@ fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
         .flex()
         .flex_col()
         .flex_none()
-        .gap(px(2.))
-        .px(px(8.))
-        .pt(px(12.))
+        .gap(ui_px(2.))
+        .px(ui_px(8.))
+        .pt(scale::row(12.))
         .border_t_1()
         .border_color(color("border-100"))
         .child(
             div()
                 .id("running-usage-title")
-                .h(px(24.))
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
+                .h(scale::row(24.))
+                .text_size(scale::text(12.))
+                .font_weight(weight(FontWeight::MEDIUM))
                 .text_color(color("text-secondary"))
                 .aria_label("Today's runs")
                 .child("Today's runs")
@@ -1541,7 +1550,7 @@ fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
             col.child(
                 div()
                     .id("running-usage-none")
-                    .text_size(px(12.))
+                    .text_size(scale::text(12.))
                     .text_color(color("text-tertiary"))
                     .aria_label(NO_RUNS_TODAY)
                     .child(NO_RUNS_TODAY)
@@ -1551,8 +1560,8 @@ fn render_usage(usage: Option<&[RuntimeUsage]>) -> impl IntoElement {
         .child(
             div()
                 .id("running-usage-note")
-                .pt(px(8.))
-                .text_size(px(12.))
+                .pt(scale::row(8.))
+                .text_size(scale::text(12.))
                 .text_color(color("text-tertiary"))
                 .aria_label(PLAN_NOTE)
                 .child(PLAN_NOTE)
