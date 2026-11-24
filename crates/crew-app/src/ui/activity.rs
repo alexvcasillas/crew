@@ -85,6 +85,9 @@ pub enum ActivityRow {
         reason: Option<String>,
     },
     Error(String),
+    /// Plain text the CLI printed that wasn't one of its events, such as
+    /// "Error: not logged in", or a warning it sent.
+    Note(String),
     /// The run's end, with its event's number and the agent's summary.
     Finished {
         ok: bool,
@@ -185,8 +188,12 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
             }
             Event::Error { message } => rows.push(ActivityRow::Error(message.clone())),
             // Lines the parser didn't know, such as stream-json system
-            // notes, stay in the store but aren't shown.
-            Event::Raw { .. } => {}
+            // notes, stay in the store but aren't shown. Plain text is.
+            Event::Raw { line } => {
+                if let Some(note) = raw_note(line) {
+                    rows.push(ActivityRow::Note(note));
+                }
+            }
             Event::TurnEnd { ok, summary, .. } => rows.push(ActivityRow::Finished {
                 ok: *ok,
                 seq: logged.seq,
@@ -195,6 +202,34 @@ pub fn activity_rows(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
         }
     }
     rows
+}
+
+/// What a line the parser didn't know shows, if anything. A JSON object
+/// is a note for the CLI itself and stays hidden, unless it is a warning
+/// with a message. Any other text is shown as it came.
+pub fn raw_note(line: &str) -> Option<String> {
+    let text = line.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let Ok(serde_json::Value::Object(v)) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Some(text.to_string());
+    };
+    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let lower = method.to_ascii_lowercase();
+    if !["warning", "deprecation", "error"]
+        .iter()
+        .any(|w| lower.contains(w))
+    {
+        return None;
+    }
+    let params = v.get("params")?;
+    ["message", "summary"]
+        .iter()
+        .find_map(|k| params.get(*k).and_then(|m| m.as_str()))
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
 }
 
 /// Marks a call as stopped by the safety check.
@@ -361,6 +396,14 @@ impl Workspace {
                 div()
                     .text_color(color("danger"))
                     .child(message.clone())
+                    .into_any_element(),
+            ),
+            ActivityRow::Note(text) => (
+                IconName::Info,
+                "text-tertiary",
+                div()
+                    .text_color(color("text-secondary"))
+                    .child(text.clone())
                     .into_any_element(),
             ),
             ActivityRow::Finished { ok, seq, summary } => (
@@ -711,6 +754,7 @@ pub fn row_label(row: &ActivityRow) -> String {
             join_words(&format!("Not allowed: {tool}"), input)
         }
         ActivityRow::Error(message) => message.clone(),
+        ActivityRow::Note(text) => text.clone(),
         ActivityRow::Finished {
             ok: true, summary, ..
         } => format!("Finished {summary}"),
@@ -859,7 +903,7 @@ mod tests {
             ),
         ];
         let rows = activity_rows(&events, run);
-        assert_eq!(rows.len(), 6, "raw lines aren't rows: {rows:?}");
+        assert_eq!(rows.len(), 7, "{rows:?}");
         assert_eq!(rows[0], ActivityRow::Thinking("hmm".into()));
         let ActivityRow::Tool(read) = &rows[1] else {
             panic!("a read row")
@@ -892,9 +936,10 @@ mod tests {
         };
         assert_eq!(bash.state, StepState::Running);
         assert_eq!(bash.output, None);
-        assert_eq!(rows[4], ActivityRow::Error("boom".into()));
+        assert_eq!(rows[4], ActivityRow::Note("not json".into()));
+        assert_eq!(rows[5], ActivityRow::Error("boom".into()));
         assert_eq!(
-            rows[5],
+            rows[6],
             ActivityRow::Denied {
                 tool: "Bash".into(),
                 input: "rm -rf x".into(),
@@ -950,6 +995,33 @@ mod tests {
             reason: None,
         };
         assert_eq!(super::row_label(&denied), "Not allowed: Bash");
+    }
+
+    #[test]
+    fn plain_cli_text_and_warnings_are_shown() {
+        let run = RunId::new();
+        let raw = |seq, line: &str| at(run, seq, Event::Raw { line: line.into() });
+        let events = vec![
+            raw(1, "Error: not logged in"),
+            raw(2, r#"{"type":"system","subtype":"hook_started"}"#),
+            raw(3, r#"{"method":"thread/compacted","params":{}}"#),
+            raw(
+                4,
+                r#"{"method":"configWarning","params":{"summary":"Unknown key in config.toml"}}"#,
+            ),
+            raw(5, "   "),
+            raw(6, "[1, 2]"),
+        ];
+        let rows = activity_rows(&events, run);
+        assert_eq!(
+            rows,
+            [
+                ActivityRow::Note("Error: not logged in".into()),
+                ActivityRow::Note("Unknown key in config.toml".into()),
+                ActivityRow::Note("[1, 2]".into()),
+            ]
+        );
+        assert_eq!(super::row_label(&rows[0]), "Error: not logged in");
     }
 
     #[test]
