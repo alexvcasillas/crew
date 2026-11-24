@@ -553,9 +553,15 @@ fn todays_runs_and_history_show_a_finished_run(cx: &mut TestAppContext) {
         "Plan limits stay with each provider. Crew only counts runs."
     ));
 
-    // A run that ends while the view is open is counted.
+    // History starts empty, and a run that ends while it is open shows
+    // there and in today's runs without asking again.
+    click(cx, window, "running-nav-history");
+    wait_to_show(cx, window, "No ended runs yet.");
     w.post("@Forge read the file");
     let run = run_in(cx, &ws, w.thread, forge, RunStatus::Done);
+    wait_until(cx, "the history row", |cx| {
+        has(cx, window, format!("history-run-{run}"))
+    });
     wait_until(cx, "today's Claude Code runs", |cx| {
         label_of(cx, window, "running-usage-claude-count")
             .is_some_and(|l| l.starts_with("1 run · "))
@@ -567,11 +573,11 @@ fn todays_runs_and_history_show_a_finished_run(cx: &mut TestAppContext) {
     assert!(!has(cx, window, "running-usage-none"));
     assert!(!has(cx, window, "running-usage-codex"), "no Codex runs");
 
-    // History lists it, and opening its row opens its thread.
+    // Clicking History again keeps the rows while it asks.
     click(cx, window, "running-nav-history");
-    wait_until(cx, "the history row", |cx| {
-        has(cx, window, format!("history-run-{run}"))
-    });
+    assert!(has(cx, window, format!("history-run-{run}")));
+    assert!(!has(cx, window, "history-empty"));
+    // Its row names the run, and opening it opens its thread.
     assert_eq!(
         label_of(cx, window, format!("history-run-{run}")).as_deref(),
         Some("Forge · demo · #general · fix the login")
@@ -579,6 +585,10 @@ fn todays_runs_and_history_show_a_finished_run(cx: &mut TestAppContext) {
     let state = label_of(cx, window, format!("history-state-{run}")).unwrap_or_default();
     assert!(state.starts_with("Done · "), "{state}");
     assert!(!has(cx, window, "history-older"), "one page only");
+    assert!(
+        !has(cx, window, format!("history-open-{run}")),
+        "the row opens it"
+    );
     assert!(
         !has(cx, window, format!("history-resume-{run}")),
         "it is done"
@@ -592,7 +602,7 @@ fn todays_runs_and_history_show_a_finished_run(cx: &mut TestAppContext) {
 fn resume_asks_a_stopped_agent_to_continue(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let home = short_home();
-    let _daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
+    let daemon = Daemon::start_with(home.path().to_path_buf(), busy_claude(tmp.path()));
     let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
     let forge = w.agents[0];
     let (window, ws) = open(cx, home.path());
@@ -624,12 +634,59 @@ fn resume_asks_a_stopped_agent_to_continue(cx: &mut TestAppContext) {
         })
     });
     // It starts Forge again.
+    let mut again = None;
     wait_until(cx, "a new run", |cx| {
-        ws.read_with(cx, |ws, _| {
+        again = ws.read_with(cx, |ws, _| {
             ws.state()
                 .thread_runs(w.thread)
                 .iter()
-                .any(|r| r.id != run && r.agent == forge)
+                .find(|r| r.id != run && r.agent == forge && r.status == RunStatus::Working)
+                .map(|r| r.id)
+        });
+        again.is_some()
+    });
+    let again = again.unwrap();
+
+    // History's Resume posts once and opens the thread, its row's click
+    // adding nothing.
+    let _: serde_json::Value = w.ask(Request::StopRun { run: again });
+    run_in(cx, &ws, w.thread, forge, RunStatus::Stopped);
+    wait_until(cx, "both stopped", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().run(again).unwrap().status == RunStatus::Stopped
         })
     });
+    press(cx, window, "cmd-2");
+    click(cx, window, "running-nav-history");
+    wait_until(cx, "the history resume", |cx| {
+        has(cx, window, format!("history-resume-{again}"))
+    });
+    click(cx, window, format!("history-resume-{again}"));
+    assert!(!has(cx, window, "running"));
+    ws.read_with(cx, |ws, _| assert_eq!(ws.open_thread_id(), Some(w.thread)));
+    let resumes = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .messages(w.thread)
+                .iter()
+                .filter(|m| m.body == "@Forge continue where you stopped.")
+                .count()
+        })
+    };
+    wait_until(cx, "the second resume", |cx| resumes(cx) == 2);
+    let _: serde_json::Value = w.ask(Request::StopAll);
+    assert_eq!(resumes(cx), 2, "posted once");
+
+    // A History that can't load says why.
+    drop(daemon);
+    wait_until(cx, "the lost connection", |cx| {
+        ws.read_with(cx, |ws, _| !ws.connected())
+    });
+    press(cx, window, "cmd-2");
+    click(cx, window, "running-nav-history");
+    wait_until(cx, "the history error", |cx| {
+        label_of(cx, window, "history-error")
+            .is_some_and(|l| l.starts_with("Couldn't load history. "))
+    });
+    assert!(!has(cx, window, "history-empty"));
 }

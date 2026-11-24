@@ -420,6 +420,7 @@ impl Workspace {
         // Today's runs change when one ends, and may have while away.
         if run_ended || snapshot {
             self.refresh_usage(cx);
+            self.refresh_history(cx);
         }
         self.sync_settings(window, cx);
         self.sync(cx);

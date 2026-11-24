@@ -372,11 +372,10 @@ impl State {
         });
     }
 
-    /// Takes crewd's limits. Once they match what was sent, they show.
+    /// Takes crewd's limits, which show from now on: crewd reports every
+    /// change in order, so its next word follows anything sent before.
     fn limits_changed(&mut self, limits: Limits) {
-        if self.sent_limits == Some(limits) {
-            self.sent_limits = None;
-        }
+        self.sent_limits = None;
         self.limits = limits;
     }
 
@@ -1616,29 +1615,38 @@ mod tests {
         });
         assert_eq!(*state.limits(), stored);
 
-        // A change just sent shows at once, and an older report doesn't
-        // undo it.
+        // A change just sent shows at once, until crewd says anything.
         let sent = Limits {
             max_runs: 6,
             ..stored
         };
         state.expect_limits(sent);
         assert_eq!(*state.limits(), sent);
-        state.apply(ServerMsg::LimitsChanged {
-            limits: Limits {
-                max_runs: 3,
-                ..stored
-            },
-        });
-        assert_eq!(*state.limits(), sent);
         state.apply(ServerMsg::LimitsChanged { limits: sent });
         assert_eq!(*state.limits(), sent);
-        // Once reported, a change from another app shows.
+        // crewd's word wins, even when it differs from what was sent.
+        state.expect_limits(Limits {
+            max_runs: 8,
+            ..sent
+        });
         let other = Limits {
             paused: false,
             ..sent
         };
         state.apply(ServerMsg::LimitsChanged { limits: other });
+        assert_eq!(*state.limits(), other);
+        // So does a fresh snapshot.
+        state.expect_limits(Limits::default());
+        state.apply(ServerMsg::Snapshot {
+            projects: vec![],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+            limits: other,
+        });
         assert_eq!(*state.limits(), other);
         // A failed request goes back to crewd's copy.
         state.expect_limits(Limits::default());

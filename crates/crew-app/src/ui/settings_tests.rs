@@ -833,23 +833,41 @@ fn run_limits_read_short() {
     assert_eq!(run_limit_label(45), "45 min");
 }
 
-/// crewd's limits as a newly connected app sees them.
-fn crewd_limits(home: &Path) -> crew_proto::Limits {
-    use futures::StreamExt as _;
-    let (_client, mut events) = crate::client::spawn(crate::connection::ConnectionConfig {
-        crew_home: home.to_path_buf(),
-    });
-    futures::executor::block_on(async {
-        while let Some(event) = events.next().await {
-            if let crate::client::ClientEvent::Msg(crew_proto::ServerMsg::Snapshot {
-                limits, ..
-            }) = event
-            {
-                return limits;
+/// A second app on crewd, which follows its limits.
+struct LimitsWatch {
+    _client: crate::client::ClientHandle,
+    events: futures::channel::mpsc::UnboundedReceiver<crate::client::ClientEvent>,
+    latest: Option<crew_proto::Limits>,
+}
+
+impl LimitsWatch {
+    fn new(home: &Path) -> Self {
+        let (client, events) = crate::client::spawn(crate::connection::ConnectionConfig {
+            crew_home: home.to_path_buf(),
+        });
+        Self {
+            _client: client,
+            events,
+            latest: None,
+        }
+    }
+
+    /// The limits crewd last told this app, taking in what has arrived.
+    /// Never blocks, so `wait_until` bounds how long a test waits.
+    fn latest(&mut self) -> Option<crew_proto::Limits> {
+        use crate::client::ClientEvent;
+        use crew_proto::ServerMsg;
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                ClientEvent::Msg(ServerMsg::Snapshot { limits, .. })
+                | ClientEvent::Msg(ServerMsg::LimitsChanged { limits }) => {
+                    self.latest = Some(limits);
+                }
+                _ => {}
             }
         }
-        panic!("no snapshot");
-    })
+        self.latest
+    }
 }
 
 /// Opens the menu of the control `id` and picks its `ix`th item.
@@ -871,6 +889,7 @@ fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
     let home = short_home();
     let daemon = Daemon::start(home.path().to_path_buf());
     let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let mut other = LimitsWatch::new(home.path());
     let (window, ws) = open_tall(cx, home.path());
     wait_until(cx, "the project", |cx| {
         ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
@@ -909,12 +928,14 @@ fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
         Some("2")
     );
     wait_until(cx, "crewd to keep 2", |_| {
-        crewd_limits(home.path()).max_runs == 2
+        other.latest().is_some_and(|l| l.max_runs == 2)
     });
 
     click(cx, window, "limits-runs-paused");
     assert!(shows(cx, window, "Paused (selected)"));
-    wait_until(cx, "crewd to pause", |_| crewd_limits(home.path()).paused);
+    wait_until(cx, "crewd to pause", |_| {
+        other.latest().is_some_and(|l| l.paused)
+    });
 
     click(cx, window, "limits-policy-budget");
     assert!(shows(cx, window, "Run with budget (selected)"));
@@ -924,8 +945,9 @@ fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
         Some("5")
     );
     wait_until(cx, "crewd to keep the budget", |_| {
-        let limits = crewd_limits(home.path());
-        limits.handoff_policy == HandoffPolicy::Budget && limits.handoff_budget == 5
+        other
+            .latest()
+            .is_some_and(|l| l.handoff_policy == HandoffPolicy::Budget && l.handoff_budget == 5)
     });
     // What crewd reports back stays shown.
     wait_until(cx, "the app to hear back", |cx| {

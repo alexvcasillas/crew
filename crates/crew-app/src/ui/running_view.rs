@@ -90,6 +90,8 @@ pub(super) struct RunningView {
     history: Vec<StoredRun>,
     history_more: bool,
     history_loaded: bool,
+    /// Why the last History load failed, if it did.
+    history_error: Option<String>,
     history_task: Option<Task<()>>,
 }
 
@@ -105,6 +107,7 @@ impl RunningView {
             history: Vec::new(),
             history_more: false,
             history_loaded: false,
+            history_error: None,
             history_task: None,
         }
     }
@@ -354,8 +357,9 @@ impl Workspace {
     }
 
     /// Asks crewd for History's first page, or with `older` the page
-    /// after the last run listed.
-    fn load_history(&mut self, older: bool, cx: &mut Context<Self>) {
+    /// after the last run listed. The rows shown stay until the answer
+    /// lands; a fresh first page keeps older pages already loaded below it.
+    pub(super) fn load_history(&mut self, older: bool, cx: &mut Context<Self>) {
         let Some(view) = self.running.as_ref() else {
             return;
         };
@@ -379,14 +383,24 @@ impl Workspace {
                 match page {
                     Ok(page) => {
                         let full = page.len() >= HISTORY_PAGE as usize;
-                        if !older {
-                            view.history.clear();
+                        if older {
+                            let added = merge_history(&mut view.history, page);
+                            view.history_more = full && added > 0;
+                        } else {
+                            let known = std::mem::take(&mut view.history);
+                            let fresh = page.len();
+                            view.history = page;
+                            merge_history(&mut view.history, known);
+                            // Older pages were loaded already: their own
+                            // Show older still holds.
+                            if view.history.len() == fresh {
+                                view.history_more = full;
+                            }
                         }
-                        let added = merge_history(&mut view.history, page);
-                        view.history_more = full && added > 0;
                         view.history_loaded = true;
+                        view.history_error = None;
                     }
-                    Err(e) => eprintln!("crew: couldn't ask for the run history: {e}"),
+                    Err(e) => view.history_error = Some(e),
                 }
                 cx.notify();
             })
@@ -394,6 +408,18 @@ impl Workspace {
         });
         if let Some(view) = self.running.as_mut() {
             view.history_task = Some(task);
+        }
+    }
+
+    /// Loads History's first page again while it is shown.
+    pub(super) fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|v| v.section == Section::History)
+            && self.connected()
+        {
+            self.load_history(false, cx);
         }
     }
 
@@ -793,7 +819,11 @@ impl Workspace {
                 row
             })
             .collect();
-        let empty = view.history_loaded && rows.is_empty();
+        let error = view
+            .history_error
+            .as_ref()
+            .map(|e| format!("Couldn't load history. {e}"));
+        let empty = view.history_loaded && error.is_none() && rows.is_empty();
         let rows: Vec<AnyElement> = rows
             .into_iter()
             .map(|row| render_row(row, cx).into_any_element())
@@ -816,6 +846,17 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("History"),
             )
+            .when_some(error, |main, error| {
+                main.child(
+                    div()
+                        .id("history-error")
+                        .mb(px(12.))
+                        .text_color(color("danger"))
+                        .aria_label(error.clone())
+                        .child(error)
+                        .test_support(),
+                )
+            })
             .when(empty, |main| {
                 main.child(
                     div()
@@ -1348,6 +1389,8 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
                 .small()
                 .label("Resume")
                 .on_click(cx.listener(move |this, _, window, cx| {
+                    // A History row opens the thread on its own click.
+                    cx.stop_propagation();
                     this.resume(thread, agent.clone(), window, cx);
                 }))
                 .into_any_element()
@@ -1427,10 +1470,8 @@ fn render_actions(row: &Row, cx: &mut Context<Workspace>) -> Vec<AnyElement> {
             .into_iter()
             .chain([open(format!("running-open-{run}"), "Open", cx)])
             .collect(),
-        RowKind::History(run) => resume("history", run, cx)
-            .into_iter()
-            .chain([open(format!("history-open-{run}"), "Open", cx)])
-            .collect(),
+        // The row itself opens the thread.
+        RowKind::History(run) => resume("history", run, cx).into_iter().collect(),
     }
 }
 
