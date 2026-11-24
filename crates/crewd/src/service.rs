@@ -1464,12 +1464,15 @@ impl Service {
     ) {
         let mut summary = String::new();
         let mut texts: Vec<String> = Vec::new();
+        // Whether the last turn that counts ended well.
+        let mut answered = false;
         while let Some(event) = rx.recv().await {
             match &event {
                 // A resumed session can print an empty result before the
                 // one for its prompt. The last result that counts wins.
-                Event::TurnEnd { summary: s, .. } if !event.is_empty_turn_end() => {
-                    summary = s.clone()
+                Event::TurnEnd { ok, summary: s, .. } if !event.is_empty_turn_end() => {
+                    summary = s.clone();
+                    answered = *ok;
                 }
                 Event::Message { text } => texts.push(text.clone()),
                 Event::SessionStarted { session_id, .. } => self.name_session(run, session_id),
@@ -1493,7 +1496,10 @@ impl Service {
         let outcome = join
             .await
             .unwrap_or_else(|e| RunOutcome::Failed(format!("The run task ended: {e}")));
-        let reply = if summary.is_empty() {
+        let reply = if !answered && outcome != RunOutcome::Done {
+            // A run stopped before it answered has nothing to post.
+            String::new()
+        } else if summary.is_empty() {
             texts.join("\n")
         } else {
             summary
@@ -1518,6 +1524,8 @@ impl Service {
         }
     }
 
+    /// Records how a run ended and posts what it has to say. `reply` is
+    /// its answer, empty if it gave none.
     fn finish(
         &self,
         thread: ThreadId,
@@ -1539,6 +1547,11 @@ impl Service {
         self.cancel_permissions(&mut state, &mut db, run);
         self.expire_blocked_after(&mut db, thread, agent, run);
         let done = matches!(outcome, RunOutcome::Done);
+        // A run stopped after it answered still posts its answer, ahead of
+        // the note that it stopped.
+        if matches!(outcome, RunOutcome::Stopped) && !state.shutting_down && !reply.is_empty() {
+            self.add_message(&mut db, thread, Author::Agent(agent), &reply, Some(run))?;
+        }
         let (status, author, body) = match outcome {
             RunOutcome::Stopped if state.shutting_down => (
                 RunStatus::Interrupted,
