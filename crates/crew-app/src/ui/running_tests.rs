@@ -341,11 +341,11 @@ fn needs_you_row_approves_inline(cx: &mut TestAppContext) {
     });
     let id = asked.unwrap();
 
-    wait_label(cx, window, "title-running".into(), "0 running · 1 need you");
+    // A run waiting on you still runs, and its ask counts on its own.
+    wait_label(cx, window, "title-running".into(), "1 running · 1 need you");
     wait_label(cx, window, "status-needs".into(), "1 need you");
-    // Waiting on you isn't running, anywhere.
-    assert!(!has(cx, window, "status-working"));
-    assert!(!has(cx, window, "sidebar-running"));
+    assert!(has(cx, window, "status-working"));
+    wait_label(cx, window, "sidebar-running".into(), "1 agent running");
     press(cx, window, "cmd-2");
     wait_label(cx, window, "running-group-needs".into(), "NEEDS YOU · 1");
     assert!(!has(cx, window, "running-group-working"), "it waits on you");
