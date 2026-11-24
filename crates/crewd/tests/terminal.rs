@@ -499,8 +499,10 @@ async fn appended_lines_stream_live_to_subscribers() {
     write_session(&path, SHOWN, &p.root, "cli", "First ask");
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     c.change(SHOWN, |_| true).await;
 
     let err = c
@@ -597,8 +599,10 @@ async fn liveness_comes_from_the_session_registry() {
 
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     let deadline = Instant::now() + WAIT;
     let mut live = Vec::new();
     while Instant::now() < deadline {
@@ -636,8 +640,10 @@ async fn without_a_registry_old_files_are_not_live() {
 
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     let session = c.change(old, |_| true).await;
     assert!(!session.live);
     // Written to again: live.
@@ -666,8 +672,10 @@ async fn a_large_file_is_only_tailed() {
 
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     let session = c.change(SHOWN, |_| true).await;
     // The title comes from the start of the file.
     assert_eq!(session.title, "First ask");
@@ -693,8 +701,10 @@ async fn sessions_are_found_by_polling_when_the_folder_comes_later() {
     std::fs::remove_dir(p.claude_home.join("projects")).unwrap();
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
 
     write_session(&p.transcript(&p.root, SHOWN), SHOWN, &p.root, "cli", "Late");
     let session = c.change(SHOWN, |_| true).await;
@@ -709,8 +719,10 @@ async fn a_rewritten_file_resets_its_backlog() {
     append(&path, &[reply(SHOWN, &p.root, 3, "Old answer")]);
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     c.change(SHOWN, |_| true).await;
     c.call(Request::SubscribeTerminal {
         session: SHOWN.into(),
@@ -754,8 +766,10 @@ async fn old_and_deleted_sessions_are_not_listed() {
 
     start(&p, no_claude()).await;
     let mut c = Client::connect(&p).await;
-    create_project(&mut c, &p.root).await;
+    // Subscribed first: a session found once the project exists is then
+    // always told as a change, never only in the snapshot.
     c.snapshot().await;
+    create_project(&mut c, &p.root).await;
     c.change(SHOWN, |_| true).await;
     let mut other = Client::connect(&p).await;
     let ids: Vec<String> = other.snapshot().await.into_iter().map(|s| s.id).collect();
