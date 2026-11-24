@@ -11,6 +11,7 @@ mod dev_hooks;
 mod dialogs;
 pub mod diff_view;
 mod first_launch;
+mod folder;
 mod inspector;
 mod markdown_view;
 mod mention_menu;
@@ -42,6 +43,8 @@ mod codex_tests;
 mod dialog_tests;
 #[cfg(test)]
 mod diff_tests;
+#[cfg(test)]
+mod folder_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]

@@ -17,6 +17,7 @@ use gpui_kit::*;
 use super::common::{
     clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip, with_font_probe,
 };
+use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
@@ -140,6 +141,7 @@ impl Workspace {
                                     .child(format!("Thread in #{channel_name}")),
                             ),
                     )
+                    .children(self.render_mode_chip(thread))
                     .child(self.render_participants(thread))
                     .child({
                         let (label, icon) = if self.inspector_shown {
@@ -313,6 +315,28 @@ impl Workspace {
                     .child(self.render_live_card(run, &summary, cx)),
             )
             .test_support()
+    }
+
+    /// "in place" for a thread writing in the project folder, "{n}
+    /// worktrees" for one with a worktree per repo.
+    fn render_mode_chip(&self, thread: ThreadId) -> Option<AnyElement> {
+        let state = self.state();
+        match folder_mode(state, thread)? {
+            FolderMode::InPlace => Some(in_place_chip("thread-mode-chip").into_any_element()),
+            FolderMode::OwnCopy => {
+                let n = state
+                    .thread(thread)
+                    .and_then(|t| t.worktree.as_ref())
+                    .map(|wt| wt.repos.len())
+                    .filter(|n| *n > 0)?;
+                let text = format!("{n} {}", if n == 1 { "worktree" } else { "worktrees" });
+                Some(
+                    mode_chip("thread-mode-chip", text, "text-secondary", "surface-300")
+                        .test_support()
+                        .into_any_element(),
+                )
+            }
+        }
     }
 
     /// Overlapping monograms of the agents in the thread.

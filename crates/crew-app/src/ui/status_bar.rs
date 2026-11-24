@@ -15,7 +15,7 @@ use super::settings::Page;
 use super::workspace::Workspace;
 use crate::connection::ConnectionState;
 use crate::theme::color;
-use crate::theme::scale::{self, ui_px};
+use crate::theme::scale::{self, code_family, ui_px};
 
 pub const STATUS_BAR_HEIGHT: f32 = 28.;
 /// Names the status bar lists before "+N more".
@@ -74,6 +74,11 @@ impl Workspace {
         let connected = connection.is_none();
         if self.running.is_some() {
             return self.render_running_status(connection, cx);
+        }
+        if self.settings.is_none()
+            && let Some((seen, files)) = self.review_viewed()
+        {
+            return render_review_status(connection, seen, files);
         }
         let names: Vec<String> = state
             .working_agents()
@@ -221,6 +226,51 @@ impl Workspace {
 }
 
 /// The bar itself, before its items.
+/// Review changes' status bar: how many files you viewed and the keys
+/// that step through the changes.
+fn render_review_status(
+    connection: Option<(&'static str, &'static str)>,
+    seen: usize,
+    files: usize,
+) -> AnyElement {
+    let viewed = format!(
+        "Viewed {seen} of {files} {}",
+        if files == 1 { "file" } else { "files" }
+    );
+    let key = |k: &'static str| {
+        div()
+            .font_family(code_family())
+            .text_size(scale::mono(11.))
+            .child(k)
+    };
+    status_frame()
+        .when_some(connection, |bar, (token, text)| {
+            bar.child(item("status-connection", token, text.to_string()))
+        })
+        .child(
+            div()
+                .id("review-viewed-count")
+                .aria_label(viewed.clone())
+                .child(viewed)
+                .test_support(),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .id("review-keys")
+                .flex()
+                .items_center()
+                .gap(ui_px(4.))
+                .aria_label("j k next / previous change")
+                .child(key("j"))
+                .child(key("k"))
+                .child("next / previous change")
+                .test_support(),
+        )
+        .test_support()
+        .into_any_element()
+}
+
 fn status_frame() -> Stateful<Div> {
     div()
         .id("status-bar")

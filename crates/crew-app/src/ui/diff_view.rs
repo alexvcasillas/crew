@@ -3,11 +3,11 @@
 //! It takes the place of the sidebar, the main area and the inspector.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use crew_core::ids::{AgentId, ThreadId};
 use crew_core::store::Author;
-use crew_core::worktree::Diff;
-use crew_proto::Request;
+use crew_proto::{OutsideFile, Request, ThreadChanges};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
@@ -19,6 +19,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{dot, spinner};
+use super::folder::{
+    BRANCH_ICON, FILE_ICON, FolderMode, and_list, files_count, folder_mode, in_place_chip,
+    mode_chip, small_icon, warning_note,
+};
 use super::inspector::INSPECTOR_WIDTH;
 use super::markdown_view::render_doc;
 use super::workspace::Workspace;
@@ -26,7 +30,7 @@ use crate::checks::{Check, CheckState, checks};
 use crate::comments::{Comment, comments, place, reviewer_replies};
 use crate::diff_parse::{FileDiff, FileKind, Line, LineKind, parse, split_pairs};
 use crate::theme::color;
-use crate::theme::scale::{self, code_family, ui_px, weight};
+use crate::theme::scale::{self, code_family, ui_family, ui_px, weight};
 
 actions!(
     review,
@@ -35,6 +39,10 @@ actions!(
         CloseReview,
         /// Leave the commit message for the review.
         LeaveMessage,
+        /// Scroll to the next hunk.
+        NextChange,
+        /// Scroll to the hunk before.
+        PreviousChange,
     ]
 );
 
@@ -51,12 +59,18 @@ const LINE_HEIGHT: f32 = 20.;
 const NOTHING_TO_REVIEW: &str = "No changes to review.";
 const OUTSIDE_TITLE: &str = "Comments outside the diff";
 const NOTE: &str = "Nothing is pushed. Committing stays on your machine, and the branch is yours to merge or open a PR from.";
+const IN_PLACE_NOTE: &str =
+    "In-place threads commit on each repo's current branch. Nothing is pushed.";
+const OUTSIDE_THREAD: &str = "changed outside this thread";
+const NOT_IN_GIT: &str = "Not in git, can't review or undo.";
 
 /// Esc leaves the commit message first, then the review.
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("escape", CloseReview, Some(REVIEW_CONTEXT)),
         KeyBinding::new("escape", LeaveMessage, Some("ReviewMessage > Input")),
+        KeyBinding::new("j", NextChange, Some("Review && !Input")),
+        KeyBinding::new("k", PreviousChange, Some("Review && !Input")),
     ]
 }
 
@@ -126,6 +140,102 @@ pub(super) struct Review {
     /// Why Open in editor failed, shown above the diff.
     open_error: Option<String>,
     focus: FocusHandle,
+    /// Set for a folder project: the files by repo, a commit per repo
+    /// and the files git can't see.
+    folder: Option<FolderReview>,
+    /// The hunk header j or k last went to, by row.
+    change_row: Option<usize>,
+}
+
+/// The parts of a review only a folder project has.
+pub(super) struct FolderReview {
+    mode: FolderMode,
+    /// In the order crewd lists the repos, each with its files.
+    groups: Vec<RepoGroup>,
+    /// Files the thread changed outside any repo.
+    outside_git: Vec<OutsideFile>,
+    /// A commit message per repo, made as repos show up.
+    messages: Vec<RepoMessage>,
+}
+
+/// One repo's files in [`Review::files`].
+#[derive(Debug, Clone, PartialEq)]
+struct RepoGroup {
+    /// Relative to the project folder; empty for the folder itself.
+    repo: String,
+    branch: Option<String>,
+    files: Range<usize>,
+    /// Files of the range, by path, the thread didn't change.
+    outside: HashSet<String>,
+}
+
+impl RepoGroup {
+    /// The files a commit or discard takes: the thread's own.
+    fn own(&self, files: &[FileDiff]) -> usize {
+        files[self.files.clone()]
+            .iter()
+            .filter(|f| !self.outside.contains(&f.path))
+            .count()
+    }
+}
+
+struct RepoMessage {
+    repo: String,
+    input: Entity<TextareaState>,
+    _events: Subscription,
+}
+
+/// The files of `changes` repo by repo, with each repo's place in them.
+/// Paths keep the repo in front, as the patch names them.
+fn group_files(changes: &ThreadChanges) -> (Vec<FileDiff>, Vec<RepoGroup>) {
+    let mut files = Vec::new();
+    let mut groups = Vec::new();
+    for repo in changes.repos.iter().filter(|r| !r.diff.files.is_empty()) {
+        let start = files.len();
+        files.extend(parse(&repo.diff.patch));
+        let outside = repo
+            .outside_thread
+            .iter()
+            .map(|p| repo_path(&repo.repo, p))
+            .collect();
+        groups.push(RepoGroup {
+            repo: repo.repo.clone(),
+            branch: repo.branch.clone(),
+            files: start..files.len(),
+            outside,
+        });
+    }
+    (files, groups)
+}
+
+/// `path` of `repo` as the project folder has it.
+fn repo_path(repo: &str, path: &str) -> String {
+    if repo.is_empty() {
+        path.to_string()
+    } else {
+        format!("{repo}/{path}")
+    }
+}
+
+/// `path` without its repo in front.
+fn in_repo<'a>(repo: &str, path: &'a str) -> &'a str {
+    if repo.is_empty() {
+        return path;
+    }
+    path.strip_prefix(repo)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
+}
+
+/// The row j (`forward`) or k goes to from `top`: the next or previous
+/// hunk's header.
+fn next_hunk(rows: &[Row], top: usize, forward: bool) -> Option<usize> {
+    let hunk = |ix: &usize| matches!(rows[*ix], Row::Hunk(..));
+    if forward {
+        (top + 1..rows.len()).find(hunk)
+    } else {
+        (0..top).rev().find(hunk)
+    }
 }
 
 impl Review {
@@ -353,6 +463,12 @@ impl Workspace {
         });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let folder = folder_mode(self.state(), thread).map(|mode| FolderReview {
+            mode,
+            groups: Vec::new(),
+            outside_git: Vec::new(),
+            messages: Vec::new(),
+        });
         self.review = Some(Review {
             thread,
             loaded: false,
@@ -375,6 +491,8 @@ impl Workspace {
             synced: None,
             open_error: None,
             focus,
+            folder,
+            change_row: None,
         });
         self.sync_review_comments(cx);
         self.load_thread_diff(thread, cx);
@@ -417,6 +535,15 @@ impl Workspace {
             return false;
         };
         let text = review.message.read(cx).value().to_string();
+        for message in review.folder.iter().flat_map(|f| &f.messages) {
+            self.repo_messages.insert(
+                (review.thread, message.repo.clone()),
+                SavedMessage {
+                    text: message.input.read(cx).value().to_string(),
+                    draft: review.draft.clone(),
+                },
+            );
+        }
         self.commit_messages.insert(
             review.thread,
             SavedMessage {
@@ -425,6 +552,53 @@ impl Workspace {
             },
         );
         true
+    }
+
+    /// Makes a commit message for each repo that shows up in a folder
+    /// review: the one you left there, else the draft.
+    pub(super) fn ensure_repo_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = &self.review else {
+            return;
+        };
+        let Some(folder) = &review.folder else {
+            return;
+        };
+        let missing: Vec<String> = folder
+            .groups
+            .iter()
+            .map(|g| g.repo.clone())
+            .filter(|repo| !folder.messages.iter().any(|m| &m.repo == repo))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let (thread, draft) = (review.thread, review.draft.clone());
+        let mut made = Vec::new();
+        for repo in missing {
+            let text = match self.repo_messages.remove(&(thread, repo.clone())) {
+                Some(saved) if saved.text != saved.draft && !saved.text.is_empty() => saved.text,
+                _ => draft.clone(),
+            };
+            let input = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .rows(3)
+                    .placeholder("Say what changed and why.")
+                    .default_value(text)
+            });
+            let events = cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+            made.push(RepoMessage {
+                repo,
+                input,
+                _events: events,
+            });
+        }
+        if let Some(folder) = self.review.as_mut().and_then(|r| r.folder.as_mut()) {
+            folder.messages.extend(made);
+        }
     }
 
     /// The commit message drafted from the reply of the run that made the
@@ -457,12 +631,18 @@ impl Workspace {
         if draft == review.draft {
             return;
         }
-        let text = review.message.read(cx).value().to_string();
-        if text.is_empty() || text == review.draft {
-            let new = draft.clone();
+        let inputs = std::iter::once(review.message.clone()).chain(
             review
-                .message
-                .update(cx, |input, cx| input.set_value(new, window, cx));
+                .folder
+                .iter()
+                .flat_map(|f| f.messages.iter().map(|m| m.input.clone())),
+        );
+        for input in inputs {
+            let text = input.read(cx).value().to_string();
+            if text.is_empty() || text == review.draft {
+                let new = draft.clone();
+                input.update(cx, |input, cx| input.set_value(new, window, cx));
+            }
         }
         review.draft = draft;
         cx.notify();
@@ -484,10 +664,9 @@ impl Workspace {
         if self.review.as_ref().is_some_and(|r| r.synced == Some(key)) {
             return;
         }
-        let root = state
-            .thread(thread)
-            .and_then(|t| t.worktree.as_ref())
-            .map(|wt| wt.path.to_string_lossy().into_owned())
+        let root = self
+            .review_root(thread)
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let replies = reviewer_replies(state, thread);
         let mut found = Vec::new();
@@ -649,19 +828,33 @@ impl Workspace {
         let seq = self.diff_seq;
         let answer = self.client.request(Request::ThreadDiff { thread });
         let background = cx.background_executor().clone();
-        let parse_it = self.review.as_ref().is_some_and(|r| r.thread == thread);
+        // Whether to parse the patch, and whether by repo.
+        let parse_it = self
+            .review
+            .as_ref()
+            .filter(|r| r.thread == thread)
+            .map(|r| r.folder.is_some());
         self.inspector.diff_task = Some(cx.spawn(async move |this, cx| {
-            let read = answer
-                .await
-                .and_then(|v| serde_json::from_value::<Diff>(v).map_err(|e| e.to_string()));
-            let read = match read {
-                Ok(diff) if parse_it => {
-                    let patch = diff.patch.clone();
-                    let files = background.spawn(async move { parse(&patch) }).await;
-                    Ok((diff, Some(files)))
+            let read = answer.await.and_then(|v| {
+                serde_json::from_value::<ThreadChanges>(v).map_err(|e| e.to_string())
+            });
+            let read = match (read, parse_it) {
+                (Ok(changes), Some(by_repo)) => {
+                    let copy = changes.clone();
+                    let parsed = background
+                        .spawn(async move {
+                            if by_repo {
+                                let (files, groups) = group_files(&copy);
+                                (files, Some(groups))
+                            } else {
+                                (parse(&copy.patch), None)
+                            }
+                        })
+                        .await;
+                    Ok((changes, Some(parsed)))
                 }
-                Ok(diff) => Ok((diff, None)),
-                Err(e) => Err(e),
+                (Ok(changes), None) => Ok((changes, None)),
+                (Err(e), _) => Err(e),
             };
             this.update(cx, |this, cx| {
                 if this.diff_seq != seq || this.nav.thread != Some(thread) {
@@ -669,12 +862,16 @@ impl Workspace {
                 }
                 let review = this.review.as_mut().filter(|r| r.thread == thread);
                 match read {
-                    Ok((diff, files)) => {
-                        if let (Some(review), Some(files)) = (review, files) {
+                    Ok((changes, parsed)) => {
+                        if let (Some(review), Some((files, groups))) = (review, parsed) {
                             let kept = keep_scroll(review);
                             review.loaded = true;
                             review.failed = None;
                             review.files = files;
+                            if let (Some(folder), Some(groups)) = (review.folder.as_mut(), groups) {
+                                folder.groups = groups;
+                                folder.outside_git = changes.outside_git.clone();
+                            }
                             review
                                 .shown
                                 .retain(|p| review.files.iter().any(|f| &f.path == p));
@@ -697,7 +894,7 @@ impl Workspace {
                                 });
                             }
                         }
-                        this.inspector.diff = Some(diff);
+                        this.inspector.diff = Some(changes);
                     }
                     Err(e) => {
                         if let Some(review) = review {
@@ -796,6 +993,18 @@ impl Workspace {
             .map(|r| r.message.read(cx).value().to_string())
     }
 
+    /// The commit message of a folder review's group `ix`.
+    #[cfg(test)]
+    pub(super) fn review_repo_message(&self, ix: usize, cx: &App) -> Option<String> {
+        let folder = self.review.as_ref()?.folder.as_ref()?;
+        let repo = &folder.groups.get(ix)?.repo;
+        folder
+            .messages
+            .iter()
+            .find(|m| &m.repo == repo)
+            .map(|m| m.input.read(cx).value().to_string())
+    }
+
     /// Whether Commit can be pressed: there are changes, a message, and
     /// nothing else is being sent.
     pub(super) fn review_can_commit(&self, cx: &App) -> bool {
@@ -804,19 +1013,173 @@ impl Workspace {
         })
     }
 
-    /// Whether the open thread has a worktree with changes to review.
+    /// Whether the open thread has a worktree, or works in place, with
+    /// changes to review.
     pub(super) fn can_review(&self, thread: ThreadId) -> bool {
-        let has_worktree = self
-            .state()
-            .thread(thread)
-            .is_some_and(|t| t.worktree.is_some());
+        let state = self.state();
+        let has_worktree = state.thread(thread).is_some_and(|t| t.worktree.is_some())
+            || folder_mode(state, thread) == Some(FolderMode::InPlace);
         has_worktree
             && self.nav.thread == Some(thread)
             && self
                 .inspector
                 .diff
                 .as_ref()
-                .is_some_and(|d| !d.files.is_empty())
+                .is_some_and(|d| !d.files.is_empty() || !d.outside_git.is_empty())
+    }
+
+    /// Files viewed and files to review, for the footer.
+    pub(super) fn review_viewed(&self) -> Option<(usize, usize)> {
+        let review = self.review.as_ref()?;
+        let viewed = self.viewed.get(&review.thread);
+        let seen = review
+            .files
+            .iter()
+            .filter(|f| viewed.is_some_and(|v| v.contains(&f.path)))
+            .count();
+        Some((seen, review.files.len()))
+    }
+
+    /// j and k: the next or previous hunk at the top of the list.
+    fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        let top = review.list.logical_scroll_top().item_ix;
+        // Near the end the list can't scroll a hunk to the top, so the
+        // last one gone to counts unless you scrolled past it.
+        let from = match review.change_row {
+            Some(row) if row >= top => Some(row),
+            _ => None,
+        };
+        let next = match from {
+            Some(row) => next_hunk(&review.rows, row, forward),
+            None if forward => {
+                (top..review.rows.len()).find(|&ix| matches!(review.rows[ix], Row::Hunk(..)))
+            }
+            None => next_hunk(&review.rows, top, false),
+        };
+        if let Some(ix) = next {
+            review.change_row = Some(ix);
+            review.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: ui_px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    /// The hunk header row j or k last went to.
+    #[cfg(test)]
+    pub(super) fn review_change(&self) -> Option<usize> {
+        self.review.as_ref().and_then(|r| r.change_row)
+    }
+
+    /// The repos a folder review's discard takes: those with files the
+    /// thread changed.
+    fn discard_repos(&self) -> Vec<String> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let Some(folder) = &review.folder else {
+            return Vec::new();
+        };
+        folder
+            .groups
+            .iter()
+            .filter(|g| g.own(&review.files) > 0)
+            .map(|g| g.repo.clone())
+            .collect()
+    }
+
+    /// How a repo is named: its folder, or the project's for the folder
+    /// itself.
+    fn repo_name(&self, thread: ThreadId, repo: &str) -> String {
+        if !repo.is_empty() {
+            return repo.to_string();
+        }
+        let state = self.state();
+        state
+            .thread_project(thread)
+            .and_then(|p| state.project(p))
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether the commit of group `ix` can be pressed.
+    fn repo_can_commit(&self, ix: usize, cx: &App) -> bool {
+        let Some(review) = &self.review else {
+            return false;
+        };
+        let Some(folder) = &review.folder else {
+            return false;
+        };
+        let Some(group) = folder.groups.get(ix) else {
+            return false;
+        };
+        let message = folder.messages.iter().find(|m| m.repo == group.repo);
+        !review.busy
+            && group.own(&review.files) > 0
+            && message.is_some_and(|m| !m.input.read(cx).value().trim().is_empty())
+    }
+
+    /// Commits the thread's files of group `ix`'s repo.
+    fn commit_repo(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.repo_can_commit(ix, cx) {
+            return;
+        }
+        let Some(review) = &mut self.review else {
+            return;
+        };
+        let Some(folder) = &review.folder else {
+            return;
+        };
+        let group = folder.groups[ix].clone();
+        let Some(input) = folder
+            .messages
+            .iter()
+            .find(|m| m.repo == group.repo)
+            .map(|m| m.input.clone())
+        else {
+            return;
+        };
+        review.busy = true;
+        let thread = review.thread;
+        let paths: Vec<String> = review.files[group.files.clone()]
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        let message = input.read(cx).value().to_string();
+        let name = self.repo_name(thread, &group.repo);
+        let branch = group.branch.clone().unwrap_or_default();
+        let answer = self.client.request(Request::Commit {
+            thread,
+            repo: (!group.repo.is_empty()).then(|| group.repo.clone()),
+            message,
+        });
+        self.spawn_request(window, cx, async move |this, cx| {
+            let result = answer.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(review) = &mut this.review {
+                    review.busy = false;
+                }
+                if result.is_ok() {
+                    window.push_notification(
+                        Notification::success(format!("Committed to {branch} in {name}.")),
+                        cx,
+                    );
+                    if let Some(viewed) = this.viewed.get_mut(&thread) {
+                        viewed.retain(|p| !paths.contains(p));
+                    }
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                    this.load_review(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+            result.map(drop).map_err(|e| (e, None))
+        });
+        cx.notify();
     }
 
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -869,9 +1232,31 @@ impl Workspace {
         let whose = self
             .review_agent(review.thread)
             .map_or_else(|| "these".to_string(), |a| format!("{a}'s"));
-        let ask = format!(
-            "Discard {whose} changes? The worktree is removed. A branch with commits is kept."
-        );
+        let thread = review.thread;
+        let ask = match review.folder.as_ref().map(|f| f.mode) {
+            None => format!(
+                "Discard {whose} changes? The worktree is removed. A branch with commits is kept."
+            ),
+            Some(mode) => {
+                let repos = self.discard_repos();
+                if repos.is_empty() {
+                    return;
+                }
+                let names: Vec<String> = repos.iter().map(|r| self.repo_name(thread, r)).collect();
+                let names = and_list(&names);
+                match mode {
+                    FolderMode::InPlace => format!(
+                        "Discard {whose} changes in {names}? Files this thread changed go back to what git has. Files not in git stay as they are."
+                    ),
+                    FolderMode::OwnCopy if repos.len() == 1 => format!(
+                        "Discard {whose} changes in {names}? Its worktree is removed. A branch with commits is kept."
+                    ),
+                    FolderMode::OwnCopy => format!(
+                        "Discard {whose} changes in {names}? Their worktrees are removed. A branch with commits is kept."
+                    ),
+                }
+            }
+        };
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
             let confirm = this.clone();
@@ -911,11 +1296,19 @@ impl Workspace {
         let Some(review) = &mut self.review else {
             return;
         };
+        let folder = review.folder.is_some();
         review.busy = true;
         let thread = review.thread;
+        let repos = if folder {
+            let repos = self.discard_repos();
+            // The project folder as the one repo is all of them.
+            (!repos.iter().any(String::is_empty)).then_some(repos)
+        } else {
+            None
+        };
         let answer = self.client.request(Request::Discard {
             thread,
-            repos: None,
+            repos,
             delete_branch: false,
         });
         self.spawn_request(window, cx, async move |this, cx| {
@@ -983,12 +1376,7 @@ impl Workspace {
         let Some(thread) = self.review.as_ref().map(|r| r.thread) else {
             return;
         };
-        let Some(worktree) = self
-            .state()
-            .thread(thread)
-            .and_then(|t| t.worktree.as_ref())
-            .map(|wt| wt.path.clone())
-        else {
+        let Some(worktree) = self.review_root(thread) else {
             return;
         };
         let app = self.editor_app();
@@ -1020,6 +1408,24 @@ impl Workspace {
         });
     }
 
+    /// The folder the review's paths are relative to: the thread's
+    /// worktree, or the project folder for a thread working in place.
+    fn review_root(&self, thread: ThreadId) -> Option<std::path::PathBuf> {
+        let state = self.state();
+        if let Some(path) = state
+            .thread(thread)
+            .and_then(|t| t.worktree.as_ref())
+            .map(|wt| wt.path.clone())
+        {
+            return Some(path);
+        }
+        (folder_mode(state, thread) == Some(FolderMode::InPlace))
+            .then(|| state.thread_project(thread))
+            .flatten()
+            .and_then(|p| state.project(p))
+            .map(|p| p.root.clone())
+    }
+
     fn render_review_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(review) = &self.review else {
             return div().into_any_element();
@@ -1032,6 +1438,17 @@ impl Workspace {
             Row::File(f) => {
                 let file = &review.files[f];
                 let checked = viewed.is_some_and(|v| v.contains(&file.path));
+                let group = review
+                    .folder
+                    .as_ref()
+                    .and_then(|d| d.groups.iter().find(|g| g.files.contains(&f)));
+                let outside = group.is_some_and(|g| g.outside.contains(&file.path));
+                // A folder review names the repo on a chip, then the path in it.
+                let repo = group.filter(|g| !g.repo.is_empty()).map(|g| g.repo.clone());
+                let shown_path = match group {
+                    Some(g) => in_repo(&g.repo, &file.path).to_string(),
+                    None => file.path.clone(),
+                };
                 div()
                     .id(("diff-file", f))
                     .w_full()
@@ -1048,14 +1465,32 @@ impl Workspace {
                     .font_family(code_family())
                     .text_size(scale::mono(12.))
                     .aria_label(file.path.clone())
+                    .when_some(repo, |row, repo| {
+                        row.child(mode_chip(
+                            ("diff-file-repo", f),
+                            repo,
+                            "text-secondary",
+                            "surface-300",
+                        ))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_color(color("text-primary"))
-                            .child(file.path.clone()),
+                            .child(shown_path),
                     )
+                    .when(outside, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .font_family(ui_family())
+                                .text_size(scale::text(12.))
+                                .text_color(color("text-tertiary"))
+                                .child(OUTSIDE_THREAD),
+                        )
+                    })
                     .child(plus_minus(file.added, file.removed))
                     .child(
                         Checkbox::new(("review-viewed", f))
@@ -1296,7 +1731,18 @@ impl Workspace {
         let heading = self
             .review_agent(review.thread)
             .map_or_else(|| "Changes".to_string(), |a| format!("{a}'s changes"));
-        let where_ = format!("{title} · #{channel}");
+        let mode = review.folder.as_ref().map(|f| f.mode);
+        let where_ = match mode {
+            None => format!("{title} · #{channel}"),
+            Some(_) => {
+                let project = thread
+                    .and_then(|t| state.channel(t.channel))
+                    .and_then(|c| state.project(c.project))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                format!("{title} · {project} · #{channel}")
+            }
+        };
         let left = div()
             .flex()
             .items_center()
@@ -1329,6 +1775,9 @@ impl Workspace {
                     .child(where_)
                     .test_support(),
             )
+            .when(mode == Some(FolderMode::InPlace), |row| {
+                row.child(in_place_chip("review-mode-chip"))
+            })
             .into_any_element();
         let right = div()
             .flex()
@@ -1392,6 +1841,10 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &CloseReview, window, cx| {
                 this.close_review(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NextChange, _, cx| this.step_change(true, cx)))
+            .on_action(cx.listener(|this, _: &PreviousChange, _, cx| {
+                this.step_change(false, cx);
+            }))
             .flex()
             .flex_1()
             .min_h_0()
@@ -1424,6 +1877,12 @@ impl Workspace {
             .map(|r| (r.thread, r.checks.clone()))
             .filter(|(_, c)| !c.is_empty());
         let ran = ran.and_then(|(thread, list)| Some((self.review_agent(thread)?, list)));
+        let by_repo = review.is_some_and(|r| r.folder.is_some());
+        let repo_rows = if by_repo {
+            self.render_folder_files(cx)
+        } else {
+            Vec::new()
+        };
         div()
             .id("review-files")
             .flex()
@@ -1434,30 +1893,31 @@ impl Workspace {
             .border_r_1()
             .border_color(color("border-100"))
             .overflow_y_scroll()
-            .child(
-                div()
-                    .id("review-summary")
-                    .flex()
-                    .items_center()
-                    .gap(ui_px(8.))
-                    .h(scale::row(40.))
-                    .px(ui_px(16.))
-                    .text_size(scale::text(12.))
-                    .aria_label(summary)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(color("text-secondary"))
-                            .child(format!("{n} {} changed", files_word(n))),
-                    )
-                    .child(plus_minus(added, removed))
-                    .test_support(),
-            )
-            .children(
-                files
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, (path, kind, added, removed))| {
+            .children(repo_rows)
+            .when(!by_repo, |col| {
+                col.child(
+                    div()
+                        .id("review-summary")
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(8.))
+                        .h(scale::row(40.))
+                        .px(ui_px(16.))
+                        .text_size(scale::text(12.))
+                        .aria_label(summary)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(color("text-secondary"))
+                                .child(format!("{n} {} changed", files_word(n))),
+                        )
+                        .child(plus_minus(added, removed))
+                        .test_support(),
+                )
+            })
+            .when(!by_repo, |col| {
+                col.children(files.into_iter().enumerate().map(
+                    |(ix, (path, kind, added, removed))| {
                         let seen = viewed.contains(&path);
                         div()
                             .id(("review-file", ix))
@@ -1498,8 +1958,9 @@ impl Workspace {
                                 this.scroll_to_file(ix, cx);
                             }))
                             .test_support()
-                    }),
-            )
+                    },
+                ))
+            })
             .when_some(ran, |col, (agent, list)| {
                 col.child(
                     div()
@@ -1570,6 +2031,205 @@ impl Workspace {
             })
     }
 
+    /// A folder review's file list: the count, each repo's files, then
+    /// the files git doesn't have.
+    fn render_folder_files(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(review) = &self.review else {
+            return Vec::new();
+        };
+        let Some(folder) = &review.folder else {
+            return Vec::new();
+        };
+        let viewed = self.viewed.get(&review.thread);
+        let added: u32 = review.files.iter().map(|f| f.added).sum();
+        let removed: u32 = review.files.iter().map(|f| f.removed).sum();
+        let n = review.files.len() + folder.outside_git.len();
+        let repos = folder.groups.len();
+        let count = match repos {
+            0 => files_count(n),
+            1 => format!("{} in 1 repo", files_count(n)),
+            _ => format!("{} in {repos} repos", files_count(n)),
+        };
+        let mut rows = vec![
+            div()
+                .id("review-summary")
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt(scale::row(12.))
+                .pb(scale::row(4.))
+                .px(ui_px(16.))
+                .aria_label(format!("{count} · +{added} −{removed}"))
+                .child(
+                    div()
+                        .text_size(scale::text(12.))
+                        .font_weight(weight(FontWeight::MEDIUM))
+                        .text_color(color("text-secondary"))
+                        .child(count),
+                )
+                .child(plus_minus(added, removed))
+                .test_support()
+                .into_any_element(),
+        ];
+        for (gi, group) in folder.groups.iter().enumerate() {
+            let name = self.repo_name(review.thread, &group.repo);
+            let files = files_count(group.files.len());
+            rows.push(
+                group_header(("review-repo", gi), BRANCH_ICON, "text-primary")
+                    .aria_label(format!("{name} · {files}"))
+                    .child(div().font_family(code_family()).child(name))
+                    .child(
+                        div()
+                            .font_weight(weight(FontWeight::NORMAL))
+                            .text_color(color("text-tertiary"))
+                            .child(format!("· {files}")),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            );
+            let file_rows = group.files.clone().map(|ix| {
+                let file = &review.files[ix];
+                let path = in_repo(&group.repo, &file.path).to_string();
+                let outside = group.outside.contains(&file.path);
+                let seen = viewed.is_some_and(|v| v.contains(&file.path));
+                let current = review.current_file.as_ref() == Some(&file.path);
+                let mut label = format!(
+                    "{} {path} +{} −{}",
+                    file.kind.letter(),
+                    file.added,
+                    file.removed
+                );
+                if outside {
+                    label.push_str(&format!(" · {OUTSIDE_THREAD}"));
+                }
+                let text = if current {
+                    "text-primary"
+                } else if seen || outside {
+                    "text-tertiary"
+                } else {
+                    "text-secondary"
+                };
+                div()
+                    .id(("review-file", ix))
+                    .flex()
+                    .items_center()
+                    .gap(ui_px(8.))
+                    .h(scale::row(28.))
+                    .px(ui_px(8.))
+                    .rounded(ui_px(6.))
+                    .cursor_pointer()
+                    .when(current, |row| row.bg(color("surface-300")))
+                    .when(!current, |row| row.hover(|s| s.bg(color("surface-100"))))
+                    .font_family(code_family())
+                    .whitespace_nowrap()
+                    .aria_label(label)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(scale::mono(12.))
+                            .text_size(scale::mono(10.))
+                            .font_weight(weight(FontWeight::MEDIUM))
+                            .text_color(color(letter_colour(&file.kind)))
+                            .child(file.kind.letter().to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::mono(12.))
+                            .text_color(color(text))
+                            .child(path),
+                    )
+                    .when(seen, |row| row.child(dot("text-tertiary")))
+                    .child(short_plus_minus(file.added, file.removed))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_file(ix, cx);
+                    }))
+                    .test_support()
+                    .into_any_element()
+            });
+            rows.push(group_rows(file_rows.collect()));
+        }
+        if !folder.outside_git.is_empty() {
+            let files = files_count(folder.outside_git.len());
+            rows.push(
+                group_header("review-not-in-git", FILE_ICON, "text-secondary")
+                    .aria_label(format!("Not in git · {files}"))
+                    .child("Not in git")
+                    .child(
+                        div()
+                            .font_weight(weight(FontWeight::NORMAL))
+                            .text_color(color("text-tertiary"))
+                            .child(format!("· {files}")),
+                    )
+                    .test_support()
+                    .into_any_element(),
+            );
+            let mut outside: Vec<AnyElement> = folder
+                .outside_git
+                .iter()
+                .enumerate()
+                .map(|(ix, file)| {
+                    let what = if file.exists { "edited" } else { "removed" };
+                    div()
+                        .id(("review-outside", ix))
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(8.))
+                        .h(scale::row(28.))
+                        .px(ui_px(8.))
+                        .whitespace_nowrap()
+                        .text_color(color("text-secondary"))
+                        .aria_label(format!("{} {what}", file.path))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(scale::mono(12.))
+                                .font_family(code_family())
+                                .text_size(scale::mono(10.))
+                                .font_weight(weight(FontWeight::MEDIUM))
+                                .text_color(color("text-tertiary"))
+                                .child("·"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(code_family())
+                                .text_size(scale::mono(12.))
+                                .child(file.path.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(scale::text(11.))
+                                .text_color(color("text-tertiary"))
+                                .child(what),
+                        )
+                        .test_support()
+                        .into_any_element()
+                })
+                .collect();
+            outside.push(
+                div()
+                    .id("review-outside-note")
+                    .pt(scale::row(2.))
+                    .pl(ui_px(28.))
+                    .pr(ui_px(8.))
+                    .text_size(scale::text(12.))
+                    .line_height(scale::line(18.))
+                    .text_color(color("text-tertiary"))
+                    .aria_label(NOT_IN_GIT)
+                    .child(NOT_IN_GIT)
+                    .test_support()
+                    .into_any_element(),
+            );
+            rows.push(group_rows(outside));
+        }
+        rows
+    }
+
     fn render_review_diff(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let review = self.review.as_ref();
         let empty = match review {
@@ -1633,6 +2293,9 @@ impl Workspace {
         let Some(review) = &self.review else {
             return div().into_any_element();
         };
+        if review.folder.is_some() {
+            return self.render_folder_next(cx);
+        }
         let state = self.state();
         let thread = state.thread(review.thread);
         let branch = thread
@@ -1805,6 +2468,258 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// What next for a folder project: a commit per repo, what git can't
+    /// undo, then asking for changes or discarding them.
+    fn render_folder_next(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(review) = &self.review else {
+            return div().into_any_element();
+        };
+        let Some(folder) = &review.folder else {
+            return div().into_any_element();
+        };
+        let thread = review.thread;
+        let agent = self.review_agent(thread);
+        let mut primary_used = false;
+        let mut panels = Vec::new();
+        for (gi, group) in folder.groups.iter().enumerate() {
+            let own = group.own(&review.files);
+            if own == 0 {
+                continue;
+            }
+            let Some(message) = folder.messages.iter().find(|m| m.repo == group.repo) else {
+                continue;
+            };
+            let name = self.repo_name(thread, &group.repo);
+            let branch = group.branch.clone().unwrap_or_default();
+            let files = files_count(own);
+            let can = self.repo_can_commit(gi, cx);
+            let primary = can && !primary_used;
+            primary_used |= primary;
+            let drafted = !review.draft.is_empty()
+                && message.input.read(cx).value().as_ref() == review.draft.as_str();
+            let caption = match &agent {
+                Some(agent) if drafted => format!("Commit message · drafted by {agent}"),
+                _ => "Commit message".to_string(),
+            };
+            let label = format!("Commit {files} in {name}");
+            let button = Button::new(("review-commit-repo", gi))
+                .w_full()
+                .label(label)
+                .disabled(!can)
+                .on_click(cx.listener(move |this, _, window, cx| this.commit_repo(gi, window, cx)));
+            let input = message.input.clone();
+            panels.push(
+                div()
+                    .id(("review-repo-panel", gi))
+                    .flex()
+                    .flex_col()
+                    .gap(ui_px(8.))
+                    .p(ui_px(12.))
+                    .border_1()
+                    .border_color(color("border-100"))
+                    .rounded(ui_px(8.))
+                    .child(
+                        div()
+                            .id(("review-repo-head", gi))
+                            .flex()
+                            .items_center()
+                            .gap(ui_px(8.))
+                            .aria_label(format!("{name} on {branch} · {files}"))
+                            .child(
+                                div()
+                                    .font_family(code_family())
+                                    .font_weight(weight(FontWeight::MEDIUM))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(ui_px(4.))
+                                    .min_w_0()
+                                    .text_size(scale::text(12.))
+                                    .text_color(color("text-tertiary"))
+                                    .child("on")
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_family(code_family())
+                                            .text_size(scale::mono(12.))
+                                            .child(branch),
+                                    )
+                                    .child(format!("· {files}")),
+                            )
+                            .test_support(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(ui_px(6.))
+                            .child(
+                                div()
+                                    .id(("review-repo-caption", gi))
+                                    .text_size(scale::text(12.))
+                                    .font_weight(weight(FontWeight::MEDIUM))
+                                    .text_color(color("text-secondary"))
+                                    .aria_label(caption.clone())
+                                    .child(caption)
+                                    .test_support(),
+                            )
+                            .child(
+                                div()
+                                    .id(("review-repo-message", gi))
+                                    .key_context(MESSAGE_CONTEXT)
+                                    .on_action(cx.listener(|this, _: &LeaveMessage, window, cx| {
+                                        if let Some(review) = &this.review {
+                                            review.focus.focus(window, cx);
+                                        }
+                                    }))
+                                    .font_family(code_family())
+                                    .child(Textarea::new(&input).aria_label("Commit message"))
+                                    .on_click(cx.listener(move |_, _, window, cx| {
+                                        input.update(cx, |m, cx| m.focus(window, cx));
+                                    }))
+                                    .test_support(),
+                            ),
+                    )
+                    .child(if primary {
+                        button.primary()
+                    } else {
+                        button.outline()
+                    })
+                    .into_any_element(),
+            );
+        }
+        let outside: Vec<String> = folder.outside_git.iter().map(|f| f.path.clone()).collect();
+        let warning = match outside.as_slice() {
+            [] => None,
+            [one] => Some(format!(
+                "{one} is not in git. It's already changed on disk and Crew can't undo it."
+            )),
+            many => Some(format!(
+                "{} are not in git. They're already changed on disk and Crew can't undo them.",
+                and_list(many)
+            )),
+        };
+        let repos: Vec<String> = self
+            .discard_repos()
+            .iter()
+            .map(|r| self.repo_name(thread, r))
+            .collect();
+        let discard = if repos.is_empty() {
+            "Discard changes".to_string()
+        } else {
+            format!("Discard changes in {}", and_list(&repos))
+        };
+        let note = if folder.mode == FolderMode::InPlace {
+            IN_PLACE_NOTE
+        } else {
+            NOTE
+        };
+        div()
+            .id("review-next")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(scale::chrome(INSPECTOR_WIDTH))
+            .h_full()
+            .border_l_1()
+            .border_color(color("border-100"))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(scale::row(44.))
+                    .px(ui_px(16.))
+                    .border_b_1()
+                    .border_color(color("border-100"))
+                    .text_size(scale::text(14.))
+                    .font_weight(weight(FontWeight::SEMIBOLD))
+                    .child("What next"),
+            )
+            .child(
+                div()
+                    .id("review-next-body")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(ui_px(16.))
+                    .p(ui_px(16.))
+                    .overflow_y_scroll()
+                    .when_some(review.left.clone(), |col, (agent, n)| {
+                        let text = format!(
+                            "{agent} left {n} {}.",
+                            if n == 1 { "comment" } else { "comments" }
+                        );
+                        col.child(
+                            div()
+                                .id("review-callout")
+                                .px(ui_px(12.))
+                                .py(scale::row(10.))
+                                .bg(color("surface-100"))
+                                .border_1()
+                                .border_color(color("border-200"))
+                                .rounded(ui_px(8.))
+                                .text_size(scale::text(13.))
+                                .text_color(color("text-primary"))
+                                .aria_label(text.clone())
+                                .child(text)
+                                .test_support(),
+                        )
+                    })
+                    .children(panels)
+                    .when_some(warning, |col, text| {
+                        col.child(warning_note("review-outside-warning", text))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(ui_px(8.))
+                            .child(
+                                Button::new("review-ask")
+                                    .outline()
+                                    .w_full()
+                                    .label(agent.as_ref().map_or_else(
+                                        || "Ask for changes".to_string(),
+                                        |a| format!("Ask {a} for changes"),
+                                    ))
+                                    .disabled(agent.is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ask_for_changes(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("review-discard")
+                                    .ghost()
+                                    .w_full()
+                                    .text_color(color("danger"))
+                                    .label(discard)
+                                    .disabled(repos.is_empty() || review.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ask_to_discard(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("review-note")
+                            .text_size(scale::text(12.))
+                            .line_height(scale::line(18.))
+                            .text_color(color("text-tertiary"))
+                            .aria_label(note)
+                            .child(note)
+                            .test_support(),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 /// Notes where the list is scrolled, before its rows or files change.
 fn keep_scroll(review: &Review) -> Kept {
     let top = review.list.logical_scroll_top();
@@ -1842,6 +2757,9 @@ fn rebuild_rows_from(review: &mut Review, kept: Kept) {
                 offset_in_item: kept.offset,
             });
         }
+    }
+    if rows != review.rows {
+        review.change_row = None;
     }
     review.rows = rows;
     review.file_rows = starts;
@@ -1926,6 +2844,57 @@ fn split_side(id: (&'static str, usize), line: Option<&Line>, left: bool) -> imp
 /// "{Agent} · {path}:{line}".
 fn comment_header(comment: &Comment) -> String {
     format!("{} · {}:{}", comment.agent, comment.path, comment.line)
+}
+
+/// A group's title in a folder review's file list.
+fn group_header(id: impl Into<ElementId>, icon: &'static [u8], token: &str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(ui_px(6.))
+        .h(scale::row(28.))
+        .px(ui_px(16.))
+        .mt(ui_px(8.))
+        .text_size(scale::text(12.))
+        .font_weight(weight(FontWeight::MEDIUM))
+        .text_color(color(token))
+        .child(small_icon(icon, "text-secondary"))
+}
+
+/// The rows under a group's title.
+fn group_rows(rows: Vec<AnyElement>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(ui_px(1.))
+        .px(ui_px(8.))
+        .children(rows)
+        .into_any_element()
+}
+
+/// `+n −m` at 11 px, leaving out a side that is zero.
+fn short_plus_minus(added: u32, removed: u32) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_none()
+        .gap(ui_px(4.))
+        .font_family(code_family())
+        .text_size(scale::mono(11.))
+        .when(added > 0, |row| {
+            row.child(
+                div()
+                    .text_color(color("success"))
+                    .child(format!("+{added}")),
+            )
+        })
+        .when(removed > 0, |row| {
+            row.child(
+                div()
+                    .text_color(color("danger"))
+                    .child(format!("−{removed}")),
+            )
+        })
 }
 
 fn plus_minus(added: u32, removed: u32) -> impl IntoElement {

@@ -154,6 +154,8 @@ pub struct Workspace {
     review_pending: Option<ThreadId>,
     /// Commit messages of closed reviews, per thread.
     pub(super) commit_messages: HashMap<ThreadId, SavedMessage>,
+    /// The same, per thread and repo, for folder projects.
+    pub(super) repo_messages: HashMap<(ThreadId, String), SavedMessage>,
     /// Numbers the thread diff reads, so only the latest lands.
     pub(super) diff_seq: u64,
     /// Running now, shown in place of the body.
@@ -313,6 +315,7 @@ impl Workspace {
             viewed: HashMap::new(),
             review_pending: hooks.review,
             commit_messages: HashMap::new(),
+            repo_messages: HashMap::new(),
             diff_seq: 0,
             running,
             stopping_all: false,
@@ -665,10 +668,14 @@ impl Workspace {
             .filter(|r| r.status == RunStatus::Working)
             .filter_map(|r| self.state.agent(r.agent).map(|a| a.spec.name.clone()))
             .collect();
+        let queued = self
+            .nav
+            .thread
+            .and_then(|t| super::folder::queue_hint(&self.state, t));
         let hint = if live.is_empty() {
             self.last_agent().map(|name| reply_hint(&name))
         } else {
-            working_hint(&working)
+            queued.or_else(|| working_hint(&working))
         };
         let busy = self.creating.is_some()
             && matches!(self.draft_key(), Some(DraftKey::NewThread(c)) if self.creating == Some(c));
@@ -691,7 +698,16 @@ impl Workspace {
                 .running()
                 .iter()
                 .any(|r| r.status == RunStatus::Working);
-        if working.is_empty() && !running_ticks && !self.channel_ticks() {
+        // An agent writing in the open thread's folder from another thread
+        // shows its time in the Working copy.
+        let folder_ticks = self.nav.thread.is_some_and(|t| {
+            super::folder::folder_mode(&self.state, t) == Some(super::folder::FolderMode::InPlace)
+                && self
+                    .state
+                    .thread_project(t)
+                    .is_some_and(|p| !super::folder::writers(&self.state, p).is_empty())
+        });
+        if working.is_empty() && !running_ticks && !folder_ticks && !self.channel_ticks() {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -1318,6 +1334,7 @@ fn working_hint(names: &[String]) -> Option<String> {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_width = window.viewport_size().width;
+        self.ensure_repo_messages(window, cx);
         let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
         let lights = crate::app::traffic_lights();
         if self.traffic_lights != Some(lights) {
