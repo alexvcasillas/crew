@@ -25,6 +25,7 @@ pub mod method {
 
     pub const COMMAND_APPROVAL: &str = "item/commandExecution/requestApproval";
     pub const FILE_CHANGE_APPROVAL: &str = "item/fileChange/requestApproval";
+    pub const PERMISSIONS_APPROVAL: &str = "item/permissions/requestApproval";
     pub const MCP_ELICITATION: &str = "mcpServer/elicitation/request";
 }
 
@@ -129,6 +130,10 @@ pub struct TurnStartParams {
     pub input: Vec<UserInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Sandbox for this turn and later ones, in object form, such as
+    /// `{"type":"workspaceWrite","writableRoots":[...],...}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -421,6 +426,7 @@ pub struct TurnCompleted {
 pub enum ServerRequest {
     CommandApproval(CommandApprovalParams),
     FileChangeApproval(FileChangeApprovalParams),
+    PermissionsApproval(PermissionsApprovalParams),
     McpElicitation(ElicitationParams),
     Raw(Value),
 }
@@ -430,6 +436,7 @@ impl ServerRequest {
         let parsed = match method {
             method::COMMAND_APPROVAL => typed(params).map(ServerRequest::CommandApproval),
             method::FILE_CHANGE_APPROVAL => typed(params).map(ServerRequest::FileChangeApproval),
+            method::PERMISSIONS_APPROVAL => typed(params).map(ServerRequest::PermissionsApproval),
             method::MCP_ELICITATION => typed(params).map(ServerRequest::McpElicitation),
             _ => None,
         };
@@ -460,6 +467,20 @@ pub struct FileChangeApprovalParams {
     pub item_id: String,
     pub reason: Option<String>,
     pub grant_root: Option<String>,
+}
+
+/// The agent asks for more than its sandbox allows, such as network
+/// access or more writable folders, for the turn or the session.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PermissionsApprovalParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub cwd: Option<String>,
+    pub reason: Option<String>,
+    /// `{"network": ..., "fileSystem": ...}`, each null when not asked for.
+    pub permissions: Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]

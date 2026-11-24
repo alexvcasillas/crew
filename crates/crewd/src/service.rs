@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use uuid::Uuid;
 
-use crate::codex_runner::{Ask, CodexInvocation, spawn_codex_run};
+use crate::codex_runner::{Ask, CodexInvocation, Resume, spawn_codex_run};
 use crate::runner::{RunHandle, RunOutcome, spawn_run, spawn_setup};
 
 /// Told once per run when permission prompts can't reach crewd.
@@ -1208,11 +1208,12 @@ impl Service {
             status: None,
             thread: Some(job.thread),
         };
-        // Resume the agent's latest run here that really started a session.
-        // A run that failed before `claude` came up has nothing to resume.
+        // Resume the agent's latest run here that really started a session
+        // with the CLI it uses now. A run that failed before its CLI came up
+        // has nothing to resume, and one CLI can't resume another's session.
         let mut previous = None;
         for run in db.store.runs(filter)?.into_iter().rev() {
-            if run.agent != job.agent || run.session_id.is_empty() {
+            if run.agent != job.agent || run.session_id.is_empty() || run.runtime != spec.runtime {
                 continue;
             }
             let started = db
@@ -1225,7 +1226,14 @@ impl Service {
                 break;
             }
         }
-        let (resume, prompt) = match previous {
+        // The prompt for a new session: the chat so far, then the prompt.
+        let fresh = match &pending {
+            Some(p) => p.fresh.clone(),
+            // A handoff: the whole thread so far, then the brief.
+            None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
+        };
+        // A resumed session gets what it missed, then the prompt.
+        let resume = match previous {
             Some(run) => {
                 let messages = db.store.messages(job.thread)?;
                 let missed = missed_messages(
@@ -1234,27 +1242,19 @@ impl Service {
                     pending.as_ref().map(|p| p.message),
                     job.agent,
                 );
-                let prompt = with_context(&missed, &agents, &job.prompt);
-                (Some(run.session_id), prompt)
+                Some((run.session_id, with_context(&missed, &agents, &job.prompt)))
             }
-            None => {
-                let prompt = match pending {
-                    Some(p) => p.fresh,
-                    // A handoff: the whole thread so far, then the brief.
-                    None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
-                };
-                (None, prompt)
-            }
+            None => None,
         };
-        // Crew names a new Claude session. Codex names its threads, so a
-        // new Codex run gets its session once the thread has started.
+        // Crew names a Claude session. Codex names its threads, so a Codex
+        // run gets its session once the thread has started or resumed.
         let new_session = Uuid::new_v4();
         let session_id = match (&resume, &spec.runtime) {
-            (Some(id), _) => id.clone(),
+            (Some((id, _)), Runtime::ClaudeCode) => id.clone(),
             (None, Runtime::ClaudeCode) => new_session.to_string(),
-            (None, Runtime::Codex) => String::new(),
+            (_, Runtime::Codex) => String::new(),
         };
-        db.store.start_run(job.run, &session_id)?;
+        db.store.start_run(job.run, &spec.runtime, &session_id)?;
         if announce {
             self.publish_status(db, job.thread, job.run, RunStatus::Working);
         }
@@ -1286,9 +1286,9 @@ impl Service {
         };
         let inv = match spec.runtime {
             Runtime::ClaudeCode => {
-                let session = match resume {
-                    Some(id) => SessionArg::Resume(id),
-                    None => SessionArg::New(new_session),
+                let (session, prompt) = match resume {
+                    Some((id, prompt)) => (SessionArg::Resume(id), prompt),
+                    None => (SessionArg::New(new_session), fresh),
                 };
                 let mut inv = build_claude(&spec, &prompt, &cwd, session, wiring, Some(&context));
                 if let Some(bin) = &self.0.bins.claude {
@@ -1311,8 +1311,8 @@ impl Service {
                     model: spec.model.clone(),
                     permission_mode: spec.permission_mode.clone(),
                     developer_instructions,
-                    prompt,
-                    resume,
+                    prompt: fresh,
+                    resume: resume.map(|(thread, prompt)| Resume { thread, prompt }),
                     mcp: wiring,
                 })
             }
@@ -1355,8 +1355,9 @@ impl Service {
         self.start_ready();
     }
 
-    /// Saves the session a run started if it had none yet, as a new Codex
-    /// run doesn't: Codex names its thread itself. A later run resumes it.
+    /// Saves the session a run started if it had none yet, as a Codex run
+    /// hasn't: Codex names its threads, and a resume may start a new one.
+    /// A later run resumes it.
     fn name_session(&self, run: RunId, session_id: &str) {
         let db = self.db();
         let unnamed = db.store.run(run).is_ok_and(|r| r.session_id.is_empty());
@@ -1661,6 +1662,7 @@ mod tests {
             status,
             started_at: 1,
             ended_at: None,
+            runtime: crew_core::agent::Runtime::ClaudeCode,
         }
     }
 

@@ -115,7 +115,7 @@ fn runs_start_queued_then_get_a_session() {
     assert_eq!(queued.session_id, "");
     assert!(queued.ended_at.is_none());
 
-    store.start_run(r, "sess-1").unwrap();
+    store.start_run(r, &Runtime::ClaudeCode, "sess-1").unwrap();
     let started = store.run(r).unwrap();
     assert_eq!(started.status, RunStatus::Working);
     assert_eq!(started.session_id, "sess-1");
@@ -123,9 +123,14 @@ fn runs_start_queued_then_get_a_session() {
     assert!(started.ended_at.is_none());
 
     assert!(matches!(
-        store.start_run(crew_core::ids::RunId::new(), "x"),
+        store.start_run(crew_core::ids::RunId::new(), &Runtime::ClaudeCode, "x"),
         Err(StoreError::NotFound("run"))
     ));
+
+    assert_eq!(started.runtime, Runtime::ClaudeCode);
+    let r2 = store.create_run(t, a).unwrap();
+    store.start_run(r2, &Runtime::Codex, "").unwrap();
+    assert_eq!(store.run(r2).unwrap().runtime, Runtime::Codex);
 
     // A session the CLI names itself is saved once it is known.
     store.set_run_session(r, "thr-1").unwrap();
@@ -146,7 +151,7 @@ fn unfinished_runs_become_interrupted_on_startup() {
     let r1 = store.create_run(t, a).unwrap();
     let r2 = store.create_run(t, a).unwrap();
     let r3 = store.create_run(t, a).unwrap();
-    store.start_run(r1, "s1").unwrap();
+    store.start_run(r1, &Runtime::ClaudeCode, "s1").unwrap();
     assert_eq!(store.run(r1).unwrap().status, RunStatus::Working);
     assert_eq!(store.run(r2).unwrap().status, RunStatus::Queued);
     store.set_run_status(r3, RunStatus::Done).unwrap();
@@ -355,7 +360,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -724,7 +729,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -733,6 +738,52 @@ fn migrates_v2_db_to_v3_keeping_agents() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert!(broken.is_empty(), "foreign keys broken: {broken:?}");
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V3: &str = include_str!("../src/store/schema_v3.sql");
+
+#[test]
+fn migrates_v3_db_to_v4_runs_were_claude_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    let (p, c, t, a, r) = (
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+    );
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        let spec = serde_json::to_string(&spec("Ada")).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO projects (id, name, root, main_branch, created_at) VALUES ('{p}', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at) VALUES ('{c}', '{p}', 'general', 2);
+             INSERT INTO agents (id, name, spec, created_at) VALUES ('{a}', 'Ada', '{spec}', 3);
+             INSERT INTO threads (id, channel_id, title, created_at) VALUES ('{t}', '{c}', 'first', 4);
+             INSERT INTO runs VALUES ('{r}', '{t}', '{a}', 'sess', 'done', 6, 7, 0);"
+        ))
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let runs = store.runs(RunFilter::default()).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].session_id, "sess");
+    assert_eq!(runs[0].runtime, Runtime::ClaudeCode);
+    drop(store);
+
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();

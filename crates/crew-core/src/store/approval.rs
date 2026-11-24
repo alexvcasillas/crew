@@ -68,10 +68,10 @@ pub struct StoredApproval {
 /// Longest tool input shown in a permission ask.
 const SHORT_INPUT: usize = 80;
 
-/// A short, one-line view of a tool's input: its command or path if it
-/// has one, else its JSON.
+/// A short, one-line view of a tool's input: its label, command or path
+/// if it has one, else its JSON.
 pub fn short_input(input: &serde_json::Value) -> String {
-    let text = ["command", "file_path", "path", "url", "pattern"]
+    let text = ["label", "command", "file_path", "path", "url", "pattern"]
         .iter()
         .find_map(|k| input.get(k).and_then(serde_json::Value::as_str))
         .map(String::from)
@@ -264,6 +264,11 @@ mod tests {
     #[test]
     fn short_input_picks_the_command_and_cuts_it() {
         assert_eq!(short_input(&json!({"command": "ls -la"})), "ls -la");
+        // A shorter label wins over the full command.
+        assert_eq!(
+            short_input(&json!({"command": "/bin/zsh -lc 'ls'", "label": "ls"})),
+            "ls"
+        );
         assert_eq!(
             short_input(&json!({"file_path": "/work/demo/a"})),
             "/work/demo/a"

@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::AgentSpec;
+use crate::agent::{AgentSpec, Runtime};
 use crate::event::{Event, RunStatus};
 use crate::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
 use crate::policy::HandoffPolicy;
@@ -22,11 +22,12 @@ pub use approval::{
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
     include_str!("migrate_v3.sql"),
+    include_str!("migrate_v4.sql"),
 ];
 
 /// Errors from the store.
@@ -153,6 +154,13 @@ pub struct StoredRun {
     pub started_at: i64,
     /// Unix milliseconds, set once the run reaches a terminal status.
     pub ended_at: Option<i64>,
+    /// The CLI that ran it. Set when it starts; Claude Code until then.
+    #[serde(default = "claude_code")]
+    pub runtime: Runtime,
+}
+
+fn claude_code() -> Runtime {
+    Runtime::ClaudeCode
 }
 
 /// Narrows `Store::runs`. Unset fields match everything.
@@ -193,6 +201,14 @@ fn status_text(s: &RunStatus) -> Result<String> {
 }
 
 fn parse_status(s: &str) -> Result<RunStatus> {
+    parse_enum(s)
+}
+
+fn runtime_text(r: &Runtime) -> Result<String> {
+    enum_text(r)
+}
+
+fn parse_runtime(s: &str) -> Result<Runtime> {
     parse_enum(s)
 }
 
@@ -675,15 +691,17 @@ impl Store {
         Ok(id)
     }
 
-    /// Moves a run to `Working` with its session id. `started_at` becomes now.
-    pub fn start_run(&self, r: RunId, session_id: &str) -> Result<()> {
+    /// Moves a run to `Working` with the CLI that runs it and its session
+    /// id. `started_at` becomes now.
+    pub fn start_run(&self, r: RunId, runtime: &Runtime, session_id: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE runs SET session_id = ?2, status = ?3, started_at = ?4 WHERE id = ?1",
+            "UPDATE runs SET session_id = ?2, status = ?3, started_at = ?4, runtime = ?5 WHERE id = ?1",
             params![
                 r.to_string(),
                 session_id,
                 status_text(&RunStatus::Working)?,
-                now_ms()
+                now_ms(),
+                runtime_text(runtime)?
             ],
         )?;
         if changed == 0 {
@@ -904,7 +922,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
 }
 
 const RUN_COLUMNS: &str =
-    "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at FROM runs";
+    "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -916,6 +934,14 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
         status: RunStatus::Queued,
         started_at: r.get(5)?,
         ended_at: r.get(6)?,
+        runtime: Runtime::ClaudeCode,
     };
-    Ok(parse_status(&status).map(|status| StoredRun { status, ..run }))
+    let runtime: String = r.get(7)?;
+    Ok(parse_status(&status).and_then(|status| {
+        Ok(StoredRun {
+            status,
+            runtime: parse_runtime(&runtime)?,
+            ..run
+        })
+    }))
 }

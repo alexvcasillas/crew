@@ -14,8 +14,11 @@ use crew_core::claude::claude_bin_from;
 use crew_core::codex::CodexConn;
 use crew_core::codex::proto::{InitializeParams, ModelListResponse, method};
 use crew_proto::{ModelInfo, RuntimeInfo};
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use tokio::process::Command;
 
+use crate::runner::signal_group;
 use crate::service::{CliBins, log};
 
 /// How long one CLI command may take.
@@ -112,19 +115,27 @@ pub(crate) async fn codex_signed_in(bin: &Path) -> io::Result<Option<bool>> {
 }
 
 /// The models a short-lived `codex app-server` lists, minus hidden ones.
-/// Empty if it fails or takes too long.
+/// Empty if it fails or takes too long. Its process group is killed after.
 async fn codex_models(bin: &Path) -> Vec<ModelInfo> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("app-server").stderr(Stdio::null()).process_group(0);
+    let (conn, _incoming) = match CodexConn::spawn(cmd) {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            log(format!("couldn't start `codex app-server`: {e}"));
+            return vec![];
+        }
+    };
+    let pgid = conn.pid().map(|p| Pid::from_raw(p as i32));
     let list = async {
-        let mut cmd = Command::new(bin);
-        cmd.arg("app-server").stderr(Stdio::null());
-        // Dropping the connection ends the process.
-        let (conn, _incoming) = CodexConn::spawn(cmd)?;
         conn.initialize(&InitializeParams::crew(env!("CARGO_PKG_VERSION")))
             .await?;
         conn.call::<_, ModelListResponse>(method::MODEL_LIST, &serde_json::json!({}))
             .await
     };
-    match tokio::time::timeout(TIMEOUT, list).await {
+    let listed = tokio::time::timeout(TIMEOUT, list).await;
+    signal_group(pgid, Signal::SIGKILL);
+    match listed {
         Ok(Ok(list)) => list
             .data
             .into_iter()
@@ -194,24 +205,26 @@ async fn probe(runtime: Runtime, bin: &Path, sign_in: SignIn) -> RuntimeInfo {
     let Some(path) = find(bin) else {
         return missing;
     };
-    // All at once, so a slow CLI takes one time limit, not several.
-    let (version, signed_in, models) = tokio::join!(
-        run(&path, &["--version"], true),
-        async {
-            match sign_in {
-                SignIn::Claude => run(&path, &["auth", "status"], false)
+    // The version alongside the rest, so a slow CLI takes at most two
+    // time limits: Codex lists its models only once it is signed in.
+    let (version, (signed_in, models)) = tokio::join!(run(&path, &["--version"], true), async {
+        match sign_in {
+            SignIn::Claude => {
+                let signed_in = run(&path, &["auth", "status"], false)
                     .await
-                    .and_then(signed_in),
-                SignIn::Codex => codex_signed_in(&path).await.ok().flatten(),
+                    .and_then(signed_in);
+                (signed_in, claude_models())
             }
-        },
-        async {
-            match sign_in {
-                SignIn::Claude => claude_models(),
-                SignIn::Codex => codex_models(&path).await,
+            SignIn::Codex => {
+                let signed_in = codex_signed_in(&path).await.ok().flatten();
+                let models = match signed_in {
+                    Some(false) => vec![],
+                    _ => codex_models(&path).await,
+                };
+                (signed_in, models)
             }
-        },
-    );
+        }
+    },);
     // The binary is there even if it won't say its version, as a stuck or
     // stubbed CLI may not.
     let version = match version {
