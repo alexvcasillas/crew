@@ -29,6 +29,8 @@ mod title_bar;
 pub mod workspace;
 
 #[cfg(test)]
+mod add_project_tests;
+#[cfg(test)]
 mod appearance_tests;
 #[cfg(test)]
 mod auto_tests;

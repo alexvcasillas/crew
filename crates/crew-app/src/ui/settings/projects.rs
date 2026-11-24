@@ -1,11 +1,10 @@
-//! Settings › Projects: add a git folder, its channels and what a new
-//! worktree gets.
+//! Settings › Projects: each project's channels and what a new worktree
+//! gets. Projects are added through the Add project dialog.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::rc::Rc;
 
-use crew_core::ids::{ChannelId, ProjectId};
+use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::StoredChannel;
 use crew_proto::Request;
@@ -16,17 +15,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{control, field, form_error, help, segment, segmented};
-use crate::client::ClientHandle;
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
-use crate::ui::common::chip;
 use crate::ui::thread_settings::policy_name;
 use crate::ui::title_bar::home_relative;
 use crate::ui::workspace::Workspace;
 
-pub const NOT_GIT: &str = "Crew needs a git repository. Run `git init` there first.";
-const NO_BRANCH: &str = "Crew couldn't tell the main branch. Check out a branch there first.";
-const NO_GIT: &str = "Crew couldn't run git. Install the Xcode command line tools, then try again.";
 /// Budget shown when no layer sets one.
 const DEFAULT_BUDGET: u32 = 3;
 
@@ -42,12 +36,21 @@ pub type PickFolder = Rc<dyn Fn(&mut App) -> Task<Option<PathBuf>>>;
 
 /// The system's folder picker, directories only.
 pub fn native_picker() -> PickFolder {
-    Rc::new(|cx: &mut App| {
+    system_picker(false, "Add project")
+}
+
+/// The system's picker for a setup file or folder.
+pub fn native_file_picker() -> PickFolder {
+    system_picker(true, "Add file")
+}
+
+fn system_picker(files: bool, prompt: &'static str) -> PickFolder {
+    Rc::new(move |cx: &mut App| {
         let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
+            files,
             directories: true,
             multiple: false,
-            prompt: Some("Add project".into()),
+            prompt: Some(prompt.into()),
         });
         cx.spawn(async move |_| {
             paths
@@ -58,44 +61,6 @@ pub fn native_picker() -> PickFolder {
                 .and_then(|p| p.into_iter().next())
         })
     })
-}
-
-/// A git repository's top folder and its current branch, found by git.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Repo {
-    pub root: PathBuf,
-    pub branch: String,
-}
-
-/// Asks git whether `dir` is in a repository, and which branch is out.
-/// Blocks: run it off the UI thread.
-pub fn check_folder(dir: &Path) -> Result<Repo, String> {
-    let git = |args: &[&str]| -> Result<Option<String>, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .map_err(|_| NO_GIT.to_string())?;
-        Ok(out
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .filter(|s| !s.is_empty()))
-    };
-    let root = git(&["rev-parse", "--show-toplevel"])?.ok_or_else(|| NOT_GIT.to_string())?;
-    let branch = git(&["symbolic-ref", "--short", "HEAD"])?.ok_or_else(|| NO_BRANCH.to_string())?;
-    Ok(Repo {
-        root: PathBuf::from(root),
-        branch,
-    })
-}
-
-/// A project's name from its folder.
-pub fn folder_name(root: &Path) -> String {
-    root.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".into())
 }
 
 /// One path per line, blank lines dropped.
@@ -120,57 +85,11 @@ pub fn channel_name(text: &str, taken: &[&str], project: &str) -> Result<String,
 /// The general channel every new project starts with.
 pub const FIRST_CHANNEL: &str = "general";
 
-/// Makes the project and its `#general`, the way both Settings and the
-/// first launch add one.
-pub(crate) async fn create_project(
-    client: ClientHandle,
-    name: String,
-    repo: Repo,
-) -> Result<(ProjectId, ChannelId), String> {
-    let project = client
-        .request(Request::CreateProject {
-            name,
-            root: repo.root.to_string_lossy().into_owned(),
-            main_branch: repo.branch,
-            work_mode: None,
-            copy_files: vec![],
-            setup_command: None,
-        })
-        .await?;
-    let project: ProjectId = serde_json::from_value(project).map_err(|e| e.to_string())?;
-    let channel = client
-        .request(Request::CreateChannel {
-            project,
-            name: FIRST_CHANNEL.into(),
-        })
-        .await?;
-    let channel: ChannelId = serde_json::from_value(channel).map_err(|e| e.to_string())?;
-    Ok((project, channel))
-}
-
-/// Who asked for a folder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FolderFor {
-    Settings,
-    FirstLaunch,
-}
-
 /// Settings › Projects.
 #[derive(Default)]
 pub struct ProjectsPage {
     pub selected: Option<ProjectId>,
     pub form: Option<ProjectForm>,
-    /// A folder chosen to add, waiting for its name.
-    pub adding: Option<Adding>,
-    /// What went wrong with the folder you chose.
-    pub folder_error: Option<String>,
-}
-
-pub struct Adding {
-    pub repo: Repo,
-    pub name: Entity<InputState>,
-    pub error: Option<String>,
-    pub saving: bool,
 }
 
 pub struct ProjectForm {
@@ -188,7 +107,7 @@ pub struct ProjectForm {
 impl Workspace {
     pub(super) fn projects_page_opened(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let page = self.settings.as_ref().map(|s| &s.projects);
-        if page.is_some_and(|p| p.form.is_some() || p.adding.is_some()) {
+        if page.is_some_and(|p| p.form.is_some()) {
             return;
         }
         if let Some(first) = self.state().projects().first().map(|p| p.id) {
@@ -237,8 +156,6 @@ impl Workspace {
         ];
         if let Some(page) = self.projects_page() {
             page.selected = Some(project);
-            page.adding = None;
-            page.folder_error = None;
             page.form = Some(ProjectForm {
                 project,
                 setup,
@@ -254,137 +171,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the folder picker. The folder must be a git repository.
-    pub(crate) fn choose_folder(
-        &mut self,
-        target: FolderFor,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // One picker at a time.
-        if self.folder_task.is_some() {
-            return;
-        }
-        let picked = (self.pick_folder)(cx);
-        let background = cx.background_executor().clone();
-        self.folder_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let checked = match picked.await {
-                Some(dir) => Some(background.spawn(async move { check_folder(&dir) }).await),
-                None => None,
-            };
-            this.update_in(cx, |this, window, cx| {
-                this.folder_task = None;
-                if let Some(checked) = checked {
-                    this.folder_checked(target, checked, window, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// A picker is open or git is being asked about its folder.
-    pub(crate) fn picking_folder(&self) -> bool {
-        self.folder_task.is_some()
-    }
-
-    fn folder_checked(
-        &mut self,
-        target: FolderFor,
-        checked: Result<Repo, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let checked = checked.and_then(|repo| {
-            let known = self.state().projects().iter().any(|p| p.root == repo.root);
-            if known {
-                Err(format!(
-                    "{} is already a project. Open it from the sidebar.",
-                    folder_name(&repo.root)
-                ))
-            } else {
-                Ok(repo)
-            }
-        });
-        match target {
-            FolderFor::FirstLaunch => self.first_launch_folder(checked, window, cx),
-            FolderFor::Settings => {
-                let adding = checked.map(|repo| {
-                    let name = folder_name(&repo.root);
-                    Adding {
-                        repo,
-                        name: cx.new(|cx| InputState::new(window, cx).default_value(name)),
-                        error: None,
-                        saving: false,
-                    }
-                });
-                if let Some(page) = self.projects_page() {
-                    match adding {
-                        Ok(adding) => {
-                            page.adding = Some(adding);
-                            page.folder_error = None;
-                            page.form = None;
-                            page.selected = None;
-                        }
-                        Err(e) => page.folder_error = Some(e),
-                    }
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    /// Makes the project from the folder being added.
-    fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(adding) = self.projects_page().and_then(|p| p.adding.as_mut()) else {
-            return;
-        };
-        if adding.saving {
-            return;
-        }
-        let name = adding.name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            adding.error = Some("Give the project a name.".into());
-            cx.notify();
-            return;
-        }
-        adding.saving = true;
-        adding.error = None;
-        let id = adding.name.entity_id();
-        let repo = adding.repo.clone();
-        let made = create_project(self.client.clone(), name, repo);
-        self.spawn_request(window, cx, async move |this, cx| {
-            let made = made.await;
-            this.update_in(cx, |this, window, cx| match made {
-                Ok((project, _)) => this.project_added(project, window, cx),
-                Err(e) => {
-                    if let Some(adding) = this
-                        .projects_page()
-                        .and_then(|p| p.adding.as_mut())
-                        .filter(|a| a.name.entity_id() == id)
-                    {
-                        adding.saving = false;
-                        adding.error = Some(e);
-                    }
-                    cx.notify();
-                }
-            })
-            .ok();
-            Ok(())
-        });
-        cx.notify();
-    }
-
-    /// Selects a project once crewd has told the app about it.
-    fn project_added(&mut self, project: ProjectId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(page) = self.projects_page() {
-            page.adding = None;
-            page.selected = Some(project);
-        }
-        self.select_project(project, window, cx);
-    }
-
     /// Fills the form of a project that was selected before crewd told
     /// the app about it.
     pub(crate) fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -396,14 +182,6 @@ impl Workspace {
         {
             self.select_project(project, window, cx);
         }
-    }
-
-    fn cancel_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(page) = self.projects_page() {
-            page.adding = None;
-        }
-        self.projects_page_opened(window, cx);
-        cx.notify();
     }
 
     fn save_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -491,17 +269,13 @@ impl Workspace {
         let page = self.settings.as_ref().map(|s| &s.projects);
         let main = match page {
             Some(ProjectsPage {
-                adding: Some(adding),
-                ..
-            }) => self.render_adding(adding, cx).into_any_element(),
-            Some(ProjectsPage {
                 form: Some(form), ..
             }) => self.render_project_form(form, cx).into_any_element(),
             _ => div()
                 .flex_1()
                 .p(ui_px(32.))
                 .child(help(
-                    "Add a project to give your agents a repository to work in.",
+                    "Add a project to give your agents a folder to work in.",
                 ))
                 .into_any_element(),
         };
@@ -519,7 +293,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = page.and_then(|p| p.selected);
-        let folder_error = page.and_then(|p| p.folder_error.clone());
         let projects = self.state().projects();
         let count = match projects.len() {
             1 => "1 project".to_string(),
@@ -595,98 +368,12 @@ impl Workspace {
                             .xsmall()
                             .icon(IconName::Plus)
                             .label("Add project")
-                            .disabled(self.picking_folder())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.choose_folder(FolderFor::Settings, window, cx);
+                                this.open_add_project(window, cx);
                             })),
                     ),
             )
-            .when_some(folder_error, |list, error| {
-                list.child(
-                    div()
-                        .px(ui_px(8.))
-                        .pb(scale::row(8.))
-                        .child(form_error("project-folder-error", error)),
-                )
-            })
             .children(rows)
-            .test_support()
-    }
-
-    fn render_adding(&self, adding: &Adding, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("project-adding")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scroll()
-            .px(ui_px(32.))
-            .py(ui_px(24.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .max_w(ui_px(760.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_px(8.))
-                            .pb(scale::row(16.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(scale::text(20.))
-                                    .font_weight(weight(FontWeight::SEMIBOLD))
-                                    .child("Add project"),
-                            )
-                            .child(
-                                Button::new("project-add-cancel")
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.cancel_adding(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("project-add-confirm")
-                                    .primary()
-                                    .small()
-                                    .label("Add project")
-                                    .disabled(adding.saving)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_project(window, cx);
-                                    })),
-                            ),
-                    )
-                    .when_some(adding.error.clone(), |col, e| {
-                        col.child(form_error("project-add-error", e))
-                    })
-                    .child(field(
-                        "Folder",
-                        None,
-                        chip(home_relative(&adding.repo.root)),
-                    ))
-                    .child(field(
-                        "Main branch",
-                        Some("New threads branch from here."),
-                        div()
-                            .id("project-add-branch")
-                            .font_family(code_family())
-                            .text_size(scale::mono(12.))
-                            .aria_label(adding.repo.branch.clone())
-                            .child(adding.repo.branch.clone())
-                            .test_support(),
-                    ))
-                    .child(field(
-                        "Name",
-                        None,
-                        control("project-add-name", Input::new(&adding.name)),
-                    )),
-            )
             .test_support()
     }
 
@@ -737,11 +424,15 @@ impl Workspace {
                                             .child(project.name.clone())
                                             .test_support(),
                                     )
-                                    .child(help(format!(
-                                        "{} · {}",
-                                        home_relative(&project.root),
-                                        project.main_branch
-                                    ))),
+                                    .child(help(if project.main_branch.is_empty() {
+                                        home_relative(&project.root)
+                                    } else {
+                                        format!(
+                                            "{} · {}",
+                                            home_relative(&project.root),
+                                            project.main_branch
+                                        )
+                                    })),
                             )
                             .when(form.saved, |row| {
                                 row.child(
@@ -904,40 +595,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{NOT_GIT, channel_name, check_folder, copy_lines, folder_name};
-    use std::path::Path;
-    use std::process::Command;
-
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    }
-
-    #[test]
-    fn a_git_folder_gives_its_root_and_branch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("demo");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        git(&repo, &["init", "-q", "-b", "trunk"]);
-        let found = check_folder(&repo.join("src")).unwrap();
-        assert_eq!(found.branch, "trunk");
-        assert_eq!(
-            found.root.canonicalize().unwrap(),
-            repo.canonicalize().unwrap()
-        );
-        assert_eq!(folder_name(&found.root), "demo");
-
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        assert_eq!(check_folder(&plain).unwrap_err(), NOT_GIT);
-    }
+    use super::{channel_name, copy_lines};
 
     #[test]
     fn copy_files_are_one_per_line() {

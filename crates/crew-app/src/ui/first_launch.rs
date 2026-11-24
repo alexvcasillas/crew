@@ -1,6 +1,8 @@
 //! The first launch: no projects yet. Add one, check the agent CLIs and
 //! make a starter agent, then land in `#general`.
 
+use std::path::PathBuf;
+
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::ids::{AgentId, ChannelId, ProjectId};
 use crew_proto::{Request, RuntimeInfo};
@@ -12,7 +14,7 @@ use gpui_kit::*;
 use super::common::provider_icon;
 use super::settings::Page;
 use super::settings::agents::{INSTALL_CLAUDE, blank_spec, default_codex_model, models_of};
-use super::settings::projects::{FIRST_CHANNEL, FolderFor, Repo, create_project, folder_name};
+use super::settings::projects::FIRST_CHANNEL;
 use super::settings::runtimes::{runtime_name, runtime_state};
 use super::title_bar::home_relative;
 use super::workspace::Workspace;
@@ -85,58 +87,37 @@ pub struct FirstLaunch {
     /// step 1 is then done.
     pub project: Option<ProjectId>,
     pub channel: Option<ChannelId>,
-    pub repo: Option<Repo>,
+    pub added: Option<AddedFolder>,
     pub error: Option<String>,
     /// Waiting on crewd.
     pub busy: bool,
 }
 
+/// The folder added in step 1, as step 1 shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddedFolder {
+    pub name: String,
+    pub root: PathBuf,
+    /// The checked out branch, for a git repo.
+    pub branch: Option<String>,
+}
+
 impl Workspace {
-    /// Called with the folder you picked, checked.
-    pub(super) fn first_launch_folder(
+    /// The Add project dialog added `project` while the first launch
+    /// shows: step 1 is done.
+    pub(super) fn first_launch_added(
         &mut self,
-        checked: Result<Repo, String>,
-        window: &mut Window,
+        project: ProjectId,
+        channel: Option<ChannelId>,
+        added: AddedFolder,
         cx: &mut Context<Self>,
     ) {
-        // A project was already added, or is being added.
-        let Some(first) = self
-            .first_launch
-            .as_mut()
-            .filter(|f| f.project.is_none() && !f.busy)
-        else {
-            return;
-        };
-        let repo = match checked {
-            Ok(repo) => repo,
-            Err(e) => {
-                first.error = Some(e);
-                cx.notify();
-                return;
-            }
-        };
-        first.error = None;
-        first.busy = true;
-        let made = create_project(self.client.clone(), folder_name(&repo.root), repo.clone());
-        self.spawn_request(window, cx, async move |this, cx| {
-            let made = made.await;
-            this.update(cx, |this, cx| {
-                if let Some(first) = this.first_launch.as_mut() {
-                    first.busy = false;
-                    match made {
-                        Ok((project, channel)) => {
-                            first.project = Some(project);
-                            first.channel = Some(channel);
-                            first.repo = Some(repo);
-                        }
-                        Err(e) => first.error = Some(e),
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-            Ok(())
-        });
+        if let Some(first) = self.first_launch.as_mut().filter(|f| f.project.is_none()) {
+            first.project = Some(project);
+            first.channel = channel;
+            first.added = Some(added);
+            first.error = None;
+        }
         cx.notify();
     }
 
@@ -223,10 +204,14 @@ impl Workspace {
         };
         // Done once the project is added, whether or not crewd's notice of
         // it arrived yet.
-        let added = first.repo.as_ref().filter(|_| first.project.is_some());
+        let added = first.added.as_ref().filter(|_| first.project.is_some());
         let step1 = match added {
-            Some(repo) => {
-                let name = folder_name(&repo.root);
+            Some(added) => {
+                let name = added.name.clone();
+                let place = match &added.branch {
+                    Some(branch) => format!("{} · {branch}", home_relative(&added.root)),
+                    None => home_relative(&added.root),
+                };
                 div()
                     .id("first-launch-project")
                     .flex()
@@ -240,7 +225,7 @@ impl Workspace {
                             .font_family(code_family())
                             .text_size(scale::mono(12.))
                             .text_color(color("text-tertiary"))
-                            .child(format!("{} · {}", home_relative(&repo.root), repo.branch)),
+                            .child(place),
                     )
                     .test_support()
                     .into_any_element()
@@ -252,9 +237,9 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Choose a folder…")
-                        .disabled(first.busy || self.picking_folder())
+                        .disabled(first.busy)
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.choose_folder(FolderFor::FirstLaunch, window, cx);
+                            this.open_add_project(window, cx);
                         })),
                 )
                 .into_any_element(),
@@ -334,7 +319,7 @@ impl Workspace {
                     .child(step(
                         1,
                         "Add your first project",
-                        "A git repository on this Mac. Each thread gets its own worktree, so your checkout stays as it is.",
+                        "A folder on this Mac: a git repo, a folder of repos or a plain folder.",
                         div()
                             .flex()
                             .flex_col()

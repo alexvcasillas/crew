@@ -26,7 +26,7 @@ use super::markdown_view::DocCache;
 use super::mention_menu::MentionAgent;
 use super::running_view::RunningView;
 use super::service_control::ServiceAction;
-use super::settings::projects::{PickFolder, native_picker};
+use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
@@ -178,7 +178,9 @@ pub struct Workspace {
     snapshot_seen: bool,
     /// Opens a folder picker.
     pub(super) pick_folder: PickFolder,
-    /// Picking a folder and asking git about it.
+    /// Opens a picker for a setup file to add.
+    pub(super) pick_file: PickFolder,
+    /// Picking a folder or a setup file.
     pub(super) folder_task: Option<Task<()>>,
     /// The editor you chose in settings, if you did.
     pub(super) editor_choice: Option<String>,
@@ -321,6 +323,7 @@ impl Workspace {
             first_launch: None,
             snapshot_seen: false,
             pick_folder: native_picker(),
+            pick_file: native_file_picker(),
             folder_task: None,
             editor_choice,
             editors,
@@ -361,6 +364,12 @@ impl Workspace {
     #[cfg(test)]
     pub(super) fn set_folder_picker(&mut self, pick: PickFolder) {
         self.pick_folder = pick;
+    }
+
+    /// Replaces the setup file picker, as tests do.
+    #[cfg(test)]
+    pub(super) fn set_file_picker(&mut self, pick: PickFolder) {
+        self.pick_file = pick;
     }
 
     /// Moves focus off any field onto the window, as clicking empty space
@@ -814,7 +823,7 @@ impl Workspace {
 
     /// Writes the recents to the prefs file, off the UI thread, after any
     /// write still pending, so none is dropped and the latest lands last.
-    fn save_recents(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_recents(&mut self, cx: &mut Context<Self>) {
         let recents = self.recents.clone();
         let home = self.conn.crew_home.clone();
         let pending = self.recents_task.take();

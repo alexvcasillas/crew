@@ -19,8 +19,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::monogram;
-use super::settings::Page;
-use super::settings::projects::FolderFor;
 use super::workspace::{Place, Workspace};
 use crate::client::ClientHandle;
 use crate::theme::color;
@@ -777,8 +775,7 @@ impl Workspace {
             Target::Running => self.show_running(window, cx),
             Target::StopAll => self.stop_all(window, cx),
             Target::AddProject => {
-                self.open_settings(Page::Projects, window, cx);
-                self.choose_folder(FolderFor::Settings, window, cx);
+                self.open_add_project(window, cx);
             }
             Target::ShowAll(_) => {}
         }
