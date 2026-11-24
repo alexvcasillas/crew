@@ -892,10 +892,33 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// How long `agent add` waits for Codex to list its models after crewd's
+/// quick answer.
+const CODEX_MODELS_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// The model a new Codex agent starts on, from the models crewd lists.
 async fn default_codex_model(c: &mut Client) -> Result<crew_proto::ModelInfo> {
-    let runtimes: Vec<RuntimeInfo> = c.ask(Request::Runtimes).await?;
-    let codex = runtimes.iter().find(|r| r.runtime == Runtime::Codex);
+    // A slow check is answered with what is on PATH, and the rest comes
+    // only to `SubscribeAll` connections.
+    c.call(Request::SubscribeAll).await?;
+    let quick: Vec<RuntimeInfo> = c.ask(Request::Runtimes).await?;
+    let mut codex = quick.into_iter().find(|r| r.runtime == Runtime::Codex);
+    let partial = |r: &RuntimeInfo| r.installed && r.models.is_empty() && r.signed_in.is_none();
+    if codex.as_ref().is_some_and(partial) {
+        let full = tokio::time::timeout(CODEX_MODELS_WAIT, async {
+            loop {
+                match c.next().await? {
+                    Some(ServerMsg::RuntimesChanged { runtimes }) => return Ok(Some(runtimes)),
+                    Some(_) => {}
+                    None => return Ok::<_, anyhow::Error>(None),
+                }
+            }
+        })
+        .await;
+        if let Ok(Ok(Some(runtimes))) = full {
+            codex = runtimes.into_iter().find(|r| r.runtime == Runtime::Codex);
+        }
+    }
     match codex {
         Some(r) if !r.installed => {
             bail!("Codex isn't installed. Install it, or use --runtime claude.")
