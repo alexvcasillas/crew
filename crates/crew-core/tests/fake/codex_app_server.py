@@ -26,7 +26,9 @@ The scenario file is a JSON object with a "steps" list. Steps run in order:
    "params": {...}, "reply": {"decision": "accept"}}
       Send a server request, then read the next client message, which must be
       a reply with the same id. "reply" is optional; when given, the reply's
-      result must equal it.
+      result must equal it. Use "replyError": {"code": -32601} instead to
+      require an error reply whose error contains those fields. The id can be
+      any JSON value.
 
   {"sleep": 0.2}
       Pause for that many seconds.
@@ -109,9 +111,12 @@ def main():
             msg = read_message()
             if "method" in msg or msg.get("id") != rid:
                 fail("expected a reply to request %s, got %s" % (rid, json.dumps(msg)))
-            if "result" not in msg:
+            if "replyError" in step:
+                if "error" not in msg or not is_subset(step["replyError"], msg["error"]):
+                    fail("expected an error reply to %s, got %s" % (rid, json.dumps(msg)))
+            elif "result" not in msg:
                 fail("reply to %s has no result: %s" % (rid, json.dumps(msg)))
-            if "reply" in step and msg["result"] != step["reply"]:
+            elif "reply" in step and msg["result"] != step["reply"]:
                 fail("reply to %s was %s" % (rid, json.dumps(msg["result"])))
         elif "sleep" in step:
             time.sleep(step["sleep"])

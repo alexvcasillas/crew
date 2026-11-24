@@ -424,3 +424,155 @@ fn unknown_server_request_is_raw() {
         ServerRequest::Raw(json!("nope"))
     );
 }
+
+#[tokio::test]
+async fn unknown_server_request_gets_an_error_reply() {
+    let (_dir, conn, mut rx) = start(json!([
+        {"request": "item/tool/requestUserInput", "id": 7, "params": {"threadId": "t-1"},
+         "replyError": {"code": -32601, "message": "not supported"}},
+        {"send": {"method": "after/error", "params": {}}}
+    ]));
+
+    let Incoming::ServerRequest { id, method, params } = next(&mut rx).await else {
+        panic!("expected a server request");
+    };
+    assert_eq!(id, RequestId::Int(7));
+    assert!(matches!(
+        ServerRequest::parse(&method, &params),
+        ServerRequest::Raw(_)
+    ));
+    conn.reply_error(id, -32601, "not supported").await.unwrap();
+
+    // The fake only gets here if it accepted the error reply.
+    let after = next_notification(&mut rx).await;
+    assert!(matches!(after, ServerNotification::Raw(ref v) if v["method"] == "after/error"));
+}
+
+#[tokio::test]
+async fn odd_server_request_id_is_kept_and_echoed() {
+    let (_dir, conn, mut rx) = start(json!([
+        {"request": "item/tool/requestUserInput", "id": {"odd": [1]}, "params": {},
+         "reply": {"ok": true}},
+        {"send": {"method": "after/reply", "params": {}}}
+    ]));
+
+    let Incoming::ServerRequest { id, .. } = next(&mut rx).await else {
+        panic!("expected a server request");
+    };
+    assert_eq!(id, RequestId::Other(json!({"odd": [1]})));
+    conn.reply(id, json!({"ok": true})).await.unwrap();
+
+    let after = next_notification(&mut rx).await;
+    assert!(matches!(after, ServerNotification::Raw(ref v) if v["method"] == "after/reply"));
+}
+
+/// A connection over an in-memory pipe; the returned half plays the server.
+fn duplex(
+    max_line: usize,
+) -> (
+    CodexConn,
+    UnboundedReceiver<Incoming>,
+    tokio::io::DuplexStream,
+) {
+    let (client_end, server_end) = tokio::io::duplex(1 << 16);
+    let (read, write) = tokio::io::split(client_end);
+    let (conn, rx) = CodexConn::from_io_with_max_line(read, write, max_line);
+    (conn, rx, server_end)
+}
+
+/// Reads one client line from the server end, so replies are not sent
+/// before the request is registered.
+async fn read_client_line(server: &mut tokio::io::DuplexStream) -> Value {
+    use tokio::io::AsyncReadExt;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while timeout(LIMIT, server.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .is_ok()
+        && byte[0] != b'\n'
+    {
+        line.push(byte[0]);
+    }
+    serde_json::from_slice(&line).unwrap()
+}
+
+async fn write_server(server: &mut tokio::io::DuplexStream, bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    server.write_all(bytes).await.unwrap();
+    server.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn bad_utf8_and_garbage_lines_do_not_close_the_connection() {
+    let (conn, mut rx, mut server) = duplex(CodexConn::MAX_LINE);
+    let pending = {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.request(method::MODEL_LIST, json!({})).await })
+    };
+    assert_eq!(read_client_line(&mut server).await["id"], 1);
+
+    write_server(&mut server, b"\xff\xfe not even json\n").await;
+    write_server(&mut server, b"{not json}\n").await;
+    write_server(
+        &mut server,
+        b"{\"method\":\"warning\",\"params\":{\"message\":\"caf\xe9\"}}\n",
+    )
+    .await;
+    write_server(&mut server, b"{\"id\":\"str\",\"result\":{}}\n").await;
+    write_server(&mut server, b"{\"id\":1,\"result\":{\"data\":[]}}\n").await;
+
+    let res = timeout(LIMIT, pending).await.unwrap().unwrap().unwrap();
+    assert_eq!(res, json!({"data": []}));
+
+    let warning = next_notification(&mut rx).await;
+    let ServerNotification::Raw(v) = warning else {
+        panic!("expected Raw, got {warning:?}");
+    };
+    assert_eq!(v["params"]["message"], "caf\u{fffd}");
+}
+
+#[tokio::test]
+async fn over_long_line_is_skipped_and_reading_goes_on() {
+    let (conn, mut rx, mut server) = duplex(64);
+    let pending = {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.request(method::MODEL_LIST, json!({})).await })
+    };
+    assert_eq!(read_client_line(&mut server).await["id"], 1);
+
+    let long = format!(
+        "{{\"method\":\"big\",\"params\":{{\"x\":\"{}\"}}}}\n",
+        "a".repeat(1000)
+    );
+    // Send it in pieces so the cap is hit across several reads.
+    for chunk in long.as_bytes().chunks(100) {
+        write_server(&mut server, chunk).await;
+    }
+    write_server(&mut server, b"{\"method\":\"small\"}\n").await;
+    write_server(&mut server, b"{\"id\":1,\"result\":{}}\n").await;
+
+    let small = next_notification(&mut rx).await;
+    assert!(matches!(small, ServerNotification::Raw(ref v) if v["method"] == "small"));
+    let res = timeout(LIMIT, pending).await.unwrap().unwrap();
+    assert_eq!(res.unwrap(), json!({}));
+}
+
+#[tokio::test]
+async fn a_line_split_across_writes_is_read_whole() {
+    let (conn, _rx, mut server) = duplex(CodexConn::MAX_LINE);
+    let pending = {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.request(method::MODEL_LIST, json!({})).await })
+    };
+    assert_eq!(read_client_line(&mut server).await["id"], 1);
+
+    write_server(&mut server, b"{\"id\":1,\"res").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_server(&mut server, b"ult\":{\"data\":[]}}").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_server(&mut server, b"\n").await;
+
+    let res = timeout(LIMIT, pending).await.unwrap().unwrap().unwrap();
+    assert_eq!(res, json!({"data": []}));
+}

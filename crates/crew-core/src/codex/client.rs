@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,19 +39,22 @@ pub enum CodexError {
     Json(#[from] serde_json::Error),
 }
 
-/// Id of a request the server sent us. Codex uses numbers, JSON-RPC allows strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Id of a request the server sent us. Codex uses numbers, JSON-RPC allows
+/// strings; anything else is kept as is so the reply can echo it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
     Int(i64),
     Str(String),
+    Other(Value),
 }
 
 /// A message the server sent on its own.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
     Notification(ServerNotification),
-    /// Needs an answer through [`CodexConn::reply`] with the same id.
+    /// Needs an answer through [`CodexConn::reply`] or
+    /// [`CodexConn::reply_error`] with the same id, or Codex waits for ever.
     /// Read it with [`super::proto::ServerRequest::parse`].
     ServerRequest {
         id: RequestId,
@@ -83,8 +87,14 @@ struct Inner {
 }
 
 impl CodexConn {
+    /// Longest line read from the server. Longer lines are skipped.
+    pub const MAX_LINE: usize = 64 * 1024 * 1024;
+
     /// Starts the process with piped stdin and stdout. Stderr is left as the
     /// command has it. Needs a Tokio runtime.
+    ///
+    /// The receiver is unbounded so a slow reader can never hold up
+    /// responses; drain it.
     pub fn spawn(mut cmd: Command) -> Result<(CodexConn, mpsc::UnboundedReceiver<Incoming>)> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -113,6 +123,7 @@ impl CodexConn {
             Some(exit_rx),
             pid,
             Some(kill_tx),
+            Self::MAX_LINE,
         ))
     }
 
@@ -121,7 +132,16 @@ impl CodexConn {
         reader: impl AsyncRead + Send + 'static,
         writer: impl AsyncWrite + Send + 'static,
     ) -> (CodexConn, mpsc::UnboundedReceiver<Incoming>) {
-        Self::start(reader, writer, None, None, None)
+        Self::from_io_with_max_line(reader, writer, Self::MAX_LINE)
+    }
+
+    /// [`CodexConn::from_io`] with a different line cap.
+    pub fn from_io_with_max_line(
+        reader: impl AsyncRead + Send + 'static,
+        writer: impl AsyncWrite + Send + 'static,
+        max_line: usize,
+    ) -> (CodexConn, mpsc::UnboundedReceiver<Incoming>) {
+        Self::start(reader, writer, None, None, None, max_line)
     }
 
     fn start(
@@ -130,10 +150,12 @@ impl CodexConn {
         exited: Option<oneshot::Receiver<()>>,
         pid: Option<u32>,
         kill: Option<oneshot::Sender<()>>,
+        max_line: usize,
     ) -> (CodexConn, mpsc::UnboundedReceiver<Incoming>) {
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(read_loop(Box::pin(reader), pending.clone(), tx, exited));
+        let lines = LineReader::new(Box::pin(reader), max_line);
+        tokio::spawn(read_loop(lines, pending.clone(), tx, exited));
         let conn = CodexConn {
             inner: Arc::new(Inner {
                 writer: tokio::sync::Mutex::new(Box::pin(writer)),
@@ -159,13 +181,13 @@ impl CodexConn {
             Some(map) => map.insert(id, tx),
             None => return Err(CodexError::Closed),
         };
+        // Removes the entry if this future is dropped or fails early.
+        let _guard = PendingGuard {
+            pending: &self.inner.pending,
+            id,
+        };
         let msg = json!({ "id": id, "method": method, "params": params });
-        if let Err(e) = self.send(&msg).await {
-            if let Some(map) = self.inner.pending.lock().unwrap().as_mut() {
-                map.remove(&id);
-            }
-            return Err(e);
-        }
+        self.send(&msg).await?;
         rx.await.unwrap_or(Err(CodexError::Closed))
     }
 
@@ -191,6 +213,12 @@ impl CodexConn {
     /// Answers a server request.
     pub async fn reply(&self, id: RequestId, result: Value) -> Result<()> {
         self.send(&json!({ "id": id, "result": result })).await
+    }
+
+    /// Answers a server request with an error, for requests Crew does not handle.
+    pub async fn reply_error(&self, id: RequestId, code: i64, message: &str) -> Result<()> {
+        let error = json!({ "code": code, "message": message });
+        self.send(&json!({ "id": id, "error": error })).await
     }
 
     /// Runs the handshake: `initialize`, then the `initialized` notification.
@@ -219,34 +247,115 @@ impl CodexConn {
     }
 }
 
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    id: i64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(map) = self.pending.lock().unwrap().as_mut() {
+            map.remove(&self.id);
+        }
+    }
+}
+
+enum Line {
+    Full(Vec<u8>),
+    TooLong,
+    Eof,
+}
+
+/// Reads raw lines with a length cap. Over-long lines are dropped up to the
+/// next newline. Cancel safe: partial lines live in `self`.
+struct LineReader {
+    inner: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
+    buf: Vec<u8>,
+    discarding: bool,
+    max: usize,
+}
+
+impl LineReader {
+    fn new(reader: Pin<Box<dyn AsyncRead + Send>>, max: usize) -> Self {
+        LineReader {
+            inner: BufReader::new(reader),
+            buf: Vec::new(),
+            discarding: false,
+            max,
+        }
+    }
+
+    async fn next(&mut self) -> std::io::Result<Line> {
+        loop {
+            let avail = self.inner.fill_buf().await?;
+            if avail.is_empty() {
+                if std::mem::take(&mut self.discarding) {
+                    return Ok(Line::TooLong);
+                }
+                if self.buf.is_empty() {
+                    return Ok(Line::Eof);
+                }
+                return Ok(Line::Full(std::mem::take(&mut self.buf)));
+            }
+            let newline = avail.iter().position(|&b| b == b'\n');
+            let chunk = &avail[..newline.unwrap_or(avail.len())];
+            if !self.discarding {
+                if self.buf.len() + chunk.len() > self.max {
+                    self.discarding = true;
+                    self.buf = Vec::new();
+                } else {
+                    self.buf.extend_from_slice(chunk);
+                }
+            }
+            let used = newline.map_or(avail.len(), |i| i + 1);
+            self.inner.consume(used);
+            if newline.is_some() {
+                if std::mem::take(&mut self.discarding) {
+                    return Ok(Line::TooLong);
+                }
+                return Ok(Line::Full(std::mem::take(&mut self.buf)));
+            }
+        }
+    }
+}
+
 async fn read_loop(
-    reader: Pin<Box<dyn AsyncRead + Send>>,
+    mut lines: LineReader,
     pending: Pending,
     tx: mpsc::UnboundedSender<Incoming>,
     exited: Option<oneshot::Receiver<()>>,
 ) {
-    let mut lines = BufReader::new(reader).lines();
     let mut exited = exited;
     let mut gone = false;
     loop {
         let line = if gone {
-            match tokio::time::timeout(DRAIN_AFTER_EXIT, lines.next_line()).await {
+            match tokio::time::timeout(DRAIN_AFTER_EXIT, lines.next()).await {
                 Ok(line) => line,
                 Err(_) => break,
             }
         } else if let Some(exit) = exited.as_mut() {
             tokio::select! {
-                line = lines.next_line() => line,
+                line = lines.next() => line,
                 _ = exit => {
                     gone = true;
                     continue;
                 }
             }
         } else {
-            lines.next_line().await
+            lines.next().await
         };
-        let Ok(Some(line)) = line else { break };
-        handle_line(&line, &pending, &tx);
+        match line {
+            Ok(Line::Full(line)) => handle_line(&line, &pending, &tx),
+            Ok(Line::TooLong) => eprintln!(
+                "crew: skipped a codex app-server line longer than {} bytes",
+                lines.max
+            ),
+            Ok(Line::Eof) => break,
+            Err(e) => {
+                eprintln!("crew: reading from codex app-server failed: {e}");
+                break;
+            }
+        }
     }
     // Fail everything still waiting; dropping `tx` ends the receiver.
     let waiting = pending.lock().unwrap().take();
@@ -255,25 +364,43 @@ async fn read_loop(
     }
 }
 
-fn handle_line(line: &str, pending: &Pending, tx: &mpsc::UnboundedSender<Incoming>) {
-    let Ok(Value::Object(mut msg)) = serde_json::from_str::<Value>(line) else {
+/// Parses a line, replacing bad UTF-8 if that is all that is wrong with it.
+fn parse_line(line: &[u8]) -> Option<Value> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let parsed = serde_json::from_slice(line).or_else(|e| match std::str::from_utf8(line) {
+        Ok(_) => Err(e),
+        Err(_) => serde_json::from_str(&String::from_utf8_lossy(line)),
+    });
+    match parsed {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("crew: codex app-server sent a line that is not JSON: {e}");
+            None
+        }
+    }
+}
+
+fn handle_line(line: &[u8], pending: &Pending, tx: &mpsc::UnboundedSender<Incoming>) {
+    let Some(Value::Object(mut msg)) = parse_line(line) else {
         return;
     };
     let id = msg.get("id").filter(|id| !id.is_null()).cloned();
     if let Some(Value::String(method)) = msg.get("method").cloned() {
-        let incoming = match id.map(serde_json::from_value::<RequestId>) {
-            Some(Ok(id)) => Incoming::ServerRequest {
-                id,
+        let incoming = match id {
+            Some(id) => Incoming::ServerRequest {
+                id: serde_json::from_value(id.clone()).unwrap_or(RequestId::Other(id)),
                 method,
                 params: msg.remove("params").unwrap_or(Value::Null),
             },
-            Some(Err(_)) => return,
             None => Incoming::Notification(ServerNotification::parse(Value::Object(msg))),
         };
         let _ = tx.send(incoming);
         return;
     }
-    let Some(id) = id.and_then(|id| id.as_i64()) else {
+    let Some(id) = id.as_ref().and_then(Value::as_i64) else {
+        eprintln!("crew: codex app-server sent a reply with an unknown id: {id:?}");
         return;
     };
     let Some(reply) = pending.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) else {
@@ -292,4 +419,28 @@ fn handle_line(line: &str, pending: &Pending, tx: &mpsc::UnboundedSender<Incomin
         None => Ok(msg.remove("result").unwrap_or(Value::Null)),
     };
     let _ = reply.send(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_len(conn: &CodexConn) -> usize {
+        conn.inner.pending.lock().unwrap().as_ref().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn dropped_request_leaves_no_pending_entry() {
+        let (client_end, _server_end) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(client_end);
+        let (conn, _rx) = CodexConn::from_io(read, write);
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            conn.request("model/list", json!({})),
+        )
+        .await;
+        assert!(res.is_err(), "no reply was sent, so it must time out");
+        assert_eq!(pending_len(&conn), 0);
+    }
 }
