@@ -1576,3 +1576,57 @@ async fn a_live_edit_refreshes_the_counts() {
         .unwrap();
     c.until_status(RunStatus::Stopped).await;
 }
+
+/// A fake claude that writes `file.txt` and reports no edit.
+fn quiet_writing_script(dir: &Path) -> PathBuf {
+    let path = dir.join("claude-writes-quietly.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}'\n",
+            fake("claude_writes.sh").display(),
+            fixture("read_file.jsonl").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_or_a_discard_tells_the_app_the_counts_changed() {
+    let scripts = tempfile::tempdir().unwrap();
+    let d = Daemon::start(quiet_writing_script(scripts.path())).await;
+    let mut c = d.client().await;
+    let s = setup(&d, &mut c).await;
+    post(&mut c, s.thread, "@Forge fix it").await;
+    c.until_status(RunStatus::Done).await;
+    let fix = summary(&overview(&mut c, s.channel).await, s.thread).clone();
+    assert_eq!(fix.worktree, WorktreeState::Uncommitted { files: 1 });
+    let mut app = app_client(&d).await;
+    let is_stale = |m: &ServerMsg| matches!(m, ServerMsg::ChannelOverviewStale { channel } if *channel == s.channel);
+    let early = timeout(Duration::from_millis(300), app.until(is_stale)).await;
+    assert!(early.is_err(), "nothing changed yet");
+
+    let _: String = c
+        .ok(Request::Commit {
+            thread: s.thread,
+            message: "Add file".into(),
+        })
+        .await;
+    timeout(Duration::from_millis(2000), app.until(is_stale))
+        .await
+        .expect("told after the commit");
+    let fix = summary(&overview(&mut c, s.channel).await, s.thread).clone();
+    assert_eq!(fix.worktree, WorktreeState::Committed);
+
+    c.call(Request::Discard {
+        thread: s.thread,
+        delete_branch: true,
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_millis(2000), app.until(is_stale))
+        .await
+        .expect("told after the discard");
+}

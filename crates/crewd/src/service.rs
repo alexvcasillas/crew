@@ -806,6 +806,9 @@ impl Service {
         .await;
         self.changes_may_differ(thread);
         self.release_change(thread);
+        if matches!(result, Ok(Some(_))) {
+            self.thread_overview_stale(thread);
+        }
         match result? {
             Some(sha) => json(sha),
             None => Err("Nothing to commit.".into()),
@@ -850,6 +853,7 @@ impl Service {
             Ok(())
         };
         self.release_change(thread);
+        self.thread_overview_stale(thread);
         result?;
         cleared?;
         Ok(serde_json::Value::Null)
