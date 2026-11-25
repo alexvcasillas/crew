@@ -1,11 +1,13 @@
-//! Settings, in place of the body: General, Appearance, Agents, Runtimes,
-//! Handoffs and limits, Projects and Shortcuts.
+//! Settings, in place of the body: General, Appearance, Skills, Agents,
+//! Runtimes, Handoffs and limits, Projects and Shortcuts.
 
 pub mod agents;
 pub mod appearance;
+pub mod general;
 pub mod limits;
 pub mod projects;
 pub mod runtimes;
+pub mod skills;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::select::{Select, SelectEvent};
@@ -22,7 +24,9 @@ use crate::theme::scale::{self, code_family, ui_px, weight};
 
 pub use agents::AgentsPage;
 pub use appearance::AppearancePage;
+pub use general::GeneralPage;
 pub use projects::ProjectsPage;
+pub use skills::SkillsPage;
 
 actions!(
     settings,
@@ -54,6 +58,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum Page {
     General,
     Appearance,
+    Skills,
     Agents,
     Runtimes,
     Limits,
@@ -61,9 +66,10 @@ pub enum Page {
     Shortcuts,
 }
 
-const PAGES: [(Page, &str, &str); 7] = [
+const PAGES: [(Page, &str, &str); 8] = [
     (Page::General, "settings-nav-general", "General"),
     (Page::Appearance, "settings-nav-appearance", "Appearance"),
+    (Page::Skills, "settings-nav-skills", "Skills"),
     (Page::Agents, "settings-nav-agents", "Agents"),
     (Page::Runtimes, "settings-nav-runtimes", "Runtimes"),
     (Page::Limits, "settings-nav-limits", "Handoffs and limits"),
@@ -79,6 +85,10 @@ pub struct SettingsView {
     pub projects: ProjectsPage,
     /// The appearance page's controls, made when it first opens.
     pub appearance: Option<AppearancePage>,
+    /// The skills page's controls, made when it first opens.
+    pub skills: Option<SkillsPage>,
+    /// The general page's controls, made when it first opens.
+    pub general: Option<GeneralPage>,
 }
 
 impl SettingsView {
@@ -89,6 +99,8 @@ impl SettingsView {
             agents: AgentsPage::default(),
             projects: ProjectsPage::default(),
             appearance: None,
+            skills: None,
+            general: None,
         }
     }
 }
@@ -186,6 +198,8 @@ impl Workspace {
             Page::Agents => self.agents_page_opened(window, cx),
             Page::Projects => self.projects_page_opened(window, cx),
             Page::Appearance => self.appearance_page_opened(window, cx),
+            Page::Skills => self.skills_page_opened(window, cx),
+            Page::General => self.general_page_opened(window, cx),
             _ => {}
         }
     }
@@ -232,8 +246,9 @@ impl Workspace {
             return div().into_any_element();
         };
         let page = match view.page {
-            Page::General => self.render_general().into_any_element(),
+            Page::General => self.render_general(cx).into_any_element(),
             Page::Appearance => self.render_appearance_page(cx),
+            Page::Skills => self.render_skills_page(cx),
             Page::Agents => self.render_agents_page(cx),
             Page::Projects => self.render_projects_page(cx),
             Page::Runtimes => self.render_runtimes_page(cx),
@@ -279,24 +294,40 @@ impl Workspace {
             }))
     }
 
-    fn render_general(&self) -> impl IntoElement {
+    fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
         page_scroll("settings-general")
-            .child(page_title("General"))
-            .child(field(
-                "Crew home",
-                Some("Where crewd keeps its database, socket and worktrees."),
-                value_text("general-home", home_relative(&self.conn.crew_home), true),
-            ))
-            .child(field(
-                "Editor",
-                Some("Open in editor uses this app."),
-                div().w(ui_px(280.)).child(control(
-                    "general-editor",
-                    Select::new(&self.editor_select)
-                        .small()
-                        .accessibility_label("Editor"),
-                )),
-            ))
+            .gap_0()
+            .pb(ui_px(32.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .max_w(ui_px(general::PAGE_WIDTH))
+                    .child(
+                        div()
+                            .mb(ui_px(16.))
+                            .text_size(scale::text(24.))
+                            .line_height(scale::line(32.))
+                            .font_weight(weight(FontWeight::SEMIBOLD))
+                            .child("General"),
+                    )
+                    .child(self.render_title_fields(cx))
+                    .child(general::board_row(field(
+                        "Crew home",
+                        Some("Where crewd keeps its database, socket and worktrees."),
+                        value_text("general-home", home_relative(&self.conn.crew_home), true),
+                    )))
+                    .child(general::board_row(field(
+                        "Editor",
+                        Some("Open in editor uses this app."),
+                        div().w(ui_px(280.)).child(control(
+                            "general-editor",
+                            Select::new(&self.editor_select)
+                                .small()
+                                .accessibility_label("Editor"),
+                        )),
+                    ))),
+            )
     }
 }
 

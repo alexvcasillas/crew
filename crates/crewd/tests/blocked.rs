@@ -119,6 +119,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 max_runs: 4,
                 claude_bin: Some(claude),
                 crew_mcp_bin: None,
@@ -298,6 +299,7 @@ async fn setup(d: &Daemon, c: &mut Client) -> ThreadId {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -309,6 +311,8 @@ async fn blocked(c: &mut Client, thread: ThreadId, body: &str) -> (StoredApprova
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -385,6 +389,8 @@ async fn a_blocked_call_asks_you_and_allow_retries_it_once() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge again".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -457,6 +463,8 @@ async fn only_auto_agents_get_blocked_cards() {
     c.call(Request::PostMessage {
         thread,
         body: "@Scout clean up BLOCK".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -536,6 +544,8 @@ async fn a_later_run_of_the_agent_makes_a_stopped_call_stale() {
     c.call(Request::PostMessage {
         thread,
         body: "@Scout have a look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -554,6 +564,8 @@ async fn a_later_run_of_the_agent_makes_a_stopped_call_stale() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge carry on".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -592,6 +604,8 @@ async fn only_a_real_safety_check_refusal_makes_a_card() {
         c.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();

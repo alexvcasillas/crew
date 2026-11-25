@@ -25,7 +25,7 @@ pub use approval::{
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 14;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -38,7 +38,67 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v9.sql"),
     include_str!("migrate_v10.sql"),
     include_str!("migrate_v11.sql"),
+    include_str!("migrate_v12.sql"),
+    include_str!("migrate_v13.sql"),
+    include_str!("migrate_v14.sql"),
 ];
+
+/// How a new thread gets its title.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleMode {
+    /// A short run of a cheap model names the thread after its first
+    /// message. The first line stands until it answers.
+    #[default]
+    Generated,
+    /// The first line of the first message.
+    FirstLine,
+}
+
+/// The model a generated title comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleModel {
+    #[default]
+    Haiku,
+    Sonnet,
+    /// The cheapest model Codex lists.
+    CodexCheapest,
+}
+
+/// How new threads get their titles. Stored as rows of `settings`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TitleSettings {
+    pub mode: TitleMode,
+    pub model: TitleModel,
+}
+
+/// Where a thread's title came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    /// The first line of its first message, or the title it was created
+    /// with.
+    #[default]
+    FirstLine,
+    /// Still the first line, while a title is being generated.
+    Generating,
+    Generated,
+    /// You renamed it. Nothing replaces it.
+    User,
+}
+
+impl TitleSource {
+    fn parse(raw: &str) -> TitleSource {
+        match raw {
+            "generating" => TitleSource::Generating,
+            "generated" => TitleSource::Generated,
+            "user" => TitleSource::User,
+            _ => TitleSource::FirstLine,
+        }
+    }
+}
 
 /// The global limits you set in the app. Stored as rows of `settings`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +290,9 @@ pub struct StoredThread {
     /// Unix milliseconds, set while the thread is archived.
     #[serde(default)]
     pub archived_at: Option<i64>,
+    /// Where its title came from.
+    #[serde(default)]
+    pub title_source: TitleSource,
 }
 
 /// What a channel overview needs from one thread's messages and asks.
@@ -268,6 +331,16 @@ pub struct StoredRun {
     /// While queued: the run writing in the same folder it waits for.
     #[serde(default)]
     pub waiting_for: Option<RunId>,
+    /// The skill the run was asked to run, if any.
+    #[serde(default)]
+    pub skill: Option<String>,
+    /// The model the run was asked to use instead of its agent's, for
+    /// this one message. Boxed to keep runs small in messages.
+    #[serde(default)]
+    pub model_override: Option<Box<str>>,
+    /// The message that asked for the run, if one did.
+    #[serde(default)]
+    pub message: Option<MessageId>,
 }
 
 fn claude_code() -> Runtime {
@@ -418,6 +491,50 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Whether the "/" menu lists the skill with this key. Skills are
+    /// shown until hidden.
+    pub fn skill_shown(&self, key: &str) -> Result<bool> {
+        Ok(self.setting(&format!("skill_shown:{key}"))?.as_deref() != Some("0"))
+    }
+
+    /// Saves whether the "/" menu lists the skill with this key.
+    pub fn set_skill_shown(&self, key: &str, shown: bool) -> Result<()> {
+        self.set_setting(&format!("skill_shown:{key}"), if shown { "1" } else { "0" })
+    }
+
+    /// How new threads get their titles. A missing or unreadable row
+    /// gives its default.
+    pub fn title_settings(&self) -> Result<TitleSettings> {
+        let mode = match self.setting("title_mode")?.as_deref() {
+            Some("first_line") => TitleMode::FirstLine,
+            _ => TitleMode::Generated,
+        };
+        let model = match self.setting("title_model")?.as_deref() {
+            Some("sonnet") => TitleModel::Sonnet,
+            Some("codex_cheapest") => TitleModel::CodexCheapest,
+            _ => TitleModel::Haiku,
+        };
+        Ok(TitleSettings { mode, model })
+    }
+
+    /// Saves how new threads get their titles.
+    pub fn set_title_settings(&self, titles: &TitleSettings) -> Result<()> {
+        let mode = match titles.mode {
+            TitleMode::Generated => "generated",
+            TitleMode::FirstLine => "first_line",
+        };
+        let model = match titles.model {
+            TitleModel::Haiku => "haiku",
+            TitleModel::Sonnet => "sonnet",
+            TitleModel::CodexCheapest => "codex_cheapest",
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        self.set_setting("title_mode", mode)?;
+        self.set_setting("title_model", model)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -833,11 +950,26 @@ impl Store {
             .collect())
     }
 
+    /// A thread titled with the first line of its first message, which a
+    /// generated title may replace.
     pub fn create_thread(&self, c: ChannelId, title: &str) -> Result<ThreadId> {
+        self.create_thread_titled(c, title, false)
+    }
+
+    /// A thread with a title you chose when `chosen`, which nothing
+    /// replaces; else as [`Store::create_thread`].
+    pub fn create_thread_titled(
+        &self,
+        c: ChannelId,
+        title: &str,
+        chosen: bool,
+    ) -> Result<ThreadId> {
         let id = ThreadId::new();
+        let source = if chosen { "user" } else { "first_line" };
         self.conn.execute(
-            "INSERT INTO threads (id, channel_id, title, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), c.to_string(), title, now_ms()],
+            "INSERT INTO threads (id, channel_id, title, created_at, title_source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), c.to_string(), title, now_ms(), source],
         )?;
         Ok(id)
     }
@@ -915,9 +1047,68 @@ impl Store {
         Ok(found)
     }
 
+    /// Marks a thread whose title is still its first line as having one
+    /// generated. False if its title came from anywhere else.
+    pub fn start_title(&self, t: ThreadId) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET title_source = 'generating'
+             WHERE id = ?1 AND title_source = 'first_line'",
+            [t.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Replaces the first line with a generated title, unless you renamed
+    /// the thread meanwhile. True if it was replaced. The first line is
+    /// kept for the thread's branch name.
+    pub fn set_generated_title(&self, t: ThreadId, title: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET first_title = title, title = ?2, title_source = 'generated'
+             WHERE id = ?1 AND title_source = 'generating'",
+            params![t.to_string(), title],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Leaves the first line as the title of a thread whose title wasn't
+    /// generated. True if it was still being generated.
+    pub fn keep_first_line(&self, t: ThreadId) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE threads SET title_source = 'first_line'
+             WHERE id = ?1 AND title_source = 'generating'",
+            [t.to_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Titles left generating by an earlier crewd stay their first line.
+    pub fn end_stale_titles(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET title_source = 'first_line' WHERE title_source = 'generating'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// What the thread's branch is named after: the title it had before
+    /// one was generated, else its title.
+    pub fn branch_title(&self, t: ThreadId) -> Result<String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(first_title, title) FROM threads WHERE id = ?1",
+                [t.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        row.ok_or(StoreError::NotFound("thread"))
+    }
+
+    /// Sets the title you gave the thread. A title being generated no
+    /// longer replaces it.
     pub fn rename_thread(&self, t: ThreadId, title: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE threads SET title = ?2 WHERE id = ?1",
+            "UPDATE threads SET title = ?2, title_source = 'user' WHERE id = ?1",
             params![t.to_string(), title],
         )?;
         if changed == 0 {
@@ -1187,6 +1378,36 @@ impl Store {
             ],
         )?;
         Ok(id)
+    }
+
+    /// Saves the skill a queued run was asked to run.
+    pub fn set_run_skill(&self, r: RunId, skill: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET skill = ?2 WHERE id = ?1",
+            params![r.to_string(), skill],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    /// Saves the message that asked for a queued run and the model it
+    /// was asked to use for that message alone.
+    pub fn set_run_request(
+        &self,
+        r: RunId,
+        message: MessageId,
+        model_override: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET message_id = ?2, model_override = ?3 WHERE id = ?1",
+            params![r.to_string(), message.to_string(), model_override],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
     }
 
     /// Adds a queued run of `a` that `from` brought in with a handoff.
@@ -1541,7 +1762,7 @@ fn read_channel(r: &Row) -> rusqlite::Result<Result<StoredChannel>> {
 
 const THREAD_COLUMNS: &str = "SELECT id, channel_id, title, created_at, worktree_path,
      worktree_branch, worktree_base, handoff_policy, handoff_budget, handoffs_used,
-     worktree_ready, archived_at, worktree_repos FROM threads";
+     worktree_ready, archived_at, worktree_repos, title_source FROM threads";
 
 fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
     let path: Option<String> = r.get(4)?;
@@ -1567,6 +1788,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
         handoff_budget: r.get(8)?,
         handoffs_used: r.get(9)?,
         archived_at: r.get(11)?,
+        title_source: TitleSource::parse(&r.get::<_, String>(13)?),
     };
     let policy: Option<String> = r.get(7)?;
     let repos: String = r.get(12)?;
@@ -1585,7 +1807,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
 
 const RUN_COLUMNS: &str =
     "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime,
-     waiting_for FROM runs";
+     waiting_for, skill, model_override, message_id FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -1602,6 +1824,12 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
             .get::<_, Option<String>>(8)?
             .and_then(|w| Uuid::parse_str(&w).ok())
             .map(RunId),
+        skill: r.get(9)?,
+        model_override: r.get(10)?,
+        message: r
+            .get::<_, Option<String>>(11)?
+            .and_then(|m| Uuid::parse_str(&m).ok())
+            .map(MessageId),
     };
     let runtime: String = r.get(7)?;
     Ok(parse_status(&status).and_then(|status| {

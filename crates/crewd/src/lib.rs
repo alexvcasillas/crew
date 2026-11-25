@@ -12,6 +12,8 @@ mod runtimes;
 mod search;
 pub mod server;
 pub mod service;
+mod skills;
 mod terminal;
+mod titles;
 
 pub use server::{AlreadyRunning, ServeOptions, claude_home_from, serve, serve_until};

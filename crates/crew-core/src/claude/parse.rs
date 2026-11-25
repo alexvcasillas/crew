@@ -259,11 +259,32 @@ pub fn parse_line(line: &str) -> Vec<Event> {
     };
     match str_at(&v, "type") {
         "system" => match str_at(&v, "subtype") {
-            "init" => vec![Event::SessionStarted {
-                session_id: str_at(&v, "session_id").to_string(),
-                model: str_at(&v, "model").to_string(),
-                cwd: str_at(&v, "cwd").to_string(),
-            }],
+            "init" => {
+                let mut events = vec![Event::SessionStarted {
+                    session_id: str_at(&v, "session_id").to_string(),
+                    model: str_at(&v, "model").to_string(),
+                    cwd: str_at(&v, "cwd").to_string(),
+                }];
+                // Commands are listed apart from skills; both can be run.
+                let listed = |key: &str| {
+                    v.get(key).and_then(Value::as_array).map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let (skills, commands) = (listed("skills"), listed("slash_commands"));
+                if skills.is_some() || commands.is_some() {
+                    let mut all = skills.unwrap_or_default();
+                    for name in commands.unwrap_or_default() {
+                        if !all.contains(&name) {
+                            all.push(name);
+                        }
+                    }
+                    events.push(Event::SkillsListed { skills: all });
+                }
+                events
+            }
             "hook_started" | "hook_response" | "thinking_tokens" | "commands_changed" => vec![],
             "permission_denied" if !str_at(&v, "tool_name").is_empty() => {
                 vec![Event::PermissionDenied {

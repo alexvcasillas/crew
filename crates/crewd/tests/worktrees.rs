@@ -129,6 +129,7 @@ impl Daemon {
         assert_eq!(path.is_relative(), relative);
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
                 ..opts
@@ -305,6 +306,7 @@ async fn setup(d: &Daemon, c: &mut Client) -> Setup {
         .ok(Request::CreateThread {
             channel,
             title: "Fix login".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -319,6 +321,8 @@ async fn post(c: &mut Client, thread: ThreadId, body: &str) {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -936,6 +940,7 @@ async fn relative_crew_home_keeps_worktrees_in_the_home() {
 async fn lagging_subscriber_is_told_to_resync() {
     let scripts = tempfile::tempdir().unwrap();
     let opts = ServeOptions {
+        no_title_runs: true,
         notice_buffer: 2,
         ..ServeOptions::default()
     };
@@ -972,6 +977,7 @@ async fn lagging_subscriber_is_told_to_resync() {
 async fn time_limit_starts_after_setup() {
     let scripts = tempfile::tempdir().unwrap();
     let opts = ServeOptions {
+        no_title_runs: true,
         minute: Duration::from_secs(1),
         ..ServeOptions::default()
     };
@@ -1280,12 +1286,14 @@ async fn channel_overview_sums_up_each_thread() {
         .ok(Request::CreateThread {
             channel: s.channel,
             title: "Nothing yet".into(),
+            first_line: false,
         })
         .await;
     let noted: ThreadId = c
         .ok(Request::CreateThread {
             channel: s.channel,
             title: "Just a note".into(),
+            first_line: false,
         })
         .await;
     post(
@@ -1474,6 +1482,7 @@ async fn channel_settings_keep_an_old_name_and_cap_the_description() {
 async fn a_slow_count_comes_later_and_archived_threads_skip_git() {
     let scripts = tempfile::tempdir().unwrap();
     let opts = ServeOptions {
+        no_title_runs: true,
         count_delay: Duration::from_secs(3),
         ..ServeOptions::default()
     };

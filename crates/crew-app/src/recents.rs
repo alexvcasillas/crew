@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 /// enough behind.
 pub const KEPT_THREADS: usize = 10;
 
+/// Skills kept, more than the `/` menu shows, so hidden or removed ones
+/// leave enough behind.
+pub const KEPT_SKILLS: usize = 10;
+
 /// Folders Add project lists under Recent folders.
 pub const KEPT_FOLDERS: usize = 3;
 
@@ -37,6 +41,8 @@ pub struct Recents {
     pub project: Option<ProjectId>,
     /// Folders picked or added, newest first.
     pub folders: Vec<RecentFolder>,
+    /// Skills you ran, by key such as `global:unslop`, newest first.
+    pub skills: Vec<String>,
 }
 
 impl Recents {
@@ -51,6 +57,17 @@ impl Recents {
     pub fn save(&self, crew_home: &Path) -> std::io::Result<()> {
         let value = serde_json::to_value(self).map_err(std::io::Error::other)?;
         crate::prefs::write(crew_home, KEY, value)
+    }
+
+    /// Puts the skill `key` first. Whether anything changed.
+    pub fn used_skill(&mut self, key: &str) -> bool {
+        if self.skills.first().map(String::as_str) == Some(key) {
+            return false;
+        }
+        self.skills.retain(|k| k != key);
+        self.skills.insert(0, key.to_string());
+        self.skills.truncate(KEPT_SKILLS);
+        true
     }
 
     /// Puts `thread` first. Whether anything changed.
@@ -104,7 +121,7 @@ mod tests {
 
     use crew_core::project_kind::ProjectKind;
 
-    use super::{KEPT_FOLDERS, KEPT_THREADS, Recents};
+    use super::{KEPT_FOLDERS, KEPT_SKILLS, KEPT_THREADS, Recents};
 
     fn thread() -> ThreadId {
         ThreadId::new()
@@ -168,5 +185,19 @@ mod tests {
             crate::editor::load_choice(home.path()).as_deref(),
             Some("Zed")
         );
+    }
+
+    #[test]
+    fn skills_used_come_first_once() {
+        let mut r = Recents::default();
+        assert!(r.used_skill("global:unslop"));
+        assert!(r.used_skill("project:bench"));
+        assert!(!r.used_skill("project:bench"));
+        assert!(r.used_skill("global:unslop"));
+        assert_eq!(r.skills, ["global:unslop", "project:bench"]);
+        for i in 0..20 {
+            r.used_skill(&format!("global:s{i}"));
+        }
+        assert_eq!(r.skills.len(), KEPT_SKILLS);
     }
 }

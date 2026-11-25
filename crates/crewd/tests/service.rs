@@ -116,6 +116,7 @@ impl Daemon {
         crew_mcp_bin: Option<PathBuf>,
     ) -> Daemon {
         Daemon::start_opts(ServeOptions {
+            no_title_runs: true,
             max_runs,
             claude_bin: Some(claude_bin),
             crew_mcp_bin,
@@ -301,6 +302,7 @@ async fn setup(c: &mut Client, root: &Path, n: usize) -> (AgentId, Vec<ThreadId>
             c.ok(Request::CreateThread {
                 channel,
                 title: format!("thread {i}"),
+                first_line: false,
             })
             .await,
         );
@@ -328,7 +330,7 @@ async fn hello_with_wrong_version_is_refused() {
     let err = c.call(Request::Hello { version: 99 }).await.unwrap_err();
     assert_eq!(
         err,
-        "crewd speaks protocol 14, client speaks 99. Restart crewd."
+        "crewd speaks protocol 15, client speaks 99. Restart crewd."
     );
     assert!(c.recv().await.is_none(), "connection should be closed");
 }
@@ -349,6 +351,8 @@ async fn mention_starts_run_and_agent_replies() {
         .ok(Request::PostMessage {
             thread,
             body: "@Forge fix it".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
 
@@ -430,6 +434,8 @@ async fn usage_gets_the_window_remembered_for_its_model() {
             .ok(Request::PostMessage {
                 thread,
                 body: body.into(),
+                skill: None,
+                model_override: None,
             })
             .await;
         let seen = c
@@ -500,6 +506,8 @@ async fn agent_cli_gets_the_run_id() {
         .ok(Request::PostMessage {
             thread,
             body: "@Forge go".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
     c.until(|m| {
@@ -536,6 +544,8 @@ async fn unknown_mention_posts_system_message() {
     c.call(Request::PostMessage {
         thread,
         body: "hey @Nobody".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -563,6 +573,8 @@ async fn late_subscriber_gets_backlog_from_seq_0() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge fix it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -624,6 +636,8 @@ async fn client_disconnect_keeps_run_alive() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge fix it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -654,6 +668,8 @@ async fn stop_all_stops_running_and_queued() {
         c.call(Request::PostMessage {
             thread,
             body: "@Forge wait".into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -745,6 +761,8 @@ async fn second_daemon_refuses_and_leaves_runs_alone() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge wait".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -794,6 +812,8 @@ async fn failed_spawn_does_not_get_resumed() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge first".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -813,6 +833,8 @@ async fn failed_spawn_does_not_get_resumed() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge second".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -852,6 +874,8 @@ async fn reply_in_thread_resumes_agent_session() {
     c.call(Request::PostMessage {
         thread,
         body: "hello".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -859,6 +883,8 @@ async fn reply_in_thread_resumes_agent_session() {
         c.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -900,6 +926,8 @@ async fn runs_get_crew_mcp_when_it_exists() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -980,6 +1008,8 @@ async fn runs_hear_their_crew_context_in_one_system_prompt() {
     c.call(Request::PostMessage {
         thread,
         body: "@Scout look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1025,6 +1055,8 @@ async fn read_only_runs_get_handoff_but_no_prompt_tool() {
     c.call(Request::PostMessage {
         thread,
         body: "@Scout look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1058,6 +1090,8 @@ async fn runs_go_without_crew_mcp_when_it_is_missing() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1102,6 +1136,8 @@ async fn queued_run_is_listed_and_can_be_stopped() {
     c.call(Request::PostMessage {
         thread: t1,
         body: "@Forge wait".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1110,6 +1146,8 @@ async fn queued_run_is_listed_and_can_be_stopped() {
     c.call(Request::PostMessage {
         thread: t2,
         body: "@Forge later".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1167,6 +1205,8 @@ async fn resumed_agent_hears_what_it_missed() {
         c.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -1313,6 +1353,8 @@ for line in open({frames:?}):
     c.call(Request::PostMessage {
         thread,
         body: "@Forge build".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1419,6 +1461,8 @@ async fn stopped_run_still_posts_its_answer() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge look at it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1454,6 +1498,7 @@ async fn run_stopped_by_its_limit_still_posts_its_answer() {
     let script = answer_then_wait_script(dir.path(), "read_file.jsonl");
     // Forge's 20 min limit lasts 1 s, well before a lingering run ends.
     let d = Daemon::start_opts(ServeOptions {
+        no_title_runs: true,
         max_runs: 4,
         claude_bin: Some(script),
         minute: Duration::from_millis(50),
@@ -1467,6 +1512,8 @@ async fn run_stopped_by_its_limit_still_posts_its_answer() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge look at it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1496,6 +1543,8 @@ async fn run_stopped_before_it_answered_posts_no_answer() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge wait".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1528,6 +1577,8 @@ async fn unmentioned_reply_goes_to_the_last_agent() {
     c.call(Request::PostMessage {
         thread,
         body: "hello".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1539,6 +1590,8 @@ async fn unmentioned_reply_goes_to_the_last_agent() {
         c.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -1566,6 +1619,8 @@ async fn unmentioned_reply_waits_while_an_agent_works() {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge wait".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1573,6 +1628,8 @@ async fn unmentioned_reply_waits_while_an_agent_works() {
     c.call(Request::PostMessage {
         thread,
         body: "one more thing".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

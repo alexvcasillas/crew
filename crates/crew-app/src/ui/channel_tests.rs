@@ -108,6 +108,7 @@ fn cards_show_title_status_counts_and_branch(cx: &mut TestAppContext) {
     let quiet: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "plan the release".into(),
+        first_line: false,
     });
     let (window, ws) = open(cx, home.path());
     w.post("@Forge fix it");
@@ -271,6 +272,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
     let old: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "old notes".into(),
+        first_line: false,
     });
     let (channel, quiet, forge, scout) = (w.channel, w.thread, w.agents[0], w.agents[1]);
     drop(w);
@@ -295,6 +297,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::CreateThread {
             channel,
             title: "write the docs".into(),
+            first_line: false,
         },
     );
     let needs: ThreadId = ask(
@@ -302,6 +305,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::CreateThread {
             channel,
             title: "bump the deps".into(),
+            first_line: false,
         },
     );
     // Tall enough to show every section.
@@ -311,6 +315,8 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::PostMessage {
             thread: working,
             body: "@Forge write them".into(),
+            skill: None,
+            model_override: None,
         },
     );
     let _: MessageId = ask(
@@ -318,6 +324,8 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::PostMessage {
             thread: needs,
             body: "@Scout bump them".into(),
+            skill: None,
+            model_override: None,
         },
     );
     run_of(cx, &ws, working, forge, RunStatus::Working);
@@ -456,6 +464,7 @@ fn sort_by_created_puts_the_newest_thread_first(cx: &mut TestAppContext) {
         Request::CreateThread {
             channel: b.channel,
             title: "add search".into(),
+            first_line: false,
         },
     );
     // Something happens in the older one, a moment later so the times
@@ -466,6 +475,8 @@ fn sort_by_created_puts_the_newest_thread_first(cx: &mut TestAppContext) {
         Request::PostMessage {
             thread: b.quiet,
             body: "a note for later".into(),
+            skill: None,
+            model_override: None,
         },
     );
     wait_until(cx, "latest activity first", |cx| {
@@ -565,6 +576,7 @@ fn counts_crewd_finishes_later_land_on_the_card(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             count_delay: Duration::from_secs(2),
             ..Default::default()

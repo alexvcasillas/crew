@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crew_core::agent::{AgentSpec, Runtime};
 use gpui_kit::component::{Icon, IconName};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::model::ThreadStatus;
@@ -251,6 +252,92 @@ fn chip_frame() -> Div {
         .text_size(scale::mono(11.))
         .line_height(scale::mono(16.))
         .text_color(color("text-secondary"))
+}
+
+/// How long the band takes to cross a title being generated.
+const TITLE_SWEEP: Duration = Duration::from_millis(1200);
+/// How long a generated title takes to fade in.
+const TITLE_FADE: Duration = Duration::from_millis(150);
+/// The light band of a title being generated.
+const TITLE_BAND: u32 = 0xcfcfcf;
+
+/// A thread's title, inside an element that sets its size and cuts it.
+/// While a title is generated, the first line shows with a light band
+/// sweeping left to right (static under Reduce motion); the element gives
+/// it [`generating_title`]'s weight and colour. When a generated title has
+/// just `replaced` the first line, the two cross-fade: the first line on
+/// top fades out as the title under it fades in, both cut the same way.
+pub fn thread_title_text(
+    id: impl Into<SharedString>,
+    title: &str,
+    generating: bool,
+    replaced: Option<&str>,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    if generating {
+        return gpui_kit::component::shimmer::ShimmerText::new(title.to_string())
+            .id(SharedString::from(format!("{id}-shimmer")))
+            .duration(TITLE_SWEEP)
+            .highlight_color(rgb(TITLE_BAND))
+            .min_w_0()
+            .truncate()
+            .into_any_element();
+    }
+    let text = div().min_w_0().truncate().child(title.to_string());
+    let Some(first_line) = replaced else {
+        return text.into_any_element();
+    };
+    let fade = |name: &str| ElementId::Name(format!("{id}-{name}-{title}").into());
+    div()
+        .relative()
+        .min_w_0()
+        .child(
+            text.with_animation(fade("in"), Animation::new(TITLE_FADE), |el, t| {
+                el.opacity(t)
+            }),
+        )
+        .child(
+            generating_title(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .min_w_0()
+                    .truncate(),
+            )
+            .child(first_line.to_string())
+            .with_animation(fade("out"), Animation::new(TITLE_FADE), |el, t| {
+                el.opacity(1. - t)
+            }),
+        )
+        .into_any_element()
+}
+
+/// A title being generated reads in medium tertiary grey.
+pub fn generating_title<E: Styled>(el: E) -> E {
+    el.font_weight(weight(FontWeight::MEDIUM))
+        .text_color(color("text-tertiary"))
+}
+
+/// The boards' small switch, 28 by 16. Off, its knob is grey on the
+/// border colour.
+pub fn switch(on: bool) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .when(on, |t| t.justify_end())
+        .w(ui_px(28.))
+        .h(ui_px(16.))
+        .p(ui_px(2.))
+        .rounded_full()
+        .bg(color(if on { "text-primary" } else { "border-200" }))
+        .child(div().size(ui_px(12.)).rounded_full().bg(color(if on {
+            "bg-100"
+        } else {
+            "text-tertiary"
+        })))
 }
 
 /// A small round dot in the colour token `token`.

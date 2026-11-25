@@ -18,7 +18,7 @@ pub struct DevHooks {
     pub review: Option<ThreadId>,
     /// `CREW_APP_SHOW=running`: Running now.
     pub running: bool,
-    /// `CREW_APP_SHOW=settings` or `settings:agents|projects|runtimes|limits|shortcuts`.
+    /// `CREW_APP_SHOW=settings` or `settings:skills|agents|projects|runtimes|limits|shortcuts`.
     pub settings: Option<Page>,
     /// `CREW_APP_SHOW=terminal:<session>`: a terminal session, opened
     /// once it is known.
@@ -44,6 +44,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
             "settings" => settings = Some(Page::General),
             _ if v.starts_with("settings:") => {
                 settings = match &v["settings:".len()..] {
+                    "skills" => Some(Page::Skills),
                     "agents" => Some(Page::Agents),
                     "projects" => Some(Page::Projects),
                     "runtimes" => Some(Page::Runtimes),

@@ -35,6 +35,7 @@ impl Daemon {
         Self::start_with_options(
             home,
             crewd::ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 ..Default::default()
             },

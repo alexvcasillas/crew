@@ -103,6 +103,11 @@ pub struct Workspace {
     pub(super) nav: Nav,
     /// What you wrote and left, per thread and per new-thread draft.
     drafts: HashMap<DraftKey, String>,
+    /// The skill picked for a message on its way, by where it was
+    /// written; put back with the text if the send fails.
+    sent_picks: HashMap<DraftKey, super::composer::Picked>,
+    /// The skill picked for a draft you left, put back when you return.
+    draft_picks: HashMap<DraftKey, super::composer::Picked>,
     /// The channel whose new thread is being created.
     creating: Option<ChannelId>,
     /// A thread to open once it is known (debug builds' startup hook).
@@ -207,6 +212,8 @@ pub struct Workspace {
     pub(super) palette: Option<Entity<super::palette::Palette>>,
     /// What you opened lately, for the palette.
     pub(super) recents: Recents,
+    /// The skills crewd found, per project.
+    pub(super) skills: super::skills_cache::SkillsCache,
     /// Writing the recents to the prefs file.
     recents_task: Option<Task<()>>,
     /// Lays out again when the appearance settings change.
@@ -245,7 +252,11 @@ impl Workspace {
                 &composer,
                 window,
                 |this, _, event, window, cx| match event {
-                    ComposerEvent::Send(text) => this.send(text.clone(), window, cx),
+                    ComposerEvent::Send(out) => this.send(out.clone(), window, cx),
+                    ComposerEvent::SkillsWanted => this.skills_wanted(cx),
+                    ComposerEvent::ManageSkills => {
+                        this.open_settings(Page::Skills, window, cx);
+                    }
                     ComposerEvent::Cancel => this.cancel_new_thread(window, cx),
                     ComposerEvent::OpenAgentSettings => {
                         this.open_settings(Page::Agents, window, cx);
@@ -297,6 +308,8 @@ impl Workspace {
             focus,
             nav: Nav::default(),
             drafts: HashMap::new(),
+            sent_picks: HashMap::new(),
+            draft_picks: HashMap::new(),
             creating: None,
             open_pending: hooks.review.or(hooks.open_thread),
             terminal: None,
@@ -348,6 +361,7 @@ impl Workspace {
             page: None,
             palette: None,
             recents,
+            skills: Default::default(),
             recents_task: None,
             _appearance: appearance,
             traffic_lights: None,
@@ -675,6 +689,8 @@ impl Workspace {
             .agents()
             .into_iter()
             .map(|a| MentionAgent {
+                id: a.id,
+                model: a.spec.model.clone(),
                 name: a.spec.name.clone(),
                 role: a.spec.role.clone(),
                 chip: runtime_chip(&a.spec),
@@ -710,10 +726,48 @@ impl Workspace {
             .and_then(|c| self.state.project(c.project))
             .map(|p| p.main_branch.clone())
             .unwrap_or_default();
+        let reply_to = self.last_agent();
+        let models = vec![
+            (
+                crew_core::agent::Runtime::ClaudeCode,
+                super::settings::agents::MODELS
+                    .iter()
+                    .map(|(id, label)| crew_proto::ModelInfo {
+                        id: (*id).into(),
+                        label: (*label).into(),
+                    })
+                    .collect(),
+            ),
+            (
+                crew_core::agent::Runtime::Codex,
+                super::settings::agents::models_of(
+                    &self.runtimes,
+                    &crew_core::agent::Runtime::Codex,
+                )
+                .to_vec(),
+            ),
+        ];
+        let recent = self.recents.skills.clone();
+        let skills_from = self.current_project().and_then(|p| {
+            self.skills
+                .projects
+                .get(&p)
+                .filter(|s| s.fetched.is_some())
+                .map(|s| (p, s.rev))
+        });
+        let skills = &self.skills;
         self.composer.update(cx, |composer, cx| {
             composer.set_context(agents, project, hint, cx);
             composer.set_busy(busy, cx);
             composer.set_base(base, cx);
+            composer.set_skill_context(recent, models, reply_to, cx);
+            if composer.skills_from() != skills_from {
+                let list = skills_from
+                    .and_then(|(p, _)| skills.projects.get(&p))
+                    .map(|s| s.list.as_slice())
+                    .unwrap_or_default();
+                composer.set_skills(skills_from, list, cx);
+            }
         });
 
         let running_ticks = self.running.is_some()
@@ -973,6 +1027,11 @@ impl Workspace {
     /// Keeps the composer's text for what is open, before leaving it.
     fn stash_draft(&mut self, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key() {
+            // A skill picked stays with the draft.
+            match self.composer.read(cx).picked() {
+                Some(picked) => self.draft_picks.insert(key, picked),
+                None => self.draft_picks.remove(&key),
+            };
             let text = self.composer.read(cx).text(cx);
             if text.is_empty() {
                 self.drafts.remove(&key);
@@ -982,14 +1041,31 @@ impl Workspace {
         }
     }
 
-    /// Puts the text kept for what is now open in the composer.
+    /// Puts the text kept for what is now open in the composer, with the
+    /// skill of a message that failed to send there.
     fn load_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self
-            .draft_key()
+        let key = self.draft_key();
+        let text = key
             .and_then(|key| self.drafts.remove(&key))
             .unwrap_or_default();
-        self.composer
-            .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+        let picked = key.and_then(|key| self.draft_picks.remove(&key));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_text(&text, window, cx);
+            if let Some(picked) = picked {
+                composer.restore_pick(picked, window, cx);
+            }
+        });
+    }
+
+    /// crewd took the message sent from `key`: its skill leads Recent.
+    fn sent(&mut self, key: DraftKey, skill_key: Option<String>, cx: &mut Context<Self>) {
+        self.sent_picks.remove(&key);
+        if let Some(used) = skill_key
+            && self.recents.used_skill(&used)
+        {
+            self.save_recents(cx);
+            self.sync(cx);
+        }
     }
 
     /// Gives `text` back to `key` after a send failed, unless you have
@@ -1002,12 +1078,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.draft_key() == Some(key) {
-            if self.composer.read(cx).text(cx).trim().is_empty() {
-                self.composer
-                    .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+            let empty = {
+                let composer = self.composer.read(cx);
+                composer.text(cx).trim().is_empty() && composer.skill().is_none()
+            };
+            if empty {
+                let picked = self.sent_picks.remove(&key);
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_text(&text, window, cx);
+                    // The skill, agent and model go back with the text.
+                    if let Some(picked) = picked {
+                        composer.restore_pick(picked, window, cx);
+                    }
+                });
             }
         } else {
             self.drafts.entry(key).or_insert(text);
+            if let Some(picked) = self.sent_picks.remove(&key) {
+                self.draft_picks.entry(key).or_insert(picked);
+            }
         }
     }
 
@@ -1046,10 +1135,27 @@ impl Workspace {
     /// Posts what you wrote: in the open thread, or as the first message
     /// of a new one titled by its first line. A new thread opens when
     /// crewd made it, if you are still on its draft.
-    fn send(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        out: super::composer::Outgoing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let client = self.client.clone();
         let Some(key) = self.draft_key() else {
             return;
+        };
+        let super::composer::Outgoing {
+            text,
+            skill,
+            model_override,
+            skill_key,
+            picked,
+        } = out;
+        // Kept until crewd takes the message, to put back if it doesn't.
+        match picked {
+            Some(picked) => self.sent_picks.insert(key, *picked),
+            None => self.sent_picks.remove(&key),
         };
         match key {
             DraftKey::NewThread(channel) => {
@@ -1061,10 +1167,17 @@ impl Workspace {
                 self.nav.drafting = true;
                 self.sync_composer_mode(window, cx);
                 self.sync(cx);
-                let title = thread_title(&text);
+                let title = match &skill {
+                    Some(skill) if text.trim().is_empty() => format!("/{}", skill.name),
+                    _ => thread_title(&text),
+                };
                 self.spawn_request(window, cx, async move |this, cx| {
                     let made = client
-                        .request(Request::CreateThread { channel, title })
+                        .request(Request::CreateThread {
+                            channel,
+                            title,
+                            first_line: true,
+                        })
                         .await
                         .and_then(|v| {
                             serde_json::from_value::<ThreadId>(v).map_err(|e| e.to_string())
@@ -1088,6 +1201,8 @@ impl Workspace {
                         .request(Request::PostMessage {
                             thread,
                             body: text.clone(),
+                            skill: skill.clone(),
+                            model_override: model_override.clone(),
                         })
                         .await;
                     let back = if still_here {
@@ -1095,19 +1210,33 @@ impl Workspace {
                     } else {
                         key
                     };
+                    this.update(cx, |this, cx| match &posted {
+                        Ok(_) => this.sent(key, skill_key, cx),
+                        Err(_) => {
+                            if let Some(picked) = this.sent_picks.remove(&key) {
+                                this.sent_picks.insert(back, picked);
+                            }
+                        }
+                    })
+                    .ok();
                     posted.map(drop).map_err(|e| (e, Some((back, text))))
                 });
             }
             DraftKey::Thread(thread) => {
-                self.spawn_request(window, cx, async move |_, _| {
-                    client
+                self.spawn_request(window, cx, async move |this, cx| {
+                    let posted = client
                         .request(Request::PostMessage {
                             thread,
                             body: text.clone(),
+                            skill: skill.clone(),
+                            model_override: model_override.clone(),
                         })
-                        .await
-                        .map(drop)
-                        .map_err(|e| (e, Some((key, text))))
+                        .await;
+                    if posted.is_ok() {
+                        this.update(cx, |this, cx| this.sent(key, skill_key, cx))
+                            .ok();
+                    }
+                    posted.map(drop).map_err(|e| (e, Some((key, text))))
                 });
             }
         }
@@ -1342,9 +1471,9 @@ fn dev_hooks() -> StartupHooks {
     }
 }
 
-/// "Replying to Forge. Type @ to bring in someone else."
+/// "Replying to Forge. Type @ to bring in someone else, / for a skill."
 fn reply_hint(name: &str) -> String {
-    format!("Replying to {name}. Type @ to bring in someone else.")
+    format!("Replying to {name}. Type @ to bring in someone else, / for a skill.")
 }
 
 /// "Forge is working. Replies without @Forge become context for its next
@@ -1621,7 +1750,7 @@ mod tests {
     fn the_hint_names_who_a_reply_goes_to() {
         assert_eq!(
             reply_hint("Forge"),
-            "Replying to Forge. Type @ to bring in someone else."
+            "Replying to Forge. Type @ to bring in someone else, / for a skill."
         );
     }
 
@@ -1820,6 +1949,7 @@ mod gpui_tests {
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel: gone_channel,
             title: "fix the login".into(),
+            first_line: false,
         }))
         .unwrap();
 
@@ -1890,6 +2020,7 @@ mod gpui_tests {
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel,
             title: "fix the login".into(),
+            first_line: false,
         }))
         .unwrap();
 

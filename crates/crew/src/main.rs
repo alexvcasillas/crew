@@ -392,6 +392,7 @@ async fn init_demo(c: &mut Client) -> Result<()> {
         .ask(Request::CreateThread {
             channel,
             title: "Demo".into(),
+            first_line: false,
         })
         .await?;
     println!("{thread}");
@@ -459,6 +460,7 @@ fn event_line(event: &Event) -> Option<String> {
             ToolKind::Other => with_target(name, target),
         }),
         Event::SessionStarted { model, .. } => Some(format!("started ({model})")),
+        Event::SkillsListed { .. } => None,
         Event::Thinking { .. } => Some("thinking…".into()),
         Event::Message { text } => Some(format!("says: {}", first_line(text))),
         Event::PermissionDenied {
@@ -735,6 +737,7 @@ async fn watch(
             | ServerMsg::AgentChanged { .. }
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::LimitsChanged { .. }
+            | ServerMsg::TitleSettingsChanged { .. }
             | ServerMsg::TerminalSessionChanged { .. }
             | ServerMsg::TerminalEvent { .. }
             | ServerMsg::TerminalSessionRemoved { .. }
@@ -783,6 +786,8 @@ async fn run(cli: Cli) -> Result<()> {
                 .ask(Request::PostMessage {
                     thread,
                     body: body.join(" "),
+                    skill: None,
+                    model_override: None,
                 })
                 .await?;
             Ok(())

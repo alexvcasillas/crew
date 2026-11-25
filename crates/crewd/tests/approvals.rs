@@ -100,6 +100,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 max_runs: 4,
                 claude_bin: Some(claude),
                 crew_mcp_bin: None,
@@ -311,6 +312,7 @@ async fn setup(d: &Daemon, c: &mut Client, forge_minutes: u32) -> Chat {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -332,6 +334,8 @@ async fn start_forge_with(c: &mut Client, thread: ThreadId, body: &str) -> RunId
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

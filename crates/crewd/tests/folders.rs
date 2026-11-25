@@ -155,6 +155,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
                 ..ServeOptions::default()
@@ -335,6 +336,7 @@ async fn new_thread(c: &mut Client, channel: ChannelId, title: &str) -> ThreadId
         .ok(Request::CreateThread {
             channel,
             title: title.into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -345,6 +347,8 @@ async fn post(c: &mut Client, thread: ThreadId, body: &str) {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

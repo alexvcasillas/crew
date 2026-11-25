@@ -22,10 +22,12 @@ use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{
     ApprovalStatus, Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun,
-    ThreadWorktree,
+    ThreadWorktree, TitleMode, TitleModel, TitleSettings,
 };
 use crew_core::worktree;
-use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg};
+use crew_proto::{
+    Limits, PermissionAnswer, Request, ServerMsg, SkillInfo, SkillRef, SkillSource, skill_key,
+};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -84,8 +86,19 @@ impl Db {
     }
 }
 
+/// Skills found in a project. `codex` is `None` when its listing failed
+/// and is to be tried again.
+#[derive(Clone)]
+struct SkillCache {
+    claude: Vec<crate::skills::Found>,
+    codex: Option<Vec<crate::skills::Found>>,
+}
+
 /// What a queued run needs besides its job.
 struct Pending {
+    /// The skill the run is for, and the model to use for this run alone.
+    skill: Option<SkillRef>,
+    model_override: Option<String>,
     /// The message that asked for the run.
     message: MessageId,
     /// The prompt to use if the run starts a new session.
@@ -151,6 +164,14 @@ struct Inner {
     count_delay_ms: std::sync::atomic::AtomicU64,
     /// File lists of project roots and worktrees, for search.
     files: Mutex<FileIndex>,
+    /// Claude Code's home, where its skills and plugins are looked for.
+    claude_home: OnceLock<PathBuf>,
+    /// Skills found per project, until a reload.
+    skills: Mutex<HashMap<ProjectId, SkillCache>>,
+    /// The skills a Claude Code run's init line listed, by project.
+    claude_listed: Mutex<HashMap<ProjectId, std::collections::HashSet<String>>>,
+    /// Title runs under way. Shutdown drops them.
+    titles: Mutex<JoinSet<()>>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -182,6 +203,8 @@ pub struct CliBins {
     /// How long `Runtimes` waits for the CLIs before it answers with
     /// less. `None` is [`QUICK_ANSWER`].
     pub runtimes_wait: Option<Duration>,
+    /// For tests only: never generate thread titles.
+    pub no_title_runs: bool,
 }
 
 impl Service {
@@ -202,6 +225,10 @@ impl Service {
         // Nothing waits for permission asks of an earlier crewd any more.
         if let Err(e) = crate::approvals::cancel_stale_permissions(&store) {
             log(format!("couldn't cancel old permission asks: {e}"));
+        }
+        // Nothing is generating the titles an earlier crewd started.
+        if let Err(e) = store.end_stale_titles() {
+            log(format!("couldn't end old title runs: {e}"));
         }
         // The run cap from the command line or environment only seeds the
         // setting. Once it is saved, the saved value wins.
@@ -250,7 +277,17 @@ impl Service {
             count_slots: Arc::new(tokio::sync::Semaphore::new(crate::overview::GIT_AT_ONCE)),
             count_delay_ms: std::sync::atomic::AtomicU64::new(0),
             files: Mutex::new(FileIndex::default()),
+            claude_home: OnceLock::new(),
+            skills: Mutex::new(HashMap::new()),
+            claude_listed: Mutex::new(HashMap::new()),
+            titles: Mutex::new(JoinSet::new()),
         }))
+    }
+
+    /// Where to look for Claude Code's own skills and plugins. Without it,
+    /// only a project's skills are found.
+    pub fn set_claude_home(&self, home: PathBuf) {
+        let _ = self.0.claude_home.set(home);
     }
 
     /// A receiver for all notifications from now on.
@@ -500,6 +537,10 @@ impl Service {
                 self.thread_summaries(project, channels).await
             }
             Request::Runtimes => self.runtimes().await,
+            Request::Skills {
+                project,
+                force_reload,
+            } => self.skills(project, force_reload).await,
             Request::Search {
                 query,
                 project,
@@ -579,8 +620,12 @@ impl Service {
                 self.delete_agent(agent)?;
                 Ok(serde_json::Value::Null)
             }
-            Request::CreateThread { channel, title } => json(
-                self.create_thread(channel, &title)
+            Request::CreateThread {
+                channel,
+                title,
+                first_line,
+            } => json(
+                self.create_thread(channel, &title, !first_line)
                     .map_err(|e| e.to_string())?,
             ),
             Request::RenameThread { thread, title } => {
@@ -616,10 +661,34 @@ impl Service {
                 self.update_channel(channel, &name, description.trim())?;
                 Ok(serde_json::Value::Null)
             }
-            Request::PostMessage { thread, body } => json(
-                self.post_message(thread, &body)
-                    .map_err(|e| e.to_string())?,
-            ),
+            Request::PostMessage {
+                thread,
+                body,
+                skill,
+                model_override,
+            } => json(self.post_message(thread, &body, skill, model_override)?),
+            Request::SetSkillShown {
+                runtime,
+                source,
+                name,
+                shown,
+                project,
+            } => {
+                let key = match (&source, project) {
+                    (SkillSource::Project, None) => {
+                        return Err("Say which project the skill is in.".into());
+                    }
+                    // Only a project's own skill's key holds the project.
+                    (_, project) => {
+                        skill_key(&runtime, &source, &name, project.unwrap_or_default())
+                    }
+                };
+                self.db()
+                    .store
+                    .set_skill_shown(&key, shown)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
             Request::StopRun { run } => {
                 self.stop_run(run)?;
                 Ok(serde_json::Value::Null)
@@ -634,6 +703,14 @@ impl Service {
             }
             Request::SetLimits { limits } => {
                 self.set_limits(limits)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::SetTitleSettings { titles } => {
+                let mut db = self.db();
+                db.store
+                    .set_title_settings(&titles)
+                    .map_err(|e| e.to_string())?;
+                self.publish_global(&mut db, ServerMsg::TitleSettingsChanged { titles });
                 Ok(serde_json::Value::Null)
             }
             Request::RunHistory { before, limit } => json(
@@ -699,6 +776,7 @@ impl Service {
             | Request::Search { .. }
             | Request::ProjectOverview { .. }
             | Request::AgentProfile { .. }
+            | Request::Skills { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::RenameProject { project, name } => {
                 let name = name.trim();
@@ -801,6 +879,74 @@ impl Service {
         }
     }
 
+    /// The skills of both CLIs in the project. Found once and kept until
+    /// `force_reload`. Codex ones are left out if it isn't installed or
+    /// signed in. A Codex listing that failed or timed out isn't kept, so
+    /// the next request tries it again. Plugin skills of Claude Code that
+    /// a run's init line didn't list are left out, once a run has told.
+    async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
+        let cached = (!force_reload)
+            .then(|| self.0.skills.lock().unwrap().get(&project).cloned())
+            .flatten();
+        let root = {
+            let db = self.db();
+            db.store.project(project).map_err(|e| e.to_string())?.root
+        };
+        let claude = match &cached {
+            Some(cached) => cached.claude.clone(),
+            None => {
+                let home = self.0.claude_home.get().cloned();
+                let scan_root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::skills::scan_claude(home.as_deref(), &scan_root)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
+        };
+        let codex = match cached.and_then(|c| c.codex) {
+            Some(codex) => Some(codex),
+            None => {
+                let bin = crate::runtimes::codex_bin(&self.0.bins);
+                match crate::runtimes::find_bin(&bin) {
+                    // Not installed: a definitive answer.
+                    None => Some(vec![]),
+                    Some(path) => match crate::runtimes::codex_signed_in(&path).await {
+                        Ok(Some(true)) => {
+                            crate::skills::scan_codex(&bin, &root, force_reload).await
+                        }
+                        // Signed out: a definitive answer.
+                        Ok(Some(false)) => Some(vec![]),
+                        // Couldn't tell: try again next time.
+                        _ => None,
+                    },
+                }
+            }
+        };
+        self.0.skills.lock().unwrap().insert(
+            project,
+            SkillCache {
+                claude: claude.clone(),
+                codex: codex.clone(),
+            },
+        );
+        let listed = self.0.claude_listed.lock().unwrap().get(&project).cloned();
+        let db = self.db();
+        let list: Vec<SkillInfo> = claude
+            .iter()
+            .filter(|f| match (&f.source, &listed) {
+                (SkillSource::Plugin(_), Some(listed)) => listed.contains(&f.name),
+                _ => true,
+            })
+            .chain(codex.iter().flatten())
+            .map(|f| {
+                let key = skill_key(&f.runtime, &f.source, &f.name, project);
+                f.info(db.store.skill_shown(&key).unwrap_or(true))
+            })
+            .collect();
+        json(list)
+    }
+
     /// Tells `SubscribeAll` clients the channel as it is now.
     fn channel_changed(&self, db: &mut Db, channel: ChannelId) -> Result<(), String> {
         let channel = db.store.channel(channel).map_err(|e| e.to_string())?;
@@ -864,10 +1010,16 @@ impl Service {
     }
 
     /// Saves a thread and tells `SubscribeAll` clients.
-    fn create_thread(&self, channel: ChannelId, title: &str) -> Result<ThreadId, StoreError> {
+    /// A `chosen` title is never replaced by a generated one.
+    fn create_thread(
+        &self,
+        channel: ChannelId,
+        title: &str,
+        chosen: bool,
+    ) -> Result<ThreadId, StoreError> {
         let mut db = self.db();
         db.store.ensure_channel_open(channel)?;
-        let id = db.store.create_thread(channel, title)?;
+        let id = db.store.create_thread_titled(channel, title, chosen)?;
         let thread = db.store.thread(id)?;
         self.publish_global(&mut db, ServerMsg::ThreadCreated { channel, thread });
         Ok(id)
@@ -1264,6 +1416,7 @@ impl Service {
             approvals,
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
+            titles: db.store.title_settings()?,
         };
         Ok((msg, db.serial))
     }
@@ -1272,35 +1425,111 @@ impl Service {
     /// message that mentions no one goes to the agent that ran last in
     /// the thread, if none is queued or working there; otherwise it is
     /// context for the next run.
-    pub fn post_message(&self, thread: ThreadId, body: &str) -> Result<MessageId, StoreError> {
-        let id = {
+    pub fn post_message(
+        &self,
+        thread: ThreadId,
+        body: &str,
+        skill: Option<SkillRef>,
+        model_override: Option<String>,
+    ) -> Result<MessageId, String> {
+        let model_override = model_override
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        // The override goes to the CLI as an argument: refuse anything
+        // that could pass for a flag or break the value.
+        if let Some(m) = &model_override
+            && (m.starts_with('-')
+                || m.chars().any(|c| c.is_whitespace() || c.is_control())
+                || m.chars().count() > 128)
+        {
+            return Err("That model name isn't valid. Pick one from the list.".into());
+        }
+        let (id, title_run) = {
             let mut state = self.state();
             let mut db = self.db();
-            db.store.ensure_thread_open(thread)?;
-            let earlier = db.store.messages(thread)?;
-            let agents = db.store.agents()?;
-            let id = self.add_message(&mut db, thread, Author::You, body, None)?;
+            db.store
+                .ensure_thread_open(thread)
+                .map_err(|e| e.to_string())?;
+            let earlier = db.store.messages(thread).map_err(|e| e.to_string())?;
+            let agents = db.store.agents().map_err(|e| e.to_string())?;
 
             let names: Vec<&str> = agents.iter().map(|(_, a)| a.name.as_str()).collect();
             let (known, unknown) = parse_mentions(body, &names);
-            let context = render_context(&earlier, &db.store.agents_with_deleted()?);
-            let fresh = if context.is_empty() {
-                body.to_string()
-            } else {
-                format!("{context}\n\n{body}")
-            };
             let mut called: Vec<AgentId> = known
                 .iter()
                 .filter_map(|name| agents.iter().find(|(_, a)| a.name == *name))
                 .map(|(agent, _)| *agent)
                 .collect();
-            if called.is_empty() && unknown.is_empty() {
+            // A skill picked to run with one agent goes to it alone; the
+            // agents mentioned stay mentioned.
+            if let Some(agent) = skill.as_ref().and_then(|s| s.agent) {
+                if !agents.iter().any(|(id, _)| *id == agent) {
+                    return Err("That agent no longer exists. Pick another.".into());
+                }
+                called = vec![agent];
+            } else if called.is_empty() && unknown.is_empty() {
                 // A reply to nobody in particular goes to whoever answered
                 // last, unless someone is still at work.
-                called.extend(self.last_agent(&db, thread, &agents)?);
+                called.extend(
+                    self.last_agent(&db, thread, &agents)
+                        .map_err(|e| e.to_string())?,
+                );
             }
+            // A skill goes to an agent that uses its CLI. Nothing is saved
+            // otherwise.
+            if let Some(skill) = &skill {
+                let runtime = match skill.runtime {
+                    Runtime::ClaudeCode => "Claude Code",
+                    Runtime::Codex => "Codex",
+                };
+                if called.is_empty() {
+                    return Err(format!(
+                        "Mention an agent that uses {runtime} to run /{}.",
+                        skill.name
+                    ));
+                }
+                let wrong = called.iter().any(|agent| {
+                    agents
+                        .iter()
+                        .any(|(id, a)| id == agent && a.runtime != skill.runtime)
+                });
+                if wrong {
+                    return Err(format!(
+                        "/{} runs on {runtime}. Pick an agent that uses it.",
+                        skill.name
+                    ));
+                }
+            }
+            let id = self
+                .add_message(&mut db, thread, Author::You, body, None)
+                .map_err(|e| e.to_string())?;
+            let title_run = if earlier.is_empty() {
+                self.start_title(&mut db, thread, body)
+            } else {
+                None
+            };
+            let context = render_context(
+                &earlier,
+                &db.store.agents_with_deleted().map_err(|e| e.to_string())?,
+            );
+            let fresh = if context.is_empty() {
+                body.to_string()
+            } else {
+                format!("{context}\n\n{body}")
+            };
             for agent in &called {
-                let run = db.store.create_run(thread, *agent)?;
+                let run = db
+                    .store
+                    .create_run(thread, *agent)
+                    .map_err(|e| e.to_string())?;
+                if let Some(skill) = &skill {
+                    db.store
+                        .set_run_skill(run, &skill.name)
+                        .map_err(|e| e.to_string())?;
+                }
+                db.store
+                    .set_run_request(run, id, model_override.as_deref())
+                    .map_err(|e| e.to_string())?;
                 self.publish_status(&mut db, thread, run, RunStatus::Queued);
                 state.scheduler.enqueue(Job {
                     run,
@@ -1311,6 +1540,8 @@ impl Service {
                 state.pending.insert(
                     run,
                     Pending {
+                        skill: skill.clone(),
+                        model_override: model_override.clone(),
                         message: id,
                         fresh: fresh.clone(),
                     },
@@ -1323,12 +1554,68 @@ impl Service {
                     Author::System,
                     &format!("No agent named @{name}."),
                     None,
-                )?;
+                )
+                .map_err(|e| e.to_string())?;
             }
-            id
+            (id, title_run)
         };
+        if let Some(model) = title_run {
+            self.spawn_title(thread, body.to_string(), model);
+        }
         self.start_ready();
         Ok(id)
+    }
+
+    /// Marks the thread's title as being generated, when titles are and
+    /// it is still its first line, and gives the model to generate it on.
+    /// A message with no text, such as a skill alone, keeps its title.
+    fn start_title(&self, db: &mut Db, thread: ThreadId, body: &str) -> Option<TitleModel> {
+        if body.trim().is_empty() || self.0.bins.no_title_runs {
+            return None;
+        }
+        let started = db.store.title_settings().and_then(|titles| {
+            Ok(match titles {
+                TitleSettings {
+                    mode: TitleMode::Generated,
+                    model,
+                } => db.store.start_title(thread)?.then_some(model),
+                _ => None,
+            })
+        });
+        match started {
+            Ok(Some(model)) => {
+                self.thread_changed_or_log(db, thread);
+                Some(model)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log(format!("couldn't start a title run: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Generates the thread's title from its first message, apart from
+    /// any run. The first line stays if it fails or you renamed the
+    /// thread meanwhile.
+    fn spawn_title(&self, thread: ThreadId, message: String, model: TitleModel) {
+        let svc = self.clone();
+        let mut titles = self.0.titles.lock().unwrap_or_else(PoisonError::into_inner);
+        // Forget the ones that ended.
+        while titles.try_join_next().is_some() {}
+        titles.spawn(async move {
+            let title = crate::titles::generate(&svc.0.bins, model, &message).await;
+            let mut db = svc.db();
+            let changed = match &title {
+                Some(title) => db.store.set_generated_title(thread, title),
+                None => db.store.keep_first_line(thread),
+            };
+            match changed {
+                Ok(true) => svc.thread_changed_or_log(&mut db, thread),
+                Ok(false) => {}
+                Err(e) => log(format!("couldn't save the thread's title: {e}")),
+            }
+        });
     }
 
     /// The agent that ran last in `thread`, if it still exists and no run
@@ -1431,6 +1718,12 @@ impl Service {
             }
             std::mem::take(&mut state.watchers)
         };
+        // Title runs are dropped, their processes with them.
+        self.0
+            .titles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .abort_all();
         while watchers.join_next().await.is_some() {}
     }
 
@@ -1651,7 +1944,7 @@ impl Service {
                 let (handle, rx, join) = match inv {
                     Invocation::Claude(inv) => spawn_run(inv),
                     Invocation::Codex(inv) => {
-                        spawn_codex_run(inv, self.codex_hooks(job.thread, job.run))
+                        spawn_codex_run(*inv, self.codex_hooks(job.thread, job.run))
                     }
                 };
                 state.live.insert(job.run, (job.thread, handle));
@@ -1756,7 +2049,10 @@ impl Service {
             let found = db.store.project_of_thread(job.thread).and_then(|project| {
                 // Removed ones too, so slugs stay as they were.
                 let projects = db.store.all_projects()?;
-                let thread = db.store.thread(job.thread)?;
+                let mut thread = db.store.thread(job.thread)?;
+                // The branch keeps the name of the first line, even once
+                // a title was generated.
+                thread.title = db.store.branch_title(job.thread)?;
                 let slug = project_slug(&projects, project.id);
                 Ok((project, slug, thread))
             });
@@ -1930,7 +2226,12 @@ impl Service {
         if spec.deleted_at.is_some() {
             return Err(StoreError::NotFound("agent"));
         }
-        let spec = spec.spec;
+        let mut spec = spec.spec;
+        // The override is for this run alone; the agent keeps its model.
+        let skill = pending.as_ref().and_then(|p| p.skill.clone());
+        if let Some(model) = pending.as_ref().and_then(|p| p.model_override.clone()) {
+            spec.model = model;
+        }
         let cwd = db.store.thread_cwd(job.thread)?;
         let project = db.store.project_of_thread(job.thread)?;
         // A thread folder of repo worktrees leaves plain files out; the
@@ -2028,6 +2329,11 @@ impl Service {
                     Some((id, prompt)) => (SessionArg::Resume(id), prompt),
                     None => (SessionArg::New(new_session), fresh),
                 };
+                // Claude Code runs a skill when the prompt starts with it.
+                let prompt = match &skill {
+                    Some(skill) => format!("/{} {prompt}", skill.name),
+                    None => prompt,
+                };
                 let mut inv = build_claude(
                     &spec,
                     &prompt,
@@ -2063,7 +2369,7 @@ impl Service {
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-                Invocation::Codex(CodexInvocation {
+                Invocation::Codex(Box::new(CodexInvocation {
                     bin: crate::runtimes::codex_bin(&self.0.bins),
                     agent: spec.name.clone(),
                     cwd,
@@ -2071,10 +2377,11 @@ impl Service {
                     permission_mode: spec.permission_mode.clone(),
                     developer_instructions,
                     prompt: fresh,
+                    skill: skill.map(|s| (s.name, s.path)),
                     resume: resume.map(|(thread, prompt)| Resume { thread, prompt }),
                     mcp: wiring,
                     env: Vec::new(),
-                })
+                }))
             }
         };
         Ok((spec.name, inv))
@@ -2104,6 +2411,16 @@ impl Service {
                     answered = *ok;
                 }
                 Event::Message { text } => texts.push(text.clone()),
+                Event::SkillsListed { skills } => {
+                    let project = self.db().store.project_of_thread(thread).map(|p| p.id);
+                    if let Ok(project) = project {
+                        self.0
+                            .claude_listed
+                            .lock()
+                            .unwrap()
+                            .insert(project, skills.iter().cloned().collect());
+                    }
+                }
                 Event::SessionStarted {
                     session_id,
                     model: started,
@@ -2367,7 +2684,7 @@ impl Service {
 /// What starts a run: the agent's CLI and how it is called.
 enum Invocation {
     Claude(ClaudeInvocation),
-    Codex(CodexInvocation),
+    Codex(Box<CodexInvocation>),
 }
 
 /// A folder as compared between projects: links resolved when it exists,
@@ -2518,6 +2835,9 @@ mod tests {
             ended_at: None,
             runtime: crew_core::agent::Runtime::ClaudeCode,
             waiting_for: None,
+            skill: None,
+            model_override: None,
+            message: None,
         }
     }
 

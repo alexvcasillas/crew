@@ -99,6 +99,8 @@ pub struct CodexInvocation {
     pub developer_instructions: String,
     /// The prompt for a new thread: the chat so far, then the new prompt.
     pub prompt: String,
+    /// A skill to run, as its name and file.
+    pub skill: Option<(String, String)>,
     /// The thread to continue, if any. If Codex no longer has it, a new
     /// thread starts with `prompt`.
     pub resume: Option<Resume>,
@@ -221,10 +223,21 @@ impl CodexInvocation {
         }
     }
 
+    fn turn_input(&self, prompt: &str) -> Vec<UserInput> {
+        let mut input = vec![UserInput::text(prompt)];
+        if let Some((name, path)) = &self.skill {
+            input.push(UserInput::Skill {
+                name: name.clone(),
+                path: path.clone(),
+            });
+        }
+        input
+    }
+
     pub fn turn_params(&self, thread: &str, prompt: &str) -> TurnStartParams {
         TurnStartParams {
             thread_id: thread.to_string(),
-            input: vec![UserInput::text(prompt)],
+            input: self.turn_input(prompt),
             effort: None,
             sandbox_policy: Some(self.sandbox_policy()),
         }
@@ -736,6 +749,7 @@ mod tests {
             permission_mode: mode,
             developer_instructions: "Be brief.".into(),
             prompt: "go".into(),
+            skill: None,
             resume: None,
             mcp: None,
             env: Vec::new(),

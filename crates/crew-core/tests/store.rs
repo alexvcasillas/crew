@@ -7,7 +7,7 @@ use crew_core::policy::HandoffPolicy;
 use crew_core::project_kind::{ProjectKind, WorkMode};
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, Limits, RepoWorktree, RunFilter, Store, StoreError,
-    ThreadWorktree,
+    ThreadWorktree, TitleMode, TitleModel, TitleSettings, TitleSource,
 };
 
 fn spec(name: &str) -> AgentSpec {
@@ -418,7 +418,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -795,7 +795,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -849,7 +849,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -882,7 +882,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -955,7 +955,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -994,7 +994,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1225,7 +1225,7 @@ fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1375,7 +1375,7 @@ fn migrates_v8_db_to_v9_keeping_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1643,7 +1643,7 @@ fn migrates_v9_db_to_v10_as_a_repo_with_its_own_copies() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1718,7 +1718,7 @@ fn migrates_v10_db_to_v11_with_no_pins() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 14);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1748,4 +1748,238 @@ fn pins_and_unpins_a_project() {
     // Adding the folder again brings it back unpinned.
     store.restore_project(p, "demo").unwrap();
     assert_eq!(store.project(p).unwrap().pinned_at, None);
+}
+
+const SCHEMA_V11: &str = include_str!("../src/store/schema_v11.sql");
+
+#[test]
+fn migrates_v11_db_to_v12_with_runs_of_no_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V11).unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "work").unwrap();
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    let run = store.create_run(t, a).unwrap();
+    assert_eq!(store.run(run).unwrap().skill, None);
+    store.set_run_skill(run, "lint").unwrap();
+    assert_eq!(store.run(run).unwrap().skill.as_deref(), Some("lint"));
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 14);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn skills_are_shown_until_hidden() {
+    let store = Store::open_in_memory().unwrap();
+    let key = "claude_code:global:unslop";
+    assert!(store.skill_shown(key).unwrap());
+    store.set_skill_shown(key, false).unwrap();
+    assert!(!store.skill_shown(key).unwrap());
+    assert!(store.skill_shown("codex:global:unslop").unwrap());
+    store.set_skill_shown(key, true).unwrap();
+    assert!(store.skill_shown(key).unwrap());
+}
+
+const SCHEMA_V12: &str = include_str!("../src/store/schema_v12.sql");
+
+#[test]
+fn migrates_v12_db_to_v13_with_runs_asked_by_no_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V12).unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "work").unwrap();
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    let run = store.create_run(t, a).unwrap();
+    let before = store.run(run).unwrap();
+    assert_eq!((before.message, before.model_override), (None, None));
+    let m = store.add_message(t, Author::You, "@Ada go", None).unwrap();
+    store.set_run_request(run, m, Some("opus")).unwrap();
+    let after = store.run(run).unwrap();
+    assert_eq!(after.message, Some(m));
+    assert_eq!(after.model_override.as_deref(), Some("opus"));
+    store.set_run_request(run, m, None).unwrap();
+    assert_eq!(store.run(run).unwrap().model_override, None);
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 14);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+const SCHEMA_V13: &str = include_str!("../src/store/schema_v13.sql");
+
+#[test]
+fn migrates_v13_db_to_v14_with_titles_from_the_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    let t = "00000000-0000-7000-8000-0000000000c1";
+    {
+        // A thread made by a v13 crewd.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V13).unwrap();
+        conn.pragma_update(None, "user_version", 13).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO projects (id, name, root, main_branch, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000a1', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO projects (id, name, root, main_branch, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000a2', 'api', '/work/api', 'main', 2);
+             INSERT INTO settings (key, value) VALUES ('skill_shown:claude_code:project:bench', '0');
+             INSERT INTO settings (key, value) VALUES ('skill_shown:claude_code:global:tdd', '0');
+             INSERT INTO channels (id, project_id, name, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000b1', '00000000-0000-7000-8000-0000000000a1', 'general', 1);
+             INSERT INTO threads (id, channel_id, title, created_at)
+             VALUES ('{t}', '00000000-0000-7000-8000-0000000000b1', 'old one', 1);"
+        ))
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let thread = store.open_threads(None).unwrap().remove(0);
+    assert_eq!(thread.id.to_string(), t);
+    assert_eq!(thread.title, "old one");
+    assert_eq!(thread.title_source, TitleSource::FirstLine);
+    let t = thread.id;
+    // A project skill hidden for every project is now hidden in each.
+    for project in store.projects().unwrap() {
+        let key = format!("claude_code:project:{}:bench", project.id);
+        assert!(!store.skill_shown(&key).unwrap(), "{key}");
+    }
+    assert!(!store.skill_shown("claude_code:global:tdd").unwrap());
+    assert!(
+        store.skill_shown("claude_code:project:bench").unwrap(),
+        "the old row is gone"
+    );
+    let fresh_project = store
+        .create_project("web", Path::new("/work/web"), "main")
+        .unwrap();
+    assert!(
+        store
+            .skill_shown(&format!("claude_code:project:{fresh_project}:bench"))
+            .unwrap()
+    );
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.branch_title(t).unwrap(), "old one");
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 14);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
+}
+
+#[test]
+fn a_generated_title_replaces_only_a_first_line() {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+
+    // Generated: the first line is kept for the branch.
+    let t = store
+        .create_thread(c, "can you look at the runner")
+        .unwrap();
+    assert!(store.start_title(t).unwrap());
+    assert_eq!(
+        store.thread(t).unwrap().title_source,
+        TitleSource::Generating
+    );
+    assert!(!store.start_title(t).unwrap(), "one title run at a time");
+    assert!(store.set_generated_title(t, "Flaky runner").unwrap());
+    let thread = store.thread(t).unwrap();
+    assert_eq!(thread.title, "Flaky runner");
+    assert_eq!(thread.title_source, TitleSource::Generated);
+    assert_eq!(store.branch_title(t).unwrap(), "can you look at the runner");
+    assert!(!store.start_title(t).unwrap(), "a generated title stays");
+
+    // Renamed while generating: the rename wins.
+    let t = store.create_thread(c, "first line").unwrap();
+    assert!(store.start_title(t).unwrap());
+    store.rename_thread(t, "Mine").unwrap();
+    assert!(!store.set_generated_title(t, "Theirs").unwrap());
+    assert!(!store.keep_first_line(t).unwrap());
+    let thread = store.thread(t).unwrap();
+    assert_eq!(
+        (thread.title.as_str(), thread.title_source),
+        ("Mine", TitleSource::User)
+    );
+    assert!(!store.start_title(t).unwrap());
+
+    // Failed: the first line stays.
+    let t = store.create_thread(c, "keep me").unwrap();
+    assert!(store.start_title(t).unwrap());
+    assert!(store.keep_first_line(t).unwrap());
+    let thread = store.thread(t).unwrap();
+    assert_eq!(
+        (thread.title.as_str(), thread.title_source),
+        ("keep me", TitleSource::FirstLine)
+    );
+
+    // Left generating by a crewd that stopped.
+    let t = store.create_thread(c, "stale").unwrap();
+    assert!(store.start_title(t).unwrap());
+    store.end_stale_titles().unwrap();
+    assert_eq!(
+        store.thread(t).unwrap().title_source,
+        TitleSource::FirstLine
+    );
+}
+
+#[test]
+fn title_settings_default_to_generated_on_haiku_and_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(
+        store.title_settings().unwrap(),
+        TitleSettings {
+            mode: TitleMode::Generated,
+            model: TitleModel::Haiku,
+        }
+    );
+    let set = TitleSettings {
+        mode: TitleMode::FirstLine,
+        model: TitleModel::CodexCheapest,
+    };
+    store.set_title_settings(&set).unwrap();
+    assert_eq!(store.title_settings().unwrap(), set);
+    store.set_setting("title_model", "bogus").unwrap();
+    assert_eq!(store.title_settings().unwrap().model, TitleModel::Haiku);
 }

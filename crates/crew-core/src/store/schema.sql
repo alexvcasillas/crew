@@ -44,7 +44,9 @@ CREATE TABLE threads (
     handoff_budget INTEGER,
     handoffs_used INTEGER NOT NULL DEFAULT 0,
     archived_at INTEGER,
-    worktree_repos TEXT NOT NULL DEFAULT '[]'
+    worktree_repos TEXT NOT NULL DEFAULT '[]',
+    title_source TEXT NOT NULL DEFAULT 'first_line',
+    first_title TEXT
 );
 
 CREATE TABLE messages (
@@ -71,7 +73,10 @@ CREATE TABLE runs (
     ord INTEGER NOT NULL,
     runtime TEXT NOT NULL DEFAULT 'claude_code',
     handed_from TEXT REFERENCES runs(id),
-    waiting_for TEXT REFERENCES runs(id)
+    waiting_for TEXT REFERENCES runs(id),
+    skill TEXT,
+    model_override TEXT,
+    message_id TEXT
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);

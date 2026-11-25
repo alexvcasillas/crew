@@ -9,7 +9,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::super::common::{
-    clean_line, dot, elapsed, monogram, now_ms, pulsing, runtime_badge_for, runtime_chip, spinner,
+    clean_line, dot, elapsed, generating_title, monogram, now_ms, pulsing, runtime_badge_for,
+    runtime_chip, spinner, thread_title_text,
 };
 use super::super::run_card::summarize;
 use super::super::workspace::Workspace;
@@ -354,7 +355,15 @@ impl Workspace {
                             .line_height(scale::line(20.))
                             .font_weight(weight(FontWeight::SEMIBOLD))
                             .aria_label(card.title.clone())
-                            .child(card.title.clone())
+                            .when(card.generating, |el| {
+                                generating_title(el).aria_description("Generating a title")
+                            })
+                            .child(thread_title_text(
+                                format!("thread-title-{id}"),
+                                &card.title,
+                                card.generating,
+                                self.state().title_replaced(id),
+                            ))
                             .test_support(),
                     )
                     .child(top_right),

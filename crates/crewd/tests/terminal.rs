@@ -171,6 +171,7 @@ fn dead_pid() -> u32 {
 async fn start(p: &Paths, claude_bin: PathBuf) {
     let home = p.crew_home.clone();
     let opts = ServeOptions {
+        no_title_runs: true,
         claude_bin: Some(claude_bin),
         codex_bin: Some(PathBuf::from("/nonexistent/codex")),
         crew_mcp_bin: None,
@@ -354,12 +355,15 @@ async fn crew_run_session(c: &mut Client, project: ProjectId) -> String {
         .ok(Request::CreateThread {
             channel,
             title: "t".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
     c.call(Request::PostMessage {
         thread,
         body: "@Forge read it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

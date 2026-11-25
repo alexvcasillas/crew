@@ -149,12 +149,15 @@ async fn start_long_run(c: &mut Client, dir: &Path) -> ThreadId {
         .ok(Request::CreateThread {
             channel,
             title: "t".into(),
+            first_line: false,
         })
         .await;
     let _: crew_core::ids::MessageId = c
         .ok(Request::PostMessage {
             thread,
             body: "@Forge wait".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
     thread
@@ -237,6 +240,7 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
     let home = tmp.path().join("crew");
     let pid_file = tmp.path().join("agent.pid");
     let opts = crewd::ServeOptions {
+        no_title_runs: true,
         max_runs: 1,
         claude_bin: Some(sleeping_script(tmp.path(), &pid_file)),
         crew_mcp_bin: None,
@@ -259,6 +263,8 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
         .ok(Request::PostMessage {
             thread,
             body: "@Forge next".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
 

@@ -112,6 +112,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 codex_bin: Some(PathBuf::from("/nonexistent/codex")),
                 crew_mcp_bin: None,
@@ -230,6 +231,7 @@ impl Client {
         self.ok(Request::CreateThread {
             channel,
             title: title.into(),
+            first_line: false,
         })
         .await
     }
@@ -256,6 +258,8 @@ impl Client {
         self.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -821,10 +825,13 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         Request::PostMessage {
             thread: busy,
             body: "@Forge again".into(),
+            skill: None,
+            model_override: None,
         },
         Request::CreateThread {
             channel: general,
             title: "New".into(),
+            first_line: false,
         },
         Request::CreateChannel {
             project: p,

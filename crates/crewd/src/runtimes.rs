@@ -58,6 +58,19 @@ fn names(bins: &CliBins) -> (PathBuf, PathBuf) {
     (claude, codex_bin(bins))
 }
 
+/// The `claude` command runs use.
+pub(crate) fn claude_bin(bins: &CliBins) -> PathBuf {
+    names(bins).0
+}
+
+/// Whether Claude Code is signed in, from `claude auth status`. `None`
+/// if it couldn't tell.
+pub(crate) async fn claude_signed_in(bin: &Path) -> Option<bool> {
+    run(bin, &["auth", "status"], false)
+        .await
+        .and_then(signed_in)
+}
+
 /// The `codex` command runs and checks use.
 pub(crate) fn codex_bin(bins: &CliBins) -> PathBuf {
     bins.codex.clone().unwrap_or_else(|| PathBuf::from("codex"))
@@ -116,7 +129,7 @@ pub(crate) async fn codex_signed_in(bin: &Path) -> io::Result<Option<bool>> {
 
 /// The models a short-lived `codex app-server` lists, minus hidden ones.
 /// Empty if it fails or takes too long. Its process group is killed after.
-async fn codex_models(bin: &Path) -> Vec<ModelInfo> {
+pub(crate) async fn codex_models(bin: &Path) -> Vec<ModelInfo> {
     let mut cmd = Command::new(bin);
     cmd.arg("app-server").stderr(Stdio::null()).process_group(0);
     let (conn, _incoming) = match CodexConn::spawn(cmd) {
@@ -210,9 +223,7 @@ async fn probe(runtime: Runtime, bin: &Path, sign_in: SignIn) -> RuntimeInfo {
     let (version, (signed_in, models)) = tokio::join!(run(&path, &["--version"], true), async {
         match sign_in {
             SignIn::Claude => {
-                let signed_in = run(&path, &["auth", "status"], false)
-                    .await
-                    .and_then(signed_in);
+                let signed_in = claude_signed_in(&path).await;
                 (signed_in, claude_models())
             }
             SignIn::Codex => {
@@ -283,6 +294,11 @@ fn find(bin: &Path) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|p| is_executable(p))
+}
+
+/// [`find`], for the rest of the crate.
+pub(crate) fn find_bin(bin: &Path) -> Option<PathBuf> {
+    find(bin)
 }
 
 fn is_executable(p: &Path) -> bool {

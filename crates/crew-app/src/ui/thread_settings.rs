@@ -760,6 +760,7 @@ mod tests {
             handoff_budget: None,
             handoffs_used: 1,
             archived_at: None,
+            title_source: Default::default(),
         };
         assert_eq!(effective(&t, (None, None)), (HandoffPolicy::AskFirst, 3));
         assert_eq!(

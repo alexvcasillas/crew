@@ -159,6 +159,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 codex_bin: Some(codex_bin),
                 crew_mcp_bin: crew_mcp,
@@ -348,6 +349,7 @@ async fn setup(c: &mut Client, root: &Path, mode: PermissionMode) -> ThreadId {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -359,6 +361,8 @@ async fn ask_forge(c: &mut Client, thread: ThreadId, body: &str) -> RunId {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -1008,6 +1012,7 @@ async fn switching_to_codex_starts_a_fresh_thread() {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -1322,6 +1327,7 @@ async fn in_a_folder_of_repos_codex_writes_only_its_thread_folder() {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();

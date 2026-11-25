@@ -256,6 +256,16 @@ impl Workspace {
             .collect();
         let choices = run_labels(&runs);
         let shown = self.shown_run(thread).map(|r| r.id);
+        // A skill run's row needs the skill's file.
+        if let Some(project) = shown
+            .and_then(|r| state.run(r))
+            .filter(|r| r.skill.is_some())
+            .and_then(|_| state.thread_project(thread))
+            && !self.skills.projects.contains_key(&project)
+        {
+            self.ensure_skills(project, cx);
+        }
+        let state = self.state();
         let counts = events_per_run(state.events(thread));
         let approvals = state.thread_approvals(thread);
         let asks = shown
@@ -280,7 +290,8 @@ impl Workspace {
 
         match shown {
             Some(run) if self.inspector.rows_from != Some((run, count_of(run))) => {
-                let rows = activity_rows_asked(self.state().events(thread), run, &asks);
+                let mut rows = self.request_rows(run);
+                rows.extend(activity_rows_asked(self.state().events(thread), run, &asks));
                 let same_run = self.inspector.rows_from.map(|(r, _)| r) == Some(run);
                 let old = std::mem::replace(&mut self.inspector.rows, rows);
                 let list = &self.inspector.list;

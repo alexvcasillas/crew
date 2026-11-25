@@ -39,6 +39,7 @@ fn start_crewd_with(home: &Path, claude_bin: PathBuf, codex_bin: Option<PathBuf>
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let opts = ServeOptions {
+                no_title_runs: true,
                 max_runs: 4,
                 claude_bin: Some(claude_bin),
                 // Never the real codex.

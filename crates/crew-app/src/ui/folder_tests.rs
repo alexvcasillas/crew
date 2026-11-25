@@ -320,11 +320,14 @@ fn in_place_a_second_writer_waits_its_turn(cx: &mut TestAppContext) {
     let other: ThreadId = f.w.ask(Request::CreateThread {
         channel: f.w.channel,
         title: "write the notes".into(),
+        first_line: false,
     });
     let (window, ws) = open_thread(cx, f.home.path(), &f.w);
     let _: crew_core::ids::MessageId = f.w.ask(Request::PostMessage {
         thread: other,
         body: "@Quill write".into(),
+        skill: None,
+        model_override: None,
     });
     run_of(cx, &ws, other, quill, RunStatus::Working);
     f.w.post("@Forge tidy up");

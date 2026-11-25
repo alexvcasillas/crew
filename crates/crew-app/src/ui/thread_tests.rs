@@ -42,6 +42,8 @@ impl World {
         let _: MessageId = self.ask(Request::PostMessage {
             thread: self.thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         });
     }
 }
@@ -122,6 +124,7 @@ pub(super) fn world_named(
         Request::CreateThread {
             channel,
             title: "fix the login".into(),
+            first_line: true,
         },
     );
     World {
@@ -221,7 +224,7 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
         !shows(
             cx,
             window,
-            "Replying to Forge. Type @ to bring in someone else."
+            "Replying to Forge. Type @ to bring in someone else, / for a skill."
         ),
         "no one has answered here yet"
     );
@@ -253,7 +256,7 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
     wait_to_show(
         cx,
         window,
-        "Replying to Forge. Type @ to bring in someone else.",
+        "Replying to Forge. Type @ to bring in someone else, / for a skill.",
     );
 }
 
@@ -593,6 +596,7 @@ fn drafts_stay_with_their_thread(cx: &mut TestAppContext) {
     let other: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "second".into(),
+        first_line: false,
     });
     let (window, ws) = open_thread(cx, home.path(), &w);
 

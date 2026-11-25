@@ -1,6 +1,7 @@
 //! The `@` menu above the composer: agents matching what follows the `@`.
 
 use crew_core::agent::Runtime;
+use crew_core::ids::AgentId;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -40,10 +41,13 @@ pub fn opens_below(top: f32, height: f32) -> bool {
 /// An agent as the menu shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MentionAgent {
+    pub id: AgentId,
     pub name: String,
     pub role: String,
     /// `claude · haiku`.
     pub chip: String,
+    /// The agent's own model, as its spec names it.
+    pub model: String,
     /// The runtime behind `chip`, for its provider mark.
     pub runtime: Runtime,
     pub status: ThreadStatus,
@@ -262,9 +266,11 @@ mod tests {
 
     fn agent(name: &str) -> MentionAgent {
         MentionAgent {
+            id: crew_core::ids::AgentId::new(),
             name: name.into(),
             role: String::new(),
             chip: "claude · haiku".into(),
+            model: "haiku".into(),
             runtime: Runtime::ClaudeCode,
             status: ThreadStatus::Idle,
         }

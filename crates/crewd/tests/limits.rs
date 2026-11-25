@@ -39,6 +39,7 @@ struct Daemon {
 impl Daemon {
     async fn start(home: &Path, max_runs: usize, claude: PathBuf) -> Daemon {
         let opts = ServeOptions {
+            no_title_runs: true,
             max_runs,
             claude_bin: Some(claude),
             crew_mcp_bin: None,
@@ -195,6 +196,7 @@ async fn setup(c: &mut Client, root: &Path, n: usize) -> (AgentId, Vec<ThreadId>
             .ok(Request::CreateThread {
                 channel,
                 title: format!("thread {i}"),
+                first_line: false,
             })
             .await;
         c.call(Request::Subscribe { thread }).await.unwrap();
@@ -207,6 +209,8 @@ async fn say(c: &mut Client, thread: ThreadId, body: &str) {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

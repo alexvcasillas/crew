@@ -75,6 +75,7 @@ impl Setup {
             Request::CreateThread {
                 channel,
                 title: "a thread".into(),
+                first_line: false,
             },
         );
         Setup {
@@ -155,6 +156,7 @@ fn start(home: &Path, claude_home: &Path) -> Daemon {
     Daemon::start_with_options(
         home.to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(PathBuf::from("/nonexistent/claude")),
             claude_home: Some(claude_home.to_path_buf()),
             ..Default::default()

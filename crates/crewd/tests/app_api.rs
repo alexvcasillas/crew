@@ -72,6 +72,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 codex_bin: Some(codex_bin),
                 crew_mcp_bin: None,
@@ -205,6 +206,7 @@ async fn thread(c: &mut Client, channel: ChannelId, title: &str) -> ThreadId {
     c.ok(Request::CreateThread {
         channel,
         title: title.into(),
+        first_line: false,
     })
     .await
 }
@@ -253,6 +255,7 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
         approvals,
         terminal_sessions,
         limits: _,
+        titles: _,
     } = c.recv().await
     else {
         panic!("expected a snapshot first");
@@ -278,6 +281,8 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
         c.call(Request::PostMessage {
             thread: t,
             body: "@Forge look".into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -483,6 +488,8 @@ async fn update_agent_changes_next_run_args() {
     c.call(Request::PostMessage {
         thread: t,
         body: "@Forge look".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -547,6 +554,8 @@ async fn delete_agent_refused_while_running() {
     c.call(Request::PostMessage {
         thread: t,
         body: "@Forge wait".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();
@@ -592,6 +601,8 @@ async fn delete_agent_refused_while_running() {
     c.call(Request::PostMessage {
         thread: t,
         body: "@Forge again".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

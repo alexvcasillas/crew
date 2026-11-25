@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crew_core::event::RunStatus;
 use crew_core::ids::{ChannelId, ThreadId};
-use crew_proto::{ChannelOverview, Request, ThreadSummary, WorktreeState};
+use crew_proto::{ChannelOverview, Request, ThreadSummary, TitleSource, WorktreeState};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 
@@ -242,6 +242,8 @@ pub struct Card {
     pub summary: ThreadSummary,
     /// `crew/<slug>`, once the thread has a worktree.
     pub branch: Option<String>,
+    /// Its title is being generated.
+    pub generating: bool,
 }
 
 /// One row of the card list.
@@ -883,6 +885,7 @@ impl Workspace {
                     status,
                     last_activity: summary.last_activity_at.max(t.created_at),
                     branch: t.worktree.as_ref().map(|wt| wt.branch.clone()),
+                    generating: t.title_source == TitleSource::Generating,
                     summary,
                 }
             })
@@ -1177,6 +1180,7 @@ mod tests {
             last_activity,
             summary: summary(thread),
             branch: None,
+            generating: false,
         }
     }
 

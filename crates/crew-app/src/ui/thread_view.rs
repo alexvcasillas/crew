@@ -7,7 +7,7 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun,
+    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun, TitleSource,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _};
@@ -15,7 +15,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{
-    clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip, with_font_probe,
+    clock, elapsed, generating_title, monogram, pulsing, runtime_badge, runtime_badge_for,
+    runtime_chip, thread_title_text, with_font_probe,
 };
 use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
 use super::markdown_view::{DocKey, render_doc};
@@ -38,6 +39,7 @@ impl Workspace {
         };
         let channel = state.channel(t.channel);
         let channel_name = channel.map(|c| c.name.clone()).unwrap_or_default();
+        let generating = t.title_source == TitleSource::Generating;
         let policy = state
             .thread_handoff(thread)
             .0
@@ -74,7 +76,8 @@ impl Workspace {
                 && state.run(run).is_some_and(|r| r.status == RunStatus::Done)
             {
                 let summary = summarize(events, run);
-                if !summary.files.is_empty() {
+                let skill = state.run(run).is_some_and(|r| r.skill.is_some());
+                if !summary.files.is_empty() || skill {
                     items.push(
                         indented(self.render_done_card(run, &summary, cx)).into_any_element(),
                     );
@@ -129,7 +132,15 @@ impl Workspace {
                                     .text_size(scale::text(14.))
                                     .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label(t.title.clone())
-                                    .child(t.title.clone())
+                                    .when(generating, |el| {
+                                        generating_title(el).aria_description("Generating a title")
+                                    })
+                                    .child(thread_title_text(
+                                        "thread-title",
+                                        &t.title,
+                                        generating,
+                                        state.title_replaced(thread),
+                                    ))
                                     .test_support(),
                             )
                             .child(
@@ -246,28 +257,85 @@ impl Workspace {
                 let agent = state.agent(*agent);
                 let name =
                     agent.map_or_else(|| "Deleted agent".to_string(), |a| a.spec.name.clone());
-                let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
+                // A run on its message's own model says so.
+                let chip = message
+                    .run
+                    .and_then(|r| state.run(r))
+                    .filter(|r| r.model_override.is_some())
+                    .and_then(|r| self.run_chip(r));
+                let runtime = agent.map(|a| match chip {
+                    Some(text) => (runtime_badge_for(&a.spec.runtime, text.clone()), text),
+                    None => (runtime_badge(&a.spec), runtime_chip(&a.spec)),
+                });
                 (name.clone(), monogram(&name, 32.), runtime)
             }
             _ => ("You".to_string(), you_avatar(), None),
         };
+        let mut label = message.body.clone();
         let body = if matches!(message.author, Author::Agent(_)) {
             let doc = self.docs.get(DocKey::Message(id), &message.body);
             render_doc(&doc, names, &format!("md-{id}")).into_any_element()
         } else {
-            styled_body(&message.body, names).into_any_element()
+            let (body, skill) = self.render_your_body(message, names);
+            if let Some(skill) = skill {
+                label = format!("/{skill} {label}").trim_end().to_string();
+            }
+            body
         };
-        message_row(
-            id.to_string(),
-            avatar,
-            name,
-            runtime,
-            time,
-            message.body.clone(),
-            body,
-        )
-        .test_support()
-        .into_any_element()
+        message_row(id.to_string(), avatar, name, runtime, time, label, body)
+            .test_support()
+            .into_any_element()
+    }
+
+    /// Your message: the skill it ran on a chip before the text, and who
+    /// ran it under it.
+    fn render_your_body(
+        &self,
+        message: &StoredMessage,
+        names: &[String],
+    ) -> (AnyElement, Option<String>) {
+        let state = self.state();
+        let id = message.id;
+        let Some(run) = state
+            .thread_runs(message.thread)
+            .into_iter()
+            .find(|r| r.message == Some(id) && r.skill.is_some())
+        else {
+            return (styled_body(&message.body, names).into_any_element(), None);
+        };
+        let skill = run.skill.clone().unwrap_or_default();
+        let agent = state
+            .agent(run.agent)
+            .map_or_else(|| "Deleted agent".to_string(), |a| a.spec.name.clone());
+        let ran = match run.model_override.as_deref() {
+            Some(model) => {
+                let runtime = self.run_runtime(run);
+                let models = super::settings::agents::models_of(&self.runtimes, &runtime);
+                format!(
+                    "Ran with {agent} · {} for this message",
+                    super::runs_with::model_name(&runtime, model, models)
+                )
+            }
+            None => format!("Ran with {agent}"),
+        };
+        let body = div()
+            .flex()
+            .flex_col()
+            // The skill runs inline before the text, so long lines wrap
+            // under it.
+            .child(skill_body(&skill, &message.body, names))
+            .child(
+                div()
+                    .id(format!("message-ran-{id}"))
+                    .mt(scale::row(4.))
+                    .text_size(scale::text(12.))
+                    .text_color(color("text-tertiary"))
+                    .aria_label(ran.clone())
+                    .child(ran)
+                    .test_support(),
+            )
+            .into_any_element();
+        (body, Some(skill))
     }
 
     /// An agent at work: its avatar, ringed in blue and pulsing while
@@ -276,7 +344,15 @@ impl Workspace {
         let state = self.state();
         let agent = state.agent(run.agent);
         let name = agent.map_or_else(|| "Agent".to_string(), |a| a.spec.name.clone());
-        let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
+        let chip = run
+            .model_override
+            .is_some()
+            .then(|| self.run_chip(run))
+            .flatten();
+        let runtime = agent.map(|a| match chip {
+            Some(text) => (runtime_badge_for(&a.spec.runtime, text.clone()), text),
+            None => (runtime_badge(&a.spec), runtime_chip(&a.spec)),
+        });
         let asks = decided_asks(&state.thread_approvals(run.thread), run.id);
         let summary = summarize_asked(state.events(run.thread), run.id, &asks);
         let id = run.id;
@@ -533,7 +609,12 @@ fn body_spans(body: &str, names: &[String]) -> Vec<(Range<usize>, Span)> {
 /// The body with `@Agent` mentions in blue and `code` in mono on a
 /// background. Text runs share one size and have no corner radius.
 fn styled_body(body: &str, names: &[String]) -> StyledText {
-    let runs = body_spans(body, names)
+    StyledText::new(body.to_string()).with_runs(body_runs(body, names))
+}
+
+/// The runs [`styled_body`] draws `body` with.
+fn body_runs(body: &str, names: &[String]) -> Vec<TextRun> {
+    body_spans(body, names)
         .into_iter()
         .map(|(range, span)| {
             let (mut font, text, background) = match span {
@@ -559,8 +640,35 @@ fn styled_body(body: &str, names: &[String]) -> StyledText {
                 strikethrough: None,
             }
         })
-        .collect();
-    StyledText::new(body.to_string()).with_runs(runs)
+        .collect()
+}
+
+/// `/skill` as an inline mono chip, then the body as [`styled_body`]
+/// draws it.
+fn skill_body(skill: &str, body: &str, names: &[String]) -> StyledText {
+    // Thin spaces pad the chip inside its background.
+    let chip = format!("\u{2009}/{skill}\u{2009}");
+    let mut runs = vec![
+        TextRun {
+            len: chip.len(),
+            font: font(code_family()),
+            color: color("text-primary"),
+            background_color: Some(color("surface-300")),
+            underline: None,
+            strikethrough: None,
+        },
+        TextRun {
+            len: 1,
+            font: font(ui_family()),
+            color: color("text-primary"),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        },
+    ];
+    let text = format!("{chip} {body}");
+    runs.extend(body_runs(body, names));
+    StyledText::new(text).with_runs(runs)
 }
 
 /// Byte ranges of `code` spans, backticks included.

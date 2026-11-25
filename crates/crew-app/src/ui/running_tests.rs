@@ -51,6 +51,7 @@ fn shop(w: &World, root: &Path) -> Shop {
     let thread: ThreadId = w.ask(Request::CreateThread {
         channel,
         title: "add search".into(),
+        first_line: false,
     });
     Shop { project, thread }
 }
@@ -59,6 +60,8 @@ fn post(w: &World, thread: ThreadId, body: &str) {
     let _: MessageId = w.ask(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     });
 }
 
@@ -264,6 +267,7 @@ fn queued_run_shows_in_queued_group(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             max_runs: 1,
             claude_bin: Some(busy_claude(tmp.path())),
             ..Default::default()
