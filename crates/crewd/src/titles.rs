@@ -123,12 +123,15 @@ fn claude_command(bin: &Path, model: &str, prompt: &str) -> Command {
 /// `codex exec` in a read-only sandbox (no writes, no network) that never asks
 /// for more, with no saved session. Codex has no switch that takes its
 /// shell tool away, so this is the least it can do: read files. It prints
-/// the final answer on stdout.
+/// the final answer on stdout. `-c notify=[]` drops any notify hook from
+/// your config for this run alone.
 fn codex_command(bin: &Path, model: &str, prompt: &str) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args([
         "--ask-for-approval",
         "never",
+        "-c",
+        "notify=[]",
         "exec",
         "--model",
         model,

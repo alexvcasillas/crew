@@ -525,7 +525,10 @@ async fn without_claude_signed_in_codex_names_the_thread_on_its_cheapest_model()
         .lines()
         .map(String::from)
         .collect();
-    assert_eq!(args[..3], ["--ask-for-approval", "never", "exec"]);
+    assert_eq!(
+        args[..5],
+        ["--ask-for-approval", "never", "-c", "notify=[]", "exec"]
+    );
     let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
     assert_eq!(args[at("--model") + 1], "gpt-luna-mini");
     assert_eq!(args[at("--sandbox") + 1], "read-only");

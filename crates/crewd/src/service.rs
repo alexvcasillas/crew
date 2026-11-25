@@ -1435,6 +1435,15 @@ impl Service {
         let model_override = model_override
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
+        // The override goes to the CLI as an argument: refuse anything
+        // that could pass for a flag or break the value.
+        if let Some(m) = &model_override
+            && (m.starts_with('-')
+                || m.chars().any(|c| c.is_whitespace() || c.is_control())
+                || m.chars().count() > 128)
+        {
+            return Err("That model name isn't valid. Pick one from the list.".into());
+        }
         let (id, title_run) = {
             let mut state = self.state();
             let mut db = self.db();

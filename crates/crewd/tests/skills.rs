@@ -728,6 +728,42 @@ async fn a_skill_needs_an_agent_of_its_runtime() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_odd_model_override_is_refused_and_nothing_is_saved() {
+    let mut w = world(0).await;
+    let long = "m".repeat(129);
+    for odd in [
+        "--dangerously-skip-permissions",
+        "-m",
+        "two words",
+        "bad\nmodel",
+        "bell\u{7}",
+        long.as_str(),
+    ] {
+        let err =
+            w.c.call(Request::PostMessage {
+                thread: w.thread,
+                body: "@Ada go".into(),
+                skill: None,
+                model_override: Some(odd.into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.contains("isn't valid"), "{odd:?}: {err}");
+    }
+    let runs: Vec<StoredRun> = w.c.ok(Request::ListRuns { status: None }).await;
+    assert!(runs.is_empty());
+    // A fresh subscription holds no message and no run.
+    w.c.call(Request::Subscribe { thread: w.thread })
+        .await
+        .unwrap();
+    // The next good message is the first the thread has.
+    let run = post(&mut w, "@Ada fine", None, Some("opus")).await;
+    let runs: Vec<StoredRun> = w.c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, run);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn plugin_skills_a_run_did_not_list_are_filtered_out() {
     let mut w = world(1).await;
     let plugin = w.dir.join("plugins-src/tools");
