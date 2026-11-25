@@ -71,7 +71,8 @@ CREATE TABLE runs (
     ord INTEGER NOT NULL,
     runtime TEXT NOT NULL DEFAULT 'claude_code',
     handed_from TEXT REFERENCES runs(id),
-    waiting_for TEXT REFERENCES runs(id)
+    waiting_for TEXT REFERENCES runs(id),
+    skill TEXT
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);

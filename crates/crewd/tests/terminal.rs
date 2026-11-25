@@ -360,6 +360,8 @@ async fn crew_run_session(c: &mut Client, project: ProjectId) -> String {
     c.call(Request::PostMessage {
         thread,
         body: "@Forge read it".into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

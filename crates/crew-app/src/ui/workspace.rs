@@ -1088,6 +1088,8 @@ impl Workspace {
                         .request(Request::PostMessage {
                             thread,
                             body: text.clone(),
+                            skill: None,
+                            model_override: None,
                         })
                         .await;
                     let back = if still_here {
@@ -1104,6 +1106,8 @@ impl Workspace {
                         .request(Request::PostMessage {
                             thread,
                             body: text.clone(),
+                            skill: None,
+                            model_override: None,
                         })
                         .await
                         .map(drop)

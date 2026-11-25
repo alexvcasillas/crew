@@ -332,6 +332,8 @@ async fn start_forge_with(c: &mut Client, thread: ThreadId, body: &str) -> RunId
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

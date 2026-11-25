@@ -256,6 +256,8 @@ impl Client {
         self.call(Request::PostMessage {
             thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         })
         .await
         .unwrap();
@@ -821,6 +823,8 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         Request::PostMessage {
             thread: busy,
             body: "@Forge again".into(),
+            skill: None,
+            model_override: None,
         },
         Request::CreateThread {
             channel: general,

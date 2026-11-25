@@ -200,6 +200,8 @@ fn post(client: &ClientHandle, thread: ThreadId) {
         Request::PostMessage {
             thread,
             body: "@Forge read a.txt".into(),
+            skill: None,
+            model_override: None,
         },
     );
 }

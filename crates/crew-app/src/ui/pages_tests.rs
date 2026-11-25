@@ -565,6 +565,8 @@ fn start_a_thread_opens_the_composer_in_its_last_channel(cx: &mut TestAppContext
     let _: crew_core::ids::MessageId = w.ask(Request::PostMessage {
         thread: there,
         body: "@Forge look".into(),
+        skill: None,
+        model_override: None,
     });
     run_of(cx, &ws, there, forge, RunStatus::Done);
 
@@ -611,6 +613,8 @@ fn a_deleted_agent_and_a_removed_project_say_removed(cx: &mut TestAppContext) {
     let _: crew_core::ids::MessageId = w.ask(Request::PostMessage {
         thread: second,
         body: "@Forge look".into(),
+        skill: None,
+        model_override: None,
     });
     let gone = run_of(cx, &ws, second, forge, RunStatus::Done);
     let _: serde_json::Value = w.ask(Request::RemoveProject { project: other });

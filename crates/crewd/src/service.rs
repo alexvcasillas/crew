@@ -25,7 +25,7 @@ use crew_core::store::{
     ThreadWorktree,
 };
 use crew_core::worktree;
-use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg};
+use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg, SkillInfo, SkillRef, skill_key};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -86,6 +86,9 @@ impl Db {
 
 /// What a queued run needs besides its job.
 struct Pending {
+    /// The skill the run is for, and the model to use for this run alone.
+    skill: Option<SkillRef>,
+    model_override: Option<String>,
     /// The message that asked for the run.
     message: MessageId,
     /// The prompt to use if the run starts a new session.
@@ -151,6 +154,10 @@ struct Inner {
     count_delay_ms: std::sync::atomic::AtomicU64,
     /// File lists of project roots and worktrees, for search.
     files: Mutex<FileIndex>,
+    /// Claude Code's home, where its skills and plugins are looked for.
+    claude_home: OnceLock<PathBuf>,
+    /// Skills found per project, until a reload.
+    skills: Mutex<HashMap<ProjectId, Vec<crate::skills::Found>>>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -250,7 +257,15 @@ impl Service {
             count_slots: Arc::new(tokio::sync::Semaphore::new(crate::overview::GIT_AT_ONCE)),
             count_delay_ms: std::sync::atomic::AtomicU64::new(0),
             files: Mutex::new(FileIndex::default()),
+            claude_home: OnceLock::new(),
+            skills: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Where to look for Claude Code's own skills and plugins. Without it,
+    /// only a project's skills are found.
+    pub fn set_claude_home(&self, home: PathBuf) {
+        let _ = self.0.claude_home.set(home);
     }
 
     /// A receiver for all notifications from now on.
@@ -500,6 +515,10 @@ impl Service {
                 self.thread_summaries(project, channels).await
             }
             Request::Runtimes => self.runtimes().await,
+            Request::Skills {
+                project,
+                force_reload,
+            } => self.skills(project, force_reload).await,
             Request::Search {
                 query,
                 project,
@@ -616,10 +635,25 @@ impl Service {
                 self.update_channel(channel, &name, description.trim())?;
                 Ok(serde_json::Value::Null)
             }
-            Request::PostMessage { thread, body } => json(
-                self.post_message(thread, &body)
-                    .map_err(|e| e.to_string())?,
-            ),
+            Request::PostMessage {
+                thread,
+                body,
+                skill,
+                model_override,
+            } => json(self.post_message(thread, &body, skill, model_override)?),
+            Request::SetSkillShown {
+                runtime,
+                source,
+                name,
+                shown,
+            } => {
+                let key = skill_key(&runtime, &source, &name);
+                self.db()
+                    .store
+                    .set_skill_shown(&key, shown)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
+            }
             Request::StopRun { run } => {
                 self.stop_run(run)?;
                 Ok(serde_json::Value::Null)
@@ -699,6 +733,7 @@ impl Service {
             | Request::Search { .. }
             | Request::ProjectOverview { .. }
             | Request::AgentProfile { .. }
+            | Request::Skills { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::RenameProject { project, name } => {
                 let name = name.trim();
@@ -799,6 +834,55 @@ impl Service {
             Ok(Ok(full)) => json(full),
             _ => json(crate::runtimes::found(&self.0.bins)),
         }
+    }
+
+    /// The skills of both CLIs in the project. Found once and kept until
+    /// `force_reload`. Codex ones are left out if it isn't installed or
+    /// signed in.
+    async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
+        let cached = (!force_reload)
+            .then(|| self.0.skills.lock().unwrap().get(&project).cloned())
+            .flatten();
+        let found = match cached {
+            Some(found) => found,
+            None => {
+                let root = {
+                    let db = self.db();
+                    db.store.project(project).map_err(|e| e.to_string())?.root
+                };
+                let home = self.0.claude_home.get().cloned();
+                let scan_root = root.clone();
+                let mut found = tokio::task::spawn_blocking(move || {
+                    crate::skills::scan_claude(home.as_deref(), &scan_root)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                let codex = crate::runtimes::codex_bin(&self.0.bins);
+                let usable = match crate::runtimes::find_bin(&codex) {
+                    Some(path) => {
+                        matches!(
+                            crate::runtimes::codex_signed_in(&path).await,
+                            Ok(Some(true))
+                        )
+                    }
+                    None => false,
+                };
+                if usable {
+                    found.extend(crate::skills::scan_codex(&codex, &root, force_reload).await);
+                }
+                self.0.skills.lock().unwrap().insert(project, found.clone());
+                found
+            }
+        };
+        let db = self.db();
+        let list: Vec<SkillInfo> = found
+            .iter()
+            .map(|f| {
+                let key = skill_key(&f.runtime, &f.source, &f.name);
+                f.info(db.store.skill_shown(&key).unwrap_or(true))
+            })
+            .collect();
+        json(list)
     }
 
     /// Tells `SubscribeAll` clients the channel as it is now.
@@ -1272,23 +1356,27 @@ impl Service {
     /// message that mentions no one goes to the agent that ran last in
     /// the thread, if none is queued or working there; otherwise it is
     /// context for the next run.
-    pub fn post_message(&self, thread: ThreadId, body: &str) -> Result<MessageId, StoreError> {
+    pub fn post_message(
+        &self,
+        thread: ThreadId,
+        body: &str,
+        skill: Option<SkillRef>,
+        model_override: Option<String>,
+    ) -> Result<MessageId, String> {
+        let model_override = model_override
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
         let id = {
             let mut state = self.state();
             let mut db = self.db();
-            db.store.ensure_thread_open(thread)?;
-            let earlier = db.store.messages(thread)?;
-            let agents = db.store.agents()?;
-            let id = self.add_message(&mut db, thread, Author::You, body, None)?;
+            db.store
+                .ensure_thread_open(thread)
+                .map_err(|e| e.to_string())?;
+            let earlier = db.store.messages(thread).map_err(|e| e.to_string())?;
+            let agents = db.store.agents().map_err(|e| e.to_string())?;
 
             let names: Vec<&str> = agents.iter().map(|(_, a)| a.name.as_str()).collect();
             let (known, unknown) = parse_mentions(body, &names);
-            let context = render_context(&earlier, &db.store.agents_with_deleted()?);
-            let fresh = if context.is_empty() {
-                body.to_string()
-            } else {
-                format!("{context}\n\n{body}")
-            };
             let mut called: Vec<AgentId> = known
                 .iter()
                 .filter_map(|name| agents.iter().find(|(_, a)| a.name == *name))
@@ -1297,10 +1385,58 @@ impl Service {
             if called.is_empty() && unknown.is_empty() {
                 // A reply to nobody in particular goes to whoever answered
                 // last, unless someone is still at work.
-                called.extend(self.last_agent(&db, thread, &agents)?);
+                called.extend(
+                    self.last_agent(&db, thread, &agents)
+                        .map_err(|e| e.to_string())?,
+                );
             }
+            // A skill goes to an agent that uses its CLI. Nothing is saved
+            // otherwise.
+            if let Some(skill) = &skill {
+                let runtime = match skill.runtime {
+                    Runtime::ClaudeCode => "Claude Code",
+                    Runtime::Codex => "Codex",
+                };
+                if called.is_empty() {
+                    return Err(format!(
+                        "Mention an agent that uses {runtime} to run /{}.",
+                        skill.name
+                    ));
+                }
+                let wrong = called.iter().any(|agent| {
+                    agents
+                        .iter()
+                        .any(|(id, a)| id == agent && a.runtime != skill.runtime)
+                });
+                if wrong {
+                    return Err(format!(
+                        "/{} runs on {runtime}. Pick an agent that uses it.",
+                        skill.name
+                    ));
+                }
+            }
+            let id = self
+                .add_message(&mut db, thread, Author::You, body, None)
+                .map_err(|e| e.to_string())?;
+            let context = render_context(
+                &earlier,
+                &db.store.agents_with_deleted().map_err(|e| e.to_string())?,
+            );
+            let fresh = if context.is_empty() {
+                body.to_string()
+            } else {
+                format!("{context}\n\n{body}")
+            };
             for agent in &called {
-                let run = db.store.create_run(thread, *agent)?;
+                let run = db
+                    .store
+                    .create_run(thread, *agent)
+                    .map_err(|e| e.to_string())?;
+                if let Some(skill) = &skill {
+                    db.store
+                        .set_run_skill(run, &skill.name)
+                        .map_err(|e| e.to_string())?;
+                }
                 self.publish_status(&mut db, thread, run, RunStatus::Queued);
                 state.scheduler.enqueue(Job {
                     run,
@@ -1311,6 +1447,8 @@ impl Service {
                 state.pending.insert(
                     run,
                     Pending {
+                        skill: skill.clone(),
+                        model_override: model_override.clone(),
                         message: id,
                         fresh: fresh.clone(),
                     },
@@ -1323,7 +1461,8 @@ impl Service {
                     Author::System,
                     &format!("No agent named @{name}."),
                     None,
-                )?;
+                )
+                .map_err(|e| e.to_string())?;
             }
             id
         };
@@ -1651,7 +1790,7 @@ impl Service {
                 let (handle, rx, join) = match inv {
                     Invocation::Claude(inv) => spawn_run(inv),
                     Invocation::Codex(inv) => {
-                        spawn_codex_run(inv, self.codex_hooks(job.thread, job.run))
+                        spawn_codex_run(*inv, self.codex_hooks(job.thread, job.run))
                     }
                 };
                 state.live.insert(job.run, (job.thread, handle));
@@ -1930,7 +2069,12 @@ impl Service {
         if spec.deleted_at.is_some() {
             return Err(StoreError::NotFound("agent"));
         }
-        let spec = spec.spec;
+        let mut spec = spec.spec;
+        // The override is for this run alone; the agent keeps its model.
+        let skill = pending.as_ref().and_then(|p| p.skill.clone());
+        if let Some(model) = pending.as_ref().and_then(|p| p.model_override.clone()) {
+            spec.model = model;
+        }
         let cwd = db.store.thread_cwd(job.thread)?;
         let project = db.store.project_of_thread(job.thread)?;
         // A thread folder of repo worktrees leaves plain files out; the
@@ -2028,6 +2172,11 @@ impl Service {
                     Some((id, prompt)) => (SessionArg::Resume(id), prompt),
                     None => (SessionArg::New(new_session), fresh),
                 };
+                // Claude Code runs a skill when the prompt starts with it.
+                let prompt = match &skill {
+                    Some(skill) => format!("/{} {prompt}", skill.name),
+                    None => prompt,
+                };
                 let mut inv = build_claude(
                     &spec,
                     &prompt,
@@ -2063,7 +2212,7 @@ impl Service {
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-                Invocation::Codex(CodexInvocation {
+                Invocation::Codex(Box::new(CodexInvocation {
                     bin: crate::runtimes::codex_bin(&self.0.bins),
                     agent: spec.name.clone(),
                     cwd,
@@ -2071,10 +2220,11 @@ impl Service {
                     permission_mode: spec.permission_mode.clone(),
                     developer_instructions,
                     prompt: fresh,
+                    skill: skill.map(|s| (s.name, s.path)),
                     resume: resume.map(|(thread, prompt)| Resume { thread, prompt }),
                     mcp: wiring,
                     env: Vec::new(),
-                })
+                }))
             }
         };
         Ok((spec.name, inv))
@@ -2367,7 +2517,7 @@ impl Service {
 /// What starts a run: the agent's CLI and how it is called.
 enum Invocation {
     Claude(ClaudeInvocation),
-    Codex(CodexInvocation),
+    Codex(Box<CodexInvocation>),
 }
 
 /// A folder as compared between projects: links resolved when it exists,
@@ -2518,6 +2668,7 @@ mod tests {
             ended_at: None,
             runtime: crew_core::agent::Runtime::ClaudeCode,
             waiting_for: None,
+            skill: None,
         }
     }
 

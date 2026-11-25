@@ -858,6 +858,7 @@ mod tests {
                 ended_at: Some(2),
                 runtime: Runtime::ClaudeCode,
                 waiting_for: None,
+                skill: None,
             },
             ms: 1,
             files: 0,

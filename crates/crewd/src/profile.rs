@@ -376,6 +376,7 @@ mod tests {
             ended_at: None,
             runtime: Runtime::ClaudeCode,
             waiting_for: None,
+            skill: None,
         }
     }
 

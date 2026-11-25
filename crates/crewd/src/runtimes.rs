@@ -285,6 +285,11 @@ fn find(bin: &Path) -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
+/// [`find`], for the rest of the crate.
+pub(crate) fn find_bin(bin: &Path) -> Option<PathBuf> {
+    find(bin)
+}
+
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     p.metadata()

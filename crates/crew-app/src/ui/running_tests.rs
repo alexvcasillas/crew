@@ -59,6 +59,8 @@ fn post(w: &World, thread: ThreadId, body: &str) {
     let _: MessageId = w.ask(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     });
 }
 

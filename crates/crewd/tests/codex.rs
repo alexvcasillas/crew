@@ -359,6 +359,8 @@ async fn ask_forge(c: &mut Client, thread: ThreadId, body: &str) -> RunId {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

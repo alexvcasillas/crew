@@ -12,6 +12,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const INITIALIZED: &str = "initialized";
     pub const MODEL_LIST: &str = "model/list";
+    pub const SKILLS_LIST: &str = "skills/list";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_RESUME: &str = "thread/resume";
     pub const TURN_START: &str = "turn/start";
@@ -143,6 +144,8 @@ pub enum UserInput {
         text: String,
         text_elements: Vec<Value>,
     },
+    /// Runs a skill, whose file is at `path`.
+    Skill { name: String, path: String },
 }
 
 impl UserInput {

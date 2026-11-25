@@ -456,6 +456,8 @@ impl Workspace {
         let answer = self.client.request(Request::PostMessage {
             thread,
             body: format!("@{agent} continue where you stopped."),
+            skill: None,
+            model_override: None,
         });
         self.spawn_request(window, cx, async move |_, _| {
             answer.await.map(drop).map_err(|e| (e, None))
@@ -1626,6 +1628,7 @@ mod tests {
             ended_at: Some(ended_at),
             runtime: Runtime::ClaudeCode,
             waiting_for: None,
+            skill: None,
         };
         let (a, b, c) = (run(30), run(20), run(20));
         let mut known = vec![a.clone(), b.clone()];

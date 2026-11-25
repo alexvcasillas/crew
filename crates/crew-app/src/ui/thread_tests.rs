@@ -42,6 +42,8 @@ impl World {
         let _: MessageId = self.ask(Request::PostMessage {
             thread: self.thread,
             body: body.into(),
+            skill: None,
+            model_override: None,
         });
     }
 }

@@ -25,7 +25,7 @@ pub use approval::{
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -38,6 +38,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v9.sql"),
     include_str!("migrate_v10.sql"),
     include_str!("migrate_v11.sql"),
+    include_str!("migrate_v12.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -268,6 +269,9 @@ pub struct StoredRun {
     /// While queued: the run writing in the same folder it waits for.
     #[serde(default)]
     pub waiting_for: Option<RunId>,
+    /// The skill the run was asked to run, if any.
+    #[serde(default)]
+    pub skill: Option<String>,
 }
 
 fn claude_code() -> Runtime {
@@ -419,6 +423,17 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Whether the "/" menu lists the skill with this key. Skills are
+    /// shown until hidden.
+    pub fn skill_shown(&self, key: &str) -> Result<bool> {
+        Ok(self.setting(&format!("skill_shown:{key}"))?.as_deref() != Some("0"))
+    }
+
+    /// Saves whether the "/" menu lists the skill with this key.
+    pub fn set_skill_shown(&self, key: &str, shown: bool) -> Result<()> {
+        self.set_setting(&format!("skill_shown:{key}"), if shown { "1" } else { "0" })
     }
 
     /// The last context window seen for `model`, in tokens.
@@ -1189,6 +1204,18 @@ impl Store {
         Ok(id)
     }
 
+    /// Saves the skill a queued run was asked to run.
+    pub fn set_run_skill(&self, r: RunId, skill: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET skill = ?2 WHERE id = ?1",
+            params![r.to_string(), skill],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     /// Adds a queued run of `a` that `from` brought in with a handoff.
     pub fn create_handoff_run(&self, t: ThreadId, a: AgentId, from: RunId) -> Result<RunId> {
         let id = self.create_run(t, a)?;
@@ -1585,7 +1612,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
 
 const RUN_COLUMNS: &str =
     "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime,
-     waiting_for FROM runs";
+     waiting_for, skill FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -1602,6 +1629,7 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
             .get::<_, Option<String>>(8)?
             .and_then(|w| Uuid::parse_str(&w).ok())
             .map(RunId),
+        skill: r.get(9)?,
     };
     let runtime: String = r.get(7)?;
     Ok(parse_status(&status).and_then(|status| {

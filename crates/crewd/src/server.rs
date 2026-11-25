@@ -203,6 +203,9 @@ pub async fn serve_until(
     service.clean_snapshots();
     let sweeper = service.sweep_blocked();
     let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
+    if let Some(home) = &opts.claude_home {
+        service.set_claude_home(home.clone());
+    }
     let terminal = opts
         .claude_home
         .map(|claude_home| service.watch_terminal(claude_home, terminal_stopped));
@@ -635,6 +638,7 @@ async fn requests_and_notices(
                     | Request::Discard { .. }
                     | Request::ChannelOverview { .. }
                     | Request::ThreadSummaries { .. }
+                    | Request::Skills { .. }
                     | Request::Runtimes) => {
                         let (svc, tx) = (service.clone(), answer_tx.clone());
                         tokio::spawn(async move {

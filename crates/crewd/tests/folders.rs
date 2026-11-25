@@ -345,6 +345,8 @@ async fn post(c: &mut Client, thread: ThreadId, body: &str) {
     c.call(Request::PostMessage {
         thread,
         body: body.into(),
+        skill: None,
+        model_override: None,
     })
     .await
     .unwrap();

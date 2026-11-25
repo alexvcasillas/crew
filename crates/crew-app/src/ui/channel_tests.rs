@@ -311,6 +311,8 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::PostMessage {
             thread: working,
             body: "@Forge write them".into(),
+            skill: None,
+            model_override: None,
         },
     );
     let _: MessageId = ask(
@@ -318,6 +320,8 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::PostMessage {
             thread: needs,
             body: "@Scout bump them".into(),
+            skill: None,
+            model_override: None,
         },
     );
     run_of(cx, &ws, working, forge, RunStatus::Working);
@@ -466,6 +470,8 @@ fn sort_by_created_puts_the_newest_thread_first(cx: &mut TestAppContext) {
         Request::PostMessage {
             thread: b.quiet,
             body: "a note for later".into(),
+            skill: None,
+            model_override: None,
         },
     );
     wait_until(cx, "latest activity first", |cx| {

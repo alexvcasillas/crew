@@ -325,6 +325,8 @@ fn in_place_a_second_writer_waits_its_turn(cx: &mut TestAppContext) {
     let _: crew_core::ids::MessageId = f.w.ask(Request::PostMessage {
         thread: other,
         body: "@Quill write".into(),
+        skill: None,
+        model_override: None,
     });
     run_of(cx, &ws, other, quill, RunStatus::Working);
     f.w.post("@Forge tidy up");

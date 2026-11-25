@@ -783,6 +783,8 @@ async fn run(cli: Cli) -> Result<()> {
                 .ask(Request::PostMessage {
                     thread,
                     body: body.join(" "),
+                    skill: None,
+                    model_override: None,
                 })
                 .await?;
             Ok(())

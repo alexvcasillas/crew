@@ -155,6 +155,8 @@ async fn start_long_run(c: &mut Client, dir: &Path) -> ThreadId {
         .ok(Request::PostMessage {
             thread,
             body: "@Forge wait".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
     thread
@@ -259,6 +261,8 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
         .ok(Request::PostMessage {
             thread,
             body: "@Forge next".into(),
+            skill: None,
+            model_override: None,
         })
         .await;
 

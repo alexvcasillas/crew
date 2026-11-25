@@ -1083,6 +1083,7 @@ mod tests {
             ended_at: None,
             runtime: crew_core::agent::Runtime::ClaudeCode,
             waiting_for: None,
+            skill: None,
         }
     }
 

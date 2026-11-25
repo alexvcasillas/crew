@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 14;
+pub const PROTO_VERSION: u32 = 15;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -105,9 +105,17 @@ pub enum Request {
     ChannelOverview {
         channel: ChannelId,
     },
+    /// Posts a message. With `skill`, the run it starts runs that skill on
+    /// the called agent, which must use the skill's runtime. With
+    /// `model_override`, that one run uses the model instead of the
+    /// agent's own, which stays as it is.
     PostMessage {
         thread: ThreadId,
         body: String,
+        #[serde(default)]
+        skill: Option<SkillRef>,
+        #[serde(default)]
+        model_override: Option<String>,
     },
     Subscribe {
         thread: ThreadId,
@@ -253,6 +261,22 @@ pub enum Request {
     /// over a second, the answer says only which CLIs were found, and
     /// `ServerMsg::RuntimesChanged` follows with the rest.
     Runtimes,
+    /// The skills Claude Code and Codex can run in the project: answered
+    /// with `Vec<SkillInfo>`, hidden ones included with `shown: false`.
+    /// Skills are found once per project and kept; `force_reload` looks
+    /// again. Codex ones are left out if Codex isn't installed or signed in.
+    Skills {
+        project: ProjectId,
+        #[serde(default)]
+        force_reload: bool,
+    },
+    /// Shows or hides a skill in the "/" menu. Answered with null.
+    SetSkillShown {
+        runtime: Runtime,
+        source: SkillSource,
+        name: String,
+        shown: bool,
+    },
     /// Answered first, then the session's last items as
     /// [`ServerMsg::TerminalEvent`]s, then new ones as they are written.
     /// After a [`ServerMsg::TerminalSessionReset`], send it again. Terminal
@@ -744,6 +768,64 @@ pub struct RuntimeInfo {
     /// asked of the CLI for Codex. Empty if unknown.
     #[serde(default)]
     pub models: Vec<ModelInfo>,
+}
+
+/// Where a skill comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// The project's own folder.
+    Project,
+    /// The user's folder for the CLI.
+    Global,
+    /// An enabled plugin, by name.
+    Plugin(String),
+}
+
+impl SkillSource {
+    /// `project`, `global` or `plugin:<name>`, as in a skill's key.
+    pub fn key(&self) -> String {
+        match self {
+            SkillSource::Project => "project".into(),
+            SkillSource::Global => "global".into(),
+            SkillSource::Plugin(name) => format!("plugin:{name}"),
+        }
+    }
+}
+
+/// A skill the "/" menu can offer. The answer to [`Request::Skills`] is a
+/// `Vec` of these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillInfo {
+    pub runtime: Runtime,
+    pub name: String,
+    /// Empty if the skill file has none or can't be read.
+    pub description: String,
+    pub source: SkillSource,
+    /// The skill's file.
+    pub path: String,
+    /// Whether the "/" menu lists it.
+    pub shown: bool,
+}
+
+/// The skill a message runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillRef {
+    pub runtime: Runtime,
+    pub name: String,
+    /// The skill's file. Codex needs it to load the skill.
+    #[serde(default)]
+    pub path: String,
+}
+
+/// Key of the "Show in /" setting of a skill: `{runtime}:{source}:{name}`
+/// with the source as `project`, `global` or `plugin:<name>`.
+pub fn skill_key(runtime: &Runtime, source: &SkillSource, name: &str) -> String {
+    let runtime = match runtime {
+        Runtime::ClaudeCode => "claude_code",
+        Runtime::Codex => "codex",
+    };
+    format!("{runtime}:{}:{name}", source.key())
 }
 
 /// A model an agent can be set to.
@@ -1296,6 +1378,55 @@ mod tests {
         };
         assert!(terminal_sessions.is_empty());
         assert_eq!(limits, Limits::default());
+    }
+
+    #[test]
+    fn skill_messages_round_trip() {
+        let thread = ThreadId::new();
+        let msgs = [
+            Request::PostMessage {
+                thread,
+                body: "@Ada go".into(),
+                skill: Some(SkillRef {
+                    runtime: Runtime::Codex,
+                    name: "lint".into(),
+                    path: "/work/demo/SKILL.md".into(),
+                }),
+                model_override: Some("opus".into()),
+            },
+            Request::Skills {
+                project: ProjectId::new(),
+                force_reload: true,
+            },
+            Request::SetSkillShown {
+                runtime: Runtime::ClaudeCode,
+                source: SkillSource::Plugin("tools".into()),
+                name: "tools:go".into(),
+                shown: false,
+            },
+        ];
+        for req in msgs {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+        // A client from before skills posts a plain message.
+        let old = serde_json::json!({"type": "post_message", "thread": thread, "body": "hi"});
+        match serde_json::from_value::<Request>(old).unwrap() {
+            Request::PostMessage {
+                skill,
+                model_override,
+                ..
+            } => assert!(skill.is_none() && model_override.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            skill_key(&Runtime::Codex, &SkillSource::Plugin("tools".into()), "go"),
+            "codex:plugin:tools:go"
+        );
+        assert_eq!(
+            skill_key(&Runtime::ClaudeCode, &SkillSource::Project, "lint"),
+            "claude_code:project:lint"
+        );
     }
 
     #[test]
