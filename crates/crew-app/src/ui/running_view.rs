@@ -287,6 +287,7 @@ impl Workspace {
     /// Shows Running now in place of the body.
     pub(super) fn show_running(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_review(cx);
+        self.flush_agent_save(cx);
         self.settings = None;
         let view = self
             .running

@@ -3,6 +3,8 @@
 use crew_core::agent::{
     AgentSpec, DEFAULT_MAX_RUN_MINUTES, PermissionMode, Runtime, auto_supported,
 };
+use std::time::Duration;
+
 use crew_core::ids::AgentId;
 use crew_core::policy::HandoffPolicy;
 use crew_proto::{ModelInfo, Request, RuntimeInfo};
@@ -11,7 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -93,6 +95,38 @@ const AGENT_POLICIES: [(Option<HandoffPolicy>, &str, &str); 3] = [
     ),
 ];
 
+/// How long typing pauses before an existing agent's text is saved.
+pub const AUTOSAVE_PAUSE: Duration = Duration::from_millis(600);
+
+/// Saves of existing agents, one at a time, so the last edit lands last.
+#[derive(Default)]
+pub struct AgentSaves {
+    /// A save is in flight.
+    busy: bool,
+    /// The latest edit, waiting for the save in flight.
+    queued: Option<AgentSave>,
+    task: Option<Task<()>>,
+}
+
+impl AgentSaves {
+    /// Nothing in flight and nothing waiting.
+    pub fn idle(&self) -> bool {
+        !self.busy && self.queued.is_none()
+    }
+
+    /// An edit waits for the save in flight.
+    pub fn queued(&self) -> bool {
+        self.queued.is_some()
+    }
+}
+
+/// One agent's spec to save, and the form it came from.
+struct AgentSave {
+    agent: AgentId,
+    spec: AgentSpec,
+    form: EntityId,
+}
+
 /// Settings › Agents.
 #[derive(Default)]
 pub struct AgentsPage {
@@ -122,6 +156,13 @@ pub struct AgentForm {
     pub saving: bool,
     /// Saved, and nothing changed since.
     pub saved: bool,
+    /// Why crewd refused the last save of an existing agent.
+    pub failed: Option<String>,
+    /// The last spec sent for an existing agent, so the same one isn't
+    /// sent twice.
+    sent: Option<AgentSpec>,
+    /// Saves typed text once typing pauses.
+    debounce: Option<Task<()>>,
     _edits: Vec<Subscription>,
 }
 
@@ -384,14 +425,12 @@ impl AgentForm {
                 .placeholder("What this agent is for and how it should work.")
                 .default_value(f.instructions)
         });
-        let edited = |this: &mut Workspace, event: &InputEvent, cx: &mut Context<Workspace>| {
-            if matches!(event, InputEvent::Change) {
-                if let Some(form) = this.agent_form_mut() {
-                    form.saved = false;
-                }
-                cx.notify();
-            }
-        };
+        let edited =
+            |this: &mut Workspace, event: &InputEvent, cx: &mut Context<Workspace>| match event {
+                InputEvent::Change => this.agent_changed(true, cx),
+                InputEvent::Blur => this.flush_agent_save(cx),
+                _ => {}
+            };
         let mut edits: Vec<Subscription> = [&name, &role, &other_model, &allowed_tools, &budget]
             .into_iter()
             .map(|input| cx.subscribe(input, move |this, _, event, cx| edited(this, event, cx)))
@@ -414,7 +453,11 @@ impl AgentForm {
             max_minutes: f.max_minutes,
             error: None,
             saving: false,
-            saved: false,
+            // An existing agent opens as saved.
+            saved: editing.is_some(),
+            failed: None,
+            sent: None,
+            debounce: None,
             _edits: edits,
         }
     }
@@ -520,6 +563,7 @@ impl Workspace {
     }
 
     fn set_agent_form(&mut self, form: AgentForm, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_agent_save(cx);
         let name = form.name.clone();
         if let Some(settings) = self.settings.as_mut() {
             settings.agents.form = Some(form);
@@ -539,11 +583,10 @@ impl Workspace {
     fn set_model(&mut self, model: String, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.model = model;
-            form.saved = false;
             form.other_model
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
-        cx.notify();
+        self.agent_changed(false, cx);
     }
 
     /// Picks the runtime, starting on its default model.
@@ -562,25 +605,22 @@ impl Workspace {
     fn set_permission(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.permission = mode;
-            form.saved = false;
         }
-        cx.notify();
+        self.agent_changed(false, cx);
     }
 
     fn set_max_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.max_minutes = minutes;
-            form.saved = false;
         }
-        cx.notify();
+        self.agent_changed(false, cx);
     }
 
     fn set_agent_policy(&mut self, policy: Option<HandoffPolicy>, cx: &mut Context<Self>) {
         if let Some(form) = self.agent_form_mut() {
             form.policy = policy;
-            form.saved = false;
         }
-        cx.notify();
+        self.agent_changed(false, cx);
     }
 
     /// Saves the form: a new agent, or the changes to one. Its next run
@@ -640,6 +680,142 @@ impl Workspace {
             .ok();
             Ok(())
         });
+        cx.notify();
+    }
+
+    /// Something in the form changed. An existing agent saves it now, or
+    /// after a pause when you're `typing`. A new agent waits for its
+    /// button.
+    pub(crate) fn agent_changed(&mut self, typing: bool, cx: &mut Context<Self>) {
+        let Some(form) = self.agent_form_mut() else {
+            return;
+        };
+        form.saved = false;
+        form.failed = None;
+        if form.editing.is_none() {
+            cx.notify();
+            return;
+        }
+        if typing {
+            form.debounce = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(AUTOSAVE_PAUSE).await;
+                this.update(cx, |this, cx| this.autosave_agent(cx)).ok();
+            }));
+            cx.notify();
+        } else {
+            self.autosave_agent(cx);
+        }
+    }
+
+    /// Saves typed text that is still waiting for its pause: on blur, and
+    /// before the form goes away.
+    pub(crate) fn flush_agent_save(&mut self, cx: &mut Context<Self>) {
+        let waiting = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.agents.form.as_ref())
+            .is_some_and(|f| f.debounce.is_some());
+        if waiting {
+            self.autosave_agent(cx);
+        }
+    }
+
+    /// Saves the existing agent the form shows, if what it holds is
+    /// valid. A sentence says why not otherwise.
+    fn autosave_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.settings.as_ref().and_then(|s| s.agents.form.as_ref()) else {
+            return;
+        };
+        let Some(agent) = form.editing else {
+            return;
+        };
+        let usable = runtime_usable(&form.runtime, &self.runtimes);
+        let id = form.id();
+        let taken: Vec<&str> = self
+            .state()
+            .agents()
+            .into_iter()
+            .filter(|a| a.id != agent)
+            .map(|a| a.spec.name.as_str())
+            .collect();
+        let spec = form.spec(&taken, models_of(&self.runtimes, &Runtime::Codex), cx);
+        let Some(form) = self.agent_form_mut() else {
+            return;
+        };
+        form.debounce = None;
+        cx.notify();
+        if !usable {
+            return;
+        }
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(error) => {
+                form.error = Some(error);
+                return;
+            }
+        };
+        form.error = None;
+        if form.sent.as_ref() == Some(&spec) {
+            // Already sent; its answer says how it went.
+            form.saved = !form.saving && form.failed.is_none();
+            return;
+        }
+        form.sent = Some(spec.clone());
+        form.saving = true;
+        self.send_agent_save(
+            AgentSave {
+                agent,
+                spec,
+                form: id,
+            },
+            cx,
+        );
+    }
+
+    /// Sends `save` now, or after the save in flight, in place of any
+    /// edit already waiting.
+    fn send_agent_save(&mut self, save: AgentSave, cx: &mut Context<Self>) {
+        if self.agent_saves.busy {
+            self.agent_saves.queued = Some(save);
+            return;
+        }
+        self.agent_saves.busy = true;
+        let answer = self.client.request(Request::UpdateAgent {
+            agent: save.agent,
+            spec: save.spec,
+        });
+        let form = save.form;
+        self.agent_saves.task = Some(cx.spawn(async move |this, cx| {
+            let result = answer.await;
+            this.update(cx, |this, cx| this.agent_save_answered(form, result, cx))
+                .ok();
+        }));
+    }
+
+    /// crewd answered a save from the form `form`. The edit waiting, if
+    /// any, goes next.
+    fn agent_save_answered(
+        &mut self,
+        form: EntityId,
+        result: Result<serde_json::Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_saves.busy = false;
+        let next = self.agent_saves.queued.take();
+        let more = next.as_ref().is_some_and(|n| n.form == form);
+        if let Some(f) = self.agent_form_mut().filter(|f| f.id() == form && !more) {
+            f.saving = false;
+            match result {
+                Ok(_) => f.saved = f.debounce.is_none(),
+                Err(e) => {
+                    f.failed = Some(e);
+                    f.sent = None;
+                }
+            }
+        }
+        if let Some(next) = next {
+            self.send_agent_save(next, cx);
+        }
         cx.notify();
     }
 
@@ -960,17 +1136,7 @@ impl Workspace {
                                     )
                                     .child(div().flex().child(sub)),
                             )
-                            .when(form.saved, |row| {
-                                row.child(
-                                    div()
-                                        .id("agent-saved")
-                                        .text_size(scale::text(12.))
-                                        .text_color(color("success"))
-                                        .aria_label("Saved")
-                                        .child("Saved")
-                                        .test_support(),
-                                )
-                            })
+                            .children(save_status(form))
                             .when(form.editing.is_some(), |row| {
                                 row.child(
                                     Button::new("agent-duplicate")
@@ -982,16 +1148,19 @@ impl Workspace {
                                         })),
                                 )
                             })
-                            .child(
-                                Button::new("agent-save")
-                                    .primary()
-                                    .small()
-                                    .label("Save agent")
-                                    .disabled(!usable || form.saving)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_agent(window, cx);
-                                    })),
-                            ),
+                            // An existing agent saves as you change it.
+                            .when(form.editing.is_none(), |row| {
+                                row.child(
+                                    Button::new("agent-save")
+                                        .primary()
+                                        .small()
+                                        .label("Save agent")
+                                        .disabled(!usable || form.saving)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_agent(window, cx);
+                                        })),
+                                )
+                            }),
                     )
                     .when_some(form.error.clone(), |col, error| {
                         col.child(
@@ -1331,6 +1500,43 @@ impl Workspace {
         .test_support()
         .into_any_element()
     }
+}
+
+/// How an existing agent's saving goes, beside Duplicate: `Saving…`,
+/// `Saved` or crewd's refusal. A new agent has its button instead.
+fn save_status(form: &AgentForm) -> Option<AnyElement> {
+    form.editing?;
+    let (text, token, check) = if form.saving {
+        ("Saving…".to_string(), "text-tertiary", false)
+    } else if let Some(failed) = &form.failed {
+        (failed.clone(), "danger", false)
+    } else if form.saved {
+        ("Saved".to_string(), "text-tertiary", true)
+    } else {
+        return None;
+    };
+    Some(
+        div()
+            .id("agent-status")
+            .role(Role::Status)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(ui_px(6.))
+            .text_size(scale::text(12.))
+            .text_color(color(token))
+            .aria_label(text.clone())
+            .when(check, |row| {
+                row.child(
+                    Icon::new(IconName::Check)
+                        .size(ui_px(12.))
+                        .text_color(color(token)),
+                )
+            })
+            .child(text)
+            .test_support()
+            .into_any_element(),
+    )
 }
 
 /// A radio card. Disabled cards are dimmed and do nothing.

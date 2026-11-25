@@ -167,6 +167,7 @@ impl Workspace {
 
     /// Goes back to what was open before.
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_agent_save(cx);
         if self.settings.take().is_none() {
             return;
         }
