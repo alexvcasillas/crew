@@ -265,13 +265,23 @@ pub fn parse_line(line: &str) -> Vec<Event> {
                     model: str_at(&v, "model").to_string(),
                     cwd: str_at(&v, "cwd").to_string(),
                 }];
-                if let Some(skills) = v.get("skills").and_then(Value::as_array) {
-                    events.push(Event::SkillsListed {
-                        skills: skills
-                            .iter()
+                // Commands are listed apart from skills; both can be run.
+                let listed = |key: &str| {
+                    v.get(key).and_then(Value::as_array).map(|a| {
+                        a.iter()
                             .filter_map(|s| s.as_str().map(String::from))
-                            .collect(),
-                    });
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let (skills, commands) = (listed("skills"), listed("slash_commands"));
+                if skills.is_some() || commands.is_some() {
+                    let mut all = skills.unwrap_or_default();
+                    for name in commands.unwrap_or_default() {
+                        if !all.contains(&name) {
+                            all.push(name);
+                        }
+                    }
+                    events.push(Event::SkillsListed { skills: all });
                 }
                 events
             }

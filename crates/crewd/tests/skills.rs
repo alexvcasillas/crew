@@ -85,7 +85,7 @@ fn claude_script(dir: &Path) -> PathBuf {
     let body = format!(
         "#!/bin/sh\n\
          printf '%s\\n' \"$@\" > '{d}/args.log'\n\
-         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"session_id\":\"00000000-0000-4000-8000-000000000001\",\"model\":\"claude-test\",\"tools\":[],\"skills\":[\"lint\"],\"slash_commands\":[\"lint\"]}}'\n\
+         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/work/demo\",\"session_id\":\"00000000-0000-4000-8000-000000000001\",\"model\":\"claude-test\",\"tools\":[],\"skills\":[\"lint\"],\"slash_commands\":[\"lint\",\"tools:deploy\"]}}'\n\
          echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"duration_ms\":5,\"num_turns\":1,\"permission_denials\":[],\"session_id\":\"00000000-0000-4000-8000-000000000001\"}}'\n"
     );
     std::fs::write(&path, body).unwrap();
@@ -722,6 +722,12 @@ async fn plugin_skills_a_run_did_not_list_are_filtered_out() {
         &plugin.join("skills/stop/SKILL.md"),
         "---\nname: stop\n---\n",
     );
+    // A command of the plugin, which the init line lists only under
+    // `slash_commands`.
+    write(
+        &plugin.join("commands/deploy.md"),
+        "---\ndescription: Deploy\n---\n",
+    );
     write(
         &w.claude_home.join("plugins/installed_plugins.json"),
         &json!({"version": 2, "plugins": {"tools@market": [{"installPath": plugin}]}}).to_string(),
@@ -738,7 +744,7 @@ async fn plugin_skills_a_run_did_not_list_are_filtered_out() {
     };
     let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
     let got: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(got, ["unslop", "tools:go", "tools:stop"]);
+    assert_eq!(got, ["unslop", "tools:go", "tools:stop", "tools:deploy"]);
 
     // The fake claude's init line lists `lint` only. Once a run has said
     // so, plugin skills it left out are hidden; the others stay.
@@ -746,7 +752,7 @@ async fn plugin_skills_a_run_did_not_list_are_filtered_out() {
     w.c.until_ended(run).await;
     let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
     let got: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(got, ["unslop"]);
+    assert_eq!(got, ["unslop", "tools:deploy"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
