@@ -10,7 +10,9 @@ use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 pub use crew_core::project_kind::{ProjectKind, WorkMode};
-pub use crew_core::store::{Limits, RuntimeUsage};
+pub use crew_core::store::{
+    Limits, RuntimeUsage, TitleMode, TitleModel, TitleSettings, TitleSource,
+};
 use crew_core::store::{
     StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
     StoredThread,
@@ -77,10 +79,15 @@ pub enum Request {
     DeleteAgent {
         agent: AgentId,
     },
+    /// `title` is the first line of the message the thread starts with.
+    /// When titles are generated, a short run replaces it after that
+    /// first message: the thread's `title_source` reads `generating`
+    /// meanwhile, and a [`ServerMsg::ThreadChanged`] tells each step.
     CreateThread {
         channel: ChannelId,
         title: String,
     },
+    /// Sets the title. A title being generated no longer replaces it.
     RenameThread {
         thread: ThreadId,
         title: String,
@@ -136,6 +143,11 @@ pub enum Request {
     /// null; every client gets a [`ServerMsg::LimitsChanged`].
     SetLimits {
         limits: Limits,
+    },
+    /// Saves how new threads get their titles. Answered with null; every
+    /// client gets a [`ServerMsg::TitleSettingsChanged`].
+    SetTitleSettings {
+        titles: TitleSettings,
     },
     /// Ended runs that started (any final status), newest first. `before`
     /// is an inclusive `ended_at` in Unix ms, so a page repeats the runs
@@ -911,9 +923,14 @@ pub enum ServerMsg {
         /// The global limits.
         #[serde(default)]
         limits: Limits,
+        /// How new threads get their titles.
+        #[serde(default)]
+        titles: TitleSettings,
     },
     /// The global limits were saved.
     LimitsChanged { limits: Limits },
+    /// How new threads get their titles was saved.
+    TitleSettingsChanged { titles: TitleSettings },
     /// A terminal session appeared or changed.
     TerminalSessionChanged { session: TerminalSession },
     /// A terminal session's file was deleted, or it was not used for 14
@@ -941,7 +958,8 @@ pub enum ServerMsg {
         channel: ChannelId,
         thread: StoredThread,
     },
-    /// A thread was renamed or its settings changed.
+    /// A thread was renamed, got a generated title or its settings
+    /// changed.
     ThreadChanged { thread: StoredThread },
     /// Change counts in the channel's overview were worked out or may
     /// have changed: ask for it again if it is shown.

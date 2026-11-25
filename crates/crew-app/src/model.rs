@@ -10,7 +10,7 @@ use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId}
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
-    StoredProject, StoredRun, StoredThread,
+    StoredProject, StoredRun, StoredThread, TitleSettings,
 };
 use crew_proto::{ServerMsg, TerminalSession};
 
@@ -198,6 +198,10 @@ pub struct State {
     revision: u64,
     /// Limits sent to crewd and not yet reported back.
     sent_limits: Option<Limits>,
+    /// How new threads get their titles, as last reported, and as sent
+    /// but not yet reported back.
+    titles: TitleSettings,
+    sent_titles: Option<TitleSettings>,
 }
 
 /// A handoff policy and budget, `None` for "fall back".
@@ -231,9 +235,11 @@ impl State {
                 approvals,
                 terminal_sessions,
                 limits,
+                titles,
             } => {
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
                 self.limits_changed(limits);
+                self.titles_changed(titles);
                 self.terminal = terminal_sessions
                     .into_iter()
                     .map(|s| (s.id.clone(), s))
@@ -296,6 +302,7 @@ impl State {
                 }
             }
             ServerMsg::LimitsChanged { limits } => self.limits_changed(limits),
+            ServerMsg::TitleSettingsChanged { titles } => self.titles_changed(titles),
             // The workspace keeps the runtimes and refetches overviews.
             ServerMsg::Response { .. }
             | ServerMsg::Resync
@@ -365,6 +372,12 @@ impl State {
     fn limits_changed(&mut self, limits: Limits) {
         self.sent_limits = None;
         self.limits = limits;
+    }
+
+    /// Takes crewd's title settings, as for limits.
+    fn titles_changed(&mut self, titles: TitleSettings) {
+        self.sent_titles = None;
+        self.titles = titles;
     }
 
     /// Keeps the run as sent, unless a further-along copy is known.
@@ -571,6 +584,22 @@ impl State {
     /// Notes limits just sent to crewd.
     pub fn expect_limits(&mut self, limits: Limits) {
         self.sent_limits = Some(limits);
+    }
+
+    /// How new threads get their titles: the settings last sent, until
+    /// crewd reports them, else crewd's.
+    pub fn titles(&self) -> TitleSettings {
+        self.sent_titles.unwrap_or(self.titles)
+    }
+
+    /// Notes title settings just sent to crewd.
+    pub fn expect_titles(&mut self, titles: TitleSettings) {
+        self.sent_titles = Some(titles);
+    }
+
+    /// Goes back to crewd's title settings, as when sending failed.
+    pub fn drop_titles(&mut self) {
+        self.sent_titles = None;
     }
 
     /// Goes back to crewd's limits, as when sending failed.
@@ -1049,6 +1078,7 @@ mod tests {
             handoff_budget: None,
             handoffs_used: 0,
             archived_at: None,
+            title_source: Default::default(),
         }
     }
 
@@ -1160,6 +1190,7 @@ mod tests {
             approvals: vec![],
             terminal_sessions: vec![],
             limits: Default::default(),
+            titles: Default::default(),
         });
         (state, p, c, t)
     }
@@ -1564,6 +1595,7 @@ mod tests {
             approvals: vec![],
             terminal_sessions: vec![],
             limits: Default::default(),
+            titles: Default::default(),
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -1886,6 +1918,7 @@ mod tests {
             approvals: vec![],
             terminal_sessions: vec![],
             limits: stored,
+            titles: Default::default(),
         });
         assert_eq!(*state.limits(), stored);
 
@@ -1920,6 +1953,7 @@ mod tests {
             approvals: vec![],
             terminal_sessions: vec![],
             limits: other,
+            titles: Default::default(),
         });
         assert_eq!(*state.limits(), other);
         // A failed request goes back to crewd's copy.
@@ -2004,6 +2038,7 @@ mod tests {
                 session(other, "elsewhere", 50, true),
             ],
             limits: Default::default(),
+            titles: Default::default(),
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -2096,6 +2131,7 @@ mod tests {
             approvals: vec![],
             terminal_sessions: vec![],
             limits: Default::default(),
+            titles: Default::default(),
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

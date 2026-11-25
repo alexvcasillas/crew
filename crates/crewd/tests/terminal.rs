@@ -171,6 +171,7 @@ fn dead_pid() -> u32 {
 async fn start(p: &Paths, claude_bin: PathBuf) {
     let home = p.crew_home.clone();
     let opts = ServeOptions {
+        no_title_runs: true,
         claude_bin: Some(claude_bin),
         codex_bin: Some(PathBuf::from("/nonexistent/codex")),
         crew_mcp_bin: None,

@@ -266,6 +266,7 @@ fn queued_run_shows_in_queued_group(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             max_runs: 1,
             claude_bin: Some(busy_claude(tmp.path())),
             ..Default::default()

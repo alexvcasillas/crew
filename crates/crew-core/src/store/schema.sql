@@ -44,7 +44,9 @@ CREATE TABLE threads (
     handoff_budget INTEGER,
     handoffs_used INTEGER NOT NULL DEFAULT 0,
     archived_at INTEGER,
-    worktree_repos TEXT NOT NULL DEFAULT '[]'
+    worktree_repos TEXT NOT NULL DEFAULT '[]',
+    title_source TEXT NOT NULL DEFAULT 'first_line',
+    first_title TEXT
 );
 
 CREATE TABLE messages (

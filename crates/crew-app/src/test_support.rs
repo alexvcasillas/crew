@@ -35,6 +35,7 @@ impl Daemon {
         Self::start_with_options(
             home,
             crewd::ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 ..Default::default()
             },
@@ -50,6 +51,7 @@ impl Daemon {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let opts = crewd::ServeOptions {
+                    no_title_runs: true,
                     // Never the real codex.
                     codex_bin: opts
                         .codex_bin

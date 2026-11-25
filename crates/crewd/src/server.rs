@@ -61,6 +61,9 @@ pub struct ServeOptions {
     /// For tests only: extra time each change count of a channel overview
     /// takes, to make counts slow. Leave it at zero.
     pub count_delay: Duration,
+    /// For tests only: never generate thread titles, whatever the setting
+    /// says, so the fake CLIs see only the runs a test starts.
+    pub no_title_runs: bool,
 }
 
 /// Claude Code's home: `CREW_CLAUDE_HOME`, else `CLAUDE_CONFIG_DIR` (where
@@ -90,6 +93,7 @@ impl Default for ServeOptions {
             runtimes_wait: None,
             count_delay: Duration::ZERO,
             claude_home: None,
+            no_title_runs: false,
         }
     }
 }
@@ -188,6 +192,7 @@ pub async fn serve_until(
             claude: opts.claude_bin,
             codex: opts.codex_bin,
             runtimes_wait: opts.runtimes_wait,
+            no_title_runs: opts.no_title_runs,
         },
         abs_home.join(WORKTREES_DIR),
         usable_crew_mcp(opts.crew_mcp_bin).map(|bin| (bin, abs_home)),

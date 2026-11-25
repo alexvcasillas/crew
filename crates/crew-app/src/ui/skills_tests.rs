@@ -59,6 +59,7 @@ fn daemon(tmp: &Path, home: &Path) -> Daemon {
     Daemon::start_with_options(
         home.to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             claude_home: Some(claude_home),
             ..Default::default()
@@ -457,6 +458,7 @@ fn a_project_without_skills_says_none_match(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             claude_home: Some(tmp.path().join("empty-home")),
             ..Default::default()

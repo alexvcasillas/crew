@@ -721,6 +721,7 @@ fn slow_runtimes_fill_in_later(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             runtimes_wait: Some(std::time::Duration::from_millis(100)),
             ..Default::default()

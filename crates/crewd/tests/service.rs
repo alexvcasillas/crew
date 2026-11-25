@@ -116,6 +116,7 @@ impl Daemon {
         crew_mcp_bin: Option<PathBuf>,
     ) -> Daemon {
         Daemon::start_opts(ServeOptions {
+            no_title_runs: true,
             max_runs,
             claude_bin: Some(claude_bin),
             crew_mcp_bin,
@@ -1496,6 +1497,7 @@ async fn run_stopped_by_its_limit_still_posts_its_answer() {
     let script = answer_then_wait_script(dir.path(), "read_file.jsonl");
     // Forge's 20 min limit lasts 1 s, well before a lingering run ends.
     let d = Daemon::start_opts(ServeOptions {
+        no_title_runs: true,
         max_runs: 4,
         claude_bin: Some(script),
         minute: Duration::from_millis(50),

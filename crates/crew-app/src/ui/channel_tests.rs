@@ -571,6 +571,7 @@ fn counts_crewd_finishes_later_land_on_the_card(cx: &mut TestAppContext) {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             count_delay: Duration::from_secs(2),
             ..Default::default()

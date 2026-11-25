@@ -22,7 +22,7 @@ use crew_core::scheduler::{Job, Scheduler};
 use crew_core::slug::slugify;
 use crew_core::store::{
     ApprovalStatus, Author, RunFilter, Store, StoreError, StoredApproval, StoredProject, StoredRun,
-    ThreadWorktree,
+    ThreadWorktree, TitleMode, TitleModel, TitleSettings,
 };
 use crew_core::worktree;
 use crew_proto::{
@@ -170,6 +170,8 @@ struct Inner {
     skills: Mutex<HashMap<ProjectId, SkillCache>>,
     /// The skills a Claude Code run's init line listed, by project.
     claude_listed: Mutex<HashMap<ProjectId, std::collections::HashSet<String>>>,
+    /// Title runs under way. Shutdown drops them.
+    titles: Mutex<JoinSet<()>>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -201,6 +203,8 @@ pub struct CliBins {
     /// How long `Runtimes` waits for the CLIs before it answers with
     /// less. `None` is [`QUICK_ANSWER`].
     pub runtimes_wait: Option<Duration>,
+    /// For tests only: never generate thread titles.
+    pub no_title_runs: bool,
 }
 
 impl Service {
@@ -221,6 +225,10 @@ impl Service {
         // Nothing waits for permission asks of an earlier crewd any more.
         if let Err(e) = crate::approvals::cancel_stale_permissions(&store) {
             log(format!("couldn't cancel old permission asks: {e}"));
+        }
+        // Nothing is generating the titles an earlier crewd started.
+        if let Err(e) = store.end_stale_titles() {
+            log(format!("couldn't end old title runs: {e}"));
         }
         // The run cap from the command line or environment only seeds the
         // setting. Once it is saved, the saved value wins.
@@ -272,6 +280,7 @@ impl Service {
             claude_home: OnceLock::new(),
             skills: Mutex::new(HashMap::new()),
             claude_listed: Mutex::new(HashMap::new()),
+            titles: Mutex::new(JoinSet::new()),
         }))
     }
 
@@ -681,6 +690,14 @@ impl Service {
             }
             Request::SetLimits { limits } => {
                 self.set_limits(limits)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::SetTitleSettings { titles } => {
+                let mut db = self.db();
+                db.store
+                    .set_title_settings(&titles)
+                    .map_err(|e| e.to_string())?;
+                self.publish_global(&mut db, ServerMsg::TitleSettingsChanged { titles });
                 Ok(serde_json::Value::Null)
             }
             Request::RunHistory { before, limit } => json(
@@ -1380,6 +1397,7 @@ impl Service {
             approvals,
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
+            titles: db.store.title_settings()?,
         };
         Ok((msg, db.serial))
     }
@@ -1398,7 +1416,7 @@ impl Service {
         let model_override = model_override
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
-        let id = {
+        let (id, title_run) = {
             let mut state = self.state();
             let mut db = self.db();
             db.store
@@ -1457,6 +1475,11 @@ impl Service {
             let id = self
                 .add_message(&mut db, thread, Author::You, body, None)
                 .map_err(|e| e.to_string())?;
+            let title_run = if earlier.is_empty() {
+                self.start_title(&mut db, thread, body)
+            } else {
+                None
+            };
             let context = render_context(
                 &earlier,
                 &db.store.agents_with_deleted().map_err(|e| e.to_string())?,
@@ -1506,10 +1529,65 @@ impl Service {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            id
+            (id, title_run)
         };
+        if let Some(model) = title_run {
+            self.spawn_title(thread, body.to_string(), model);
+        }
         self.start_ready();
         Ok(id)
+    }
+
+    /// Marks the thread's title as being generated, when titles are and
+    /// it is still its first line, and gives the model to generate it on.
+    /// A message with no text, such as a skill alone, keeps its title.
+    fn start_title(&self, db: &mut Db, thread: ThreadId, body: &str) -> Option<TitleModel> {
+        if body.trim().is_empty() || self.0.bins.no_title_runs {
+            return None;
+        }
+        let started = db.store.title_settings().and_then(|titles| {
+            Ok(match titles {
+                TitleSettings {
+                    mode: TitleMode::Generated,
+                    model,
+                } => db.store.start_title(thread)?.then_some(model),
+                _ => None,
+            })
+        });
+        match started {
+            Ok(Some(model)) => {
+                self.thread_changed_or_log(db, thread);
+                Some(model)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log(format!("couldn't start a title run: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Generates the thread's title from its first message, apart from
+    /// any run. The first line stays if it fails or you renamed the
+    /// thread meanwhile.
+    fn spawn_title(&self, thread: ThreadId, message: String, model: TitleModel) {
+        let svc = self.clone();
+        let mut titles = self.0.titles.lock().unwrap_or_else(PoisonError::into_inner);
+        // Forget the ones that ended.
+        while titles.try_join_next().is_some() {}
+        titles.spawn(async move {
+            let title = crate::titles::generate(&svc.0.bins, model, &message).await;
+            let mut db = svc.db();
+            let changed = match &title {
+                Some(title) => db.store.set_generated_title(thread, title),
+                None => db.store.keep_first_line(thread),
+            };
+            match changed {
+                Ok(true) => svc.thread_changed_or_log(&mut db, thread),
+                Ok(false) => {}
+                Err(e) => log(format!("couldn't save the thread's title: {e}")),
+            }
+        });
     }
 
     /// The agent that ran last in `thread`, if it still exists and no run
@@ -1612,6 +1690,12 @@ impl Service {
             }
             std::mem::take(&mut state.watchers)
         };
+        // Title runs are dropped, their processes with them.
+        self.0
+            .titles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .abort_all();
         while watchers.join_next().await.is_some() {}
     }
 
@@ -1937,7 +2021,10 @@ impl Service {
             let found = db.store.project_of_thread(job.thread).and_then(|project| {
                 // Removed ones too, so slugs stay as they were.
                 let projects = db.store.all_projects()?;
-                let thread = db.store.thread(job.thread)?;
+                let mut thread = db.store.thread(job.thread)?;
+                // The branch keeps the name of the first line, even once
+                // a title was generated.
+                thread.title = db.store.branch_title(job.thread)?;
                 let slug = project_slug(&projects, project.id);
                 Ok((project, slug, thread))
             });

@@ -736,6 +736,7 @@ async fn watch(
             | ServerMsg::AgentChanged { .. }
             | ServerMsg::RuntimesChanged { .. }
             | ServerMsg::LimitsChanged { .. }
+            | ServerMsg::TitleSettingsChanged { .. }
             | ServerMsg::TerminalSessionChanged { .. }
             | ServerMsg::TerminalEvent { .. }
             | ServerMsg::TerminalSessionRemoved { .. }

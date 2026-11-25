@@ -306,6 +306,7 @@ fn requests_answered_out_of_order_reach_their_callers() {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             runtimes_wait: Some(SLOW_RUNTIMES),
             ..Default::default()
@@ -335,6 +336,7 @@ fn a_resync_reopens_only_the_stream() {
     let _daemon = Daemon::start_with_options(
         home.path().to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(claude),
             notice_buffer: 1,
             runtimes_wait: Some(SLOW_RUNTIMES),
@@ -424,6 +426,7 @@ fn terminal_daemon(home: &Path, claude_home: &Path) -> Daemon {
     Daemon::start_with_options(
         home.to_path_buf(),
         crewd::ServeOptions {
+            no_title_runs: true,
             claude_bin: Some(PathBuf::from("/nonexistent/claude")),
             claude_home: Some(claude_home.to_path_buf()),
             ..Default::default()

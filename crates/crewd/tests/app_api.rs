@@ -72,6 +72,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 codex_bin: Some(codex_bin),
                 crew_mcp_bin: None,
@@ -253,6 +254,7 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
         approvals,
         terminal_sessions,
         limits: _,
+        titles: _,
     } = c.recv().await
     else {
         panic!("expected a snapshot first");

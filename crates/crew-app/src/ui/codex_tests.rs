@@ -101,6 +101,7 @@ fn codex_daemon(home: &Path, dir: &Path, root: &Path, login_exit: i32) -> Daemon
     std::fs::create_dir_all(root).unwrap();
     models(dir);
     let opts = crewd::ServeOptions {
+        no_title_runs: true,
         claude_bin: Some(fake_claude(dir, "exit 0")),
         codex_bin: Some(fake_codex(dir, root, login_exit)),
         ..Default::default()

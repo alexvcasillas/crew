@@ -39,6 +39,7 @@ struct Daemon {
 impl Daemon {
     async fn start(home: &Path, max_runs: usize, claude: PathBuf) -> Daemon {
         let opts = ServeOptions {
+            no_title_runs: true,
             max_runs,
             claude_bin: Some(claude),
             crew_mcp_bin: None,

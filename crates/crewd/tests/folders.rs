@@ -155,6 +155,7 @@ impl Daemon {
         let path = home.clone();
         tokio::spawn(async move {
             let opts = ServeOptions {
+                no_title_runs: true,
                 claude_bin: Some(claude_bin),
                 crew_mcp_bin: None,
                 ..ServeOptions::default()

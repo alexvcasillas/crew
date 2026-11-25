@@ -239,6 +239,7 @@ async fn shutdown_hook_stops_agents_and_marks_runs_interrupted() {
     let home = tmp.path().join("crew");
     let pid_file = tmp.path().join("agent.pid");
     let opts = crewd::ServeOptions {
+        no_title_runs: true,
         max_runs: 1,
         claude_bin: Some(sleeping_script(tmp.path(), &pid_file)),
         crew_mcp_bin: None,
