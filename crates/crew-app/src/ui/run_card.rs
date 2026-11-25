@@ -399,7 +399,7 @@ impl Workspace {
                     .child(word)
                     .test_support(),
             )
-            .children(self.render_skill_header(run));
+            .children(self.render_skill_header(run, None));
         if !time.is_empty() {
             // It ticks once a second, so the last value is a second ago.
             let prev = elapsed(ms - 1000);
@@ -462,7 +462,8 @@ impl Workspace {
         let counts = summary.counts().unwrap_or_default();
         let stored = self.state().run(run);
         let thread = stored.map(|r| r.thread);
-        let skill_header = stored.and_then(|r| self.render_skill_header(r));
+        let skill_header = stored.and_then(|r| self.render_skill_header(r, Some(summary)));
+        let skill = skill_header.is_some();
         let loaded = stored.and_then(|r| self.render_loaded_skill(r));
         let can_review = thread.is_some_and(|t| self.can_review(t));
         card(run, "done-card")
@@ -486,7 +487,7 @@ impl Workspace {
                             .child("Done"),
                     )
                     .children(skill_header)
-                    .when(!summary.files.is_empty(), |row| {
+                    .when(!skill && !summary.files.is_empty(), |row| {
                         row.child(counts_line(run, summary, counts))
                     })
                     .child(div().flex_1())
@@ -510,37 +511,56 @@ impl Workspace {
                     .flex_col()
                     .px(ui_px(12.))
                     .pb(scale::row(8.))
-                    .children(loaded)
-                    .children(summary.files.iter().map(|f| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_px(8.))
-                            .h(scale::row(24.))
-                            .font_family(code_family())
-                            .text_size(scale::mono(12.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(color("text-secondary"))
-                                    .child(f.path.clone()),
-                            )
-                            .child(plus_minus(f.added, f.removed))
-                    })),
+                    // A skill run lists its steps, as its live card did.
+                    .when(skill, |body| {
+                        body.children(loaded)
+                            .children(summary.steps.iter().enumerate().map(step_row))
+                    })
+                    .when(!skill, |body| {
+                        body.children(summary.files.iter().map(|f| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(ui_px(8.))
+                                .h(scale::row(24.))
+                                .font_family(code_family())
+                                .text_size(scale::mono(12.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(color("text-secondary"))
+                                        .child(f.path.clone()),
+                                )
+                                .child(plus_minus(f.added, f.removed))
+                        }))
+                    }),
             )
             .test_support()
     }
 }
 
 impl Workspace {
-    /// `/unslop · claude · sonnet · Forge` in a skill run's card header.
-    fn render_skill_header(&self, run: &StoredRun) -> Option<AnyElement> {
+    /// `/unslop · claude · sonnet · Forge` in a skill run's card header,
+    /// then `· 1 file · +9 −24` in the same quiet text when `summary`
+    /// changed files.
+    fn render_skill_header(
+        &self,
+        run: &StoredRun,
+        summary: Option<&RunSummary>,
+    ) -> Option<AnyElement> {
         let name = run.skill.as_deref()?;
         let agent = self.state().agent(run.agent)?.spec.name.clone();
         let chip = self.run_chip(run)?;
-        let rest = format!("· {chip} · {agent}");
+        let files = summary.filter(|s| !s.files.is_empty());
+        let mut rest = format!("· {chip} · {agent}");
+        let mut label = rest.clone();
+        if let Some(summary) = files {
+            let n = summary.files.len();
+            rest = format!("{rest} · {n} {} ·", if n == 1 { "file" } else { "files" });
+            label = format!("{label} · {}", summary.counts().unwrap_or_default());
+        }
         Some(
             div()
                 .id(format!("run-skill-{}", run.id))
@@ -549,7 +569,7 @@ impl Workspace {
                 .gap(ui_px(8.))
                 .min_w_0()
                 .whitespace_nowrap()
-                .aria_label(format!("/{name} {rest}"))
+                .aria_label(format!("/{name} {label}"))
                 .child(
                     div()
                         .font_family(code_family())
@@ -557,7 +577,15 @@ impl Workspace {
                         .text_color(color("text-primary"))
                         .child(format!("/{name}")),
                 )
-                .child(div().text_color(color("text-tertiary")).child(rest))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(4.))
+                        .text_color(color("text-tertiary"))
+                        .child(rest)
+                        .children(files.map(|s| plus_minus(s.added(), s.removed()))),
+                )
                 .test_support()
                 .into_any_element(),
         )

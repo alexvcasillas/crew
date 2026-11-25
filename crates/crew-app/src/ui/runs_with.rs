@@ -162,16 +162,6 @@ pub enum RunsMenu {
 }
 
 impl Composer {
-    /// The skill at the start of the text, marked with the runtime it
-    /// runs on.
-    pub(super) fn render_skill_chip(
-        &self,
-        skill: &SkillEntry,
-        runtime: &Runtime,
-    ) -> impl IntoElement + use<> {
-        skill_chip("composer-skill", runtime, &skill.name).test_support()
-    }
-
     /// "Quill is on Codex. /review is a Claude skill."
     pub(super) fn render_runtime_note(&self, note: String) -> impl IntoElement {
         div()
@@ -240,8 +230,12 @@ impl Composer {
                     )
                     .child("· mentioned");
             }
-            Target::Picked(picked) | Target::WrongRuntime { picked, .. } => {
-                row = row.child(self.render_agent_picker(picked, &runs.runtime, !both, cx));
+            Target::Picked(picked) => {
+                row = row.child(self.render_agent_picker(picked, &runs.runtime, !both, false, cx));
+            }
+            // The picker is edged in blue to point you at it.
+            Target::WrongRuntime { picked, .. } => {
+                row = row.child(self.render_agent_picker(picked, &runs.runtime, !both, true, cx));
             }
         }
         if let Some(agent) = agent {
@@ -256,7 +250,8 @@ impl Composer {
                     .test_support(),
             );
         }
-        if send {
+        // The board draws Send in the picker and the switch states only.
+        if send && (both || matches!(runs.target, Target::Picked(_))) {
             row = row.child(div().flex_1()).child(
                 Button::new("composer-send")
                     .primary()
@@ -315,6 +310,7 @@ impl Composer {
         picked: Option<&MentionAgent>,
         runtime: &Runtime,
         show_runtime: bool,
+        point: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let open = self.runs_menu == Some(RunsMenu::Agents);
@@ -322,7 +318,7 @@ impl Composer {
             || format!("No agents on {}", runtime_name(runtime)),
             |a| a.name.clone(),
         );
-        let button = picker_button("runs-with-agent", open)
+        let button = picker_button("runs-with-agent", open, open || point)
             .aria_label(label.clone())
             .when_some(picked, |b, agent| {
                 b.child(monogram(&agent.name, 16.).rounded(ui_px(4.)))
@@ -412,7 +408,7 @@ impl Composer {
             .clone()
             .unwrap_or_else(|| agent.model.clone());
         let label = model_name(runtime, &current, &models);
-        let button = picker_button("runs-with-model", open)
+        let button = picker_button("runs-with-model", open, open)
             .aria_label(label.clone())
             .child(label.clone())
             .child(chevron())
@@ -495,8 +491,9 @@ impl Composer {
     }
 }
 
-/// A button of the "Runs with" row; blue edged while its menu is open.
-fn picker_button(id: &'static str, open: bool) -> Stateful<Div> {
+/// A button of the "Runs with" row; blue edged while its menu is open or
+/// when it wants your attention.
+fn picker_button(id: &'static str, open: bool, edged: bool) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -506,7 +503,7 @@ fn picker_button(id: &'static str, open: bool) -> Stateful<Div> {
         .pl(ui_px(8.))
         .pr(ui_px(6.))
         .border_1()
-        .border_color(color(if open { "accent-blue" } else { "border-200" }))
+        .border_color(color(if edged { "accent-blue" } else { "border-200" }))
         .rounded(ui_px(6.))
         .bg(color("bg-100"))
         .text_color(color("text-primary"))

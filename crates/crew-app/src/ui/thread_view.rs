@@ -262,37 +262,37 @@ impl Workspace {
             }
             _ => ("You".to_string(), you_avatar(), None),
         };
+        let mut label = message.body.clone();
         let body = if matches!(message.author, Author::Agent(_)) {
             let doc = self.docs.get(DocKey::Message(id), &message.body);
             render_doc(&doc, names, &format!("md-{id}")).into_any_element()
         } else {
-            self.render_your_body(message, names)
+            let (body, skill) = self.render_your_body(message, names);
+            if let Some(skill) = skill {
+                label = format!("/{skill} {label}").trim_end().to_string();
+            }
+            body
         };
-        message_row(
-            id.to_string(),
-            avatar,
-            name,
-            runtime,
-            time,
-            message.body.clone(),
-            body,
-        )
-        .test_support()
-        .into_any_element()
+        message_row(id.to_string(), avatar, name, runtime, time, label, body)
+            .test_support()
+            .into_any_element()
     }
 
     /// Your message: the skill it ran on a chip before the text, and who
     /// ran it under it.
-    fn render_your_body(&self, message: &StoredMessage, names: &[String]) -> AnyElement {
+    fn render_your_body(
+        &self,
+        message: &StoredMessage,
+        names: &[String],
+    ) -> (AnyElement, Option<String>) {
         let state = self.state();
         let id = message.id;
-        let text = styled_body(&message.body, names);
         let Some(run) = state
             .thread_runs(message.thread)
             .into_iter()
             .find(|r| r.message == Some(id) && r.skill.is_some())
         else {
-            return text.into_any_element();
+            return (styled_body(&message.body, names).into_any_element(), None);
         };
         let skill = run.skill.clone().unwrap_or_default();
         let agent = state
@@ -309,25 +309,12 @@ impl Workspace {
             }
             None => format!("Ran with {agent}"),
         };
-        div()
+        let body = div()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(ui_px(6.))
-                    .child(
-                        super::runs_with::skill_chip(
-                            format!("message-skill-{id}"),
-                            &self.run_runtime(run),
-                            &skill,
-                        )
-                        .mt(scale::row(-1.))
-                        .test_support(),
-                    )
-                    .child(div().flex_1().min_w_0().child(text)),
-            )
+            // The skill runs inline before the text, so long lines wrap
+            // under it.
+            .child(skill_body(&skill, &message.body, names))
             .child(
                 div()
                     .id(format!("message-ran-{id}"))
@@ -338,7 +325,8 @@ impl Workspace {
                     .child(ran)
                     .test_support(),
             )
-            .into_any_element()
+            .into_any_element();
+        (body, Some(skill))
     }
 
     /// An agent at work: its avatar, ringed in blue and pulsing while
@@ -612,7 +600,12 @@ fn body_spans(body: &str, names: &[String]) -> Vec<(Range<usize>, Span)> {
 /// The body with `@Agent` mentions in blue and `code` in mono on a
 /// background. Text runs share one size and have no corner radius.
 fn styled_body(body: &str, names: &[String]) -> StyledText {
-    let runs = body_spans(body, names)
+    StyledText::new(body.to_string()).with_runs(body_runs(body, names))
+}
+
+/// The runs [`styled_body`] draws `body` with.
+fn body_runs(body: &str, names: &[String]) -> Vec<TextRun> {
+    body_spans(body, names)
         .into_iter()
         .map(|(range, span)| {
             let (mut font, text, background) = match span {
@@ -638,8 +631,35 @@ fn styled_body(body: &str, names: &[String]) -> StyledText {
                 strikethrough: None,
             }
         })
-        .collect();
-    StyledText::new(body.to_string()).with_runs(runs)
+        .collect()
+}
+
+/// `/skill` as an inline mono chip, then the body as [`styled_body`]
+/// draws it.
+fn skill_body(skill: &str, body: &str, names: &[String]) -> StyledText {
+    // Thin spaces pad the chip inside its background.
+    let chip = format!("\u{2009}/{skill}\u{2009}");
+    let mut runs = vec![
+        TextRun {
+            len: chip.len(),
+            font: font(code_family()),
+            color: color("text-primary"),
+            background_color: Some(color("surface-300")),
+            underline: None,
+            strikethrough: None,
+        },
+        TextRun {
+            len: 1,
+            font: font(ui_family()),
+            color: color("text-primary"),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        },
+    ];
+    let text = format!("{chip} {body}");
+    runs.extend(body_runs(body, names));
+    StyledText::new(text).with_runs(runs)
 }
 
 /// Byte ranges of `code` spans, backticks included.

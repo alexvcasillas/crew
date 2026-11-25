@@ -103,6 +103,11 @@ pub struct Workspace {
     pub(super) nav: Nav,
     /// What you wrote and left, per thread and per new-thread draft.
     drafts: HashMap<DraftKey, String>,
+    /// The skill picked for a message on its way, by where it was
+    /// written; put back with the text if the send fails.
+    sent_picks: HashMap<DraftKey, super::composer::Picked>,
+    /// The skill picked for a draft you left, put back when you return.
+    draft_picks: HashMap<DraftKey, super::composer::Picked>,
     /// The channel whose new thread is being created.
     creating: Option<ChannelId>,
     /// A thread to open once it is known (debug builds' startup hook).
@@ -303,6 +308,8 @@ impl Workspace {
             focus,
             nav: Nav::default(),
             drafts: HashMap::new(),
+            sent_picks: HashMap::new(),
+            draft_picks: HashMap::new(),
             creating: None,
             open_pending: hooks.review.or(hooks.open_thread),
             terminal: None,
@@ -1020,6 +1027,11 @@ impl Workspace {
     /// Keeps the composer's text for what is open, before leaving it.
     fn stash_draft(&mut self, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key() {
+            // A skill picked stays with the draft.
+            match self.composer.read(cx).picked() {
+                Some(picked) => self.draft_picks.insert(key, picked),
+                None => self.draft_picks.remove(&key),
+            };
             let text = self.composer.read(cx).text(cx);
             if text.is_empty() {
                 self.drafts.remove(&key);
@@ -1029,14 +1041,31 @@ impl Workspace {
         }
     }
 
-    /// Puts the text kept for what is now open in the composer.
+    /// Puts the text kept for what is now open in the composer, with the
+    /// skill of a message that failed to send there.
     fn load_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self
-            .draft_key()
+        let key = self.draft_key();
+        let text = key
             .and_then(|key| self.drafts.remove(&key))
             .unwrap_or_default();
-        self.composer
-            .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+        let picked = key.and_then(|key| self.draft_picks.remove(&key));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_text(&text, window, cx);
+            if let Some(picked) = picked {
+                composer.restore_pick(picked, window, cx);
+            }
+        });
+    }
+
+    /// crewd took the message sent from `key`: its skill leads Recent.
+    fn sent(&mut self, key: DraftKey, skill_key: Option<String>, cx: &mut Context<Self>) {
+        self.sent_picks.remove(&key);
+        if let Some(used) = skill_key
+            && self.recents.used_skill(&used)
+        {
+            self.save_recents(cx);
+            self.sync(cx);
+        }
     }
 
     /// Gives `text` back to `key` after a send failed, unless you have
@@ -1049,12 +1078,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.draft_key() == Some(key) {
-            if self.composer.read(cx).text(cx).trim().is_empty() {
-                self.composer
-                    .update(cx, |composer, cx| composer.set_text(&text, window, cx));
+            let empty = {
+                let composer = self.composer.read(cx);
+                composer.text(cx).trim().is_empty() && composer.skill().is_none()
+            };
+            if empty {
+                let picked = self.sent_picks.remove(&key);
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_text(&text, window, cx);
+                    // The skill, agent and model go back with the text.
+                    if let Some(picked) = picked {
+                        composer.restore_pick(picked, window, cx);
+                    }
+                });
             }
         } else {
             self.drafts.entry(key).or_insert(text);
+            if let Some(picked) = self.sent_picks.remove(&key) {
+                self.draft_picks.entry(key).or_insert(picked);
+            }
         }
     }
 
@@ -1108,13 +1150,13 @@ impl Workspace {
             skill,
             model_override,
             skill_key,
+            picked,
         } = out;
-        if let Some(used) = skill_key
-            && self.recents.used_skill(&used)
-        {
-            self.save_recents(cx);
-            self.sync(cx);
-        }
+        // Kept until crewd takes the message, to put back if it doesn't.
+        match picked {
+            Some(picked) => self.sent_picks.insert(key, *picked),
+            None => self.sent_picks.remove(&key),
+        };
         match key {
             DraftKey::NewThread(channel) => {
                 if self.creating.is_some() {
@@ -1164,21 +1206,33 @@ impl Workspace {
                     } else {
                         key
                     };
+                    this.update(cx, |this, cx| match &posted {
+                        Ok(_) => this.sent(key, skill_key, cx),
+                        Err(_) => {
+                            if let Some(picked) = this.sent_picks.remove(&key) {
+                                this.sent_picks.insert(back, picked);
+                            }
+                        }
+                    })
+                    .ok();
                     posted.map(drop).map_err(|e| (e, Some((back, text))))
                 });
             }
             DraftKey::Thread(thread) => {
-                self.spawn_request(window, cx, async move |_, _| {
-                    client
+                self.spawn_request(window, cx, async move |this, cx| {
+                    let posted = client
                         .request(Request::PostMessage {
                             thread,
                             body: text.clone(),
                             skill: skill.clone(),
                             model_override: model_override.clone(),
                         })
-                        .await
-                        .map(drop)
-                        .map_err(|e| (e, Some((key, text))))
+                        .await;
+                    if posted.is_ok() {
+                        this.update(cx, |this, cx| this.sent(key, skill_key, cx))
+                            .ok();
+                    }
+                    posted.map(drop).map_err(|e| (e, Some((key, text))))
                 });
             }
         }

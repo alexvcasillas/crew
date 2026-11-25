@@ -219,9 +219,13 @@ fn a_picked_skill_runs_with_the_picked_agent_on_the_model_picked(cx: &mut TestAp
         Some("/unslop")
     );
     assert!(!has(cx, window, "slash-menu"));
-    // Backspace at the start drops the skill.
+    // The chip sits in the text: backspace takes the space after it,
+    // then the chip, and the skill with it.
+    press(cx, window, "backspace");
+    assert_eq!(composer_skill(cx, &ws).as_deref(), Some("unslop"));
     press(cx, window, "backspace");
     assert_eq!(composer_skill(cx, &ws), None);
+    assert!(!has(cx, window, "composer-skill"));
     type_text(cx, window, "/uns");
     wait_to_show(cx, window, "/unslop");
     press(cx, window, "enter");
@@ -247,6 +251,10 @@ fn a_picked_skill_runs_with_the_picked_agent_on_the_model_picked(cx: &mut TestAp
         Some("Runs with Scout · mentioned")
     );
     assert!(!has(cx, window, "runs-with-only"), "no picker, no note");
+    assert!(
+        !has(cx, window, "composer-send"),
+        "the board draws no Send here"
+    );
     set_text(cx, window, &ws, "");
     type_text(cx, window, "/uns");
     wait_to_show(cx, window, "/unslop");
@@ -259,6 +267,7 @@ fn a_picked_skill_runs_with_the_picked_agent_on_the_model_picked(cx: &mut TestAp
         Some("Forge")
     );
     assert!(has(cx, window, "runs-with-only"), "this message only");
+    assert!(has(cx, window, "composer-send"), "Send in the picker state");
     assert_eq!(
         label_of(cx, window, "runs-with-model").as_deref(),
         Some("haiku"),
@@ -303,8 +312,9 @@ fn a_picked_skill_runs_with_the_picked_agent_on_the_model_picked(cx: &mut TestAp
     });
     wait_to_show(cx, window, "Ran with Forge · sonnet for this message");
     assert_eq!(
-        label_of(cx, window, format!("message-skill-{mine}")).as_deref(),
-        Some("/unslop")
+        label_of(cx, window, format!("message-body-{mine}")).as_deref(),
+        Some("/unslop the README intro"),
+        "the skill sits inline before the text"
     );
     assert_eq!(
         label_of(cx, window, format!("run-skill-{}", run.id)).as_deref(),
@@ -314,6 +324,11 @@ fn a_picked_skill_runs_with_the_picked_agent_on_the_model_picked(cx: &mut TestAp
         label_of(cx, window, format!("run-loaded-skill-{}", run.id)).as_deref(),
         Some("Loaded skill unslop global")
     );
+    // The done card lists the run's steps after the skill, as on the board.
+    let card = format!("done-card-{}", run.id);
+    let read = label_of(cx, window, ("run-step", 0usize)).unwrap_or_default();
+    assert!(read.starts_with("Read"), "{read}");
+    assert!(has(cx, window, card), "a card even with no file changed");
     let reply = ws.read_with(cx, |ws, _| {
         ws.state()
             .messages(w.thread)
@@ -383,6 +398,10 @@ fn a_mention_on_the_other_runtime_gets_a_note_and_a_claude_agent(cx: &mut TestAp
         Some("Forge"),
         "the first Claude agent is suggested"
     );
+    assert!(
+        !has(cx, window, "composer-send"),
+        "↵ sends; the board has no Send"
+    );
     press(cx, window, "enter");
 
     let runs = ended_runs(cx, &ws, w.thread, 1);
@@ -396,7 +415,7 @@ fn a_mention_on_the_other_runtime_gets_a_note_and_a_claude_agent(cx: &mut TestAp
             .any(|r| r.agent == quill)
     });
     assert!(!ran, "Quill stays mentioned and doesn't run");
-    assert!(shows(cx, window, "@Quill the sync changes"));
+    assert!(shows(cx, window, "/bench @Quill the sync changes"));
     assert!(shows(cx, window, "Ran with Forge"));
 }
 
@@ -495,4 +514,46 @@ fn an_empty_channel_starts_a_thread_with_a_skill(cx: &mut TestAppContext) {
         ws.state().thread(thread.unwrap()).unwrap().title.clone()
     });
     assert_eq!(title, "against main");
+}
+
+#[gpui_kit::test]
+fn a_failed_send_puts_back_the_skill_agent_and_model(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = daemon(tmp.path(), home.path());
+    let w = skills_world(tmp.path(), home.path(), &["Forge", "Scout"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    click(cx, window, "composer-input");
+    type_text(cx, window, "/uns");
+    wait_to_show(cx, window, "/unslop");
+    press(cx, window, "enter");
+    type_text(cx, window, "the README");
+    click(cx, window, "runs-with-agent");
+    click(cx, window, ("runs-with-agent-option", 1usize));
+    click(cx, window, "runs-with-model");
+    click(cx, window, ("runs-with-model-option", 1usize));
+    assert_eq!(
+        label_of(cx, window, "runs-with-agent").as_deref(),
+        Some("Scout")
+    );
+
+    // Scout goes before the app hears of it: crewd refuses the message.
+    let _: serde_json::Value = w.ask(Request::DeleteAgent { agent: w.agents[1] });
+    click(cx, window, "composer-send");
+    wait_until(cx, "the draft to come back", |cx| {
+        composer_text(cx, &ws) == "the README"
+    });
+    let picked = ws
+        .read_with(cx, |ws, cx| ws.composer.read(cx).picked())
+        .expect("the skill came back");
+    assert_eq!(picked.skill.name, "unslop");
+    assert_eq!(picked.picked_agent.as_deref(), Some("Scout"));
+    assert_eq!(picked.model_choice.as_deref(), Some("sonnet"));
+    assert!(has(cx, window, "composer-skill"), "its chip too");
+    let sent = ws.read_with(cx, |ws, _| !ws.state().messages(w.thread).is_empty());
+    assert!(!sent, "nothing was saved");
+    ws.read_with(cx, |ws, _| {
+        assert!(ws.recents.skills.is_empty(), "Recent waits for a send");
+    });
 }

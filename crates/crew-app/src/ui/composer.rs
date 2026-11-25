@@ -8,14 +8,16 @@ use crew_core::slug::slugify;
 use crew_proto::{ModelInfo, SkillInfo, SkillRef};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Backspace, InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InlineToken, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{monogram, provider_icon};
 use super::mention_menu::{MentionAgent, matching, mention_at};
-use super::runs_with::{RunsMenu, RunsWith, Target, model_name, resolve, wrong_runtime_note};
+use super::runs_with::{
+    RunsMenu, RunsWith, Target, model_name, resolve, skill_chip, wrong_runtime_note,
+};
 use super::slash_menu::{SkillEntry, entries, first_selected, flat, menu_rows, slash_at};
 use super::workspace::thread_title;
 use crate::theme::color;
@@ -46,7 +48,7 @@ const NEW_THREAD_CONTEXT: &str = "NewThread";
 const PAPERCLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 8v8.5a4 4 0 0 1-8 0V6.5a2.5 2.5 0 0 1 5 0V16a1 1 0 0 1-2 0V8"/></svg>"#;
 /// Width of the @ and attach buttons, so they match.
 const FOOTER_BUTTON: f32 = 28.;
-const REPLY_PLACEHOLDER: &str = "Reply in thread. Type @ to bring in an agent.";
+const REPLY_PLACEHOLDER: &str = "Reply in thread";
 const FIRST_PLACEHOLDER: &str = "Describe the task. The first line becomes the title.";
 const EMPTY_PLACEHOLDER: &str = "Start a thread. Type @ to bring in an agent, / for a skill.";
 
@@ -76,6 +78,28 @@ impl ComposerMode {
 /// the rules crewd names it with: `crew/fix-the-login`.
 pub fn branch_preview(text: &str) -> String {
     format!("crew/{}", slugify(&thread_title(text), &|_| false))
+}
+
+/// The byte ranges of the chips in the text.
+fn token_ranges(
+    tokens: &[gpui_kit::component::input::InlineTokenSpan],
+) -> Vec<std::ops::Range<usize>> {
+    tokens.iter().map(|t| t.range()).collect()
+}
+
+/// `text` without the chips at `ranges`, and the space after each.
+pub fn body_of(text: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for range in ranges {
+        out.push_str(&text[at..range.start]);
+        at = range.end;
+        if text[at..].starts_with(' ') {
+            at += 1;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// The agents `text` mentions, in the order first mentioned.
@@ -116,6 +140,17 @@ pub struct Outgoing {
     pub model_override: Option<String>,
     /// The skill's key, for the menu's Recent section.
     pub skill_key: Option<String>,
+    /// The skill and choices as picked, to put back if the send fails.
+    pub picked: Option<Box<Picked>>,
+}
+
+/// A skill picked in the composer, with who and what runs it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picked {
+    pub skill: SkillEntry,
+    pub runtime_choice: Option<Runtime>,
+    pub picked_agent: Option<String>,
+    pub model_choice: Option<String>,
 }
 
 /// What you asked the composer to send.
@@ -242,8 +277,10 @@ impl Composer {
         }
     }
 
+    /// What you wrote, without the skill's chip.
     pub fn text(&self, cx: &App) -> String {
-        self.input.read(cx).value().to_string()
+        let input = self.input.read(cx);
+        body_of(&input.value(), &token_ranges(input.tokens()))
     }
 
     /// Waiting for a new thread: Send and ↵ do nothing meanwhile.
@@ -270,6 +307,16 @@ impl Composer {
     /// The skill this message runs, by name.
     pub fn skill(&self) -> Option<&str> {
         self.skill.as_ref().map(|s| s.name.as_str())
+    }
+
+    /// The skill picked, with who and what runs it, to keep with a draft.
+    pub fn picked(&self) -> Option<Picked> {
+        self.skill.as_ref().map(|skill| Picked {
+            skill: skill.clone(),
+            runtime_choice: self.runtime_choice.clone(),
+            picked_agent: self.picked_agent.clone(),
+            model_choice: self.model_choice.clone(),
+        })
     }
 
     /// The project and version of the skills list the menu has.
@@ -372,12 +419,17 @@ impl Composer {
 
     /// Adds `@name ` at the end of the text and puts the cursor after it.
     pub fn add_mention(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.text(cx);
-        let spaced = text.chars().next_back().is_none_or(char::is_whitespace);
-        let text = format!("{text}{}@{name} ", if spaced { "" } else { " " });
+        // Typed at the end, so the skill's chip stays.
         self.input.update(cx, |input, cx| {
-            input.set_value(text.clone(), window, cx);
-            input.set_selected_range(text.len()..text.len(), cx);
+            let text = input.value();
+            let spaced = text.chars().next_back().is_none_or(char::is_whitespace);
+            let end = text.len();
+            input.set_selected_range(end..end, cx);
+            input.replace(
+                format!("{}@{name} ", if spaced { "" } else { " " }),
+                window,
+                cx,
+            );
         });
         self.mention = None;
         self.dismissed = None;
@@ -419,6 +471,12 @@ impl Composer {
     }
 
     fn text_changed(&mut self, cx: &mut Context<Self>) {
+        let input = self.input.read(cx);
+        // Deleting the chip drops the skill.
+        if self.skill.is_some() && input.tokens().is_empty() {
+            self.clear_skill();
+            cx.notify();
+        }
         let input = self.input.read(cx);
         let text = input.value();
         let found = mention_at(&text, input.cursor()).map(|(at, q)| (at, q.to_string()));
@@ -519,6 +577,7 @@ impl Composer {
                 skill: None,
                 model_override: None,
                 skill_key: None,
+                picked: None,
             },
             Some((skill, runs)) => {
                 let Some(agent) = runs.agent() else {
@@ -540,6 +599,7 @@ impl Composer {
                     }),
                     model_override,
                     skill_key: Some(skill.key()),
+                    picked: self.picked().map(Box::new),
                 }
             }
         };
@@ -571,29 +631,57 @@ impl Composer {
         let Some(skill) = self.skills.get(entry).cloned() else {
             return;
         };
-        self.input.update(cx, |input, cx| {
-            let end = input.cursor();
-            input.set_selected_range(slash.at..end, cx);
-            input.replace("", window, cx);
-            input.focus(window, cx);
-        });
+        let end = self.input.read(cx).cursor();
         self.clear_skill();
-        self.skill = Some(skill);
+        if self.insert_chip(&skill, slash.at..end, window, cx) {
+            self.skill = Some(skill);
+        }
         cx.notify();
     }
 
-    /// Drops the skill picked, as backspace at the start of the text does.
-    fn remove_skill(&mut self, cx: &mut Context<Self>) -> bool {
-        let at_start = {
-            let input = self.input.read(cx);
-            input.selected_range() == (0..0)
-        };
-        if self.skill.is_none() || !at_start {
-            return false;
-        }
+    /// Puts `skill`'s chip in place of `range`, then a space, the cursor
+    /// after it. Whether it went in.
+    fn insert_chip(
+        &mut self,
+        skill: &SkillEntry,
+        range: std::ops::Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.input.update(cx, |input, cx| {
+            let chip = format!("/{}", skill.name);
+            let token = InlineToken::new(skill.key(), chip.clone());
+            let start = range.start;
+            if input
+                .replace_range_with_token(range, token, window, cx)
+                .is_err()
+            {
+                return false;
+            }
+            let after = start + chip.len();
+            input.set_selected_range(after..after, cx);
+            if !input.value()[after..].starts_with(' ') {
+                input.replace(" ", window, cx);
+            } else {
+                input.set_selected_range(after + 1..after + 1, cx);
+            }
+            input.focus(window, cx);
+            true
+        })
+    }
+
+    /// Puts back a skill picked for a message that failed to send, its
+    /// chip at the start of the text.
+    pub fn restore_pick(&mut self, picked: Picked, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_skill();
+        if !self.insert_chip(&picked.skill, 0..0, window, cx) {
+            return;
+        }
+        self.skill = Some(picked.skill);
+        self.runtime_choice = picked.runtime_choice;
+        self.picked_agent = picked.picked_agent;
+        self.model_choice = picked.model_choice;
         cx.notify();
-        true
     }
 
     pub(super) fn choose_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
@@ -770,11 +858,11 @@ impl Render for Composer {
         // A skill adds its chip, the note when the mention is on the
         // other runtime, and the "Runs with" row: in place of a reply's
         // footer, above a new thread's.
-        let mut chip = None;
+        let mut chip_runtime = None;
         let mut note = None;
         let mut runs_row = None;
         if let Some((skill, runs)) = self.runs_with(cx) {
-            chip = Some(self.render_skill_chip(skill, &runs.runtime));
+            chip_runtime = Some(runs.runtime.clone());
             if let Target::WrongRuntime { mentioned, .. } = runs.target {
                 note = Some(self.render_runtime_note(wrong_runtime_note(
                     mentioned,
@@ -815,11 +903,6 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &MentionClose, _, cx| this.close_menu(cx)))
             .on_action(cx.listener(|this, _: &CancelNewThread, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &StartThread, window, cx| this.send(window, cx)))
-            .capture_action(cx.listener(|this, _: &Backspace, _, cx| {
-                if this.remove_skill(cx) {
-                    cx.stop_propagation();
-                }
-            }))
             .child({
                 let top = self.top.clone();
                 canvas(
@@ -841,22 +924,21 @@ impl Render for Composer {
                             .pt(scale::row(10.))
                             .text_size(scale::text(15.)),
                     })
-                    .map(|area| match chip {
-                        Some(chip) => area.flex().items_start().gap(ui_px(4.)).child(
-                            div()
-                                .flex_none()
-                                .pl(ui_px(8.))
-                                .pt(scale::row(5.))
-                                .child(chip),
-                        ),
-                        None => area,
+                    .child({
+                        // The skill sits inline, as a chip, before the text.
+                        let runtime = chip_runtime.unwrap_or(Runtime::ClaudeCode);
+                        Textarea::new(&self.input)
+                            .appearance(false)
+                            .token(move |token, _, _| {
+                                skill_chip(
+                                    "composer-skill",
+                                    &runtime,
+                                    token.token().text().trim_start_matches('/'),
+                                )
+                                .h(token.line_height())
+                                .test_support()
+                            })
                     })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Textarea::new(&self.input).appearance(false)),
-                    )
                     .test_support(),
             )
             .children(note)
@@ -1120,7 +1202,7 @@ fn keys(text: &'static str) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_preview, mentioned, model_short};
+    use super::{body_of, branch_preview, mentioned, model_short};
     use crate::model::ThreadStatus;
     use crate::ui::mention_menu::MentionAgent;
     use crew_core::agent::Runtime;
@@ -1163,5 +1245,19 @@ mod tests {
         assert!(names("no one").is_empty());
         assert_eq!(model_short("claude · opus"), "opus");
         assert_eq!(model_short("opus"), "opus");
+    }
+
+    #[test]
+    fn the_body_leaves_the_skill_chip_out() {
+        assert_eq!(
+            body_of("/unslop the README", std::slice::from_ref(&(0..7))),
+            "the README"
+        );
+        assert_eq!(body_of("/unslop ", std::slice::from_ref(&(0..7))), "");
+        assert_eq!(
+            body_of("fix /lint now", std::slice::from_ref(&(4..9))),
+            "fix now"
+        );
+        assert_eq!(body_of("plain", &[]), "plain");
     }
 }
