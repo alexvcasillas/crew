@@ -15,7 +15,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{
-    clock, elapsed, monogram, pulsing, runtime_badge, runtime_chip, with_font_probe,
+    clock, elapsed, monogram, pulsing, runtime_badge, runtime_badge_for, runtime_chip,
+    with_font_probe,
 };
 use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
 use super::markdown_view::{DocKey, render_doc};
@@ -74,7 +75,8 @@ impl Workspace {
                 && state.run(run).is_some_and(|r| r.status == RunStatus::Done)
             {
                 let summary = summarize(events, run);
-                if !summary.files.is_empty() {
+                let skill = state.run(run).is_some_and(|r| r.skill.is_some());
+                if !summary.files.is_empty() || skill {
                     items.push(
                         indented(self.render_done_card(run, &summary, cx)).into_any_element(),
                     );
@@ -246,7 +248,16 @@ impl Workspace {
                 let agent = state.agent(*agent);
                 let name =
                     agent.map_or_else(|| "Deleted agent".to_string(), |a| a.spec.name.clone());
-                let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
+                // A run on its message's own model says so.
+                let chip = message
+                    .run
+                    .and_then(|r| state.run(r))
+                    .filter(|r| r.model_override.is_some())
+                    .and_then(|r| self.run_chip(r));
+                let runtime = agent.map(|a| match chip {
+                    Some(text) => (runtime_badge_for(&a.spec.runtime, text.clone()), text),
+                    None => (runtime_badge(&a.spec), runtime_chip(&a.spec)),
+                });
                 (name.clone(), monogram(&name, 32.), runtime)
             }
             _ => ("You".to_string(), you_avatar(), None),
@@ -255,7 +266,7 @@ impl Workspace {
             let doc = self.docs.get(DocKey::Message(id), &message.body);
             render_doc(&doc, names, &format!("md-{id}")).into_any_element()
         } else {
-            styled_body(&message.body, names).into_any_element()
+            self.render_your_body(message, names)
         };
         message_row(
             id.to_string(),
@@ -270,13 +281,81 @@ impl Workspace {
         .into_any_element()
     }
 
+    /// Your message: the skill it ran on a chip before the text, and who
+    /// ran it under it.
+    fn render_your_body(&self, message: &StoredMessage, names: &[String]) -> AnyElement {
+        let state = self.state();
+        let id = message.id;
+        let text = styled_body(&message.body, names);
+        let Some(run) = state
+            .thread_runs(message.thread)
+            .into_iter()
+            .find(|r| r.message == Some(id) && r.skill.is_some())
+        else {
+            return text.into_any_element();
+        };
+        let skill = run.skill.clone().unwrap_or_default();
+        let agent = state
+            .agent(run.agent)
+            .map_or_else(|| "Deleted agent".to_string(), |a| a.spec.name.clone());
+        let ran = match run.model_override.as_deref() {
+            Some(model) => {
+                let runtime = self.run_runtime(run);
+                let models = super::settings::agents::models_of(&self.runtimes, &runtime);
+                format!(
+                    "Ran with {agent} · {} for this message",
+                    super::runs_with::model_name(&runtime, model, models)
+                )
+            }
+            None => format!("Ran with {agent}"),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(ui_px(6.))
+                    .child(
+                        super::runs_with::skill_chip(
+                            format!("message-skill-{id}"),
+                            &self.run_runtime(run),
+                            &skill,
+                        )
+                        .mt(scale::row(-1.))
+                        .test_support(),
+                    )
+                    .child(div().flex_1().min_w_0().child(text)),
+            )
+            .child(
+                div()
+                    .id(format!("message-ran-{id}"))
+                    .mt(scale::row(4.))
+                    .text_size(scale::text(12.))
+                    .text_color(color("text-tertiary"))
+                    .aria_label(ran.clone())
+                    .child(ran)
+                    .test_support(),
+            )
+            .into_any_element()
+    }
+
     /// An agent at work: its avatar, ringed in blue and pulsing while
     /// it works, and its run card.
     fn render_live_run(&self, run: &StoredRun, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let state = self.state();
         let agent = state.agent(run.agent);
         let name = agent.map_or_else(|| "Agent".to_string(), |a| a.spec.name.clone());
-        let runtime = agent.map(|a| (runtime_badge(&a.spec), runtime_chip(&a.spec)));
+        let chip = run
+            .model_override
+            .is_some()
+            .then(|| self.run_chip(run))
+            .flatten();
+        let runtime = agent.map(|a| match chip {
+            Some(text) => (runtime_badge_for(&a.spec.runtime, text.clone()), text),
+            None => (runtime_badge(&a.spec), runtime_chip(&a.spec)),
+        });
         let asks = decided_asks(&state.thread_approvals(run.thread), run.id);
         let summary = summarize_asked(state.events(run.thread), run.id, &asks);
         let id = run.id;

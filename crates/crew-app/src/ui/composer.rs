@@ -1,17 +1,22 @@
 //! Where you write in a thread, or the first message of a new one. Typing
-//! `@` opens the mention menu.
+//! `@` opens the mention menu, `/` the skills menu.
 
+use crew_core::agent::Runtime;
+use crew_core::ids::ProjectId;
 use crew_core::mention::parse_mentions;
 use crew_core::slug::slugify;
+use crew_proto::{ModelInfo, SkillInfo, SkillRef};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Backspace, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{monogram, provider_icon};
 use super::mention_menu::{MentionAgent, matching, mention_at};
+use super::runs_with::{RunsMenu, RunsWith, Target, model_name, resolve, wrong_runtime_note};
+use super::slash_menu::{SkillEntry, entries, first_selected, flat, menu_rows, slash_at};
 use super::workspace::thread_title;
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px};
@@ -43,7 +48,7 @@ const PAPERCLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 const FOOTER_BUTTON: f32 = 28.;
 const REPLY_PLACEHOLDER: &str = "Reply in thread. Type @ to bring in an agent.";
 const FIRST_PLACEHOLDER: &str = "Describe the task. The first line becomes the title.";
-const EMPTY_PLACEHOLDER: &str = "Start a thread. Type @ to bring in an agent.";
+const EMPTY_PLACEHOLDER: &str = "Start a thread. Type @ to bring in an agent, / for a skill.";
 
 /// What the composer is for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,9 +106,25 @@ pub fn bindings() -> Vec<KeyBinding> {
     ]
 }
 
+/// A message to send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outgoing {
+    pub text: String,
+    /// The skill it runs, and with which agent.
+    pub skill: Option<SkillRef>,
+    /// The model the skill runs on for this message alone.
+    pub model_override: Option<String>,
+    /// The skill's key, for the menu's Recent section.
+    pub skill_key: Option<String>,
+}
+
 /// What you asked the composer to send.
 pub enum ComposerEvent {
-    Send(String),
+    Send(Outgoing),
+    /// The `/` menu opened: the project's skills are wanted.
+    SkillsWanted,
+    /// The `/` menu's "Manage skills" was clicked.
+    ManageSkills,
     /// Cancel or esc in the new thread composer.
     Cancel,
     /// The mention menu's "Add one in Settings." was clicked.
@@ -114,6 +135,15 @@ pub enum ComposerEvent {
 #[derive(Debug, Clone, PartialEq)]
 struct Mention {
     /// Byte offset of the `@`.
+    at: usize,
+    query: String,
+    selected: usize,
+}
+
+/// An open `/` menu.
+#[derive(Debug, Clone, PartialEq)]
+struct Slash {
+    /// Byte offset of the `/`.
     at: usize,
     query: String,
     selected: usize,
@@ -135,6 +165,31 @@ pub struct Composer {
     /// another.
     dismissed: Option<usize>,
     busy: bool,
+    /// An open `/` menu.
+    slash: Option<Slash>,
+    /// The `/` whose menu you closed.
+    slash_dismissed: Option<usize>,
+    pub(super) slash_scroll: ScrollHandle,
+    /// The project's skills, as the menu lists them.
+    pub(super) skills: Vec<SkillEntry>,
+    /// The project and version of the list `skills` came from. `None`
+    /// until crewd answered.
+    skills_from: Option<(ProjectId, u64)>,
+    /// Keys of the skills you used lately, newest first.
+    pub(super) recent_skills: Vec<String>,
+    /// The skill this message runs.
+    skill: Option<SkillEntry>,
+    /// The runtime picked with the switch, for a skill both have.
+    runtime_choice: Option<Runtime>,
+    /// The agent picked to run the skill, by name.
+    picked_agent: Option<String>,
+    /// The model picked for this message.
+    pub(super) model_choice: Option<String>,
+    pub(super) runs_menu: Option<RunsMenu>,
+    /// Each runtime's models.
+    pub(super) models: Vec<(Runtime, Vec<ModelInfo>)>,
+    /// The agent a reply goes to.
+    reply_to: Option<String>,
     /// Where the composer's top was last drawn, in window px, so the
     /// mention menu knows if it fits above.
     pub(super) top: std::rc::Rc<std::cell::Cell<Option<f32>>>,
@@ -169,6 +224,19 @@ impl Composer {
             mention: None,
             dismissed: None,
             busy: false,
+            slash: None,
+            slash_dismissed: None,
+            slash_scroll: ScrollHandle::new(),
+            skills: Vec::new(),
+            skills_from: None,
+            recent_skills: Vec::new(),
+            skill: None,
+            runtime_choice: None,
+            picked_agent: None,
+            model_choice: None,
+            runs_menu: None,
+            models: Vec::new(),
+            reply_to: None,
             top: Default::default(),
             _input_events: events,
         }
@@ -191,7 +259,76 @@ impl Composer {
     }
 
     pub fn menu_open(&self) -> bool {
-        self.mention.is_some()
+        self.mention.is_some() || self.slash_menu_shown()
+    }
+
+    /// Whether the `/` menu is drawn: open, with the skills known.
+    pub fn slash_menu_shown(&self) -> bool {
+        self.slash.is_some() && self.skills_from.is_some()
+    }
+
+    /// The skill this message runs, by name.
+    pub fn skill(&self) -> Option<&str> {
+        self.skill.as_ref().map(|s| s.name.as_str())
+    }
+
+    /// The project and version of the skills list the menu has.
+    pub fn skills_from(&self) -> Option<(ProjectId, u64)> {
+        self.skills_from
+    }
+
+    /// The project's skills, version `rev`, from crewd's list; `None`
+    /// while unknown.
+    pub fn set_skills(
+        &mut self,
+        from: Option<(ProjectId, u64)>,
+        list: &[SkillInfo],
+        cx: &mut Context<Self>,
+    ) {
+        if self.skills_from == from {
+            return;
+        }
+        self.skills_from = from;
+        self.skills = entries(list);
+        if let Some(slash) = &mut self.slash {
+            let n = flat(&menu_rows(&self.skills, &slash.query, &self.recent_skills)).len();
+            if slash.selected >= n {
+                slash.selected = 0;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The skills you used lately, newest first, and each runtime's
+    /// models.
+    pub fn set_skill_context(
+        &mut self,
+        recent: Vec<String>,
+        models: Vec<(Runtime, Vec<ModelInfo>)>,
+        reply_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.recent_skills != recent || self.models != models || self.reply_to != reply_to {
+            self.recent_skills = recent;
+            self.models = models;
+            self.reply_to = reply_to;
+            cx.notify();
+        }
+    }
+
+    /// Who runs the skill picked, if one is.
+    fn runs_with(&self, cx: &App) -> Option<(&SkillEntry, RunsWith<'_>)> {
+        let skill = self.skill.as_ref()?;
+        let text = self.text(cx);
+        let runs = resolve(
+            skill,
+            &self.agents,
+            &text,
+            self.runtime_choice.as_ref(),
+            self.picked_agent.as_deref(),
+            self.reply_to.as_deref(),
+        );
+        Some((skill, runs))
     }
 
     /// Who you can mention, in which project, and the footer hint.
@@ -238,7 +375,14 @@ impl Composer {
         let text = self.text(cx);
         let spaced = text.chars().next_back().is_none_or(char::is_whitespace);
         let text = format!("{text}{}@{name} ", if spaced { "" } else { " " });
-        self.set_text(&text, window, cx);
+        self.input.update(cx, |input, cx| {
+            input.set_value(text.clone(), window, cx);
+            input.set_selected_range(text.len()..text.len(), cx);
+        });
+        self.mention = None;
+        self.dismissed = None;
+        self.slash = None;
+        cx.notify();
         self.focus(window, cx);
     }
 
@@ -252,7 +396,7 @@ impl Composer {
     }
 
     /// Replaces the text, cursor at its end, as when you come back to a
-    /// draft.
+    /// draft. A skill picked is dropped.
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| {
             input.set_value(text.to_string(), window, cx);
@@ -260,7 +404,18 @@ impl Composer {
         });
         self.mention = None;
         self.dismissed = None;
+        self.slash = None;
+        self.slash_dismissed = None;
+        self.clear_skill();
         cx.notify();
+    }
+
+    fn clear_skill(&mut self) {
+        self.skill = None;
+        self.runtime_choice = None;
+        self.picked_agent = None;
+        self.model_choice = None;
+        self.runs_menu = None;
     }
 
     fn text_changed(&mut self, cx: &mut Context<Self>) {
@@ -270,6 +425,9 @@ impl Composer {
         if self.dismissed.is_some() && found.as_ref().map(|f| f.0) != self.dismissed {
             self.dismissed = None;
         }
+        let slash_found = (self.skill.is_none() && found.is_none())
+            .then(|| slash_at(&text, input.cursor()).map(|(at, q)| (at, q.to_string())))
+            .flatten();
         let mention = match found {
             Some((at, _)) if self.dismissed == Some(at) => None,
             Some((at, query)) => {
@@ -289,9 +447,52 @@ impl Composer {
             self.mention = mention;
             cx.notify();
         }
+        if self.slash_dismissed.is_some()
+            && slash_found.as_ref().map(|f| f.0) != self.slash_dismissed
+        {
+            self.slash_dismissed = None;
+        }
+        let slash = match slash_found {
+            Some((at, _)) if self.slash_dismissed == Some(at) => None,
+            Some((at, query)) => {
+                let selected = match &self.slash {
+                    Some(s) if s.at == at && s.query == query => s.selected,
+                    _ => {
+                        let sections = menu_rows(&self.skills, &query, &self.recent_skills);
+                        first_selected(&self.skills, &flat(&sections), &self.recent_skills)
+                    }
+                };
+                Some(Slash {
+                    at,
+                    query,
+                    selected,
+                })
+            }
+            None => None,
+        };
+        if slash != self.slash {
+            let opened = self.slash.is_none() && slash.is_some();
+            self.slash = slash;
+            if opened {
+                cx.emit(ComposerEvent::SkillsWanted);
+            }
+            self.scroll_to_selected();
+            cx.notify();
+        }
     }
 
     fn enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(slash) = &self.slash {
+            let picked = self.skills_from.and_then(|_| {
+                let sections = menu_rows(&self.skills, &slash.query, &self.recent_skills);
+                flat(&sections).get(slash.selected).map(|r| r.entry)
+            });
+            match picked {
+                Some(entry) => self.pick_skill(entry, window, cx),
+                None => self.close_menu(cx),
+            }
+            return;
+        }
         let picked = self.mention.as_ref().and_then(|m| {
             matching(&self.agents, &m.query)
                 .get(m.selected)
@@ -304,19 +505,152 @@ impl Composer {
         }
     }
 
-    /// Sends what you wrote and empties the field.
+    /// Sends what you wrote and empties the field. With a skill, only
+    /// once an agent on its runtime can run it.
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.text(cx);
-        let text = text.trim();
-        if text.is_empty() || self.busy {
+        let text = self.text(cx).trim().to_string();
+        if self.busy {
             return;
         }
-        cx.emit(ComposerEvent::Send(text.to_string()));
+        let outgoing = match self.runs_with(cx) {
+            None if text.is_empty() => return,
+            None => Outgoing {
+                text,
+                skill: None,
+                model_override: None,
+                skill_key: None,
+            },
+            Some((skill, runs)) => {
+                let Some(agent) = runs.agent() else {
+                    return;
+                };
+                let models = self.models_of_runtime(&runs.runtime);
+                let default = model_name(&runs.runtime, &agent.model, &models);
+                let model_override = self
+                    .model_choice
+                    .clone()
+                    .filter(|m| model_name(&runs.runtime, m, &models) != default);
+                Outgoing {
+                    text,
+                    skill: Some(SkillRef {
+                        runtime: runs.runtime.clone(),
+                        name: skill.name.clone(),
+                        path: skill.path(&runs.runtime).unwrap_or_default().to_string(),
+                        agent: Some(agent.id),
+                    }),
+                    model_override,
+                    skill_key: Some(skill.key()),
+                }
+            }
+        };
+        cx.emit(ComposerEvent::Send(outgoing));
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.mention = None;
         self.dismissed = None;
+        self.slash = None;
+        self.slash_dismissed = None;
+        self.clear_skill();
         cx.notify();
+    }
+
+    fn models_of_runtime(&self, runtime: &Runtime) -> Vec<ModelInfo> {
+        self.models
+            .iter()
+            .find(|(r, _)| r == runtime)
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default()
+    }
+
+    /// Takes the skill at `entry` for this message, dropping the `/` being
+    /// typed.
+    pub(super) fn pick_skill(&mut self, entry: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slash) = self.slash.take() else {
+            return;
+        };
+        let Some(skill) = self.skills.get(entry).cloned() else {
+            return;
+        };
+        self.input.update(cx, |input, cx| {
+            let end = input.cursor();
+            input.set_selected_range(slash.at..end, cx);
+            input.replace("", window, cx);
+            input.focus(window, cx);
+        });
+        self.clear_skill();
+        self.skill = Some(skill);
+        cx.notify();
+    }
+
+    /// Drops the skill picked, as backspace at the start of the text does.
+    fn remove_skill(&mut self, cx: &mut Context<Self>) -> bool {
+        let at_start = {
+            let input = self.input.read(cx);
+            input.selected_range() == (0..0)
+        };
+        if self.skill.is_none() || !at_start {
+            return false;
+        }
+        self.clear_skill();
+        cx.notify();
+        true
+    }
+
+    pub(super) fn choose_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
+        if self.runtime_choice.as_ref() != Some(&runtime) {
+            self.runtime_choice = Some(runtime);
+            self.picked_agent = None;
+            self.model_choice = None;
+            self.runs_menu = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn pick_agent(&mut self, name: String, cx: &mut Context<Self>) {
+        self.picked_agent = Some(name);
+        self.runs_menu = None;
+        cx.notify();
+    }
+
+    pub(super) fn pick_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.model_choice = Some(model);
+        self.runs_menu = None;
+        cx.notify();
+    }
+
+    pub(super) fn toggle_runs_menu(&mut self, menu: RunsMenu, cx: &mut Context<Self>) {
+        self.runs_menu = if self.runs_menu == Some(menu) {
+            None
+        } else {
+            Some(menu)
+        };
+        cx.notify();
+    }
+
+    pub(super) fn close_runs_menu(&mut self, cx: &mut Context<Self>) {
+        if self.runs_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Keeps the highlighted skill in view.
+    fn scroll_to_selected(&self) {
+        let Some(slash) = &self.slash else {
+            return;
+        };
+        let sections = menu_rows(&self.skills, &slash.query, &self.recent_skills);
+        let mut item = 0;
+        let mut row = 0;
+        for (_, rows) in &sections {
+            item += 1;
+            if slash.selected < row + rows.len() {
+                item += slash.selected - row;
+                self.slash_scroll.scroll_to_item(item);
+                return;
+            }
+            row += rows.len();
+            item += rows.len();
+        }
     }
 
     /// Replaces the `@` being typed with `@name `.
@@ -351,9 +685,22 @@ impl Composer {
             self.dismissed = Some(mention.at);
             cx.notify();
         }
+        if let Some(slash) = self.slash.take() {
+            self.slash_dismissed = Some(slash.at);
+            cx.notify();
+        }
     }
 
     fn move_selection(&mut self, by: isize, cx: &mut Context<Self>) {
+        if let Some(slash) = &mut self.slash {
+            let n = flat(&menu_rows(&self.skills, &slash.query, &self.recent_skills)).len();
+            if n > 0 {
+                slash.selected = (slash.selected as isize + by).rem_euclid(n as isize) as usize;
+                self.scroll_to_selected();
+                cx.notify();
+            }
+            return;
+        }
         let Some(mention) = &mut self.mention else {
             return;
         };
@@ -379,24 +726,75 @@ impl Composer {
         });
         self.text_changed(cx);
     }
+
+    /// Types `/` where the cursor is, opening the skills menu. With a
+    /// skill already picked, it only puts the cursor in the text.
+    fn start_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.skill.is_some() {
+            self.focus(window, cx);
+            return;
+        }
+        self.input.update(cx, |input, cx| {
+            let text = input.value();
+            let cursor = input.cursor();
+            let spaced = text[..cursor]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace);
+            input.replace(if spaced { "/" } else { " /" }, window, cx);
+            input.focus(window, cx);
+        });
+        self.text_changed(cx);
+    }
 }
 
 impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let menu = self
-            .mention
-            .as_ref()
-            .map(|m| self.render_mention_menu(&m.query, m.selected, cx));
+        let menu = match (&self.mention, &self.slash) {
+            (Some(m), _) => Some(
+                self.render_mention_menu(&m.query, m.selected, cx)
+                    .into_any_element(),
+            ),
+            (None, Some(s)) if self.skills_from.is_some() => Some(
+                self.render_slash_menu(&s.query, s.selected, cx)
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
         let context = match (&menu, self.mode) {
             (Some(_), _) => MENU_CONTEXT,
             (None, ComposerMode::NewThread) => NEW_THREAD_CONTEXT,
             (None, _) => COMPOSER_CONTEXT,
         };
         let new_thread = self.mode == ComposerMode::NewThread;
+        // A skill adds its chip, the note when the mention is on the
+        // other runtime, and the "Runs with" row: in place of a reply's
+        // footer, above a new thread's.
+        let mut chip = None;
+        let mut note = None;
+        let mut runs_row = None;
+        if let Some((skill, runs)) = self.runs_with(cx) {
+            chip = Some(self.render_skill_chip(skill, &runs.runtime));
+            if let Target::WrongRuntime { mentioned, .. } = runs.target {
+                note = Some(self.render_runtime_note(wrong_runtime_note(
+                    mentioned,
+                    &skill.name,
+                    &runs.runtime,
+                )));
+            }
+            let send = self.mode == ComposerMode::Reply;
+            let skill = skill.clone();
+            let runs = runs.clone();
+            runs_row = Some(
+                self.render_runs_with(&skill, &runs, send, cx)
+                    .into_any_element(),
+            );
+        }
         let footer = match self.mode {
-            ComposerMode::Reply => self.render_reply_footer(cx).into_any_element(),
-            ComposerMode::NewThread => self.render_new_thread_footer(cx).into_any_element(),
-            ComposerMode::Empty => self.render_empty_footer(cx).into_any_element(),
+            ComposerMode::Reply if runs_row.is_some() => None,
+            ComposerMode::Reply => Some(self.render_reply_footer(cx).into_any_element()),
+            ComposerMode::NewThread => Some(self.render_new_thread_footer(cx).into_any_element()),
+            ComposerMode::Empty => Some(self.render_empty_footer(cx).into_any_element()),
         };
         div()
             .id("composer")
@@ -417,6 +815,11 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &MentionClose, _, cx| this.close_menu(cx)))
             .on_action(cx.listener(|this, _: &CancelNewThread, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &StartThread, window, cx| this.send(window, cx)))
+            .capture_action(cx.listener(|this, _: &Backspace, _, cx| {
+                if this.remove_skill(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child({
                 let top = self.top.clone();
                 canvas(
@@ -438,10 +841,27 @@ impl Render for Composer {
                             .pt(scale::row(10.))
                             .text_size(scale::text(15.)),
                     })
-                    .child(Textarea::new(&self.input).appearance(false))
+                    .map(|area| match chip {
+                        Some(chip) => area.flex().items_start().gap(ui_px(4.)).child(
+                            div()
+                                .flex_none()
+                                .pl(ui_px(8.))
+                                .pt(scale::row(5.))
+                                .child(chip),
+                        ),
+                        None => area,
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Textarea::new(&self.input).appearance(false)),
+                    )
                     .test_support(),
             )
-            .child(footer)
+            .children(note)
+            .children(runs_row)
+            .children(footer)
             .children(menu.map(|menu| deferred(menu).with_priority(1)))
             .test_support()
     }
@@ -461,6 +881,25 @@ impl Composer {
             }))
     }
 
+    /// The @ and / buttons.
+    fn render_at_slash(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.slash_menu_shown();
+        div().flex().flex_none().child(self.render_at(cx)).child(
+            Button::new("composer-slash")
+                .ghost()
+                .small()
+                .w(ui_px(FOOTER_BUTTON))
+                .label("/")
+                .when(open, |b| {
+                    b.bg(color("surface-300")).text_color(color("text-primary"))
+                })
+                .tooltip("Insert a skill")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_slash(window, cx);
+                })),
+        )
+    }
+
     fn render_reply_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -468,7 +907,7 @@ impl Composer {
             .gap(ui_px(8.))
             .px(ui_px(8.))
             .pb(scale::row(8.))
-            .child(self.render_at(cx))
+            .child(self.render_at_slash(cx))
             .child(
                 // Same size and colour as @. Not disabled, which would
                 // fade it; it only says what is coming.
@@ -585,7 +1024,7 @@ impl Composer {
             .pb(scale::row(8.))
             .border_t_1()
             .border_color(color("border-100"))
-            .child(self.render_at(cx))
+            .child(self.render_at_slash(cx))
             .child(
                 div()
                     .id("new-thread-branch")
@@ -635,7 +1074,7 @@ impl Composer {
             .pr(ui_px(8.))
             .pt(scale::row(6.))
             .pb(scale::row(8.))
-            .child(self.render_at(cx))
+            .child(self.render_at_slash(cx))
             .child(
                 div()
                     .id("empty-composer-base")
@@ -688,9 +1127,11 @@ mod tests {
 
     fn agent(name: &str) -> MentionAgent {
         MentionAgent {
+            id: crew_core::ids::AgentId::new(),
             name: name.into(),
             role: String::new(),
             chip: "claude · opus".into(),
+            model: "opus".into(),
             runtime: Runtime::ClaudeCode,
             status: ThreadStatus::Idle,
         }

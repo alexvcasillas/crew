@@ -99,6 +99,44 @@ pub enum ActivityRow {
         seq: u64,
         summary: String,
     },
+    /// The skill the run was asked to run, with its file and its size
+    /// when known.
+    Skill {
+        name: String,
+        path: Option<String>,
+        size: Option<u64>,
+    },
+    /// The model the run used for its message alone, and its agent's own.
+    Model {
+        model: String,
+        agent: String,
+        default: String,
+    },
+}
+
+/// A slash, for a skill row.
+const SLASH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M10 2.5L6 13.5"/></svg>"#;
+/// A clock, for a model row.
+const CLOCK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></svg>"#;
+
+/// `2.1 KB`, or `512 B` under a kilobyte.
+pub fn file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.)
+    }
+}
+
+/// `path` with the home folder written as `~`.
+pub fn tilde(path: &str, home: Option<&str>) -> String {
+    match home
+        .filter(|h| !h.is_empty())
+        .and_then(|h| path.strip_prefix(h))
+    {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 /// The rows for `run`'s events, in order. A tool's result fills in the
@@ -374,6 +412,9 @@ impl Workspace {
         let Some(row) = self.inspector.rows.get(ix) else {
             return div().into_any_element();
         };
+        if matches!(row, ActivityRow::Skill { .. } | ActivityRow::Model { .. }) {
+            return render_request_row(ix, row);
+        }
         let (icon, token, content): (IconName, &str, AnyElement) = match row {
             ActivityRow::Thinking(text) => (
                 IconName::Bot,
@@ -457,6 +498,7 @@ impl Workspace {
                     .child(text.clone())
                     .into_any_element(),
             ),
+            ActivityRow::Skill { .. } | ActivityRow::Model { .. } => unreachable!(),
             ActivityRow::Finished { ok, seq, summary } => (
                 if *ok {
                     IconName::CircleCheck
@@ -786,6 +828,95 @@ impl Workspace {
 }
 
 /// The safety check's reason under a blocked call.
+/// The skill a run was asked to run, or the model it used for its
+/// message: the rows before what it did.
+fn render_request_row(ix: usize, row: &ActivityRow) -> AnyElement {
+    let base = div()
+        .id(("activity-row", ix))
+        .w_full()
+        .flex()
+        .px(ui_px(16.))
+        .py(scale::row(10.))
+        .border_b_1()
+        .border_color(color("surface-200"))
+        .text_size(scale::text(12.))
+        .line_height(scale::line(18.))
+        .aria_label(row_label(row));
+    let icon = |svg: &'static [u8]| {
+        div()
+            .flex()
+            .flex_none()
+            .justify_center()
+            .w(ui_px(16.))
+            .pt(scale::row(1.))
+            .text_color(color("text-tertiary"))
+            .child(Icon::default().data(svg).size(ui_px(13.)))
+    };
+    match row {
+        ActivityRow::Skill { name, path, size } => {
+            let loaded = match size {
+                Some(size) => format!("loaded · {}", file_size(*size)),
+                None => "loaded".to_string(),
+            };
+            let home = std::env::var("HOME").ok();
+            base.flex_col()
+                .gap(scale::row(6.))
+                .bg(color("surface-100"))
+                .child(
+                    div().flex().gap(ui_px(10.)).child(icon(SLASH)).child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(ui_px(8.))
+                            .child(div().text_color(color("text-secondary")).child("Skill"))
+                            .child(
+                                div()
+                                    .font_family(code_family())
+                                    .text_color(color("text-primary"))
+                                    .child(name.clone()),
+                            )
+                            .child(div().text_color(color("text-tertiary")).child(loaded)),
+                    ),
+                )
+                .when_some(path.clone(), |col, path| {
+                    col.child(
+                        div()
+                            .ml(ui_px(26.))
+                            .truncate()
+                            .font_family(code_family())
+                            .text_size(scale::mono(11.))
+                            .text_color(color("text-tertiary"))
+                            .child(tilde(&path, home.as_deref())),
+                    )
+                })
+                .test_support()
+                .into_any_element()
+        }
+        ActivityRow::Model {
+            model,
+            agent,
+            default,
+        } => base
+            .gap(ui_px(10.))
+            .child(icon(CLOCK))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .flex_wrap()
+                    .gap(ui_px(4.))
+                    .text_color(color("text-secondary"))
+                    .child("Model")
+                    .child(div().text_color(color("text-primary")).child(model.clone()))
+                    .child(format!("for this message. {agent}'s default is {default}.")),
+            )
+            .test_support()
+            .into_any_element(),
+        _ => div().into_any_element(),
+    }
+}
+
 fn reason_line(reason: String) -> impl IntoElement {
     div()
         .mt(ui_px(2.))
@@ -819,6 +950,15 @@ fn tool_icon(tool: &ToolRow) -> (IconName, &'static str) {
 /// What a row says, for tests and screen readers.
 pub fn row_label(row: &ActivityRow) -> String {
     match row {
+        ActivityRow::Skill { name, size, .. } => match size {
+            Some(size) => format!("Skill {name} loaded · {}", file_size(*size)),
+            None => format!("Skill {name} loaded"),
+        },
+        ActivityRow::Model {
+            model,
+            agent,
+            default,
+        } => format!("Model {model} for this message. {agent}'s default is {default}."),
         ActivityRow::Thinking(text) => format!("Thinking {text}"),
         ActivityRow::Said { text, .. } => format!("Said {text}"),
         ActivityRow::Tool(tool) => {

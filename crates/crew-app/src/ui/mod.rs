@@ -20,9 +20,12 @@ pub mod palette;
 mod project_view;
 mod run_card;
 pub mod running_view;
+mod runs_with;
 mod service_control;
 pub mod settings;
 pub(crate) mod sidebar;
+mod skills_cache;
+mod slash_menu;
 mod status_bar;
 mod terminal_tab;
 mod terminal_view;
@@ -61,6 +64,8 @@ mod running_tests;
 mod settings_tests;
 #[cfg(test)]
 mod sidebar_tests;
+#[cfg(test)]
+mod skills_tests;
 #[cfg(test)]
 mod terminal_tab_tests;
 #[cfg(test)]

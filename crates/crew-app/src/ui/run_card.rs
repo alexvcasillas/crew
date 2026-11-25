@@ -398,7 +398,8 @@ impl Workspace {
                     .aria_label(word)
                     .child(word)
                     .test_support(),
-            );
+            )
+            .children(self.render_skill_header(run));
         if !time.is_empty() {
             // It ticks once a second, so the last value is a second ago.
             let prev = elapsed(ms - 1000);
@@ -434,15 +435,17 @@ impl Workspace {
                         this.stop_run(id, window, cx);
                     })),
             );
+        let loaded = (!queued).then(|| self.render_loaded_skill(run)).flatten();
         card(id, "run-card")
             .child(header)
-            .when(!summary.steps.is_empty(), |card| {
+            .when(!summary.steps.is_empty() || loaded.is_some(), |card| {
                 card.child(
                     div()
                         .flex()
                         .flex_col()
                         .px(ui_px(12.))
                         .pb(scale::row(8.))
+                        .children(loaded)
                         .children(summary.steps.iter().enumerate().map(step_row)),
                 )
             })
@@ -457,7 +460,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let counts = summary.counts().unwrap_or_default();
-        let thread = self.state().run(run).map(|r| r.thread);
+        let stored = self.state().run(run);
+        let thread = stored.map(|r| r.thread);
+        let skill_header = stored.and_then(|r| self.render_skill_header(r));
+        let loaded = stored.and_then(|r| self.render_loaded_skill(r));
         let can_review = thread.is_some_and(|t| self.can_review(t));
         card(run, "done-card")
             .child(
@@ -479,7 +485,10 @@ impl Workspace {
                             .text_color(color("success"))
                             .child("Done"),
                     )
-                    .child(counts_line(run, summary, counts))
+                    .children(skill_header)
+                    .when(!summary.files.is_empty(), |row| {
+                        row.child(counts_line(run, summary, counts))
+                    })
                     .child(div().flex_1())
                     .child(
                         Button::new(format!("review-{run}"))
@@ -501,6 +510,7 @@ impl Workspace {
                     .flex_col()
                     .px(ui_px(12.))
                     .pb(scale::row(8.))
+                    .children(loaded)
                     .children(summary.files.iter().map(|f| {
                         div()
                             .flex()
@@ -521,6 +531,84 @@ impl Workspace {
                     })),
             )
             .test_support()
+    }
+}
+
+impl Workspace {
+    /// `/unslop · claude · sonnet · Forge` in a skill run's card header.
+    fn render_skill_header(&self, run: &StoredRun) -> Option<AnyElement> {
+        let name = run.skill.as_deref()?;
+        let agent = self.state().agent(run.agent)?.spec.name.clone();
+        let chip = self.run_chip(run)?;
+        let rest = format!("· {chip} · {agent}");
+        Some(
+            div()
+                .id(format!("run-skill-{}", run.id))
+                .flex()
+                .items_center()
+                .gap(ui_px(8.))
+                .min_w_0()
+                .whitespace_nowrap()
+                .aria_label(format!("/{name} {rest}"))
+                .child(
+                    div()
+                        .font_family(code_family())
+                        .text_size(scale::mono(12.))
+                        .text_color(color("text-primary"))
+                        .child(format!("/{name}")),
+                )
+                .child(div().text_color(color("text-tertiary")).child(rest))
+                .test_support()
+                .into_any_element(),
+        )
+    }
+
+    /// "Loaded skill unslop", tagged with where it comes from: a skill
+    /// run's first step.
+    fn render_loaded_skill(&self, run: &StoredRun) -> Option<AnyElement> {
+        let name = run.skill.clone()?;
+        let source = self.run_skill_source(run);
+        Some(
+            div()
+                .id(format!("run-loaded-skill-{}", run.id))
+                .flex()
+                .items_center()
+                .gap(ui_px(8.))
+                .h(scale::row(24.))
+                .text_size(scale::text(12.))
+                .text_color(color("text-secondary"))
+                .whitespace_nowrap()
+                .aria_label(match &source {
+                    Some(source) => format!("Loaded skill {name} {source}"),
+                    None => format!("Loaded skill {name}"),
+                })
+                .child(
+                    Icon::new(IconName::Check)
+                        .size(ui_px(12.))
+                        .text_color(color("success")),
+                )
+                .child("Loaded skill")
+                .child(
+                    div()
+                        .font_family(code_family())
+                        .text_color(color("text-primary"))
+                        .child(name),
+                )
+                .children(source.map(|source| {
+                    div()
+                        .px(ui_px(6.))
+                        .rounded(ui_px(4.))
+                        .border_1()
+                        .border_color(color("border-100"))
+                        .bg(color("surface-200"))
+                        .text_size(scale::text(11.))
+                        .line_height(scale::line(16.))
+                        .text_color(color("text-tertiary"))
+                        .child(source)
+                }))
+                .test_support()
+                .into_any_element(),
+        )
     }
 }
 

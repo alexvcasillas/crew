@@ -223,7 +223,7 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
         !shows(
             cx,
             window,
-            "Replying to Forge. Type @ to bring in someone else."
+            "Replying to Forge. Type @ to bring in someone else, / for a skill."
         ),
         "no one has answered here yet"
     );
@@ -255,7 +255,7 @@ fn posting_a_mention_runs_the_agent_and_shows_its_reply(cx: &mut TestAppContext)
     wait_to_show(
         cx,
         window,
-        "Replying to Forge. Type @ to bring in someone else.",
+        "Replying to Forge. Type @ to bring in someone else, / for a skill.",
     );
 }
 
