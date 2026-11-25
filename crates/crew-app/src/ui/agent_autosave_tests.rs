@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crew_core::agent::{AgentSpec, PermissionMode};
+use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::ids::AgentId;
 use crew_core::policy::HandoffPolicy;
 use gpui_kit::test::TestWindowExt as _;
@@ -13,9 +13,10 @@ use super::settings::agents::{AUTOSAVE_PAUSE, AgentForm};
 use super::test_ui::{
     click, has, label_of, open_tall, press, shows, type_text, wait_to_show, wait_until,
 };
-use super::thread_tests::{World, world};
+use super::thread_tests::{World, agent, ask, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, short_home};
+use crew_proto::Request;
 
 const AUTO_LABEL: &str = "Auto: edit files, ask only before risky commands";
 
@@ -201,7 +202,7 @@ fn a_change_during_a_save_saves_the_latest_after_it(cx: &mut TestAppContext) {
         })
         .unwrap();
     assert_eq!(status.as_deref(), Some("Saving…"));
-    assert!(queued, "the latest waits for the save in flight");
+    assert_eq!(queued, 1, "the latest waits for the save in flight");
     wait_until(cx, "the saves to end", |cx| {
         ws.read_with(cx, |ws, _| ws.agent_saves.idle())
     });
@@ -252,4 +253,143 @@ fn a_new_agent_still_waits_for_its_button(cx: &mut TestAppContext) {
         ws.read_with(cx, |ws, _| ws.state().agents().len() == 2)
     });
     wait_to_show(cx, window, "Saved");
+}
+
+/// Clicks each element in turn within one frame's work, before crewd can
+/// answer anything.
+fn click_now(cx: &mut TestAppContext, window: AnyWindowHandle, ids: &[String]) {
+    cx.update_window(window, |_, window, cx| {
+        for id in ids {
+            window.render_frame(cx);
+            window.click(id.clone(), cx);
+        }
+        window.render_frame(cx);
+    })
+    .unwrap();
+}
+
+fn name_in_form(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> String {
+    ws.read_with(cx, |ws, cx| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        form.name.read(cx).value().to_string()
+    })
+}
+
+#[gpui_kit::test]
+fn edits_to_two_agents_during_a_save_both_land(cx: &mut TestAppContext) {
+    let (_tmp, _home, _daemon, w, window, ws) = agents_page(cx, &["Forge", "Scout"]);
+    let (forge, scout) = (w.agents[0], w.agents[1]);
+    click(cx, window, format!("settings-agent-{forge}"));
+
+    // Forge's first save is in flight; its second and Scout's wait.
+    click_now(
+        cx,
+        window,
+        &[
+            "agent-policy-ask".into(),
+            "agent-policy-budget".into(),
+            format!("settings-agent-{scout}"),
+            "agent-policy-ask".into(),
+        ],
+    );
+    assert_eq!(ws.read_with(cx, |ws, _| ws.agent_saves.queued()), 2);
+    wait_until(cx, "the saves to end", |cx| {
+        ws.read_with(cx, |ws, _| ws.agent_saves.idle())
+    });
+    settle(cx);
+    assert_eq!(
+        spec(cx, &ws, forge).handoff_policy,
+        Some(HandoffPolicy::Budget)
+    );
+    assert_eq!(
+        spec(cx, &ws, scout).handoff_policy,
+        Some(HandoffPolicy::AskFirst)
+    );
+}
+
+#[gpui_kit::test]
+fn reopening_an_agent_keeps_what_you_typed(cx: &mut TestAppContext) {
+    let (_tmp, _home, _daemon, w, window, ws) = agents_page(cx, &["Forge", "Scout"]);
+    let (forge, scout) = (w.agents[0], w.agents[1]);
+    click(cx, window, format!("settings-agent-{forge}"));
+
+    // Its own row: the form stays as it is.
+    retype(cx, window, "agent-name", "Anvil");
+    click(cx, window, format!("settings-agent-{forge}"));
+    assert_eq!(name_in_form(cx, &ws), "Anvil");
+    click(cx, window, "agent-policy-ask");
+    wait_until(cx, "Anvil asking first", |cx| {
+        let s = spec(cx, &ws, forge);
+        s.name == "Anvil" && s.handoff_policy == Some(HandoffPolicy::AskFirst)
+    });
+
+    // Away and back before crewd answers: the form starts from the
+    // save, not crewd's older copy.
+    retype(cx, window, "agent-role", "Smith");
+    click_now(
+        cx,
+        window,
+        &[
+            format!("settings-agent-{scout}"),
+            format!("settings-agent-{forge}"),
+        ],
+    );
+    let role = ws.read_with(cx, |ws, cx| {
+        let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
+        form.role.read(cx).value().to_string()
+    });
+    assert_eq!(role, "Smith");
+    click(cx, window, "agent-policy-budget");
+    wait_until(cx, "the role and the budget", |cx| {
+        ws.read_with(cx, |ws, _| ws.agent_saves.idle())
+    });
+    settle(cx);
+    let s = spec(cx, &ws, forge);
+    assert_eq!(s.role, "Smith", "the later save kept the role");
+    assert_eq!(s.handoff_policy, Some(HandoffPolicy::Budget));
+}
+
+#[gpui_kit::test]
+fn an_agent_on_a_runtime_that_isnt_ready_still_saves(cx: &mut TestAppContext) {
+    let (_tmp, _home, _daemon, w, window, ws) = agents_page(cx, &["Forge"]);
+    // No codex in this crewd.
+    let nova: crew_core::ids::AgentId = ask(
+        &w.client,
+        Request::CreateAgent {
+            spec: AgentSpec {
+                runtime: Runtime::Codex,
+                model: "gpt-6-luna".into(),
+                ..agent("Nova", "Codex things")
+            },
+        },
+    );
+    wait_until(cx, "Nova", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(nova).is_some())
+    });
+    click(cx, window, format!("settings-agent-{nova}"));
+    retype(cx, window, "agent-role", "Planner");
+    cx.executor().advance_clock(AUTOSAVE_PAUSE);
+    wait_until(cx, "Nova's role", |cx| {
+        spec(cx, &ws, nova).role == "Planner"
+    });
+    assert!(!has(cx, window, "agent-error"));
+    wait_to_show(cx, window, "Saved");
+}
+
+#[gpui_kit::test]
+fn crewds_refusal_shows_as_the_forms_error(cx: &mut TestAppContext) {
+    let (_tmp, _home, _daemon, w, window, ws) = agents_page(cx, &["Forge"]);
+    let forge = w.agents[0];
+    retype(cx, window, "agent-name", "Anvil");
+    // Another agent takes the name before the app hears of it.
+    let _: crew_core::ids::AgentId = ask(
+        &w.client,
+        Request::CreateAgent {
+            spec: agent("Anvil", "Elsewhere"),
+        },
+    );
+    click_now(cx, window, &["agent-policy-ask".into()]);
+    wait_until(cx, "the refusal", |cx| has(cx, window, "agent-error"));
+    assert!(!has(cx, window, "agent-status"), "no Saved, no Saving…");
+    assert_eq!(spec(cx, &ws, forge).name, "Forge");
 }

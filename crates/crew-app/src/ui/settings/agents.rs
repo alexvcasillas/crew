@@ -3,6 +3,7 @@
 use crew_core::agent::{
     AgentSpec, DEFAULT_MAX_RUN_MINUTES, PermissionMode, Runtime, auto_supported,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crew_core::ids::AgentId;
@@ -103,20 +104,31 @@ pub const AUTOSAVE_PAUSE: Duration = Duration::from_millis(600);
 pub struct AgentSaves {
     /// A save is in flight.
     busy: bool,
-    /// The latest edit, waiting for the save in flight.
-    queued: Option<AgentSave>,
+    /// Edits waiting for the save in flight, in order, at most one per
+    /// agent: a newer edit takes the place of its agent's older one.
+    queued: Vec<AgentSave>,
+    /// The newest spec sent or queued per agent, until crewd's copy
+    /// matches it. A reopened form starts from it.
+    latest: HashMap<AgentId, AgentSpec>,
     task: Option<Task<()>>,
 }
 
 impl AgentSaves {
     /// Nothing in flight and nothing waiting.
     pub fn idle(&self) -> bool {
-        !self.busy && self.queued.is_none()
+        !self.busy && self.queued.is_empty()
     }
 
-    /// An edit waits for the save in flight.
-    pub fn queued(&self) -> bool {
-        self.queued.is_some()
+    /// How many edits wait for the save in flight.
+    pub fn queued(&self) -> usize {
+        self.queued.len()
+    }
+
+    fn queue(&mut self, save: AgentSave) {
+        match self.queued.iter_mut().find(|q| q.agent == save.agent) {
+            Some(older) => *older = save,
+            None => self.queued.push(save),
+        }
     }
 }
 
@@ -156,8 +168,6 @@ pub struct AgentForm {
     pub saving: bool,
     /// Saved, and nothing changed since.
     pub saved: bool,
-    /// Why crewd refused the last save of an existing agent.
-    pub failed: Option<String>,
     /// The last spec sent for an existing agent, so the same one isn't
     /// sent twice.
     sent: Option<AgentSpec>,
@@ -455,7 +465,6 @@ impl AgentForm {
             saving: false,
             // An existing agent opens as saved.
             saved: editing.is_some(),
-            failed: None,
             sent: None,
             debounce: None,
             _edits: edits,
@@ -543,10 +552,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(spec) = self.state().agent(agent).map(|a| a.spec.clone()) else {
+        let open = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.agents.form.as_ref())
+            .is_some_and(|f| f.editing == Some(agent));
+        if open {
+            return;
+        }
+        // What you typed in the open form goes first, so a form for the
+        // same agent starts from it.
+        self.flush_agent_save(cx);
+        let Some(stored) = self.state().agent(agent).map(|a| a.spec.clone()) else {
             return;
         };
-        let form = AgentForm::new(Some(agent), Fields::of(&spec, &self.runtimes), window, cx);
+        // crewd may not have caught up with the newest save yet.
+        let pending = match self.agent_saves.latest.get(&agent) {
+            Some(latest) if *latest == stored => {
+                self.agent_saves.latest.remove(&agent);
+                None
+            }
+            latest => latest.cloned(),
+        };
+        let spec = pending.clone().unwrap_or(stored);
+        let mut form = AgentForm::new(Some(agent), Fields::of(&spec, &self.runtimes), window, cx);
+        form.sent = pending;
         self.set_agent_form(form, window, cx);
     }
 
@@ -691,7 +721,6 @@ impl Workspace {
             return;
         };
         form.saved = false;
-        form.failed = None;
         if form.editing.is_none() {
             cx.notify();
             return;
@@ -729,7 +758,6 @@ impl Workspace {
         let Some(agent) = form.editing else {
             return;
         };
-        let usable = runtime_usable(&form.runtime, &self.runtimes);
         let id = form.id();
         let taken: Vec<&str> = self
             .state()
@@ -744,9 +772,8 @@ impl Workspace {
         };
         form.debounce = None;
         cx.notify();
-        if !usable {
-            return;
-        }
+        // Saved whatever the runtime's state: crewd stores the spec
+        // without the CLI, and the runtime card says what it needs.
         let spec = match spec {
             Ok(spec) => spec,
             Err(error) => {
@@ -757,7 +784,7 @@ impl Workspace {
         form.error = None;
         if form.sent.as_ref() == Some(&spec) {
             // Already sent; its answer says how it went.
-            form.saved = !form.saving && form.failed.is_none();
+            form.saved = !form.saving;
             return;
         }
         form.sent = Some(spec.clone());
@@ -775,45 +802,53 @@ impl Workspace {
     /// Sends `save` now, or after the save in flight, in place of any
     /// edit already waiting.
     fn send_agent_save(&mut self, save: AgentSave, cx: &mut Context<Self>) {
+        self.agent_saves
+            .latest
+            .insert(save.agent, save.spec.clone());
         if self.agent_saves.busy {
-            self.agent_saves.queued = Some(save);
+            self.agent_saves.queue(save);
             return;
         }
         self.agent_saves.busy = true;
         let answer = self.client.request(Request::UpdateAgent {
             agent: save.agent,
-            spec: save.spec,
+            spec: save.spec.clone(),
         });
-        let form = save.form;
         self.agent_saves.task = Some(cx.spawn(async move |this, cx| {
             let result = answer.await;
-            this.update(cx, |this, cx| this.agent_save_answered(form, result, cx))
+            this.update(cx, |this, cx| this.agent_save_answered(save, result, cx))
                 .ok();
         }));
     }
 
-    /// crewd answered a save from the form `form`. The edit waiting, if
-    /// any, goes next.
+    /// crewd answered `save`. The next edit waiting, if any, goes next.
     fn agent_save_answered(
         &mut self,
-        form: EntityId,
+        save: AgentSave,
         result: Result<serde_json::Value, String>,
         cx: &mut Context<Self>,
     ) {
         self.agent_saves.busy = false;
-        let next = self.agent_saves.queued.take();
-        let more = next.as_ref().is_some_and(|n| n.form == form);
-        if let Some(f) = self.agent_form_mut().filter(|f| f.id() == form && !more) {
+        let more = self.agent_saves.queued.iter().any(|q| q.form == save.form);
+        if result.is_err() && self.agent_saves.latest.get(&save.agent) == Some(&save.spec) {
+            // Refused: crewd's copy stays the one to start from.
+            self.agent_saves.latest.remove(&save.agent);
+        }
+        if let Some(f) = self
+            .agent_form_mut()
+            .filter(|f| f.id() == save.form && !more)
+        {
             f.saving = false;
             match result {
                 Ok(_) => f.saved = f.debounce.is_none(),
                 Err(e) => {
-                    f.failed = Some(e);
+                    f.error = Some(e);
                     f.sent = None;
                 }
             }
         }
-        if let Some(next) = next {
+        if !self.agent_saves.queued.is_empty() {
+            let next = self.agent_saves.queued.remove(0);
             self.send_agent_save(next, cx);
         }
         cx.notify();
@@ -1502,19 +1537,19 @@ impl Workspace {
     }
 }
 
-/// How an existing agent's saving goes, beside Duplicate: `Saving…`,
-/// `Saved` or crewd's refusal. A new agent has its button instead.
+/// How an existing agent's saving goes, beside Duplicate: `Saving…` or
+/// `Saved`. A refusal shows as the form's error. A new agent has its
+/// button instead.
 fn save_status(form: &AgentForm) -> Option<AnyElement> {
     form.editing?;
-    let (text, token, check) = if form.saving {
-        ("Saving…".to_string(), "text-tertiary", false)
-    } else if let Some(failed) = &form.failed {
-        (failed.clone(), "danger", false)
-    } else if form.saved {
-        ("Saved".to_string(), "text-tertiary", true)
+    let (text, check) = if form.saving {
+        ("Saving…", false)
+    } else if form.saved && form.error.is_none() {
+        ("Saved", true)
     } else {
         return None;
     };
+    let token = "text-tertiary";
     Some(
         div()
             .id("agent-status")
@@ -1525,7 +1560,7 @@ fn save_status(form: &AgentForm) -> Option<AnyElement> {
             .gap(ui_px(6.))
             .text_size(scale::text(12.))
             .text_color(color(token))
-            .aria_label(text.clone())
+            .aria_label(text)
             .when(check, |row| {
                 row.child(
                     Icon::new(IconName::Check)
