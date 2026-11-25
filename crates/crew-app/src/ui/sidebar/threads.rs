@@ -355,33 +355,61 @@ impl ThreadsSidebar {
     }
 }
 
+/// A sidebar mode shown for now without saving it, until the saved mode
+/// changes or you switch.
+struct ShownMode {
+    mode: SidebarMode,
+    /// The saved mode when it was shown.
+    over: SidebarMode,
+}
+
+impl Global for ShownMode {}
+
 /// The mode the sidebar is in.
 pub(crate) fn sidebar_mode(cx: &App) -> SidebarMode {
-    scale::appearance(cx).sidebar_mode
+    let saved = scale::appearance(cx).sidebar_mode;
+    match cx.try_global::<ShownMode>() {
+        Some(shown) if shown.over == saved => shown.mode,
+        _ => saved,
+    }
 }
 
 impl Workspace {
     /// Switches the sidebar to the other form, and saves that.
     pub(super) fn switch_sidebar(&mut self, cx: &mut Context<Self>) {
-        let mut a = scale::appearance(cx);
-        a.sidebar_mode = match a.sidebar_mode {
+        let want = match sidebar_mode(cx) {
             SidebarMode::Projects => SidebarMode::Threads,
             SidebarMode::Threads => SidebarMode::Projects,
         };
-        scale::set_appearance(a, cx);
+        if cx.has_global::<ShownMode>() {
+            cx.remove_global::<ShownMode>();
+        }
+        let mut a = scale::appearance(cx);
+        if a.sidebar_mode != want {
+            a.sidebar_mode = want;
+            scale::set_appearance(a, cx);
+        }
         cx.notify();
     }
 
     /// The threads sidebar, narrowed to `project`'s threads in all its
-    /// channels.
+    /// channels. The mode isn't saved: it is a look, not a choice.
     pub(crate) fn show_project_threads(&mut self, project: ProjectId, cx: &mut Context<Self>) {
         let t = &mut self.sidebar.threads;
         t.project = Some(project);
         t.channel = None;
         t.cursor = None;
         t.list.scroll_to(ListOffset::default());
-        if sidebar_mode(cx) != SidebarMode::Threads {
-            self.switch_sidebar(cx);
+        let saved = scale::appearance(cx).sidebar_mode;
+        if saved == SidebarMode::Threads {
+            if cx.has_global::<ShownMode>() {
+                cx.remove_global::<ShownMode>();
+            }
+        } else {
+            cx.set_global(ShownMode {
+                mode: SidebarMode::Threads,
+                over: saved,
+            });
         }
         cx.notify();
     }

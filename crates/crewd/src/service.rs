@@ -505,7 +505,9 @@ impl Service {
                 project,
                 limit,
             } => self.search(query, project, limit).await,
-            Request::ProjectOverview { project } => self.project_overview(project).await,
+            Request::ProjectOverview { project, light } => {
+                self.project_overview(project, light).await
+            }
             Request::AgentProfile { agent } => self.agent_profile(agent).await,
             other => self.handle_now(other),
         }

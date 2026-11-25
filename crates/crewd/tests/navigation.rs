@@ -478,7 +478,12 @@ async fn project_overview_sums_up_the_project() {
     // A deleted agent still shows as used here.
     c.call(Request::DeleteAgent { agent: scout }).await.unwrap();
 
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert!(o.root.exists);
     assert_eq!(o.root.branch.as_deref(), Some("main"));
     // src/lib.rs, plus .env and the two files in certs, which git
@@ -517,6 +522,19 @@ async fn project_overview_sums_up_the_project() {
             ("missing.txt", SetupFileSize::Missing),
         ]
     );
+
+    // A light overview leaves the folder alone.
+    let light: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: true,
+        })
+        .await;
+    assert_eq!(light.root, Default::default());
+    assert!(light.setup_files.is_empty());
+    assert_eq!(light.worktrees, 2);
+    assert_eq!(light.channels, o.channels);
+    assert_eq!(light.recent_threads, o.recent_threads);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -530,7 +548,12 @@ async fn a_project_whose_folder_is_gone_has_an_overview_and_can_be_removed() {
     c.thread(general, "Something").await;
     std::fs::remove_dir_all(&root).unwrap();
 
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert!(!o.root.exists);
     assert_eq!(o.root.branch, None);
     assert_eq!(o.channels.len(), 1);
@@ -541,9 +564,12 @@ async fn a_project_whose_folder_is_gone_has_an_overview_and_can_be_removed() {
     let projects: Vec<serde_json::Value> = c.ok(Request::ListProjects).await;
     assert!(projects.is_empty());
     assert!(
-        c.call(Request::ProjectOverview { project: p })
-            .await
-            .is_err()
+        c.call(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await
+        .is_err()
     );
 }
 
@@ -877,9 +903,12 @@ async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back()
     let pending: Vec<serde_json::Value> = c.ok(Request::ListApprovals { thread: None }).await;
     assert!(pending.is_empty(), "nothing waits for you any more");
     assert!(
-        c.call(Request::ProjectOverview { project: p })
-            .await
-            .is_err()
+        c.call(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await
+        .is_err()
     );
 
     // Adding the folder again brings the project back as it was, its
@@ -887,7 +916,12 @@ async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back()
     assert_eq!(c.project("demo again", &root).await, p);
     c.until(|m| matches!(m, ServerMsg::RunStatus { thread, .. } if *thread == t))
         .await;
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert_eq!(o.channels[0].channel, general);
     assert_eq!(o.recent_threads[0].thread, t);
     let r = c.search("fix it", Some(p)).await;

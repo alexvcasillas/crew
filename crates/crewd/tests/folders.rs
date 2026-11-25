@@ -1337,7 +1337,12 @@ async fn a_repo_gone_from_the_folder_still_lets_a_thread_be_discarded() {
 
     std::fs::remove_dir_all(root.join("web")).unwrap();
     // Opening the project sees the folder as it is now.
-    let _: serde_json::Value = c.ok(Request::ProjectOverview { project }).await;
+    let _: serde_json::Value = c
+        .ok(Request::ProjectOverview {
+            project,
+            light: false,
+        })
+        .await;
     assert_eq!(
         stored_project(&mut c, project).await.kind,
         ProjectKind::MultiRepo {

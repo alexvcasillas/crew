@@ -262,7 +262,20 @@ fn clicking_a_project_opens_its_overview(cx: &mut TestAppContext) {
             super::sidebar::threads::sidebar_mode(cx),
             crate::prefs::SidebarMode::Threads
         );
+        assert_eq!(
+            crate::theme::scale::appearance(cx).sidebar_mode,
+            crate::prefs::SidebarMode::Projects,
+            "for now, not saved"
+        );
         assert_eq!(ws.sidebar.threads.project, Some(w.project));
+    });
+    // Switching goes back to projects, still nothing saved.
+    click(cx, window, "sidebar-switch");
+    ws.read_with(cx, |_, cx| {
+        assert_eq!(
+            super::sidebar::threads::sidebar_mode(cx),
+            crate::prefs::SidebarMode::Projects
+        );
     });
 }
 
@@ -713,4 +726,32 @@ fn a_thread_with_a_worktree_opens_it_in_terminal(cx: &mut TestAppContext) {
             path.into_os_string()
         ]
     );
+}
+
+#[gpui_kit::test]
+fn a_missing_folder_says_so_and_can_still_be_removed(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    repo_with_readme(&root);
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &root, &[]);
+    std::fs::remove_dir_all(&root).unwrap();
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the project", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
+    });
+    go(cx, window, &ws, Place::Project(w.project));
+    wait_label(cx, window, "overview-missing".into(), "Folder not found");
+    assert!(!has(cx, window, "overview-git"));
+
+    click(cx, window, "overview-remove");
+    wait_until(cx, "the dialog", |cx| {
+        shows(cx, window, "Remove demo from Crew?")
+    });
+    click(cx, window, "dialog-confirm");
+    wait_until(cx, "the project to go", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().project(w.project).is_none())
+    });
+    assert!(!has(cx, window, "overview-page"));
 }

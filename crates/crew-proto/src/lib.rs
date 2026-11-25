@@ -275,9 +275,13 @@ pub enum Request {
         #[serde(default = "default_search_limit")]
         limit: u32,
     },
-    /// Answered with a [`ProjectOverview`].
+    /// Answered with a [`ProjectOverview`]. `light` skips looking at the
+    /// folder: `root` and `setup_files` come back empty, for a client
+    /// that keeps them from a full answer.
     ProjectOverview {
         project: ProjectId,
+        #[serde(default)]
+        light: bool,
     },
     /// Answered with an [`AgentProfile`]. Deleted agents have one too.
     AgentProfile {
@@ -1064,7 +1068,10 @@ mod tests {
                 project: Some(project),
                 limit: 5,
             },
-            Request::ProjectOverview { project },
+            Request::ProjectOverview {
+                project,
+                light: true,
+            },
             Request::AgentProfile {
                 agent: AgentId::new(),
             },

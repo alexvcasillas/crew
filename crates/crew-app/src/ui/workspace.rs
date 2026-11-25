@@ -663,6 +663,13 @@ impl Workspace {
             .and_then(|c| self.state.project(c.project))
             .map(|p| p.name.clone())
             .unwrap_or_default();
+        let names: Vec<&str> = self
+            .state
+            .agents()
+            .into_iter()
+            .map(|a| a.spec.name.as_str())
+            .collect();
+        super::common::set_agent_names(&names);
         let agents: Vec<MentionAgent> = self
             .state
             .agents()

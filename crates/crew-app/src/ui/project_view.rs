@@ -26,12 +26,18 @@ use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
 
 /// How long a page waits after a change before asking crewd again.
-const REFETCH_AFTER: Duration = Duration::from_secs(1);
+/// At most one answer per this while agents work.
+const REFETCH_AFTER: Duration = Duration::from_secs(3);
+/// How long the overview keeps the folder's git state and setup files
+/// before a refresh looks at the folder again.
+const FOLDER_FRESH: Duration = Duration::from_secs(60);
 /// Below this width of the main area the side column goes under the
 /// main one.
 const TWO_COLUMNS_FROM: f32 = 880.;
 /// The overview's side column.
 const SIDE_WIDTH: f32 = 360.;
+/// The danger box's and Remove's outline, as the board has it.
+const DANGER_BORDER: u32 = 0x3f1c1e;
 /// The setup files help, as the board has it.
 pub const SETUP_HELP: &str =
     "Copied into every new worktree. Git ignores them, so agents would not see them otherwise.";
@@ -67,6 +73,14 @@ pub(super) struct OpenPage {
     pub(super) to_setup: Rc<Cell<bool>>,
     /// The agent's threads are all listed.
     pub(super) all_threads: bool,
+    /// When the overview last looked at the folder.
+    folder_seen: Option<std::time::Instant>,
+    /// The next answer looks at the folder whatever its age.
+    folder_stale: bool,
+    /// The project's worktree folders and their branches, for the
+    /// terminal sessions, as of `branches_at`.
+    pub(super) branches: std::collections::HashMap<PathBuf, String>,
+    branches_at: Option<u64>,
 }
 
 impl OpenPage {
@@ -83,6 +97,10 @@ impl OpenPage {
             scroll: ScrollHandle::new(),
             to_setup: Rc::new(Cell::new(false)),
             all_threads: false,
+            folder_seen: None,
+            folder_stale: false,
+            branches: std::collections::HashMap::new(),
+            branches_at: None,
         }
     }
 }
@@ -90,8 +108,9 @@ impl OpenPage {
 /// How a page button looks, as the board's `.btn` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Look {
+    /// The view's one filled button.
+    Primary,
     Outline,
-    Ghost,
     Danger,
     /// 24 px high, outlined.
     Small,
@@ -102,7 +121,7 @@ pub(super) enum Look {
 /// A button of a page header or section.
 pub(super) fn page_button(id: impl Into<ElementId>, label: String, look: Look) -> Stateful<Div> {
     let small = matches!(look, Look::Small | Look::SmallGhost);
-    let ghost = matches!(look, Look::Ghost | Look::SmallGhost);
+    let ghost = look == Look::SmallGhost;
     div()
         .id(id)
         .flex()
@@ -121,15 +140,25 @@ pub(super) fn page_button(id: impl Into<ElementId>, label: String, look: Look) -
                 .border_color(transparent_black())
                 .text_color(color("text-secondary")),
             Look::Danger => b
-                .border_color(color("danger-border"))
+                .border_color(rgb(DANGER_BORDER))
                 .bg(color("bg-100"))
                 .text_color(color("danger")),
+            Look::Primary => b
+                .border_color(color("primary"))
+                .bg(color("primary"))
+                .text_color(color("on-primary")),
             _ => b
                 .border_color(color("border-200"))
                 .bg(color("bg-100"))
                 .text_color(color("text-primary")),
         })
-        .hover(|b| b.bg(color("surface-300")))
+        .map(|b| {
+            if look == Look::Primary {
+                b.hover(|b| b.bg(color("primary-hover")))
+            } else {
+                b.hover(|b| b.bg(color("surface-300")))
+            }
+        })
         .role(Role::Button)
         .aria_label(label.clone())
         .child(label)
@@ -453,10 +482,13 @@ impl Workspace {
     /// Asks crewd for the open page when it opens, and again
     /// [`REFETCH_AFTER`] a change.
     pub(super) fn sync_page(&mut self, cx: &mut Context<Self>) {
+        self.sync_branches();
+        // Under settings, Running now or a review it waits to be seen.
+        let hidden = self.settings.is_some() || self.running.is_some() || self.review.is_some();
         let Some(page) = &mut self.page else {
             return;
         };
-        if page.fetch.is_some() || page.refetch.is_some() {
+        if hidden || page.fetch.is_some() || page.refetch.is_some() {
             return;
         }
         let first = page.overview.is_none() && page.profile.is_none() && page.error.is_none();
@@ -467,13 +499,50 @@ impl Workspace {
             page.refetch = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(REFETCH_AFTER).await;
                 this.update(cx, |this, cx| {
+                    let hidden =
+                        this.settings.is_some() || this.running.is_some() || this.review.is_some();
                     if let Some(page) = this.page.as_mut().filter(|p| p.kind == kind) {
                         page.refetch = None;
-                        this.fetch_page(cx);
+                        // Hidden, it stays dirty and asks once shown.
+                        if !hidden {
+                            this.fetch_page(cx);
+                        }
                     }
                 })
                 .ok();
             }));
+        }
+    }
+
+    /// The open project's worktree folders and their branches, worked out
+    /// again only when what crewd said changed.
+    fn sync_branches(&mut self) {
+        let revision = self.state().revision();
+        let Some(PageKind::Project(project)) = self.page.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        if self.page.as_ref().and_then(|p| p.branches_at) == Some(revision) {
+            return;
+        }
+        let state = self.state();
+        let branches = state
+            .channels(project)
+            .into_iter()
+            .flat_map(|c| state.threads(c.id))
+            .filter_map(|t| t.worktree.as_ref())
+            .map(|w| (w.path.clone(), w.branch.clone()))
+            .collect();
+        if let Some(page) = &mut self.page {
+            page.branches = branches;
+            page.branches_at = Some(revision);
+        }
+    }
+
+    /// Looks at the project's folder again on the next answer: its setup
+    /// files or git state changed.
+    pub(super) fn folder_changed(&mut self) {
+        if let Some(page) = &mut self.page {
+            page.folder_stale = true;
         }
     }
 
@@ -484,8 +553,16 @@ impl Workspace {
         };
         page.dirty = false;
         let kind = page.kind;
+        // The folder's git state and setup files are looked at again only
+        // when old, or known to have changed.
+        let light = page.overview.is_some()
+            && !page.folder_stale
+            && page.folder_seen.is_some_and(|t| t.elapsed() < FOLDER_FRESH);
+        if !light {
+            page.folder_stale = false;
+        }
         let request = match kind {
-            PageKind::Project(project) => Request::ProjectOverview { project },
+            PageKind::Project(project) => Request::ProjectOverview { project, light },
             PageKind::Agent(agent) => Request::AgentProfile { agent },
         };
         let answer = self.client.request(request);
@@ -497,8 +574,17 @@ impl Workspace {
                 };
                 page.fetch = None;
                 let read = answer.and_then(|v| match kind {
-                    PageKind::Project(_) => serde_json::from_value(v)
-                        .map(|o| page.overview = Some(o))
+                    PageKind::Project(_) => serde_json::from_value::<ProjectOverview>(v)
+                        .map(|mut o| {
+                            match (light, page.overview.take()) {
+                                (true, Some(old)) => {
+                                    o.root = old.root;
+                                    o.setup_files = old.setup_files;
+                                }
+                                _ => page.folder_seen = Some(std::time::Instant::now()),
+                            }
+                            page.overview = Some(o);
+                        })
                         .map_err(|e| e.to_string()),
                     PageKind::Agent(_) => serde_json::from_value(v)
                         .map(|p| page.profile = Some(p))
@@ -637,7 +723,11 @@ impl Workspace {
                 .test_support()
         };
         let mut meta: Vec<AnyElement> = vec![
+            // On one line: the path and the remote give way first.
             chip(path.clone())
+                .flex_shrink(1.)
+                .min_w(ui_px(48.))
+                .truncate()
                 .id("overview-path")
                 .aria_label(path)
                 .test_support()
@@ -684,13 +774,17 @@ impl Workspace {
                                 div()
                                     .id("overview-remote")
                                     .flex()
-                                    .flex_none()
+                                    .flex_shrink(1.)
+                                    .min_w(ui_px(64.))
+                                    .overflow_hidden()
                                     .gap(ui_px(4.))
                                     .whitespace_nowrap()
                                     .aria_label(format!("origin {short}"))
-                                    .child("origin")
+                                    .child(div().flex_none().child("origin"))
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .truncate()
                                             .font_family(code_family())
                                             .text_size(scale::mono(12.))
                                             .text_color(color("text-primary"))
@@ -753,8 +847,10 @@ impl Workspace {
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
                             .items_center()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .gap(ui_px(8.))
                             .mt(ui_px(6.))
                             .text_size(scale::text(12.))
@@ -770,7 +866,7 @@ impl Workspace {
                     .test_support(),
             )
             .child(
-                page_button("overview-new-channel", "New channel".into(), Look::Outline)
+                page_button("overview-new-channel", "New channel".into(), Look::Primary)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_new_channel_dialog(project, window, cx)
                     }))
@@ -1071,14 +1167,19 @@ impl Workspace {
         .test_support()
     }
 
-    /// Terminal sessions in the project, each with Focus. `None` when it
-    /// has none.
+    /// Live terminal sessions in the project, each with Focus. `None`
+    /// when none is live.
     fn render_in_terminal(&self, project: ProjectId, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.state();
-        let sessions = state.terminal_sessions(project);
+        let sessions: Vec<_> = state
+            .terminal_sessions(project)
+            .into_iter()
+            .filter(|s| s.live)
+            .collect();
         if sessions.is_empty() {
             return None;
         }
+        let branches = &self.page.as_ref()?.branches;
         let now = now_ms();
         let rows: Vec<_> = sessions
             .iter()
@@ -1086,20 +1187,11 @@ impl Workspace {
                 let id = s.id.clone();
                 let cwd = PathBuf::from(&s.cwd);
                 // A thread's worktree reads as its branch.
-                let place = state
-                    .projects()
-                    .into_iter()
-                    .flat_map(|p| state.channels(p.id))
-                    .flat_map(|c| state.threads(c.id))
-                    .filter_map(|t| t.worktree.as_ref())
-                    .find(|w| w.path == cwd)
-                    .map(|w| w.branch.clone())
+                let place = branches
+                    .get(&cwd)
+                    .cloned()
                     .unwrap_or_else(|| home_relative(&cwd));
-                let age = if s.live {
-                    usage_time(now - s.started_at)
-                } else {
-                    "idle".into()
-                };
+                let age = usage_time(now - s.started_at);
                 let focus = id.clone();
                 div()
                     .id(SharedString::from(format!("overview-session-{id}")))
@@ -1359,6 +1451,7 @@ impl Workspace {
             let result = answer.await.map(drop);
             this.update(cx, |this, cx| {
                 if this.page_project() == Some(project) {
+                    this.folder_changed();
                     this.fetch_page(cx);
                 }
             })
@@ -1370,11 +1463,17 @@ impl Workspace {
 
 /// The names of a thread's agents, deleted ones marked.
 fn agents_text(ws: &Workspace, agents: &[AgentId]) -> String {
-    agents
-        .iter()
-        .map(|a| agent_name(ws, *a))
-        .collect::<Vec<_>>()
-        .join(", ")
+    let names: Vec<String> = agents.iter().map(|a| agent_name(ws, *a)).collect();
+    names_line(&names)
+}
+
+/// The first two names, then how many more: `Forge, Triage +1`.
+pub fn names_line(names: &[String]) -> String {
+    let shown = names[..names.len().min(2)].join(", ");
+    match names.len() {
+        0..=2 => shown,
+        n => format!("{shown} +{}", n - 2),
+    }
 }
 
 /// "Remove project", what it does, and Remove.
@@ -1387,7 +1486,7 @@ fn render_danger(project: ProjectId, cx: &mut Context<Workspace>) -> impl IntoEl
         .px(ui_px(16.))
         .py(scale::row(12.))
         .border_1()
-        .border_color(color("danger-border"))
+        .border_color(rgb(DANGER_BORDER))
         .rounded(ui_px(8.))
         .child(
             div()
@@ -1424,7 +1523,7 @@ fn render_danger(project: ProjectId, cx: &mut Context<Workspace>) -> impl IntoEl
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_time, git_line, page_time};
+    use super::{agent_time, git_line, names_line, page_time};
 
     const MIN: i64 = 60_000;
 
@@ -1434,6 +1533,17 @@ mod tests {
         assert_eq!(agent_time(48 * MIN + 5_000), "48m");
         assert_eq!(agent_time(125 * MIN), "2h 05m");
         assert_eq!(agent_time(400 * MIN), "6h 40m");
+    }
+
+    #[test]
+    fn names_stop_after_two() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(names_line(&names(&["Forge"])), "Forge");
+        assert_eq!(names_line(&names(&["Forge", "Quill"])), "Forge, Quill");
+        assert_eq!(
+            names_line(&names(&["Forge", "Triage", "Scout"])),
+            "Forge, Triage +1"
+        );
     }
 
     #[test]

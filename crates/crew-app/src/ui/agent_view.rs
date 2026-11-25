@@ -30,6 +30,21 @@ const THREADS_SHOWN: usize = 4;
 /// The run strip's width.
 const STRIP_WIDTH: f32 = 220.;
 
+/// `+88 −51` as one mono run of text, each part in its colour.
+fn diff_text(added: u32, removed: u32) -> StyledText {
+    let plus = format!("+{added}");
+    let text = format!("{plus} −{removed}");
+    let colour = |token: &str| HighlightStyle {
+        color: Some(color(token)),
+        ..HighlightStyle::default()
+    };
+    let highlights = vec![
+        (0..plus.len(), colour("success")),
+        (plus.len() + 1..text.len(), colour("danger")),
+    ];
+    StyledText::new(text).with_highlights(highlights)
+}
+
 /// How long a run took: `48s`, `5m 02s`, `1h 04m`.
 pub fn run_time(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
@@ -368,7 +383,7 @@ impl Workspace {
                         page_button(
                             "agent-start-thread",
                             format!("Start a thread with {first}"),
-                            Look::Ghost,
+                            Look::Primary,
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.start_thread_with(agent, window, cx)
@@ -430,6 +445,8 @@ impl Workspace {
         };
         let header = grid(div().id("agent-runs-head"))
             .h(scale::row(32.))
+            .border_b_1()
+            .border_color(color("surface-200"))
             .text_color(color("text-tertiary"))
             .child(col(96., false).child("Status"))
             .child(div().flex_1().min_w_0().child("Thread"))
@@ -477,21 +494,11 @@ impl Workspace {
             } else {
                 div()
                     .id(SharedString::from(format!("agent-run-{id}-files")))
-                    .flex()
-                    .gap(ui_px(4.))
+                    .whitespace_nowrap()
                     .font_family(code_family())
                     .text_size(scale::mono(12.))
                     .aria_label(format!("+{} −{}", row.added, row.removed))
-                    .child(
-                        div()
-                            .text_color(color("success"))
-                            .child(format!("+{}", row.added)),
-                    )
-                    .child(
-                        div()
-                            .text_color(color("danger"))
-                            .child(format!("−{}", row.removed)),
-                    )
+                    .child(diff_text(row.added, row.removed))
                     .test_support()
                     .into_any_element()
             };
@@ -538,11 +545,27 @@ impl Workspace {
                 .child(col(72., true).child(cell("when", page_time(at, now))))
                 .test_support()
         });
-        section("agent-runs", "Recent runs", Some(strip))
-            .flex_1()
-            .child(header)
-            .children(rows)
-            .test_support()
+        let empty = runs.is_empty().then(|| {
+            div()
+                .id("agent-runs-empty")
+                .px(ui_px(16.))
+                .py(scale::row(12.))
+                .text_size(scale::text(12.))
+                .text_color(color("text-tertiary"))
+                .aria_label("No runs yet.")
+                .child("No runs yet.")
+                .test_support()
+        });
+        section(
+            "agent-runs",
+            "Recent runs",
+            (!runs.is_empty()).then_some(strip),
+        )
+        .flex_1()
+        .when(!runs.is_empty(), |s| s.child(header))
+        .children(rows)
+        .children(empty)
+        .test_support()
     }
 
     /// What it can do, its longest run and how it brings in others, with
@@ -760,14 +783,10 @@ fn render_stats(stats: &AgentStats) -> impl IntoElement {
                     };
                     // The files' lines read in their colours.
                     let after_el = if ix == 3 {
-                        let (added, removed) = after.split_once(' ').unwrap_or_default();
                         div()
-                            .flex()
-                            .gap(ui_px(4.))
                             .font_family(code_family())
                             .text_size(scale::mono(12.))
-                            .child(div().text_color(color("success")).child(added.to_string()))
-                            .child(div().text_color(color("danger")).child(removed.to_string()))
+                            .child(diff_text(stats.added_week, stats.removed_week))
                             .into_any_element()
                     } else {
                         div().child(after).into_any_element()
@@ -793,10 +812,11 @@ fn render_stats(stats: &AgentStats) -> impl IntoElement {
                                 .child(key),
                         )
                         .child(
+                            // The suffix follows after a space's width.
                             div()
                                 .flex()
-                                .items_center()
-                                .gap(ui_px(6.))
+                                .items_baseline()
+                                .gap(ui_px(4.))
                                 .whitespace_nowrap()
                                 .overflow_hidden()
                                 .text_size(scale::text(16.))

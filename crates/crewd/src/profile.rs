@@ -75,8 +75,9 @@ fn count_files(dir: &Path) -> u32 {
 
 impl Service {
     /// Answers `ProjectOverview`. Channel stats come from the channel
-    /// overviews, so they share their cached change counts.
-    pub(crate) async fn project_overview(&self, project: ProjectId) -> Reply {
+    /// overviews, so they share their cached change counts. `light` leaves
+    /// the folder alone: no rescan, no git and no setup file checks.
+    pub(crate) async fn project_overview(&self, project: ProjectId, light: bool) -> Reply {
         // On the read-only connection, so writers don't wait for it.
         let (stored, channels, threads, runs, waiting) = self.with_reader(|store| {
             let found = store.project(project).and_then(|p| {
@@ -170,6 +171,13 @@ impl Service {
             .collect();
         let (root, copy_files) = (stored.root.clone(), stored.copy_files.clone());
         let svc = self.clone();
+        if light {
+            let on_disk =
+                blocking(move || Ok::<_, String>(worktrees.iter().filter(|p| p.is_dir()).count()))
+                    .await?;
+            out.worktrees = u32::try_from(on_disk).unwrap_or(u32::MAX);
+            return json(out);
+        }
         let (info, on_disk, setup) = blocking(move || {
             // Opening the project looks at what its folder holds again.
             let repos = svc.refresh_kind(project).unwrap_or_default().repos();
