@@ -9,7 +9,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -33,7 +32,6 @@ const UI_PRESETS: [&str; 2] = [DEFAULT_UI_FONT, SF_PRO];
 const CODE_PRESETS: [&str; 3] = [DEFAULT_CODE_FONT, SF_MONO, "Menlo"];
 
 const BOLDER_HELP: &str = "Heavier strokes, easier to read on external displays.";
-const COMING_SOON: &str = "Coming soon.";
 /// The preview column.
 const PREVIEW_WIDTH: f32 = 440.;
 /// How wide the form gets.
@@ -472,24 +470,17 @@ fn choices<T: Copy + PartialEq + 'static>(
     div().flex().child(segmented(options))
 }
 
-/// Projects, and Threads, which is coming.
+/// Projects or Threads: the sidebar's form.
 fn sidebar_modes(current: SidebarMode) -> impl IntoElement {
-    let projects = option(
-        "appearance-sidebar-projects".into(),
-        "Projects",
-        current == SidebarMode::Projects,
+    choices(
+        "appearance-sidebar",
+        &[
+            (SidebarMode::Projects, "projects", "Projects"),
+            (SidebarMode::Threads, "threads", "Threads"),
+        ],
+        current,
+        |a, m| a.sidebar_mode = m,
     )
-    .on_click(|_, _, cx| change(cx, |a| a.sidebar_mode = SidebarMode::Projects))
-    .test_support()
-    .into_any_element();
-    let threads = option("appearance-sidebar-threads".into(), "Threads", false)
-        .text_color(color("text-disabled"))
-        .cursor_default()
-        .aria_label("Threads, coming soon")
-        .tooltip(|window, cx| Tooltip::new(COMING_SOON).build(window, cx))
-        .test_support()
-        .into_any_element();
-    div().flex().child(segmented(vec![projects, threads]))
 }
 
 /// Standard or Bolder text, as a card with a radio.
@@ -734,6 +725,7 @@ fn preview(a: &Appearance) -> impl IntoElement {
                                 "preview-channel-general".into(),
                                 "general".into(),
                                 true,
+                                true,
                                 "preview-channel-general".into(),
                             )
                             .child(dot("warning")),
@@ -742,6 +734,7 @@ fn preview(a: &Appearance) -> impl IntoElement {
                             channel_row(
                                 "preview-channel-bugs".into(),
                                 "bugs".into(),
+                                false,
                                 false,
                                 "preview-channel-bugs".into(),
                             )

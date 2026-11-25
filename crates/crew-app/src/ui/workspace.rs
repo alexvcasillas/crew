@@ -199,6 +199,10 @@ pub struct Workspace {
     pub(super) channel_view: ChannelView,
     /// The thread or channel dialog on screen, if any.
     pub(super) dialog: Option<super::dialogs::OpenDialog>,
+    /// The sidebar's filter, groups and list.
+    pub(super) sidebar: super::sidebar::Sidebar,
+    /// The project overview or agent profile in the main area, if open.
+    pub(super) page: Option<super::project_view::OpenPage>,
     /// The ⌘K palette, while it is open.
     pub(super) palette: Option<Entity<super::palette::Palette>>,
     /// What you opened lately, for the palette.
@@ -208,7 +212,7 @@ pub struct Workspace {
     /// Lays out again when the appearance settings change.
     _appearance: Subscription,
     /// The window's width as last drawn.
-    window_width: Pixels,
+    pub(super) window_width: Pixels,
     /// Where the traffic lights were put, to move them only on a change.
     traffic_lights: Option<Point<Pixels>>,
 }
@@ -218,8 +222,9 @@ pub struct Workspace {
 pub(super) enum Place {
     Thread(ThreadId),
     Channel(ChannelId),
+    /// The agent's profile.
     Agent(AgentId),
-    /// Its first channel for now; the project overview later.
+    /// The project's overview.
     Project(ProjectId),
 }
 
@@ -257,6 +262,7 @@ impl Workspace {
         });
         let editor_events = cx.subscribe_in(&editor_select, window, Self::editor_picked);
         let channel_view = ChannelView::new(window, cx);
+        let sidebar = super::sidebar::Sidebar::new(&conn.crew_home, window, cx);
         let hooks = dev_hooks();
         let bundled_crewd = std::env::current_exe()
             .ok()
@@ -338,6 +344,8 @@ impl Workspace {
             _editor_events: editor_events,
             channel_view,
             dialog: None,
+            sidebar,
+            page: None,
             palette: None,
             recents,
             recents_task: None,
@@ -358,6 +366,7 @@ impl Workspace {
         self.inspector.list.remeasure();
         self.inspector.term_list.remeasure();
         self.channel_view.list.remeasure();
+        self.sidebar.list.remeasure();
         if let Some(terminal) = &self.terminal {
             terminal.list.remeasure();
         }
@@ -547,7 +556,9 @@ impl Workspace {
             self.refresh_usage(cx);
             self.refresh_history(cx);
         }
+        self.threads_touched(&touched, &stale, snapshot, cx);
         self.channel_touched(&touched, &stale, snapshot);
+        self.page_touched(&touched, &stale, snapshot);
         if !removed.is_empty() {
             self.leave_removed(&removed, window, cx);
         }
@@ -599,7 +610,13 @@ impl Workspace {
             .nav
             .channel
             .is_some_and(|c| self.state.channel(c).is_none());
-        if thread_gone || channel_gone {
+        let page_gone = self
+            .page_project()
+            .is_some_and(|p| self.state.project(p).is_none());
+        if page_gone {
+            self.page = None;
+        }
+        if thread_gone || channel_gone || page_gone {
             let next = self
                 .state
                 .projects()
@@ -646,6 +663,13 @@ impl Workspace {
             .and_then(|c| self.state.project(c.project))
             .map(|p| p.name.clone())
             .unwrap_or_default();
+        let names: Vec<&str> = self
+            .state
+            .agents()
+            .into_iter()
+            .map(|a| a.spec.name.as_str())
+            .collect();
+        super::common::set_agent_names(&names);
         let agents: Vec<MentionAgent> = self
             .state
             .agents()
@@ -707,7 +731,16 @@ impl Workspace {
                     .thread_project(t)
                     .is_some_and(|p| !super::folder::writers(&self.state, p).is_empty())
         });
-        if working.is_empty() && !running_ticks && !folder_ticks && !self.channel_ticks() {
+        // The threads sidebar shows how long each working thread works.
+        let threads_ticks = super::sidebar::threads::sidebar_mode(cx)
+            == crate::prefs::SidebarMode::Threads
+            && !self.state.working_runs().is_empty();
+        if working.is_empty()
+            && !running_ticks
+            && !folder_ticks
+            && !threads_ticks
+            && !self.channel_ticks()
+        {
             self.ticker = None;
         } else if self.ticker.is_none() {
             self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -721,6 +754,8 @@ impl Workspace {
         }
 
         self.sync_channel(cx);
+        self.sync_page(cx);
+        self.sync_thread_summaries(cx);
 
         let messages = self.nav.thread.map_or(0, |t| self.state.messages(t).len());
         if messages != self.nav.seen_messages {
@@ -756,6 +791,7 @@ impl Workspace {
     ) {
         self.stash_draft(cx);
         self.close_thread(cx);
+        self.page = None;
         self.nav.drafting = false;
         self.look_at(Some(channel));
         if self.recents.visited_channel(channel) {
@@ -780,6 +816,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.stash_draft(cx);
+        self.page = None;
         if self.nav.thread != Some(thread) {
             self.close_thread(cx);
             self.watch_thread(thread);
@@ -805,29 +842,22 @@ impl Workspace {
 
     /// Takes you to `place`, leaving settings, Running now or a review.
     /// Every way to a thread, channel, agent or project from the palette
-    /// goes through here. For now an agent opens its settings and a
-    /// project its first channel.
+    /// goes through here.
     pub(super) fn open_place(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_pages(cx);
         match place {
             Place::Thread(thread) => self.open_thread(thread, window, cx),
             Place::Channel(channel) => self.select_channel(channel, window, cx),
             Place::Agent(agent) => {
+                if self.state.agent(agent).is_none() {
+                    return;
+                }
                 if self.recents.visited_agent(agent) {
                     self.save_recents(cx);
                 }
-                self.open_settings(Page::Agents, window, cx);
-                self.edit_agent(agent, window, cx);
+                self.open_page(super::project_view::PageKind::Agent(agent), window, cx);
             }
-            Place::Project(project) => {
-                if self.recents.visited_project(project) {
-                    self.save_recents(cx);
-                }
-                let first = self.state.channels(project).first().map(|c| c.id);
-                if let Some(channel) = first {
-                    self.select_channel(channel, window, cx);
-                }
-            }
+            Place::Project(project) => self.open_project_page(project, false, window, cx),
         }
     }
 
@@ -985,6 +1015,7 @@ impl Workspace {
     pub(super) fn leave_for_terminal(&mut self, cx: &mut Context<Self>) {
         self.stash_draft(cx);
         self.close_thread(cx);
+        self.page = None;
         self.nav.drafting = false;
         self.look_at(None);
         self.sync(cx);
@@ -1342,6 +1373,7 @@ impl Render for Workspace {
         }
         self.inspector_shown = self.inspector_open.unwrap_or(wide);
         self.refresh_channel_rows(cx);
+        self.refresh_sidebars(cx);
         let root = div().id("workspace");
         self.add_project_drop_target(root, cx)
             .key_context("Workspace")
@@ -1456,6 +1488,15 @@ impl Workspace {
             Some(ConnectionState::Connected | ConnectionState::Reconnecting) => {
                 if self.terminal.is_some() {
                     return self.render_terminal(cx);
+                }
+                match self.page.as_ref().map(|p| p.kind) {
+                    Some(super::project_view::PageKind::Project(p)) => {
+                        return self.render_project_page(p, cx);
+                    }
+                    Some(super::project_view::PageKind::Agent(a)) => {
+                        return self.render_agent_page(a, cx);
+                    }
+                    None => {}
                 }
                 match (self.nav.thread, self.nav.channel) {
                     (Some(thread), _) if self.state.thread(thread).is_some() => {
@@ -1629,7 +1670,7 @@ mod gpui_tests {
         assert!(has(cx, window, "status-bar"));
         assert!(shows(cx, window, "Crew"), "the app name");
         assert!(shows(cx, window, "Search threads, agents, files…"));
-        assert!(shows(cx, window, "Projects"), "the sidebar");
+        assert!(shows(cx, window, "Filter options"), "the sidebar");
     }
 
     #[gpui_kit::test]

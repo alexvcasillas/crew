@@ -14,7 +14,8 @@ use super::super::common::{
 use super::super::run_card::summarize;
 use super::super::workspace::Workspace;
 use super::{
-    Card, CardStatus, card_time, counts_line, stop_label, strip_layout, working_line, worktree_word,
+    Card, CardStatus, card_time, counts_line, pill_tokens, stop_label, strip_layout, working_line,
+    worktree_word,
 };
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
@@ -27,18 +28,6 @@ const STRIP_WIDTH: f32 = 112.;
 const STRIP_GAP: f32 = 2.;
 /// Most runtime chips a card shows.
 const CHIPS_MAX: usize = 2;
-
-/// The pill's text, fill and border tokens.
-fn pill_tokens(status: CardStatus) -> (&'static str, Option<&'static str>, &'static str) {
-    match status {
-        CardStatus::Working => ("accent-blue", Some("info-subtle"), "info-border"),
-        CardStatus::NeedsYou => ("warning", Some("warning-subtle"), "warning-border"),
-        CardStatus::Done => ("success", Some("success-subtle"), "success-border"),
-        CardStatus::Stopped => ("text-secondary", Some("surface-200"), "border-200"),
-        CardStatus::Failed => ("danger", Some("danger-subtle"), "danger-border"),
-        CardStatus::Queued | CardStatus::Idle => ("text-tertiary", None, "border-200"),
-    }
-}
 
 fn pill(thread: ThreadId, status: CardStatus) -> impl IntoElement {
     let (text, fill, border) = pill_tokens(status);
@@ -87,6 +76,8 @@ struct MenuFor {
     archived: bool,
     branch: Option<String>,
     has_worktree: bool,
+    /// The thread's worktree folder, when it has one.
+    worktree: Option<std::path::PathBuf>,
     /// "Stop {Agent}" or "Stop all in thread", while agents work.
     stop: Option<String>,
 }
@@ -152,6 +143,13 @@ fn thread_menu(
             }),
         );
     }
+    if item.worktree.is_some() {
+        menu = menu.item(
+            PopupMenuItem::new("Open worktree in terminal").on_click(act(|this, t, window, cx| {
+                this.open_worktree_in_terminal(t, window, cx)
+            })),
+        );
+    }
     menu =
         if item.archived {
             menu.item(
@@ -175,6 +173,26 @@ fn thread_menu(
 }
 
 impl Workspace {
+    /// Opens Terminal in the thread's worktree.
+    fn open_worktree_in_terminal(
+        &mut self,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self
+            .state()
+            .thread(thread)
+            .and_then(|t| t.worktree.as_ref())
+            .map(|w| w.path.clone())
+        else {
+            return;
+        };
+        let args = vec!["-a".into(), "Terminal".into(), path.into_os_string()];
+        let failed = "Terminal didn't open. Check that the worktree still exists.".to_string();
+        self.run_open(args, failed, window, cx);
+    }
+
     /// Stops the agents working in `thread`.
     pub(super) fn stop_thread(
         &mut self,
@@ -279,6 +297,11 @@ impl Workspace {
             archived: card.archived,
             branch: card.branch.clone(),
             has_worktree: card.branch.is_some(),
+            worktree: self
+                .state()
+                .thread(id)
+                .and_then(|t| t.worktree.as_ref())
+                .map(|w| w.path.clone()),
             stop: stop_label(&working_names),
         };
         let this = cx.entity().downgrade();
@@ -391,6 +414,11 @@ impl Workspace {
             archived: card.archived,
             branch: card.branch.clone(),
             has_worktree: card.branch.is_some(),
+            worktree: self
+                .state()
+                .thread(id)
+                .and_then(|t| t.worktree.as_ref())
+                .map(|w| w.path.clone()),
             stop: None,
         };
         let this = cx.entity().downgrade();

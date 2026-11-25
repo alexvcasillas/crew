@@ -496,13 +496,18 @@ impl Service {
                 json(made)
             }
             Request::ChannelOverview { channel } => self.channel_overview(channel).await,
+            Request::ThreadSummaries { project, channels } => {
+                self.thread_summaries(project, channels).await
+            }
             Request::Runtimes => self.runtimes().await,
             Request::Search {
                 query,
                 project,
                 limit,
             } => self.search(query, project, limit).await,
-            Request::ProjectOverview { project } => self.project_overview(project).await,
+            Request::ProjectOverview { project, light } => {
+                self.project_overview(project, light).await
+            }
             Request::AgentProfile { agent } => self.agent_profile(agent).await,
             other => self.handle_now(other),
         }
@@ -526,7 +531,8 @@ impl Service {
             Request::CreateChannel { project, .. }
             | Request::UpdateProject { project, .. }
             | Request::RenameProject { project, .. }
-            | Request::RemoveProject { project } => db.store.ensure_project_open(*project),
+            | Request::RemoveProject { project }
+            | Request::PinProject { project, .. } => db.store.ensure_project_open(*project),
             _ => Ok(()),
         };
         open.map_err(|e| e.to_string())
@@ -689,6 +695,7 @@ impl Service {
             | Request::Commit { .. }
             | Request::Discard { .. }
             | Request::ChannelOverview { .. }
+            | Request::ThreadSummaries { .. }
             | Request::Search { .. }
             | Request::ProjectOverview { .. }
             | Request::AgentProfile { .. }
@@ -707,6 +714,14 @@ impl Service {
             }
             Request::RemoveProject { project } => {
                 self.remove_project(project)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::PinProject { project, pinned } => {
+                let mut db = self.db();
+                db.store
+                    .pin_project(project, pinned)
+                    .map_err(|e| e.to_string())?;
+                self.project_changed(&mut db, project)?;
                 Ok(serde_json::Value::Null)
             }
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),

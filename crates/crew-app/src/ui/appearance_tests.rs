@@ -6,6 +6,7 @@ use crew_core::store::Author;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Bounds, Entity, Pixels, TestAppContext};
 
 use super::common::font_probe;
+use super::sidebar::row_probe::row_of;
 use super::test_ui::{bounds_of, press, wait_until};
 use super::thread_tests::{World, open_thread, world};
 use super::workspace::Workspace;
@@ -62,12 +63,12 @@ fn defaults_keep_the_original_look(cx: &mut TestAppContext) {
     assert_eq!(sidebar.size.width, gpui_kit::px(264.), "sidebar width");
     let status = bounds(cx, window, "status-bar".into());
     assert_eq!(status.size.height, gpui_kit::px(28.), "status bar height");
-    let channel = bounds(cx, window, format!("channel-{}", w.channel));
+    let channel = bounds(cx, window, row_of(w.channel));
     assert_eq!(channel.size.height, gpui_kit::px(28.), "sidebar row height");
     let body = bounds(cx, window, format!("message-body-{message}"));
     assert_eq!(body.size.height, gpui_kit::px(20.), "a message line");
     let add = bounds(cx, window, "sidebar-projects-add".into());
-    assert_eq!(add.size.height, gpui_kit::px(16.), "a kit button");
+    assert_eq!(add.size.height, gpui_kit::px(24.), "a sidebar icon button");
     let text = |key: String| font_probe::size_of(&key).unwrap();
     assert_eq!(text(format!("message-body-{message}")), gpui_kit::px(13.));
     assert_eq!(
@@ -85,7 +86,7 @@ fn bigger_text_reaches_messages_the_sidebar_and_kit_buttons(cx: &mut TestAppCont
     let _daemon = Daemon::start(home.path().to_path_buf());
     let tmp = tempfile::tempdir().unwrap();
     let (w, window, _ws, message) = thread_with_message(cx, home.path(), &tmp.path().join("repo"));
-    let channel_id = format!("channel-{}", w.channel);
+    let channel_id = row_of(w.channel);
     let body_id = format!("message-body-{message}");
     let label_id = format!("channel-label-{}", w.channel);
     let send_before = bounds(cx, window, "composer-send".into()).size;
@@ -183,8 +184,10 @@ fn channel_cards_lay_out_again_for_bigger_text(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let w = world(home.path(), &tmp.path().join("repo"), &[]);
     let (window, _ws) = super::test_ui::open(cx, home.path());
-    let channel = format!("channel-{}", w.channel);
-    bounds(cx, window, channel.clone());
+    wait_until(cx, "the sidebar row", |cx| {
+        super::test_ui::has(cx, window, row_of(w.channel))
+    });
+    let channel = row_of(w.channel);
     super::test_ui::click(cx, window, channel);
     let card = format!("thread-{}", w.thread);
     let before = bounds(cx, window, card.clone()).size.height;
@@ -393,12 +396,6 @@ fn the_appearance_page_shows_every_row_with_the_defaults(cx: &mut TestAppContext
         "13 · 12 mono · standard"
     );
 
-    // Threads isn't built yet: it stays off.
-    super::test_ui::click(cx, window, "appearance-sidebar-threads");
-    assert_eq!(
-        current(cx).sidebar_mode,
-        crate::prefs::SidebarMode::Projects
-    );
     assert_eq!(crate::prefs::read(home.path(), APPEARANCE_KEY), None);
 }
 

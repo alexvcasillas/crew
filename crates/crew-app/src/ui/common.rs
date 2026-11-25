@@ -170,13 +170,56 @@ pub fn status_word(status: ThreadStatus) -> (&'static str, &'static str) {
     }
 }
 
-/// A grey square with the name's first letter.
+thread_local! {
+    /// The letters of each agent's monogram, by name, as last worked out.
+    static LETTERS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::default();
+}
+
+/// Each name's monogram letters, names in the order the agents were made:
+/// the first letter, or the first two once an earlier name took that
+/// letter, as Scout then Sentinel read `S` and `Se`.
+pub fn monogram_letters(names: &[&str]) -> Vec<String> {
+    let first = |name: &str| name.chars().next().map(|c| c.to_lowercase().to_string());
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut chars = name.chars();
+            let one: String = chars
+                .next()
+                .map(|c| c.to_uppercase().collect())
+                .unwrap_or_default();
+            let clash = names[..i].iter().any(|n| first(n) == first(name));
+            match chars.next() {
+                Some(second) if clash => format!("{one}{}", second.to_lowercase()),
+                _ => one,
+            }
+        })
+        .collect()
+}
+
+/// Sets the agents' names, oldest first, that monograms tell apart.
+pub fn set_agent_names(names: &[&str]) {
+    let letters = monogram_letters(names);
+    LETTERS.with(|l| {
+        let mut l = l.borrow_mut();
+        l.clear();
+        l.extend(names.iter().map(|n| n.to_string()).zip(letters));
+    });
+}
+
+/// A grey square with the name's letters: the first, or two when another
+/// agent's name starts the same.
 pub fn monogram(name: &str, size: f32) -> Div {
-    let letter: String = name
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().collect())
-        .unwrap_or_default();
+    let letter: String = LETTERS
+        .with(|l| l.borrow().get(name).cloned())
+        .unwrap_or_else(|| {
+            name.chars()
+                .next()
+                .map(|c| c.to_uppercase().collect())
+                .unwrap_or_default()
+        });
     div()
         .flex()
         .flex_none()
@@ -189,7 +232,7 @@ pub fn monogram(name: &str, size: f32) -> Div {
         .border_color(color("border-200"))
         .text_size(scale::text((size * 0.45).round().max(10.)))
         .font_weight(weight(FontWeight::SEMIBOLD))
-        .text_color(color("text-secondary"))
+        .text_color(color("text-primary"))
         .child(letter)
 }
 
@@ -202,13 +245,11 @@ fn chip_frame() -> Div {
     div()
         .flex_none()
         .px(ui_px(6.))
-        .py(scale::row(1.))
         .rounded(ui_px(4.))
         .bg(color("surface-300"))
-        .border_1()
-        .border_color(color("border-100"))
         .font_family(code_family())
         .text_size(scale::mono(11.))
+        .line_height(scale::mono(16.))
         .text_color(color("text-secondary"))
 }
 
@@ -336,11 +377,19 @@ fn ease_out_cubic(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ago, changed_positions, codex_short, cut_start, elapsed, pulse_opacity, runtime_chip,
-        short_model,
+        ago, changed_positions, codex_short, cut_start, elapsed, monogram_letters, pulse_opacity,
+        runtime_chip, short_model,
     };
     use crate::ui::settings::agents::blank_spec;
     use crew_core::agent::{AgentSpec, Runtime};
+
+    #[test]
+    fn monograms_take_two_letters_once_an_initial_is_taken() {
+        assert_eq!(
+            monogram_letters(&["Forge", "Scout", "Triage", "Sentinel", "sage", "X"]),
+            ["F", "S", "T", "Se", "Sa", "X"]
+        );
+    }
 
     #[test]
     fn model_names_read_short() {

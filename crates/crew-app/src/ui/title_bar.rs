@@ -184,6 +184,33 @@ impl Workspace {
     /// channel.
     fn render_breadcrumb(&self, cx: &App) -> Vec<AnyElement> {
         let state = self.state();
+        let slash = || div().flex_none().text_color(rgb(SLASH)).child("/");
+        let crumb = |id: &'static str, text: String| {
+            div()
+                .id(id)
+                .min_w_0()
+                .truncate()
+                .font_weight(weight(FontWeight::MEDIUM))
+                .aria_label(text.clone())
+                .child(text)
+                .test_support()
+                .into_any_element()
+        };
+        // A page shows where it is: `/ project` or `/ Agents / Name`.
+        if let Some(project) = self.page_project().and_then(|p| state.project(p)) {
+            return vec![
+                slash().into_any_element(),
+                crumb("title-project", project.name.clone()),
+            ];
+        }
+        if let Some(agent) = self.page_agent().filter(|a| state.agent(*a).is_some()) {
+            return vec![
+                slash().into_any_element(),
+                crumb("title-agents", "Agents".into()),
+                slash().into_any_element(),
+                crumb("title-agent", super::project_view::agent_name(self, agent)),
+            ];
+        }
         let Some(channel) = self.nav.channel.and_then(|c| state.channel(c)) else {
             return Vec::new();
         };
@@ -200,18 +227,9 @@ impl Workspace {
                 .sum()
         };
         let path = cut_start(&full, f32::from(ui_px(PATH_MAX_WIDTH - CHIP_INSET)), width);
-        let slash = || div().flex_none().text_color(rgb(SLASH)).child("/");
         vec![
             slash().into_any_element(),
-            div()
-                .id("title-project")
-                .min_w_0()
-                .truncate()
-                .font_weight(weight(FontWeight::MEDIUM))
-                .aria_label(project.name.clone())
-                .child(project.name.clone())
-                .test_support()
-                .into_any_element(),
+            crumb("title-project", project.name.clone()),
             slash().into_any_element(),
             div()
                 .id("title-channel")

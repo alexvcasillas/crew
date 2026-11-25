@@ -10,8 +10,8 @@ use crew_core::project_kind::{looks_secret, repo_of};
 use crew_core::store::StoredRun;
 use crew_core::worktree;
 use crew_proto::{
-    AgentProfile, AgentStats, AgentUse, ChannelRow, ProjectOverview, RecentThread, RunRow,
-    SetupFile, SetupFileSize, ThreadState,
+    AgentProfile, AgentStats, AgentUse, ChannelRow, ProjectOverview, RecentThread, RunPlace,
+    RunRow, SetupFile, SetupFileSize, ThreadState,
 };
 
 use crate::overview::{WEEK_MS, ran_since, run_ms};
@@ -75,8 +75,9 @@ fn count_files(dir: &Path) -> u32 {
 
 impl Service {
     /// Answers `ProjectOverview`. Channel stats come from the channel
-    /// overviews, so they share their cached change counts.
-    pub(crate) async fn project_overview(&self, project: ProjectId) -> Reply {
+    /// overviews, so they share their cached change counts. `light` leaves
+    /// the folder alone: no rescan, no git and no setup file checks.
+    pub(crate) async fn project_overview(&self, project: ProjectId, light: bool) -> Reply {
         // On the read-only connection, so writers don't wait for it.
         let (stored, channels, threads, runs, waiting) = self.with_reader(|store| {
             let found = store.project(project).and_then(|p| {
@@ -170,6 +171,13 @@ impl Service {
             .collect();
         let (root, copy_files) = (stored.root.clone(), stored.copy_files.clone());
         let svc = self.clone();
+        if light {
+            let on_disk =
+                blocking(move || Ok::<_, String>(worktrees.iter().filter(|p| p.is_dir()).count()))
+                    .await?;
+            out.worktrees = u32::try_from(on_disk).unwrap_or(u32::MAX);
+            return json(out);
+        }
         let (info, on_disk, setup) = blocking(move || {
             // Opening the project looks at what its folder holds again.
             let repos = svc.refresh_kind(project).unwrap_or_default().repos();
@@ -265,7 +273,7 @@ impl Service {
             stats.added_week = stats.added_week.saturating_add(e.added);
             stats.removed_week = stats.removed_week.saturating_add(e.removed);
         }
-        let recent_runs = recent
+        let mut recent_runs: Vec<RunRow> = recent
             .into_iter()
             .map(|r| {
                 let e = edits.get(&r.id).copied().unwrap_or_default();
@@ -276,6 +284,7 @@ impl Service {
                     added: e.added,
                     removed: e.removed,
                     waiting: waiting.contains(&r.id),
+                    removed_project: None,
                 }
             })
             .collect();
@@ -307,6 +316,27 @@ impl Service {
                 projects.insert(project);
                 if row.archived_at.is_none() {
                     threads.push((at, thread));
+                }
+            }
+            // Clients no longer know a removed project's threads: say
+            // where its runs ran.
+            let removed: HashMap<ProjectId, String> = store
+                .removed_projects()
+                .map_err(err)?
+                .into_iter()
+                .map(|p| (p.id, p.name))
+                .collect();
+            if !removed.is_empty() {
+                for row in &mut recent_runs {
+                    let thread = store.thread(row.run.thread).map_err(err)?;
+                    let channel = store.channel(thread.channel).map_err(err)?;
+                    if let Some(project) = removed.get(&channel.project) {
+                        row.removed_project = Some(RunPlace {
+                            project: project.clone(),
+                            channel: channel.name,
+                            thread_title: thread.title,
+                        });
+                    }
                 }
             }
             Ok::<_, String>(())

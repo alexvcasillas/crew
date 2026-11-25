@@ -634,6 +634,7 @@ async fn requests_and_notices(
                     | Request::Commit { .. }
                     | Request::Discard { .. }
                     | Request::ChannelOverview { .. }
+                    | Request::ThreadSummaries { .. }
                     | Request::Runtimes) => {
                         let (svc, tx) = (service.clone(), answer_tx.clone());
                         tokio::spawn(async move {

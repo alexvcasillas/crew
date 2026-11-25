@@ -56,6 +56,18 @@ impl CardStatus {
     }
 }
 
+/// A status pill's text, fill and border tokens.
+pub fn pill_tokens(status: CardStatus) -> (&'static str, Option<&'static str>, &'static str) {
+    match status {
+        CardStatus::Working => ("accent-blue", Some("info-subtle"), "info-border"),
+        CardStatus::NeedsYou => ("warning", Some("warning-subtle"), "warning-border"),
+        CardStatus::Done => ("success", Some("success-subtle"), "success-border"),
+        CardStatus::Stopped => ("text-secondary", Some("surface-200"), "border-200"),
+        CardStatus::Failed => ("danger", Some("danger-subtle"), "danger-border"),
+        CardStatus::Queued | CardStatus::Idle => ("text-tertiary", None, "border-200"),
+    }
+}
+
 /// A card's status: an ask waiting on you comes first, then a working
 /// run, then one waiting for a slot, then how the latest run ended.
 pub fn card_status(

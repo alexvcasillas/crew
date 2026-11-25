@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crew_core::event::RunStatus;
-use crew_core::ids::{ChannelId, ThreadId};
+use crew_core::ids::{ChannelId, ProjectId, ThreadId};
 use crew_core::project_kind::{ProjectKind, WorkMode};
 use crew_core::store::{StoredRun, StoredThread, ThreadActivity, ThreadWorktree};
 use crew_core::text::clean_line;
@@ -25,6 +25,8 @@ pub const EXCERPT_LEN: usize = 240;
 pub(crate) const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Threads whose counts are worked out at once, across all overviews.
 pub(crate) const GIT_AT_ONCE: usize = 8;
+/// Channel overviews one `ThreadSummaries` works out at once.
+const SUMMARIES_AT_ONCE: usize = 4;
 /// How long an overview waits for counts it lacks.
 const OVERVIEW_WAIT: Duration = Duration::from_millis(1500);
 /// How often a live run's edits may drop its thread's counts.
@@ -171,18 +173,18 @@ impl Service {
         &self,
         channel: ChannelId,
     ) -> Result<ChannelOverview, String> {
-        let (threads, activity, runs, project) = {
-            let db = self.db();
-            let found = db.store.channel(channel).and_then(|c| {
+        // On the read-only connection, so writers don't wait for it.
+        let (threads, activity, runs, project) = self.with_reader(|store| {
+            let found = store.channel(channel).and_then(|c| {
                 Ok((
-                    db.store.threads(channel)?,
-                    db.store.thread_activity(channel)?,
-                    db.store.channel_runs(channel)?,
-                    db.store.project(c.project)?,
+                    store.threads(channel)?,
+                    store.thread_activity(channel)?,
+                    store.channel_runs(channel)?,
+                    store.project(c.project)?,
                 ))
             });
-            found.map_err(|e| e.to_string())?
-        };
+            found.map_err(|e| e.to_string())
+        })?;
         let copied = project.copy_files.clone();
         // What each thread's changes are counted on: its worktree, or in
         // place the files its runs touched. Read before the cache is locked.
@@ -292,6 +294,65 @@ impl Service {
             &counting,
             now_ms(),
         ))
+    }
+
+    /// Answers `ThreadSummaries`: the summaries of every thread that
+    /// isn't archived, in `project` or in every project, and in
+    /// `channels` if given, from their channels' overviews, a few at a
+    /// time.
+    pub(crate) async fn thread_summaries(
+        &self,
+        project: Option<ProjectId>,
+        only: Option<Vec<ChannelId>>,
+    ) -> Reply {
+        let (channels, archived) = self
+            .with_reader(|store| {
+                // Removed projects are left out.
+                let projects = store.projects()?;
+                let mut channels = Vec::new();
+                let mut archived = HashSet::new();
+                for p in projects
+                    .iter()
+                    .filter(|p| project.is_none_or(|id| id == p.id))
+                {
+                    for c in store.channels(p.id)? {
+                        if only.as_ref().is_some_and(|o| !o.contains(&c.id)) {
+                            continue;
+                        }
+                        archived.extend(
+                            store
+                                .threads(c.id)?
+                                .into_iter()
+                                .filter(|t| t.archived_at.is_some())
+                                .map(|t| t.id),
+                        );
+                        channels.push(c.id);
+                    }
+                }
+                Ok::<_, crew_core::store::StoreError>((channels, archived))
+            })
+            .map_err(|e| e.to_string())?;
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(SUMMARIES_AT_ONCE));
+        let mut jobs = tokio::task::JoinSet::new();
+        for (i, channel) in channels.into_iter().enumerate() {
+            let (svc, slots) = (self.clone(), slots.clone());
+            jobs.spawn(async move {
+                let _slot = slots.acquire_owned().await;
+                (i, svc.channel_overview_data(channel).await)
+            });
+        }
+        let mut overviews = Vec::new();
+        while let Some(done) = jobs.join_next().await {
+            let (i, overview) = done.map_err(|e| format!("The overview task ended: {e}"))?;
+            overviews.push((i, overview?));
+        }
+        overviews.sort_by_key(|(i, _)| *i);
+        let summaries: Vec<ThreadSummary> = overviews
+            .into_iter()
+            .flat_map(|(_, o)| o.threads)
+            .filter(|t| !archived.contains(&t.thread))
+            .collect();
+        json(summaries)
     }
 
     /// Sends `ChannelOverviewStale` once none of `threads` is being

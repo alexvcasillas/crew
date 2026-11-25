@@ -1,6 +1,7 @@
 //! The Crew window, built with GPUI-kit.
 
 mod activity;
+mod agent_view;
 mod approval_card;
 mod channel_view;
 mod common;
@@ -16,11 +17,12 @@ mod inspector;
 mod markdown_view;
 mod mention_menu;
 pub mod palette;
+mod project_view;
 mod run_card;
 pub mod running_view;
 mod service_control;
 pub mod settings;
-mod sidebar;
+pub(crate) mod sidebar;
 mod status_bar;
 mod terminal_tab;
 mod terminal_view;
@@ -50,11 +52,15 @@ mod inspector_tests;
 #[cfg(test)]
 mod motion_tests;
 #[cfg(test)]
+mod pages_tests;
+#[cfg(test)]
 mod palette_tests;
 #[cfg(test)]
 mod running_tests;
 #[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod sidebar_tests;
 #[cfg(test)]
 mod terminal_tab_tests;
 #[cfg(test)]
@@ -63,6 +69,8 @@ mod terminal_tests;
 mod test_ui;
 #[cfg(test)]
 mod thread_tests;
+#[cfg(test)]
+mod threads_sidebar_tests;
 
 pub use crate::app::run;
 

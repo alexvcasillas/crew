@@ -13,6 +13,7 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::diff_tests::repo_with_readme;
 use super::inspector_tests::run_of;
+use super::sidebar::row_probe::row_of;
 use super::test_ui::{
     bounds_of, click, has, label_of, open, press, type_text, wait_to_show, wait_until,
 };
@@ -21,11 +22,10 @@ use super::workspace::Workspace;
 use crate::test_support::{Daemon, fake_claude, fixture, short_home};
 
 fn go_to_channel(cx: &mut TestAppContext, window: AnyWindowHandle, channel: ChannelId) {
-    let row = format!("channel-{channel}");
     wait_until(cx, "the channel in the sidebar", |cx| {
-        has(cx, window, row.clone())
+        has(cx, window, row_of(channel))
     });
-    click(cx, window, row);
+    click(cx, window, row_of(channel));
     wait_until(cx, "the channel view", |cx| has(cx, window, "channel-view"));
 }
 
@@ -350,10 +350,11 @@ fn discard_with_delete_branch_removes_the_worktree_and_branch(cx: &mut TestAppCo
     })
     .unwrap();
     click(cx, window, format!("thread-more-{}", w.thread));
-    // Rename, Copy branch name, Archive, a separator, Discard worktree.
+    // Rename, Copy branch name, Open worktree in terminal, Archive, a
+    // separator, Discard worktree.
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
-        window.within("popup-menu").click(4usize, cx);
+        window.within("popup-menu").click(5usize, cx);
     })
     .unwrap();
     wait_label(

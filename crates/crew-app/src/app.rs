@@ -128,6 +128,7 @@ pub fn init(crew_home: &Path, cx: &mut App) {
     cx.bind_keys(crate::ui::running_view::bindings());
     cx.bind_keys(crate::ui::settings::bindings());
     cx.bind_keys(crate::ui::palette::bindings());
+    cx.bind_keys(crate::ui::sidebar::bindings());
     cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &ZoomIn, cx| scale::step_zoom(1, cx));

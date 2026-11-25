@@ -314,7 +314,14 @@ fn agent_form_checks_names_and_duplicates(cx: &mut TestAppContext) {
         ws.read_with(cx, |ws, _| !ws.runtimes.is_empty())
     });
 
-    click(cx, window, "sidebar-agents-add");
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_settings(Page::Agents, window, cx);
+            ws.new_agent(window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
     assert_eq!(page(cx, &ws), Some(Page::Agents));
     type_text(cx, window, "Scout bot");
     click(cx, window, "agent-save");

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 12;
+pub const PROTO_VERSION: u32 = 14;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -275,9 +275,13 @@ pub enum Request {
         #[serde(default = "default_search_limit")]
         limit: u32,
     },
-    /// Answered with a [`ProjectOverview`].
+    /// Answered with a [`ProjectOverview`]. `light` skips looking at the
+    /// folder: `root` and `setup_files` come back empty, for a client
+    /// that keeps them from a full answer.
     ProjectOverview {
         project: ProjectId,
+        #[serde(default)]
+        light: bool,
     },
     /// Answered with an [`AgentProfile`]. Deleted agents have one too.
     AgentProfile {
@@ -297,6 +301,23 @@ pub enum Request {
     /// [`ServerMsg::ProjectRemoved`].
     RemoveProject {
         project: ProjectId,
+    },
+    /// Pins the project to the top of the sidebar, or unpins it. Answered
+    /// with null; every client gets a [`ServerMsg::ProjectChanged`].
+    PinProject {
+        project: ProjectId,
+        pinned: bool,
+    },
+    /// Answered with one [`ThreadSummary`] per thread that isn't
+    /// archived, in `project` or in every project, and only in
+    /// `channels` when given. Counts come from the channel overviews'
+    /// cache; a [`ServerMsg::ChannelOverviewStale`] follows for a channel
+    /// whose counts were still being worked out.
+    ThreadSummaries {
+        #[serde(default)]
+        project: Option<ProjectId>,
+        #[serde(default)]
+        channels: Option<Vec<ChannelId>>,
     },
 }
 
@@ -572,6 +593,19 @@ pub struct RunRow {
     /// An approval of this run waits for you.
     #[serde(default)]
     pub waiting: bool,
+    /// For a run in a removed project, where it ran, which clients no
+    /// longer know. `None` otherwise.
+    #[serde(default)]
+    pub removed_project: Option<RunPlace>,
+}
+
+/// Where a run in a removed project ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunPlace {
+    pub project: String,
+    pub channel: String,
+    pub thread_title: String,
 }
 
 /// A Claude Code session someone runs in their own terminal, inside one of
@@ -1034,7 +1068,10 @@ mod tests {
                 project: Some(project),
                 limit: 5,
             },
-            Request::ProjectOverview { project },
+            Request::ProjectOverview {
+                project,
+                light: true,
+            },
             Request::AgentProfile {
                 agent: AgentId::new(),
             },

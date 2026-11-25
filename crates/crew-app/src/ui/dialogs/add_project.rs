@@ -174,7 +174,7 @@ fn folder_name(path: &Path) -> String {
 
 /// A setup file you picked, relative to the project folder, with its
 /// size. Reads the disk, so off the UI thread.
-fn setup_file_in(root: &Path, picked: &Path) -> Option<SetupFile> {
+pub(crate) fn setup_file_in(root: &Path, picked: &Path) -> Option<SetupFile> {
     let root = root.canonicalize().ok()?;
     let picked = picked.canonicalize().ok()?;
     let rel = picked.strip_prefix(&root).ok()?;

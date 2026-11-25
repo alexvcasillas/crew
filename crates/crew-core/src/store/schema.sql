@@ -8,7 +8,8 @@ CREATE TABLE projects (
     copy_files TEXT NOT NULL DEFAULT '[]',
     removed_at INTEGER,
     kind TEXT NOT NULL DEFAULT '{"kind":"repo"}',
-    work_mode TEXT NOT NULL DEFAULT 'own_copy'
+    work_mode TEXT NOT NULL DEFAULT 'own_copy',
+    pinned_at INTEGER
 );
 
 CREATE TABLE channels (

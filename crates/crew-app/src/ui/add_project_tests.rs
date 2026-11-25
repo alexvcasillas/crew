@@ -379,7 +379,16 @@ fn a_folder_already_added_offers_to_open_it(cx: &mut TestAppContext) {
 
     click(cx, window, "add-project-open");
     wait_closed(cx, window, &ws);
-    wait_in_general(cx, &ws, &demo);
+    // The project it already is opens on its overview.
+    wait_until(cx, "the overview", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.settings.is_none()
+                && ws
+                    .page_project()
+                    .and_then(|p| ws.state().project(p))
+                    .is_some_and(|p| p.root == demo)
+        })
+    });
 }
 
 /// Drags `path` in from outside the window and drops it at `position`.

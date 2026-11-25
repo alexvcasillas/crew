@@ -58,6 +58,14 @@ const PERMISSIONS: [(PermissionMode, &str, &str); 3] = [
         "Read only (plan)",
     ),
 ];
+/// What an agent with `mode` may do, as its settings word it.
+pub fn permission_label(mode: PermissionMode) -> &'static str {
+    PERMISSIONS
+        .iter()
+        .find(|(m, ..)| *m == mode)
+        .map_or("", |(_, _, label)| label)
+}
+
 /// The longest run choices, in minutes. 0 is no limit.
 pub const RUN_LIMITS: [u32; 5] = [0, 30, 60, 120, 240];
 

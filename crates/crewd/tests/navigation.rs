@@ -11,8 +11,8 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, RunId, ThreadId};
 use crew_core::store::{ApprovalStatus, Author, Limits, StoredRun};
 use crew_proto::{
-    AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, SearchResults,
-    ServerMsg, SetupFileSize, ThreadState, read_frame, write_frame,
+    AgentProfile, ClientMsg, FileHit, PROTO_VERSION, ProjectOverview, Request, RunPlace,
+    SearchResults, ServerMsg, SetupFileSize, ThreadState, ThreadSummary, read_frame, write_frame,
 };
 use crewd::{ServeOptions, serve};
 use tempfile::TempDir;
@@ -478,7 +478,12 @@ async fn project_overview_sums_up_the_project() {
     // A deleted agent still shows as used here.
     c.call(Request::DeleteAgent { agent: scout }).await.unwrap();
 
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert!(o.root.exists);
     assert_eq!(o.root.branch.as_deref(), Some("main"));
     // src/lib.rs, plus .env and the two files in certs, which git
@@ -517,6 +522,19 @@ async fn project_overview_sums_up_the_project() {
             ("missing.txt", SetupFileSize::Missing),
         ]
     );
+
+    // A light overview leaves the folder alone.
+    let light: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: true,
+        })
+        .await;
+    assert_eq!(light.root, Default::default());
+    assert!(light.setup_files.is_empty());
+    assert_eq!(light.worktrees, 2);
+    assert_eq!(light.channels, o.channels);
+    assert_eq!(light.recent_threads, o.recent_threads);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -530,7 +548,12 @@ async fn a_project_whose_folder_is_gone_has_an_overview_and_can_be_removed() {
     c.thread(general, "Something").await;
     std::fs::remove_dir_all(&root).unwrap();
 
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert!(!o.root.exists);
     assert_eq!(o.root.branch, None);
     assert_eq!(o.channels.len(), 1);
@@ -541,9 +564,12 @@ async fn a_project_whose_folder_is_gone_has_an_overview_and_can_be_removed() {
     let projects: Vec<serde_json::Value> = c.ok(Request::ListProjects).await;
     assert!(projects.is_empty());
     assert!(
-        c.call(Request::ProjectOverview { project: p })
-            .await
-            .is_err()
+        c.call(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await
+        .is_err()
     );
 }
 
@@ -591,6 +617,34 @@ async fn agent_profile_counts_runs_edits_and_threads() {
     assert_eq!(row.run.status, RunStatus::Done);
     assert!(!row.waiting);
     assert_eq!(profile.threads, [second, first]);
+    assert!(
+        profile
+            .recent_runs
+            .iter()
+            .all(|r| r.removed_project.is_none())
+    );
+
+    // A run in a removed project says where it ran.
+    c.call(Request::RemoveProject { project: q }).await.unwrap();
+    let profile: AgentProfile = c.ok(Request::AgentProfile { agent: forge }).await;
+    let places: Vec<_> = profile
+        .recent_runs
+        .iter()
+        .map(|r| r.removed_project.clone())
+        .collect();
+    assert_eq!(
+        places,
+        [
+            None,
+            Some(RunPlace {
+                project: "other".into(),
+                channel: "general".into(),
+                thread_title: "Second".into(),
+            }),
+            None,
+        ]
+    );
+    assert_eq!(profile.projects, 1);
 
     // Once deleted, it still has a profile, history and all.
     c.call(Request::DeleteAgent { agent: forge }).await.unwrap();
@@ -849,9 +903,12 @@ async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back()
     let pending: Vec<serde_json::Value> = c.ok(Request::ListApprovals { thread: None }).await;
     assert!(pending.is_empty(), "nothing waits for you any more");
     assert!(
-        c.call(Request::ProjectOverview { project: p })
-            .await
-            .is_err()
+        c.call(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await
+        .is_err()
     );
 
     // Adding the folder again brings the project back as it was, its
@@ -859,7 +916,12 @@ async fn removing_a_project_closes_its_asks_and_adding_it_again_brings_it_back()
     assert_eq!(c.project("demo again", &root).await, p);
     c.until(|m| matches!(m, ServerMsg::RunStatus { thread, .. } if *thread == t))
         .await;
-    let o: ProjectOverview = c.ok(Request::ProjectOverview { project: p }).await;
+    let o: ProjectOverview = c
+        .ok(Request::ProjectOverview {
+            project: p,
+            light: false,
+        })
+        .await;
     assert_eq!(o.channels[0].channel, general);
     assert_eq!(o.recent_threads[0].thread, t);
     let r = c.search("fix it", Some(p)).await;
@@ -899,4 +961,129 @@ async fn two_clients_adding_one_folder_make_one_project() {
     let mut c = d.client().await;
     let projects: Vec<serde_json::Value> = c.ok(Request::ListProjects).await;
     assert_eq!(projects.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinning_a_project_is_broadcast_and_kept() {
+    let d = Daemon::start(PathBuf::from("/nonexistent/claude")).await;
+    let root = d.path("demo");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut c = d.client().await;
+    let p = c.project("demo", &root).await;
+    c.call(Request::SubscribeAll).await.unwrap();
+    c.call(Request::PinProject {
+        project: p,
+        pinned: true,
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(m, ServerMsg::ProjectChanged { project } if project.id == p && project.pinned_at.is_some())
+    })
+    .await;
+    let listed: Vec<crew_core::store::StoredProject> = c.ok(Request::ListProjects).await;
+    assert!(listed[0].pinned_at.is_some());
+    c.call(Request::PinProject {
+        project: p,
+        pinned: false,
+    })
+    .await
+    .unwrap();
+    c.until(|m| {
+        matches!(m, ServerMsg::ProjectChanged { project } if project.id == p && project.pinned_at.is_none())
+    })
+    .await;
+    c.call(Request::RemoveProject { project: p }).await.unwrap();
+    let err = c
+        .call(Request::PinProject {
+            project: p,
+            pinned: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, crew_core::store::REMOVED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_summaries_cover_every_project_or_one() {
+    let bins = tempfile::tempdir().unwrap();
+    let d = Daemon::start(writing_claude(bins.path())).await;
+    let root = d.path("demo");
+    repo(&root, &["src/lib.rs"]);
+    let shop_root = d.path("shop");
+    std::fs::create_dir_all(&shop_root).unwrap();
+
+    let mut c = d.client().await;
+    let demo = c.project("demo", &root).await;
+    let shop = c.project("shop", &shop_root).await;
+    let general = c.channel(demo, "general").await;
+    let bugs = c.channel(demo, "bugs").await;
+    let shop_general = c.channel(shop, "general").await;
+    let worked = c.thread(general, "Worked").await;
+    let archived = c.thread(bugs, "Archived").await;
+    let idle = c.thread(shop_general, "Idle").await;
+    c.agent("Forge", PermissionMode::Auto).await;
+    c.call(Request::SubscribeAll).await.unwrap();
+    c.post(worked, "@Forge go").await;
+    c.run_reaches(worked, RunStatus::Done).await;
+    c.call(Request::ArchiveThread {
+        thread: archived,
+        archived: true,
+    })
+    .await
+    .unwrap();
+
+    let all: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: None,
+        })
+        .await;
+    let mut ids: Vec<ThreadId> = all.iter().map(|s| s.thread).collect();
+    ids.sort_by_key(|t| t.0);
+    let mut want = vec![worked, idle];
+    want.sort_by_key(|t| t.0);
+    assert_eq!(ids, want, "archived threads are left out");
+    let w = all.iter().find(|s| s.thread == worked).unwrap();
+    assert_eq!(w.files, 1, "file.txt in the worktree");
+    assert!(w.added > 0);
+    assert_eq!(w.runs.len(), 1);
+    assert_eq!(w.runs[0].status, RunStatus::Done);
+
+    let one: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: Some(shop),
+            channels: None,
+        })
+        .await;
+    let ids: Vec<ThreadId> = one.iter().map(|s| s.thread).collect();
+    assert_eq!(ids, [idle]);
+    // Only the channels asked for.
+    let some: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: Some(vec![general, shop_general]),
+        })
+        .await;
+    let mut ids: Vec<ThreadId> = some.iter().map(|s| s.thread).collect();
+    ids.sort_by_key(|t| t.0);
+    assert_eq!(ids, want);
+    let none: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: Some(vec![bugs]),
+        })
+        .await;
+    assert!(none.is_empty(), "only the archived thread is there");
+
+    c.call(Request::RemoveProject { project: shop })
+        .await
+        .unwrap();
+    let after: Vec<ThreadSummary> = c
+        .ok(Request::ThreadSummaries {
+            project: None,
+            channels: None,
+        })
+        .await;
+    assert_eq!(after.iter().map(|s| s.thread).collect::<Vec<_>>(), [worked]);
 }
