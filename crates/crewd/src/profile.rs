@@ -377,6 +377,8 @@ mod tests {
             runtime: Runtime::ClaudeCode,
             waiting_for: None,
             skill: None,
+            model_override: None,
+            message: None,
         }
     }
 

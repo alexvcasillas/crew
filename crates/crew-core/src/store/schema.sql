@@ -72,7 +72,9 @@ CREATE TABLE runs (
     runtime TEXT NOT NULL DEFAULT 'claude_code',
     handed_from TEXT REFERENCES runs(id),
     waiting_for TEXT REFERENCES runs(id),
-    skill TEXT
+    skill TEXT,
+    model_override TEXT,
+    message_id TEXT
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);

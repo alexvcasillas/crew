@@ -816,6 +816,11 @@ pub struct SkillRef {
     /// The skill's file. Codex needs it to load the skill.
     #[serde(default)]
     pub path: String,
+    /// The agent to run it, which must use `runtime`. The agents the
+    /// message mentions are then not called. Without it, the agents the
+    /// message calls run it.
+    #[serde(default)]
+    pub agent: Option<AgentId>,
 }
 
 /// Key of the "Show in /" setting of a skill: `{runtime}:{source}:{name}`
@@ -1391,6 +1396,7 @@ mod tests {
                     runtime: Runtime::Codex,
                     name: "lint".into(),
                     path: "/work/demo/SKILL.md".into(),
+                    agent: Some(AgentId::new()),
                 }),
                 model_override: Some("opus".into()),
             },

@@ -25,7 +25,7 @@ pub use approval::{
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v10.sql"),
     include_str!("migrate_v11.sql"),
     include_str!("migrate_v12.sql"),
+    include_str!("migrate_v13.sql"),
 ];
 
 /// The global limits you set in the app. Stored as rows of `settings`.
@@ -272,6 +273,13 @@ pub struct StoredRun {
     /// The skill the run was asked to run, if any.
     #[serde(default)]
     pub skill: Option<String>,
+    /// The model the run was asked to use instead of its agent's, for
+    /// this one message. Boxed to keep runs small in messages.
+    #[serde(default)]
+    pub model_override: Option<Box<str>>,
+    /// The message that asked for the run, if one did.
+    #[serde(default)]
+    pub message: Option<MessageId>,
 }
 
 fn claude_code() -> Runtime {
@@ -1216,6 +1224,24 @@ impl Store {
         Ok(())
     }
 
+    /// Saves the message that asked for a queued run and the model it
+    /// was asked to use for that message alone.
+    pub fn set_run_request(
+        &self,
+        r: RunId,
+        message: MessageId,
+        model_override: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET message_id = ?2, model_override = ?3 WHERE id = ?1",
+            params![r.to_string(), message.to_string(), model_override],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     /// Adds a queued run of `a` that `from` brought in with a handoff.
     pub fn create_handoff_run(&self, t: ThreadId, a: AgentId, from: RunId) -> Result<RunId> {
         let id = self.create_run(t, a)?;
@@ -1612,7 +1638,7 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
 
 const RUN_COLUMNS: &str =
     "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime,
-     waiting_for, skill FROM runs";
+     waiting_for, skill, model_override, message_id FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -1630,6 +1656,11 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
             .and_then(|w| Uuid::parse_str(&w).ok())
             .map(RunId),
         skill: r.get(9)?,
+        model_override: r.get(10)?,
+        message: r
+            .get::<_, Option<String>>(11)?
+            .and_then(|m| Uuid::parse_str(&m).ok())
+            .map(MessageId),
     };
     let runtime: String = r.get(7)?;
     Ok(parse_status(&status).and_then(|status| {

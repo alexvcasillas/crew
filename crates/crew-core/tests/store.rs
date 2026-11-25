@@ -418,7 +418,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -795,7 +795,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -849,7 +849,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -882,7 +882,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -955,7 +955,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -994,7 +994,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1225,7 +1225,7 @@ fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1375,7 +1375,7 @@ fn migrates_v8_db_to_v9_keeping_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1643,7 +1643,7 @@ fn migrates_v9_db_to_v10_as_a_repo_with_its_own_copies() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1718,7 +1718,7 @@ fn migrates_v10_db_to_v11_with_no_pins() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1777,7 +1777,7 @@ fn migrates_v11_db_to_v12_with_runs_of_no_skill() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1796,4 +1796,46 @@ fn skills_are_shown_until_hidden() {
     assert!(store.skill_shown("codex:global:unslop").unwrap());
     store.set_skill_shown(key, true).unwrap();
     assert!(store.skill_shown(key).unwrap());
+}
+
+const SCHEMA_V12: &str = include_str!("../src/store/schema_v12.sql");
+
+#[test]
+fn migrates_v12_db_to_v13_with_runs_asked_by_no_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V12).unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let t = store.create_thread(c, "work").unwrap();
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    let run = store.create_run(t, a).unwrap();
+    let before = store.run(run).unwrap();
+    assert_eq!((before.message, before.model_override), (None, None));
+    let m = store.add_message(t, Author::You, "@Ada go", None).unwrap();
+    store.set_run_request(run, m, Some("opus")).unwrap();
+    let after = store.run(run).unwrap();
+    assert_eq!(after.message, Some(m));
+    assert_eq!(after.model_override.as_deref(), Some("opus"));
+    store.set_run_request(run, m, None).unwrap();
+    assert_eq!(store.run(run).unwrap().model_override, None);
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
 }

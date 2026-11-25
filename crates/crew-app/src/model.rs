@@ -1084,6 +1084,8 @@ mod tests {
             runtime: crew_core::agent::Runtime::ClaudeCode,
             waiting_for: None,
             skill: None,
+            model_override: None,
+            message: None,
         }
     }
 

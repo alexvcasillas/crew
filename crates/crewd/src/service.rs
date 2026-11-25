@@ -1414,7 +1414,14 @@ impl Service {
                 .filter_map(|name| agents.iter().find(|(_, a)| a.name == *name))
                 .map(|(agent, _)| *agent)
                 .collect();
-            if called.is_empty() && unknown.is_empty() {
+            // A skill picked to run with one agent goes to it alone; the
+            // agents mentioned stay mentioned.
+            if let Some(agent) = skill.as_ref().and_then(|s| s.agent) {
+                if !agents.iter().any(|(id, _)| *id == agent) {
+                    return Err("That agent no longer exists. Pick another.".into());
+                }
+                called = vec![agent];
+            } else if called.is_empty() && unknown.is_empty() {
                 // A reply to nobody in particular goes to whoever answered
                 // last, unless someone is still at work.
                 called.extend(
@@ -1469,6 +1476,9 @@ impl Service {
                         .set_run_skill(run, &skill.name)
                         .map_err(|e| e.to_string())?;
                 }
+                db.store
+                    .set_run_request(run, id, model_override.as_deref())
+                    .map_err(|e| e.to_string())?;
                 self.publish_status(&mut db, thread, run, RunStatus::Queued);
                 state.scheduler.enqueue(Job {
                     run,
@@ -2711,6 +2721,8 @@ mod tests {
             runtime: crew_core::agent::Runtime::ClaudeCode,
             waiting_for: None,
             skill: None,
+            model_override: None,
+            message: None,
         }
     }
 

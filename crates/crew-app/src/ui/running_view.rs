@@ -1629,6 +1629,8 @@ mod tests {
             runtime: Runtime::ClaudeCode,
             waiting_for: None,
             skill: None,
+            model_override: None,
+            message: None,
         };
         let (a, b, c) = (run(30), run(20), run(20));
         let mut known = vec![a.clone(), b.clone()];

@@ -597,6 +597,7 @@ async fn a_claude_skill_run_starts_with_the_skill_and_the_override_model() {
         runtime: Runtime::ClaudeCode,
         name: "lint".into(),
         path: "/work/demo/.claude/skills/lint/SKILL.md".into(),
+        agent: None,
     };
     let run = post(&mut w, "@Ada the whole crate", Some(skill), Some("opus")).await;
     let seen = w.c.until_ended(run).await;
@@ -651,6 +652,7 @@ async fn a_codex_skill_run_sends_a_skill_input_and_the_override_model() {
         runtime: Runtime::Codex,
         name: "lint".into(),
         path: "/work/demo/.codex/skills/lint/SKILL.md".into(),
+        agent: None,
     };
     let run = post(&mut w, "@Cody everything", Some(skill), Some("gpt-big")).await;
     w.c.until_ended(run).await;
@@ -684,6 +686,7 @@ async fn a_skill_needs_an_agent_of_its_runtime() {
         runtime: Runtime::Codex,
         name: "lint".into(),
         path: "/s/SKILL.md".into(),
+        agent: None,
     };
     let wrong =
         w.c.call(Request::PostMessage {
@@ -785,4 +788,60 @@ async fn a_failed_codex_listing_is_tried_again() {
     // A good listing is kept.
     let _: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
     assert_eq!(args_log(&w.dir).matches("app-server").count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_picked_for_one_agent_runs_with_it_alone() {
+    let mut w = world(0).await;
+    let agents: Vec<StoredAgent> =
+        w.c.ok(Request::ListAgents {
+            include_deleted: false,
+        })
+        .await;
+    let ada = agents.iter().find(|a| a.spec.name == "Ada").unwrap().id;
+    let skill = SkillRef {
+        runtime: Runtime::ClaudeCode,
+        name: "review".into(),
+        path: "/s/SKILL.md".into(),
+        agent: Some(ada),
+    };
+    // Cody is on Codex and stays mentioned; the skill runs with Ada.
+    let asked: crew_core::ids::MessageId =
+        w.c.ok(Request::PostMessage {
+            thread: w.thread,
+            body: "@Cody the sync changes".into(),
+            skill: Some(skill),
+            model_override: Some("opus".into()),
+        })
+        .await;
+    let seen =
+        w.c.until(|m| {
+            matches!(
+                m,
+                ServerMsg::RunStatus {
+                    status: RunStatus::Queued,
+                    ..
+                }
+            )
+        })
+        .await;
+    let Some(ServerMsg::RunStatus { run, .. }) = seen.last() else {
+        unreachable!()
+    };
+    w.c.until_ended(*run).await;
+    let args = claude_args(&w.dir);
+    assert!(args.last().unwrap().starts_with("/review "), "{args:?}");
+    let runs: Vec<StoredRun> = w.c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs.len(), 1, "only Ada ran");
+    assert_eq!(runs[0].agent, ada);
+    assert_eq!(runs[0].skill.as_deref(), Some("review"));
+    assert_eq!(runs[0].model_override.as_deref(), Some("opus"));
+    assert_eq!(runs[0].message, Some(asked));
+
+    // A plain message keeps who asked and no override.
+    let run = post(&mut w, "@Ada hello", None, None).await;
+    w.c.until_ended(run).await;
+    let runs: Vec<StoredRun> = w.c.ok(Request::ListRuns { status: None }).await;
+    assert_eq!(runs[1].model_override, None);
+    assert!(runs[1].message.is_some());
 }
