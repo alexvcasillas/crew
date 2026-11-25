@@ -459,6 +459,7 @@ fn event_line(event: &Event) -> Option<String> {
             ToolKind::Other => with_target(name, target),
         }),
         Event::SessionStarted { model, .. } => Some(format!("started ({model})")),
+        Event::SkillsListed { .. } => None,
         Event::Thinking { .. } => Some("thinking…".into()),
         Event::Message { text } => Some(format!("says: {}", first_line(text))),
         Event::PermissionDenied {

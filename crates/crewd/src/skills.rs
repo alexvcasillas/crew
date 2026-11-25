@@ -6,7 +6,6 @@
 //! plugin manifest and enabled list. Never reads credentials, and never
 //! writes into a CLI's home.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -211,42 +210,14 @@ fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
         .unwrap_or_default()
 }
 
-/// Plugin ids (`name@marketplace`) that settings files switch on or off,
-/// later files over earlier ones. Only `enabledPlugins` is read.
-fn enabled_plugins(files: &[PathBuf]) -> HashSet<String> {
-    #[derive(Deserialize, Default)]
-    struct Settings {
-        #[serde(default, rename = "enabledPlugins")]
-        enabled: std::collections::BTreeMap<String, serde_json::Value>,
-    }
-    let mut on = HashSet::new();
-    for file in files {
-        let settings: Settings = read_json(file);
-        for (id, value) in settings.enabled {
-            if value == serde_json::Value::Bool(true) {
-                on.insert(id);
-            } else {
-                on.remove(&id);
-            }
-        }
-    }
-    on
-}
-
-/// The skills of the plugins Claude Code lists as installed and that
-/// settings enable. A plugin that isn't there or can't be read adds none.
-fn scan_plugins(claude_home: &Path, root: &Path) -> Vec<Found> {
+/// The skills of the plugins Claude Code lists as installed, from its
+/// plugin manifest and the plugins' own folders. Whether a plugin is
+/// enabled isn't known from disk; the service learns it from a run's init
+/// line. A plugin that isn't there or can't be read adds none.
+fn scan_plugins(claude_home: &Path) -> Vec<Found> {
     let installed: Installed = read_json(&claude_home.join("plugins/installed_plugins.json"));
-    let on = enabled_plugins(&[
-        claude_home.join("settings.json"),
-        root.join(".claude/settings.json"),
-        root.join(".claude/settings.local.json"),
-    ]);
     let mut found = Vec::new();
     for (id, installs) in &installed.plugins {
-        if !on.contains(id) {
-            continue;
-        }
         let name = id.split('@').next().unwrap_or(id);
         let Some(dir) = installs
             .iter()
@@ -275,7 +246,7 @@ pub fn scan_claude(claude_home: Option<&Path>, root: &Path) -> Vec<Found> {
                 found.push(skill);
             }
         }
-        found.extend(scan_plugins(home, root));
+        found.extend(scan_plugins(home));
     }
     found
 }
@@ -344,16 +315,17 @@ fn codex_found(answer: serde_json::Value) -> Vec<Found> {
     found
 }
 
-/// What a short-lived `codex app-server` lists for `root`. Empty if it
-/// fails or takes too long. Its process group is killed after.
-pub async fn scan_codex(bin: &Path, root: &Path, force_reload: bool) -> Vec<Found> {
+/// What a short-lived `codex app-server` lists for `root`. `None` if it
+/// fails or takes too long, so the caller can try again. Its process group
+/// is killed after.
+pub async fn scan_codex(bin: &Path, root: &Path, force_reload: bool) -> Option<Vec<Found>> {
     let mut cmd = Command::new(bin);
     cmd.arg("app-server").stderr(Stdio::null()).process_group(0);
     let (conn, _incoming) = match CodexConn::spawn(cmd) {
         Ok(spawned) => spawned,
         Err(e) => {
             log(format!("couldn't start `codex app-server`: {e}"));
-            return vec![];
+            return None;
         }
     };
     let pgid = conn.pid().map(|p| Pid::from_raw(p as i32));
@@ -370,17 +342,17 @@ pub async fn scan_codex(bin: &Path, root: &Path, force_reload: bool) -> Vec<Foun
     let listed = tokio::time::timeout(TIMEOUT, list).await;
     signal_group(pgid, Signal::SIGKILL);
     match listed {
-        Ok(Ok(answer)) => codex_found(answer),
+        Ok(Ok(answer)) => Some(codex_found(answer)),
         Ok(Err(e)) => {
             log(format!("couldn't list the Codex skills: {e}"));
-            vec![]
+            None
         }
         Err(_) => {
             log(format!(
                 "Codex didn't list its skills within {} s",
                 TIMEOUT.as_secs()
             ));
-            vec![]
+            None
         }
     }
 }
@@ -508,54 +480,59 @@ mod tests {
     }
 
     #[test]
-    fn only_enabled_installed_plugins_add_skills() {
+    fn installed_plugins_come_from_the_manifest_and_settings_are_never_read() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let root = tmp.path().join("repo");
         let on = tmp.path().join("plugins/on");
-        let off = tmp.path().join("plugins/off");
         skill(
             &on,
             "brainstorm",
             "---\nname: brainstorm\ndescription: Ideas\n---\n",
         );
         write(&on.join("commands/go.md"), "---\ndescription: Go\n---\n");
-        skill(&off, "hidden", "---\nname: hidden\n---\n");
         write(
             &home.join("plugins/installed_plugins.json"),
             &json!({"version": 2, "plugins": {
                 "tools@market": [{"scope": "user", "installPath": on}],
-                "other@market": [{"scope": "user", "installPath": off}],
                 "gone@market": [{"scope": "user", "installPath": "/work/missing"}],
             }})
             .to_string(),
         );
-        write(
-            &home.join("settings.json"),
-            &json!({"enabledPlugins": {
-                "tools@market": true, "other@market": false, "gone@market": true
-            }, "apiKeyHelper": "never read"})
-            .to_string(),
-        );
-        let found = scan_claude(Some(&home), &root);
-        let got: Vec<(&str, SkillSource)> = found
-            .iter()
-            .map(|f| (f.name.as_str(), f.source.clone()))
-            .collect();
+        let list = |home: &Path| -> Vec<(String, SkillSource)> {
+            scan_claude(Some(home), &root)
+                .into_iter()
+                .map(|f| (f.name, f.source))
+                .collect()
+        };
+        let before = list(&home);
         let plugin = SkillSource::Plugin("tools".into());
         assert_eq!(
-            got,
+            before,
             [
-                ("tools:brainstorm", plugin.clone()),
-                ("tools:go", plugin.clone())
+                ("tools:brainstorm".to_string(), plugin.clone()),
+                ("tools:go".to_string(), plugin)
             ]
         );
-        // A project's settings can enable one too, or switch it off again.
+        // Settings files, with garbage or with plugins switched off, change
+        // nothing: they are not read.
+        write(
+            &home.join("settings.json"),
+            "{{ not json \u{0} token=secret",
+        );
+        write(
+            &home.join("settings.local.json"),
+            &json!({"enabledPlugins": {"tools@market": false}}).to_string(),
+        );
+        write(
+            &root.join(".claude/settings.json"),
+            &json!({"enabledPlugins": {"tools@market": false}}).to_string(),
+        );
         write(
             &root.join(".claude/settings.local.json"),
             &json!({"enabledPlugins": {"tools@market": false}}).to_string(),
         );
-        assert!(scan_claude(Some(&home), &root).is_empty());
+        assert_eq!(list(&home), before);
     }
 
     #[test]

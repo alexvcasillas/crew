@@ -259,11 +259,22 @@ pub fn parse_line(line: &str) -> Vec<Event> {
     };
     match str_at(&v, "type") {
         "system" => match str_at(&v, "subtype") {
-            "init" => vec![Event::SessionStarted {
-                session_id: str_at(&v, "session_id").to_string(),
-                model: str_at(&v, "model").to_string(),
-                cwd: str_at(&v, "cwd").to_string(),
-            }],
+            "init" => {
+                let mut events = vec![Event::SessionStarted {
+                    session_id: str_at(&v, "session_id").to_string(),
+                    model: str_at(&v, "model").to_string(),
+                    cwd: str_at(&v, "cwd").to_string(),
+                }];
+                if let Some(skills) = v.get("skills").and_then(Value::as_array) {
+                    events.push(Event::SkillsListed {
+                        skills: skills
+                            .iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect(),
+                    });
+                }
+                events
+            }
             "hook_started" | "hook_response" | "thinking_tokens" | "commands_changed" => vec![],
             "permission_denied" if !str_at(&v, "tool_name").is_empty() => {
                 vec![Event::PermissionDenied {

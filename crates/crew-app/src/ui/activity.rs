@@ -146,6 +146,7 @@ fn rows_of(events: &[LoggedEvent], run: RunId) -> Vec<ActivityRow> {
     for logged in events.iter().filter(|e| e.run == run) {
         match &logged.event {
             Event::SessionStarted { cwd: dir, .. } => cwd = dir.clone(),
+            Event::SkillsListed { .. } => {}
             // Empty thinking says nothing.
             Event::Thinking { text } if text.trim().is_empty() => {}
             Event::Thinking { text } => rows.push(ActivityRow::Thinking(text.clone())),

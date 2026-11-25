@@ -709,3 +709,74 @@ async fn a_skill_needs_an_agent_of_its_runtime() {
     let runs: Vec<StoredRun> = w.c.ok(Request::ListRuns { status: None }).await;
     assert!(runs.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_skills_a_run_did_not_list_are_filtered_out() {
+    let mut w = world(1).await;
+    let plugin = w.dir.join("plugins-src/tools");
+    write(
+        &plugin.join("skills/go/SKILL.md"),
+        "---\nname: go\ndescription: Goes\n---\n",
+    );
+    write(
+        &plugin.join("skills/stop/SKILL.md"),
+        "---\nname: stop\n---\n",
+    );
+    write(
+        &w.claude_home.join("plugins/installed_plugins.json"),
+        &json!({"version": 2, "plugins": {"tools@market": [{"installPath": plugin}]}}).to_string(),
+    );
+    // Settings are never read, whatever they hold.
+    write(&w.claude_home.join("settings.json"), "{{ garbage \u{0}");
+    write(
+        &w.claude_home.join("skills/unslop/SKILL.md"),
+        "---\nname: unslop\n---\n",
+    );
+    let ask = |project| Request::Skills {
+        project,
+        force_reload: false,
+    };
+    let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
+    let got: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(got, ["unslop", "tools:go", "tools:stop"]);
+
+    // The fake claude's init line lists `lint` only. Once a run has said
+    // so, plugin skills it left out are hidden; the others stay.
+    let run = post(&mut w, "@Ada hi", None, None).await;
+    w.c.until_ended(run).await;
+    let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
+    let got: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(got, ["unslop"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_codex_listing_is_tried_again() {
+    let mut w = world(0).await;
+    write(
+        &w.claude_home.join("skills/unslop/SKILL.md"),
+        "---\nname: unslop\n---\n",
+    );
+    // The first app-server dies before it answers.
+    scenario(&w.dir, 1, vec![json!({"exit": 1})]);
+    let ask = |project| Request::Skills {
+        project,
+        force_reload: false,
+    };
+    let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
+    assert_eq!(names(&list).len(), 1);
+    scenario(
+        &w.dir,
+        2,
+        codex_list_steps(json!([
+            {"name": "review", "description": "", "path": "/s/review/SKILL.md",
+             "enabled": true, "scope": "user"}
+        ])),
+    );
+    // No reload asked: the failure wasn't kept.
+    let list: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
+    assert_eq!(names(&list).len(), 2);
+    assert!(list.iter().any(|s| s.runtime == Runtime::Codex));
+    // A good listing is kept.
+    let _: Vec<SkillInfo> = w.c.ok(ask(w.project)).await;
+    assert_eq!(args_log(&w.dir).matches("app-server").count(), 2);
+}

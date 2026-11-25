@@ -66,6 +66,11 @@ pub enum Event {
         model: String,
         cwd: String,
     },
+    /// The skills Claude Code says it has, from its init line. Only sent
+    /// when the line lists them.
+    SkillsListed {
+        skills: Vec<String>,
+    },
     Message {
         text: String,
     },

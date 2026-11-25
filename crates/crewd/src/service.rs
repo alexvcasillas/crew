@@ -25,7 +25,9 @@ use crew_core::store::{
     ThreadWorktree,
 };
 use crew_core::worktree;
-use crew_proto::{Limits, PermissionAnswer, Request, ServerMsg, SkillInfo, SkillRef, skill_key};
+use crew_proto::{
+    Limits, PermissionAnswer, Request, ServerMsg, SkillInfo, SkillRef, SkillSource, skill_key,
+};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -82,6 +84,14 @@ impl Db {
     pub(crate) fn serial(&self) -> u64 {
         self.serial
     }
+}
+
+/// Skills found in a project. `codex` is `None` when its listing failed
+/// and is to be tried again.
+#[derive(Clone)]
+struct SkillCache {
+    claude: Vec<crate::skills::Found>,
+    codex: Option<Vec<crate::skills::Found>>,
 }
 
 /// What a queued run needs besides its job.
@@ -157,7 +167,9 @@ struct Inner {
     /// Claude Code's home, where its skills and plugins are looked for.
     claude_home: OnceLock<PathBuf>,
     /// Skills found per project, until a reload.
-    skills: Mutex<HashMap<ProjectId, Vec<crate::skills::Found>>>,
+    skills: Mutex<HashMap<ProjectId, SkillCache>>,
+    /// The skills a Claude Code run's init line listed, by project.
+    claude_listed: Mutex<HashMap<ProjectId, std::collections::HashSet<String>>>,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -259,6 +271,7 @@ impl Service {
             files: Mutex::new(FileIndex::default()),
             claude_home: OnceLock::new(),
             skills: Mutex::new(HashMap::new()),
+            claude_listed: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -838,45 +851,64 @@ impl Service {
 
     /// The skills of both CLIs in the project. Found once and kept until
     /// `force_reload`. Codex ones are left out if it isn't installed or
-    /// signed in.
+    /// signed in. A Codex listing that failed or timed out isn't kept, so
+    /// the next request tries it again. Plugin skills of Claude Code that
+    /// a run's init line didn't list are left out, once a run has told.
     async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
         let cached = (!force_reload)
             .then(|| self.0.skills.lock().unwrap().get(&project).cloned())
             .flatten();
-        let found = match cached {
-            Some(found) => found,
+        let root = {
+            let db = self.db();
+            db.store.project(project).map_err(|e| e.to_string())?.root
+        };
+        let claude = match &cached {
+            Some(cached) => cached.claude.clone(),
             None => {
-                let root = {
-                    let db = self.db();
-                    db.store.project(project).map_err(|e| e.to_string())?.root
-                };
                 let home = self.0.claude_home.get().cloned();
                 let scan_root = root.clone();
-                let mut found = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     crate::skills::scan_claude(home.as_deref(), &scan_root)
                 })
                 .await
-                .map_err(|e| e.to_string())?;
-                let codex = crate::runtimes::codex_bin(&self.0.bins);
-                let usable = match crate::runtimes::find_bin(&codex) {
-                    Some(path) => {
-                        matches!(
-                            crate::runtimes::codex_signed_in(&path).await,
-                            Ok(Some(true))
-                        )
-                    }
-                    None => false,
-                };
-                if usable {
-                    found.extend(crate::skills::scan_codex(&codex, &root, force_reload).await);
-                }
-                self.0.skills.lock().unwrap().insert(project, found.clone());
-                found
+                .map_err(|e| e.to_string())?
             }
         };
+        let codex = match cached.and_then(|c| c.codex) {
+            Some(codex) => Some(codex),
+            None => {
+                let bin = crate::runtimes::codex_bin(&self.0.bins);
+                match crate::runtimes::find_bin(&bin) {
+                    // Not installed: a definitive answer.
+                    None => Some(vec![]),
+                    Some(path) => match crate::runtimes::codex_signed_in(&path).await {
+                        Ok(Some(true)) => {
+                            crate::skills::scan_codex(&bin, &root, force_reload).await
+                        }
+                        // Signed out: a definitive answer.
+                        Ok(Some(false)) => Some(vec![]),
+                        // Couldn't tell: try again next time.
+                        _ => None,
+                    },
+                }
+            }
+        };
+        self.0.skills.lock().unwrap().insert(
+            project,
+            SkillCache {
+                claude: claude.clone(),
+                codex: codex.clone(),
+            },
+        );
+        let listed = self.0.claude_listed.lock().unwrap().get(&project).cloned();
         let db = self.db();
-        let list: Vec<SkillInfo> = found
+        let list: Vec<SkillInfo> = claude
             .iter()
+            .filter(|f| match (&f.source, &listed) {
+                (SkillSource::Plugin(_), Some(listed)) => listed.contains(&f.name),
+                _ => true,
+            })
+            .chain(codex.iter().flatten())
             .map(|f| {
                 let key = skill_key(&f.runtime, &f.source, &f.name);
                 f.info(db.store.skill_shown(&key).unwrap_or(true))
@@ -2254,6 +2286,16 @@ impl Service {
                     answered = *ok;
                 }
                 Event::Message { text } => texts.push(text.clone()),
+                Event::SkillsListed { skills } => {
+                    let project = self.db().store.project_of_thread(thread).map(|p| p.id);
+                    if let Ok(project) = project {
+                        self.0
+                            .claude_listed
+                            .lock()
+                            .unwrap()
+                            .insert(project, skills.iter().cloned().collect());
+                    }
+                }
                 Event::SessionStarted {
                     session_id,
                     model: started,
