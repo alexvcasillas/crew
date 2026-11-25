@@ -283,6 +283,7 @@ fn the_tab_is_complete_after_leaving_the_thread_and_coming_back(cx: &mut TestApp
     let other: crew_core::ids::ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "second thread".into(),
+        first_line: false,
     });
     let (window, ws) = open_thread(cx, home.path(), &w);
     w.post("@Forge go");

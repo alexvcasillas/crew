@@ -190,6 +190,7 @@ fn setup(client: &ClientHandle, root: &Path) -> ThreadId {
         Request::CreateThread {
             channel,
             title: "read the file".into(),
+            first_line: false,
         },
     )
 }

@@ -63,11 +63,13 @@ pub struct SkillsPage {
     _events: [Subscription; 2],
 }
 
-/// One skill as the page lists it.
+/// One row of the page: a skill, or a plugin with all its skills.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillRow {
     pub runtime: Runtime,
     pub source: SkillSource,
+    /// The skill shown: a plugin's first one, or its first that matches
+    /// the search.
     pub name: String,
     pub description: String,
     /// A Claude Code command rather than a skill.
@@ -76,12 +78,18 @@ pub struct SkillRow {
     pub chip: Option<String>,
     /// Where the file is, or which plugin it comes with.
     pub place: String,
+    /// On while every skill of the row shows in the "/" menu.
     pub shown: bool,
+    /// The row's skills by name: one, or each of a plugin's.
+    pub skills: Vec<String>,
+    /// The project whose own skills the page lists.
+    pub project: ProjectId,
 }
 
 impl SkillRow {
+    /// The key of the skill shown, which names the row.
     pub fn key(&self) -> String {
-        skill_key(&self.runtime, &self.source, &self.name)
+        skill_key(&self.runtime, &self.source, &self.name, self.project)
     }
 }
 
@@ -96,19 +104,25 @@ pub struct Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeGroup {
     pub runtime: Runtime,
-    /// All the runtime's skills, before the search.
+    /// Its rows before the search: one per skill, and one per plugin.
     pub found: usize,
     pub sections: Vec<Section>,
 }
 
-/// What the page lists for `list`, crewd's answer for the project named
-/// `project` at `root`: one group per runtime that `filter` keeps and that
-/// has skills matching `query` (by name or description, ignoring case),
-/// sections in the order This project, Global, Plugins.
+/// The project whose skills the page lists.
+pub struct Listed<'a> {
+    pub id: ProjectId,
+    pub name: &'a str,
+    pub root: &'a Path,
+}
+
+/// What the page lists for `list`, crewd's answer for `project`: one
+/// group per runtime that `filter` keeps and that has skills matching
+/// `query` (by name or description, ignoring case), sections in the order
+/// This project, Global, Plugins. A plugin is one row.
 pub fn groups(
     list: &[SkillInfo],
-    project: &str,
-    root: &Path,
+    project: &Listed,
     filter: RuntimeFilter,
     query: &str,
 ) -> Vec<RuntimeGroup> {
@@ -123,32 +137,62 @@ pub fn groups(
         .filter(|runtime| filter.keeps(runtime))
         .filter_map(|runtime| {
             let mine: Vec<&SkillInfo> = list.iter().filter(|s| s.runtime == runtime).collect();
-            let row = |s: &SkillInfo| SkillRow {
-                runtime: s.runtime.clone(),
-                source: s.source.clone(),
-                name: s.name.clone(),
-                description: s.description.clone(),
-                command: is_command(s),
-                chip: match &s.source {
-                    SkillSource::Plugin(plugin) => Some(plugin.clone()),
-                    _ => list
-                        .iter()
-                        .any(|o| o.runtime != s.runtime && o.name == s.name)
-                        .then(|| format!("also in {}", other_name(&s.runtime))),
-                },
-                place: place(s, &mine, project, root),
-                shown: s.shown,
+            // Each row's skills, in the order crewd listed them.
+            let mut rows: Vec<Vec<&SkillInfo>> = Vec::new();
+            for s in &mine {
+                let plugin_row = match &s.source {
+                    SkillSource::Plugin(_) => rows.iter_mut().find(|r| r[0].source == s.source),
+                    _ => None,
+                };
+                match plugin_row {
+                    Some(row) => row.push(s),
+                    None => rows.push(vec![s]),
+                }
+            }
+            let found = rows.len();
+            let row = |skills: &[&SkillInfo]| -> Option<SkillRow> {
+                let shown_skill = skills.iter().find(|s| matches(s))?;
+                let first = skills[0];
+                let s = if query.is_empty() { first } else { shown_skill };
+                let (chip, place_line) = match &s.source {
+                    SkillSource::Plugin(plugin) => {
+                        let n = skills.len();
+                        let word = if n == 1 { "skill" } else { "skills" };
+                        (
+                            Some(plugin.clone()),
+                            format!("plugin {plugin} · {n} {word}"),
+                        )
+                    }
+                    _ => (
+                        list.iter()
+                            .any(|o| o.runtime != s.runtime && o.name == s.name)
+                            .then(|| format!("also in {}", other_name(&s.runtime))),
+                        place(s, project.name, project.root),
+                    ),
+                };
+                Some(SkillRow {
+                    runtime: s.runtime.clone(),
+                    source: s.source.clone(),
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    command: is_command(s),
+                    chip,
+                    place: place_line,
+                    shown: skills.iter().all(|s| s.shown),
+                    skills: skills.iter().map(|s| s.name.clone()).collect(),
+                    project: project.id,
+                })
             };
             let section = |title: String, of: &dyn Fn(&SkillSource) -> bool| Section {
                 title,
-                rows: mine
+                rows: rows
                     .iter()
-                    .filter(|s| of(&s.source) && matches(s))
-                    .map(|s| row(s))
+                    .filter(|r| of(&r[0].source))
+                    .filter_map(|r| row(r))
                     .collect(),
             };
             let sections: Vec<Section> = [
-                section(format!("This project · {project}"), &|s| {
+                section(format!("This project · {}", project.name), &|s| {
                     *s == SkillSource::Project
                 }),
                 section("Global".into(), &|s| *s == SkillSource::Global),
@@ -159,7 +203,7 @@ pub fn groups(
             .collect();
             (!sections.is_empty()).then_some(RuntimeGroup {
                 runtime,
-                found: mine.len(),
+                found,
                 sections,
             })
         })
@@ -184,20 +228,12 @@ fn is_command(s: &SkillInfo) -> bool {
 }
 
 /// The line under a skill: `curl-runner/.claude/skills/bench/SKILL.md`
-/// for a project's, `~/.claude/skills/…` for a global one, and
-/// `plugin docs · 4 skills` for a plugin's.
-fn place(s: &SkillInfo, same_runtime: &[&SkillInfo], project: &str, root: &Path) -> String {
+/// for a project's and `~/.claude/skills/…` for a global one.
+fn place(s: &SkillInfo, project: &str, root: &Path) -> String {
     let path = Path::new(&s.path);
-    match &s.source {
-        SkillSource::Plugin(plugin) => {
-            let n = same_runtime.iter().filter(|o| o.source == s.source).count();
-            let skills = if n == 1 { "skill" } else { "skills" };
-            format!("plugin {plugin} · {n} {skills}")
-        }
-        _ => match path.strip_prefix(root) {
-            Ok(rest) => format!("{project}/{}", rest.display()),
-            Err(_) => crate::ui::title_bar::home_relative(path),
-        },
+    match path.strip_prefix(root) {
+        Ok(rest) => format!("{project}/{}", rest.display()),
+        Err(_) => crate::ui::title_bar::home_relative(path),
     }
 }
 
@@ -304,9 +340,9 @@ impl Workspace {
         }
     }
 
-    /// Shows or hides a skill in the "/" menu. Every list it is in
-    /// changes at once, so open menus follow; crewd's refusal puts it
-    /// back.
+    /// Shows or hides the row's skills in the "/" menu: one skill, or
+    /// every skill of a plugin. The lists they are in change at once, so
+    /// open menus follow; crewd's refusal puts them back.
     pub(crate) fn set_skill_shown(
         &mut self,
         row: &SkillRow,
@@ -314,20 +350,42 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = row.key();
-        self.mark_skill_shown(&key, shown);
-        let answer = self.client.request(Request::SetSkillShown {
-            runtime: row.runtime.clone(),
-            source: row.source.clone(),
-            name: row.name.clone(),
-            shown,
-        });
+        let project = row.project;
+        let keys: Vec<String> = row
+            .skills
+            .iter()
+            .map(|name| skill_key(&row.runtime, &row.source, name, project))
+            .collect();
+        for key in &keys {
+            self.skills.mark_shown(project, key, shown);
+        }
+        let answers: Vec<_> = row
+            .skills
+            .iter()
+            .map(|name| {
+                self.client.request(Request::SetSkillShown {
+                    runtime: row.runtime.clone(),
+                    source: row.source.clone(),
+                    name: name.clone(),
+                    shown,
+                    project: Some(project),
+                })
+            })
+            .collect();
         self.spawn_request(window, cx, async move |this, cx| {
-            let Err(error) = answer.await else {
+            let mut failed = None;
+            for answer in answers {
+                if let Err(error) = answer.await {
+                    failed.get_or_insert(error);
+                }
+            }
+            let Some(error) = failed else {
                 return Ok(());
             };
             this.update(cx, |this, cx| {
-                this.mark_skill_shown(&key, !shown);
+                for key in &keys {
+                    this.skills.mark_shown(project, key, !shown);
+                }
                 this.sync(cx);
                 cx.notify();
             })
@@ -336,12 +394,6 @@ impl Workspace {
         });
         self.sync(cx);
         cx.notify();
-    }
-
-    /// Sets `shown` on the skill with `key` in every project's list, and
-    /// gives each list that changed a new version.
-    fn mark_skill_shown(&mut self, key: &str, shown: bool) {
-        self.skills.mark_shown(key, shown);
     }
 
     pub(super) fn render_skills_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -354,8 +406,11 @@ impl Workspace {
         let groups = match (project, listed) {
             (Some(project), Some(listed)) => groups(
                 &listed.list,
-                &project.name,
-                &project.root,
+                &Listed {
+                    id: project.id,
+                    name: &project.name,
+                    root: &project.root,
+                },
                 page.runtime,
                 &query,
             ),
@@ -650,7 +705,17 @@ mod tests {
     use crew_core::agent::Runtime;
     use crew_proto::{SkillInfo, SkillSource};
 
-    use super::{RuntimeFilter, groups};
+    use crew_core::ids::ProjectId;
+
+    use super::{Listed, RuntimeFilter, groups};
+
+    fn demo(id: ProjectId) -> Listed<'static> {
+        Listed {
+            id,
+            name: "demo",
+            root: Path::new("/work/demo"),
+        }
+    }
 
     fn skill(runtime: Runtime, name: &str, source: SkillSource, path: &str) -> SkillInfo {
         SkillInfo {
@@ -713,18 +778,13 @@ mod tests {
 
     #[test]
     fn skills_group_by_runtime_then_source_with_their_places() {
-        let all = groups(
-            &list(),
-            "demo",
-            Path::new("/work/demo"),
-            RuntimeFilter::All,
-            "",
-        );
+        let id = ProjectId::new();
+        let all = groups(&list(), &demo(id), RuntimeFilter::All, "");
         assert_eq!(all.len(), 2);
         let claude = &all[0];
         assert_eq!(
             (claude.runtime.clone(), claude.found),
-            (Runtime::ClaudeCode, 6)
+            (Runtime::ClaudeCode, 5)
         );
         let titles: Vec<&str> = claude.sections.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, ["This project · demo", "Global", "Plugins"]);
@@ -739,9 +799,19 @@ mod tests {
         assert_eq!(global[0].chip.as_deref(), Some("also in Codex"));
         assert!(!global[1].shown);
 
+        // A plugin is one row: its first skill, all its skills under it.
         let plugins = &claude.sections[2].rows;
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "docs:write");
         assert_eq!(plugins[0].place, "plugin docs · 2 skills");
         assert_eq!(plugins[0].chip.as_deref(), Some("docs"));
+        assert_eq!(plugins[0].skills, ["docs:write", "docs:check"]);
+        assert_eq!(
+            project[0].key(),
+            format!("claude_code:project:{id}:bench"),
+            "a project skill's key names its project"
+        );
+        assert_eq!(global[0].key(), "claude_code:global:unslop");
 
         let codex = &all[1];
         assert_eq!(codex.found, 1);
@@ -754,20 +824,24 @@ mod tests {
 
     #[test]
     fn the_runtime_and_search_narrow_the_list() {
-        let root = Path::new("/work/demo");
-        let codex = groups(&list(), "demo", root, RuntimeFilter::Codex, "");
+        let p = demo(ProjectId::new());
+        let codex = groups(&list(), &p, RuntimeFilter::Codex, "");
         assert_eq!(codex.len(), 1);
         assert_eq!(codex[0].runtime, Runtime::Codex);
 
-        let found = groups(&list(), "demo", root, RuntimeFilter::All, "BENCH");
+        let found = groups(&list(), &p, RuntimeFilter::All, "BENCH");
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].found, 6, "the count is of all found");
+        assert_eq!(found[0].found, 5, "the count is of all rows");
         assert_eq!(found[0].sections.len(), 1);
         assert_eq!(found[0].sections[0].rows[0].name, "bench");
 
-        let by_description = groups(&list(), "demo", root, RuntimeFilter::Claude, "write things");
+        let by_description = groups(&list(), &p, RuntimeFilter::Claude, "write things");
         assert_eq!(by_description[0].sections[0].rows[0].name, "docs:write");
+        // A search that finds a plugin's later skill shows that one.
+        let later = groups(&list(), &p, RuntimeFilter::Claude, "check");
+        assert_eq!(later[0].sections[0].rows[0].name, "docs:check");
+        assert_eq!(later[0].sections[0].rows[0].place, "plugin docs · 2 skills");
 
-        assert!(groups(&list(), "demo", root, RuntimeFilter::All, "zzz").is_empty());
+        assert!(groups(&list(), &p, RuntimeFilter::All, "zzz").is_empty());
     }
 }

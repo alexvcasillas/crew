@@ -950,11 +950,26 @@ impl Store {
             .collect())
     }
 
+    /// A thread titled with the first line of its first message, which a
+    /// generated title may replace.
     pub fn create_thread(&self, c: ChannelId, title: &str) -> Result<ThreadId> {
+        self.create_thread_titled(c, title, false)
+    }
+
+    /// A thread with a title you chose when `chosen`, which nothing
+    /// replaces; else as [`Store::create_thread`].
+    pub fn create_thread_titled(
+        &self,
+        c: ChannelId,
+        title: &str,
+        chosen: bool,
+    ) -> Result<ThreadId> {
         let id = ThreadId::new();
+        let source = if chosen { "user" } else { "first_line" };
         self.conn.execute(
-            "INSERT INTO threads (id, channel_id, title, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), c.to_string(), title, now_ms()],
+            "INSERT INTO threads (id, channel_id, title, created_at, title_source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), c.to_string(), title, now_ms(), source],
         )?;
         Ok(id)
     }

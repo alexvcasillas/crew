@@ -75,6 +75,7 @@ impl Setup {
             Request::CreateThread {
                 channel,
                 title: "a thread".into(),
+                first_line: false,
             },
         );
         Setup {

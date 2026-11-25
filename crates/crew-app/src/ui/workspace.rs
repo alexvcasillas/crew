@@ -1173,7 +1173,11 @@ impl Workspace {
                 };
                 self.spawn_request(window, cx, async move |this, cx| {
                     let made = client
-                        .request(Request::CreateThread { channel, title })
+                        .request(Request::CreateThread {
+                            channel,
+                            title,
+                            first_line: true,
+                        })
                         .await
                         .and_then(|v| {
                             serde_json::from_value::<ThreadId>(v).map_err(|e| e.to_string())
@@ -1945,6 +1949,7 @@ mod gpui_tests {
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel: gone_channel,
             title: "fix the login".into(),
+            first_line: false,
         }))
         .unwrap();
 
@@ -2015,6 +2020,7 @@ mod gpui_tests {
         let thread: ThreadId = serde_json::from_value(ask(Request::CreateThread {
             channel,
             title: "fix the login".into(),
+            first_line: false,
         }))
         .unwrap();
 

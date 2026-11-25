@@ -202,9 +202,13 @@ pub struct State {
     /// but not yet reported back.
     titles: TitleSettings,
     sent_titles: Option<TitleSettings>,
-    /// When a generated title replaced each thread's first line.
-    titles_landed: HashMap<ThreadId, std::time::Instant>,
+    /// When a generated title replaced each thread's first line, and that
+    /// first line, for the cross-fade.
+    titles_landed: HashMap<ThreadId, (std::time::Instant, String)>,
 }
+
+/// How long a generated title counts as just in.
+const TITLE_LANDING: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A handoff policy and budget, `None` for "fall back".
 pub type Handoff = (Option<HandoffPolicy>, Option<u32>);
@@ -279,13 +283,18 @@ impl State {
                 self.channels.insert(channel.id, channel);
             }
             ServerMsg::ThreadCreated { thread, .. } | ServerMsg::ThreadChanged { thread } => {
-                let was_generating = self
+                let first_line = self
                     .threads
                     .get(&thread.id)
-                    .is_some_and(|t| t.title_source == TitleSource::Generating);
-                if was_generating && thread.title_source == TitleSource::Generated {
+                    .filter(|t| t.title_source == TitleSource::Generating)
+                    .map(|t| t.title.clone());
+                if let Some(first_line) = first_line
+                    && thread.title_source == TitleSource::Generated
+                {
                     self.titles_landed
-                        .insert(thread.id, std::time::Instant::now());
+                        .retain(|_, (at, _)| at.elapsed() < TITLE_LANDING);
+                    self.titles_landed
+                        .insert(thread.id, (std::time::Instant::now(), first_line));
                 }
                 let reported = (thread.handoff_policy, thread.handoff_budget);
                 if self.sent_thread_handoffs.get(&thread.id) == Some(&reported) {
@@ -602,12 +611,13 @@ impl State {
         self.sent_titles.unwrap_or(self.titles)
     }
 
-    /// Whether the thread's generated title came in the last second, so it
-    /// fades in.
-    pub fn title_just_landed(&self, thread: ThreadId) -> bool {
+    /// The first line a generated title replaced in the last second, so
+    /// the two cross-fade.
+    pub fn title_replaced(&self, thread: ThreadId) -> Option<&str> {
         self.titles_landed
             .get(&thread)
-            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+            .filter(|(at, _)| at.elapsed() < TITLE_LANDING)
+            .map(|(_, first_line)| first_line.as_str())
     }
 
     /// Notes title settings just sent to crewd.

@@ -312,6 +312,7 @@ async fn setup(d: &Daemon, c: &mut Client, forge_minutes: u32) -> Chat {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();

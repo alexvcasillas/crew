@@ -51,6 +51,7 @@ fn shop(w: &World, root: &Path) -> Shop {
     let thread: ThreadId = w.ask(Request::CreateThread {
         channel,
         title: "add search".into(),
+        first_line: false,
     });
     Shop { project, thread }
 }

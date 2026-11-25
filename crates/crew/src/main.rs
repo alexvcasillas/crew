@@ -392,6 +392,7 @@ async fn init_demo(c: &mut Client) -> Result<()> {
         .ask(Request::CreateThread {
             channel,
             title: "Demo".into(),
+            first_line: false,
         })
         .await?;
     println!("{thread}");

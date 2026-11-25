@@ -560,6 +560,7 @@ fn start_a_thread_opens_the_composer_in_its_last_channel(cx: &mut TestAppContext
     let there: ThreadId = w.ask(Request::CreateThread {
         channel: bugs,
         title: "in bugs".into(),
+        first_line: false,
     });
     let (window, ws) = open_tall(cx, home.path());
     let _: crew_core::ids::MessageId = w.ask(Request::PostMessage {
@@ -606,6 +607,7 @@ fn a_deleted_agent_and_a_removed_project_say_removed(cx: &mut TestAppContext) {
     let second: ThreadId = w.ask(Request::CreateThread {
         channel: other_general,
         title: "Second".into(),
+        first_line: false,
     });
     let (window, ws) = open_tall(cx, home.path());
     w.post("@Forge fix it");
@@ -669,6 +671,7 @@ fn a_thread_with_a_worktree_opens_it_in_terminal(cx: &mut TestAppContext) {
     let bare: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "no worktree".into(),
+        first_line: false,
     });
     let (window, ws) = open_tall(cx, home.path());
     w.post("@Forge fix it");

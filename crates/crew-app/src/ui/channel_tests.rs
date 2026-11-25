@@ -108,6 +108,7 @@ fn cards_show_title_status_counts_and_branch(cx: &mut TestAppContext) {
     let quiet: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "plan the release".into(),
+        first_line: false,
     });
     let (window, ws) = open(cx, home.path());
     w.post("@Forge fix it");
@@ -271,6 +272,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
     let old: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "old notes".into(),
+        first_line: false,
     });
     let (channel, quiet, forge, scout) = (w.channel, w.thread, w.agents[0], w.agents[1]);
     drop(w);
@@ -295,6 +297,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::CreateThread {
             channel,
             title: "write the docs".into(),
+            first_line: false,
         },
     );
     let needs: ThreadId = ask(
@@ -302,6 +305,7 @@ fn busy(cx: &mut TestAppContext) -> (Busy, AnyWindowHandle, Entity<Workspace>) {
         Request::CreateThread {
             channel,
             title: "bump the deps".into(),
+            first_line: false,
         },
     );
     // Tall enough to show every section.
@@ -460,6 +464,7 @@ fn sort_by_created_puts_the_newest_thread_first(cx: &mut TestAppContext) {
         Request::CreateThread {
             channel: b.channel,
             title: "add search".into(),
+            first_line: false,
         },
     );
     // Something happens in the older one, a moment later so the times

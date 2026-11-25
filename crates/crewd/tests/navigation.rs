@@ -231,6 +231,7 @@ impl Client {
         self.ok(Request::CreateThread {
             channel,
             title: title.into(),
+            first_line: false,
         })
         .await
     }
@@ -830,6 +831,7 @@ async fn removing_a_project_drops_its_queue_and_keeps_its_files() {
         Request::CreateThread {
             channel: general,
             title: "New".into(),
+            first_line: false,
         },
         Request::CreateChannel {
             project: p,

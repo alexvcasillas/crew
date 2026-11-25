@@ -86,7 +86,7 @@ fn codex_script(dir: &Path) -> PathBuf {
              case \"$1\" in\n\
              login) exit 0 ;;\n\
              app-server) exec python3 '{fake}' '{d}/scenario.json' ;;\n\
-             exec) printf '%s\\n' \"$@\" > '{d}/codex-args.log'; echo 'Codex named it' ;;\n\
+             --ask-for-approval) printf '%s\\n' \"$@\" > '{d}/codex-args.log'; echo 'Codex named it' ;;\n\
              *) exit 2 ;;\n\
              esac\n",
             fake = fake_app_server().display(),
@@ -298,6 +298,7 @@ impl World {
             .ok(Request::CreateThread {
                 channel,
                 title: FIRST.into(),
+                first_line: true,
             })
             .await;
         World {
@@ -410,6 +411,7 @@ async fn a_generated_title_replaces_the_first_line_and_is_never_a_run() {
     assert_eq!(args[at("--output-format") + 1], "json");
     at("--disable-slash-commands");
     at("--strict-mcp-config");
+    assert_eq!(args[at("--settings") + 1], r#"{"disableAllHooks":true}"#);
     let dashes = at("--");
     assert!(
         args[dashes + 1..].join("\n").contains(FIRST),
@@ -523,7 +525,7 @@ async fn without_claude_signed_in_codex_names_the_thread_on_its_cheapest_model()
         .lines()
         .map(String::from)
         .collect();
-    assert_eq!(args[0], "exec");
+    assert_eq!(args[..3], ["--ask-for-approval", "never", "exec"]);
     let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
     assert_eq!(args[at("--model") + 1], "gpt-luna-mini");
     assert_eq!(args[at("--sandbox") + 1], "read-only");
@@ -575,6 +577,7 @@ async fn the_settings_pick_the_model_or_keep_first_lines() {
         .ok(Request::CreateThread {
             channel,
             title: "keep this line".into(),
+            first_line: true,
         })
         .await;
     w.thread = thread;
@@ -610,4 +613,30 @@ async fn the_branch_keeps_the_first_line_once_a_title_is_generated() {
     let slug = crew_core::slug::slugify(FIRST, &|_| false);
     assert_eq!(branch, format!("crew/{slug}"));
     assert_eq!(w.stored().await.title, "Flaky runner");
+}
+
+#[tokio::test]
+async fn a_title_you_chose_is_never_replaced() {
+    let mut w = World::start().await;
+    w.reply(r#"{"type":"result","is_error":false,"result":"Not this"}"#);
+    let channel = w.stored_channel().await;
+    // As the CLI does: a title of its own, not a first line.
+    let thread: ThreadId = w
+        .app
+        .ok(Request::CreateThread {
+            channel,
+            title: "Release prep".into(),
+            first_line: false,
+        })
+        .await;
+    w.thread = thread;
+    assert_eq!(w.stored().await.title_source, TitleSource::User);
+    w.post("@Ada start on the changelog").await;
+    w.runs_end(1).await;
+    assert!(w.title_args().is_empty(), "no title run");
+    let stored = w.stored().await;
+    assert_eq!(
+        (stored.title.as_str(), stored.title_source),
+        ("Release prep", TitleSource::User)
+    );
 }

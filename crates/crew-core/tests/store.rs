@@ -1855,6 +1855,10 @@ fn migrates_v13_db_to_v14_with_titles_from_the_first_line() {
         conn.execute_batch(&format!(
             "INSERT INTO projects (id, name, root, main_branch, created_at)
              VALUES ('00000000-0000-7000-8000-0000000000a1', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO projects (id, name, root, main_branch, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000a2', 'api', '/work/api', 'main', 2);
+             INSERT INTO settings (key, value) VALUES ('skill_shown:claude_code:project:bench', '0');
+             INSERT INTO settings (key, value) VALUES ('skill_shown:claude_code:global:tdd', '0');
              INSERT INTO channels (id, project_id, name, created_at)
              VALUES ('00000000-0000-7000-8000-0000000000b1', '00000000-0000-7000-8000-0000000000a1', 'general', 1);
              INSERT INTO threads (id, channel_id, title, created_at)
@@ -1868,6 +1872,24 @@ fn migrates_v13_db_to_v14_with_titles_from_the_first_line() {
     assert_eq!(thread.title, "old one");
     assert_eq!(thread.title_source, TitleSource::FirstLine);
     let t = thread.id;
+    // A project skill hidden for every project is now hidden in each.
+    for project in store.projects().unwrap() {
+        let key = format!("claude_code:project:{}:bench", project.id);
+        assert!(!store.skill_shown(&key).unwrap(), "{key}");
+    }
+    assert!(!store.skill_shown("claude_code:global:tdd").unwrap());
+    assert!(
+        store.skill_shown("claude_code:project:bench").unwrap(),
+        "the old row is gone"
+    );
+    let fresh_project = store
+        .create_project("web", Path::new("/work/web"), "main")
+        .unwrap();
+    assert!(
+        store
+            .skill_shown(&format!("claude_code:project:{fresh_project}:bench"))
+            .unwrap()
+    );
     let store = Store::open(&path).unwrap();
     assert_eq!(store.branch_title(t).unwrap(), "old one");
     drop(store);

@@ -355,6 +355,7 @@ async fn crew_run_session(c: &mut Client, project: ProjectId) -> String {
         .ok(Request::CreateThread {
             channel,
             title: "t".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();

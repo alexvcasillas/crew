@@ -124,6 +124,7 @@ pub(super) fn world_named(
         Request::CreateThread {
             channel,
             title: "fix the login".into(),
+            first_line: true,
         },
     );
     World {
@@ -595,6 +596,7 @@ fn drafts_stay_with_their_thread(cx: &mut TestAppContext) {
     let other: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "second".into(),
+        first_line: false,
     });
     let (window, ws) = open_thread(cx, home.path(), &w);
 

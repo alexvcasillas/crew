@@ -362,7 +362,7 @@ impl Workspace {
                                 format!("thread-title-{id}"),
                                 &card.title,
                                 card.generating,
-                                self.state().title_just_landed(id),
+                                self.state().title_replaced(id),
                             ))
                             .test_support(),
                     )

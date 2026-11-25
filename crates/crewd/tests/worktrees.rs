@@ -306,6 +306,7 @@ async fn setup(d: &Daemon, c: &mut Client) -> Setup {
         .ok(Request::CreateThread {
             channel,
             title: "Fix login".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -1285,12 +1286,14 @@ async fn channel_overview_sums_up_each_thread() {
         .ok(Request::CreateThread {
             channel: s.channel,
             title: "Nothing yet".into(),
+            first_line: false,
         })
         .await;
     let noted: ThreadId = c
         .ok(Request::CreateThread {
             channel: s.channel,
             title: "Just a note".into(),
+            first_line: false,
         })
         .await;
     post(

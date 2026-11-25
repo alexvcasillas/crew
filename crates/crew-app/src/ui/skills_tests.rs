@@ -87,6 +87,7 @@ fn skills_world(tmp: &Path, home: &Path, agents: &[&str]) -> World {
         source: SkillSource::Global,
         name: "secret".into(),
         shown: false,
+        project: None,
     });
     w
 }
@@ -644,7 +645,7 @@ fn the_skills_page_lists_skills_and_its_switch_hides_one_from_the_menu(cx: &mut 
     let place =
         |cx: &mut TestAppContext, key: &str| label_of(cx, window, format!("skill-place-{key}"));
     assert_eq!(
-        place(cx, "claude_code:project:bench").as_deref(),
+        place(cx, &format!("claude_code:project:{}:bench", w.project)).as_deref(),
         Some("demo/.claude/skills/bench/SKILL.md")
     );
     let toggle =
@@ -664,7 +665,11 @@ fn the_skills_page_lists_skills_and_its_switch_hides_one_from_the_menu(cx: &mut 
     click(cx, window, "skills-runtime-all");
     click(cx, window, "skills-search");
     type_text(cx, window, "bench");
-    assert!(has(cx, window, "skill-row-claude_code:project:bench"));
+    assert!(has(
+        cx,
+        window,
+        format!("skill-row-claude_code:project:{}:bench", w.project)
+    ));
     assert!(!has(cx, window, "skill-row-claude_code:global:tdd"));
     press(cx, window, "cmd-a backspace");
     assert!(has(cx, window, "skill-row-claude_code:global:tdd"));
@@ -698,4 +703,77 @@ fn the_skills_page_lists_skills_and_its_switch_hides_one_from_the_menu(cx: &mut 
     set_text(cx, window, &ws, "");
     click(cx, window, "composer-slash");
     wait_to_show(cx, window, "/tdd");
+}
+
+#[gpui_kit::test]
+fn hiding_a_project_skill_hides_it_in_that_project_only(cx: &mut TestAppContext) {
+    use super::settings::Page;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = daemon(tmp.path(), home.path());
+    let w = skills_world(tmp.path(), home.path(), &["Forge"]);
+    // Another project with a /bench of its own.
+    let other_root = tmp.path().join("other");
+    skill_file(&other_root.join(".claude/skills"), "bench", "Its own bench");
+    let other: crew_core::ids::ProjectId = w.ask(Request::CreateProject {
+        name: "other".into(),
+        root: other_root.to_string_lossy().into_owned(),
+        main_branch: String::new(),
+        work_mode: Some(crew_core::project_kind::WorkMode::InPlace),
+        copy_files: vec![],
+        setup_command: None,
+    });
+    let (window, ws) = open_thread(cx, home.path(), &w);
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_settings(Page::Skills, window, cx));
+    })
+    .unwrap();
+    let mine = format!("skill-toggle-claude_code:project:{}:bench", w.project);
+    wait_until(cx, "the project's skills", |cx| {
+        has(cx, window, mine.clone())
+    });
+
+    // Load the other project's list too, then hide /bench here.
+    ws.update(cx, |ws, cx| ws.pick_skills_project(other, cx));
+    let theirs = format!("skill-toggle-claude_code:project:{other}:bench");
+    wait_until(cx, "the other project's skills", |cx| {
+        has(cx, window, theirs.clone())
+    });
+    ws.update(cx, |ws, cx| ws.pick_skills_project(w.project, cx));
+    click(cx, window, mine.clone());
+    assert_eq!(
+        label_of(cx, window, mine.clone()).as_deref(),
+        Some("Hidden /bench")
+    );
+
+    // The app's lists: hidden here, still shown there.
+    let shown_in = |cx: &mut TestAppContext, project| {
+        ws.read_with(cx, |ws, _| {
+            ws.skills.projects[&project]
+                .list
+                .iter()
+                .find(|s| s.name == "bench")
+                .unwrap()
+                .shown
+        })
+    };
+    assert!(!shown_in(cx, w.project));
+    assert!(shown_in(cx, other));
+
+    // crewd agrees, once it has the change.
+    let bench_shown = |project| {
+        let listed: Vec<crew_proto::SkillInfo> = w.ask(Request::Skills {
+            project,
+            force_reload: false,
+        });
+        listed.iter().find(|s| s.name == "bench").unwrap().shown
+    };
+    wait_until(cx, "crewd to hide /bench here", |_| !bench_shown(w.project));
+    assert!(bench_shown(other));
+    ws.update(cx, |ws, cx| ws.pick_skills_project(other, cx));
+    assert_eq!(
+        label_of(cx, window, theirs).as_deref(),
+        Some("Show in / /bench")
+    );
 }

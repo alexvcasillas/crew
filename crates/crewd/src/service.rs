@@ -620,8 +620,12 @@ impl Service {
                 self.delete_agent(agent)?;
                 Ok(serde_json::Value::Null)
             }
-            Request::CreateThread { channel, title } => json(
-                self.create_thread(channel, &title)
+            Request::CreateThread {
+                channel,
+                title,
+                first_line,
+            } => json(
+                self.create_thread(channel, &title, !first_line)
                     .map_err(|e| e.to_string())?,
             ),
             Request::RenameThread { thread, title } => {
@@ -668,8 +672,17 @@ impl Service {
                 source,
                 name,
                 shown,
+                project,
             } => {
-                let key = skill_key(&runtime, &source, &name);
+                let key = match (&source, project) {
+                    (SkillSource::Project, None) => {
+                        return Err("Say which project the skill is in.".into());
+                    }
+                    // Only a project's own skill's key holds the project.
+                    (_, project) => {
+                        skill_key(&runtime, &source, &name, project.unwrap_or_default())
+                    }
+                };
                 self.db()
                     .store
                     .set_skill_shown(&key, shown)
@@ -927,7 +940,7 @@ impl Service {
             })
             .chain(codex.iter().flatten())
             .map(|f| {
-                let key = skill_key(&f.runtime, &f.source, &f.name);
+                let key = skill_key(&f.runtime, &f.source, &f.name, project);
                 f.info(db.store.skill_shown(&key).unwrap_or(true))
             })
             .collect();
@@ -997,10 +1010,16 @@ impl Service {
     }
 
     /// Saves a thread and tells `SubscribeAll` clients.
-    fn create_thread(&self, channel: ChannelId, title: &str) -> Result<ThreadId, StoreError> {
+    /// A `chosen` title is never replaced by a generated one.
+    fn create_thread(
+        &self,
+        channel: ChannelId,
+        title: &str,
+        chosen: bool,
+    ) -> Result<ThreadId, StoreError> {
         let mut db = self.db();
         db.store.ensure_channel_open(channel)?;
-        let id = db.store.create_thread(channel, title)?;
+        let id = db.store.create_thread_titled(channel, title, chosen)?;
         let thread = db.store.thread(id)?;
         self.publish_global(&mut db, ServerMsg::ThreadCreated { channel, thread });
         Ok(id)

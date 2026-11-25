@@ -26,6 +26,8 @@ use crate::service::{CliBins, log};
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest title, in characters, as for a first line.
 pub(crate) const TITLE_MAX: usize = 80;
+/// Settings for the Claude title run alone: no hooks.
+pub(crate) const NO_HOOKS: &str = r#"{"disableAllHooks":true}"#;
 /// Most characters of the message the model is shown.
 const MESSAGE_MAX: usize = 2000;
 
@@ -93,8 +95,10 @@ fn prompt(message: &str) -> String {
     format!("{PROMPT}{message}")
 }
 
-/// `claude -p` with no tools, slash commands, MCP servers or saved
-/// session, answering in JSON. The prompt goes last, after `--`.
+/// `claude -p` with no tools, hooks, slash commands, MCP servers or saved
+/// session, answering in JSON. Hooks are turned off for this run alone,
+/// through `--settings`, so none of yours sees or announces it. The prompt
+/// goes last, after `--`.
 fn claude_command(bin: &Path, model: &str, prompt: &str) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args([
@@ -108,17 +112,23 @@ fn claude_command(bin: &Path, model: &str, prompt: &str) -> Command {
         "--disable-slash-commands",
         "--strict-mcp-config",
         "--no-session-persistence",
+        "--settings",
+        NO_HOOKS,
         "--",
         prompt,
     ]);
     cmd
 }
 
-/// `codex exec` in a read-only sandbox with no saved session. It prints
+/// `codex exec` in a read-only sandbox (no writes, no network) that never asks
+/// for more, with no saved session. Codex has no switch that takes its
+/// shell tool away, so this is the least it can do: read files. It prints
 /// the final answer on stdout.
 fn codex_command(bin: &Path, model: &str, prompt: &str) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args([
+        "--ask-for-approval",
+        "never",
         "exec",
         "--model",
         model,

@@ -46,6 +46,7 @@ fn add_thread(w: &World, channel: ChannelId) {
     let _: crew_core::ids::ThreadId = w.ask(Request::CreateThread {
         channel,
         title: "a thread".into(),
+        first_line: false,
     });
 }
 

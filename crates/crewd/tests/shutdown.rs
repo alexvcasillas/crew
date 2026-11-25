@@ -149,6 +149,7 @@ async fn start_long_run(c: &mut Client, dir: &Path) -> ThreadId {
         .ok(Request::CreateThread {
             channel,
             title: "t".into(),
+            first_line: false,
         })
         .await;
     let _: crew_core::ids::MessageId = c

@@ -79,13 +79,16 @@ pub enum Request {
     DeleteAgent {
         agent: AgentId,
     },
-    /// `title` is the first line of the message the thread starts with.
-    /// When titles are generated, a short run replaces it after that
-    /// first message: the thread's `title_source` reads `generating`
-    /// meanwhile, and a [`ServerMsg::ThreadChanged`] tells each step.
+    /// A `title` you chose is never replaced. With `first_line`, it is the
+    /// first line of the message the thread starts with: when titles are
+    /// generated, a short run replaces it after that first message. The
+    /// thread's `title_source` reads `generating` meanwhile, and a
+    /// [`ServerMsg::ThreadChanged`] tells each step.
     CreateThread {
         channel: ChannelId,
         title: String,
+        #[serde(default)]
+        first_line: bool,
     },
     /// Sets the title. A title being generated no longer replaces it.
     RenameThread {
@@ -282,12 +285,16 @@ pub enum Request {
         #[serde(default)]
         force_reload: bool,
     },
-    /// Shows or hides a skill in the "/" menu. Answered with null.
+    /// Shows or hides a skill in the "/" menu. Answered with null. A
+    /// project's own skill needs its `project`: hiding it there leaves a
+    /// skill of that name in other projects alone.
     SetSkillShown {
         runtime: Runtime,
         source: SkillSource,
         name: String,
         shown: bool,
+        #[serde(default)]
+        project: Option<ProjectId>,
     },
     /// Answered first, then the session's last items as
     /// [`ServerMsg::TerminalEvent`]s, then new ones as they are written.
@@ -836,13 +843,23 @@ pub struct SkillRef {
 }
 
 /// Key of the "Show in /" setting of a skill: `{runtime}:{source}:{name}`
-/// with the source as `project`, `global` or `plugin:<name>`.
-pub fn skill_key(runtime: &Runtime, source: &SkillSource, name: &str) -> String {
+/// with the source as `global` or `plugin:<name>`, or as
+/// `project:<project id>` for a project's own skill, whose setting is
+/// that project's alone.
+pub fn skill_key(
+    runtime: &Runtime,
+    source: &SkillSource,
+    name: &str,
+    project: ProjectId,
+) -> String {
     let runtime = match runtime {
         Runtime::ClaudeCode => "claude_code",
         Runtime::Codex => "codex",
     };
-    format!("{runtime}:{}:{name}", source.key())
+    match source {
+        SkillSource::Project => format!("{runtime}:project:{project}:{name}"),
+        _ => format!("{runtime}:{}:{name}", source.key()),
+    }
 }
 
 /// A model an agent can be set to.
@@ -1427,6 +1444,7 @@ mod tests {
                 source: SkillSource::Plugin("tools".into()),
                 name: "tools:go".into(),
                 shown: false,
+                project: Some(ProjectId::new()),
             },
         ];
         for req in msgs {
@@ -1443,13 +1461,19 @@ mod tests {
             } => assert!(skill.is_none() && model_override.is_none()),
             other => panic!("{other:?}"),
         }
+        let project = ProjectId::new();
         assert_eq!(
-            skill_key(&Runtime::Codex, &SkillSource::Plugin("tools".into()), "go"),
+            skill_key(
+                &Runtime::Codex,
+                &SkillSource::Plugin("tools".into()),
+                "go",
+                project
+            ),
             "codex:plugin:tools:go"
         );
         assert_eq!(
-            skill_key(&Runtime::ClaudeCode, &SkillSource::Project, "lint"),
-            "claude_code:project:lint"
+            skill_key(&Runtime::ClaudeCode, &SkillSource::Project, "lint", project),
+            format!("claude_code:project:{project}:lint")
         );
     }
 

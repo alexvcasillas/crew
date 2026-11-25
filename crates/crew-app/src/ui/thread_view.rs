@@ -139,7 +139,7 @@ impl Workspace {
                                         "thread-title",
                                         &t.title,
                                         generating,
-                                        state.title_just_landed(thread),
+                                        state.title_replaced(thread),
                                     ))
                                     .test_support(),
                             )

@@ -155,6 +155,7 @@ fn typing_finds_a_thread_and_enter_opens_it(cx: &mut TestAppContext) {
     let release: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "plan the release".into(),
+        first_line: false,
     });
     let (window, ws) = open(cx, home.path());
     wait_for_snapshot(cx, &ws, release);
@@ -251,6 +252,7 @@ fn tab_toggles_all_projects(cx: &mut TestAppContext) {
     let docs: ThreadId = w.ask(Request::CreateThread {
         channel: general,
         title: "fix the docs".into(),
+        first_line: false,
     });
     let (window, ws) = open(cx, home.path());
     wait_for_snapshot(cx, &ws, docs);
@@ -717,6 +719,7 @@ fn name_hits_come_before_files(cx: &mut TestAppContext) {
     let _: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "supa launch".into(),
+        first_line: false,
     });
     let (window, ws) = open(cx, home.path());
     wait_until(cx, "the projects", |cx| {

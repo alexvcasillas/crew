@@ -361,6 +361,7 @@ async fn world(login_exit: i32) -> World {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -488,8 +489,20 @@ async fn lists_both_runtimes_with_sources_and_the_show_toggle() {
             source: SkillSource::Global,
             name: "unslop".into(),
             shown: false,
+            project: None,
         })
         .await;
+    // A project's own skill is hidden in one project, named.
+    let refused =
+        w.c.call(Request::SetSkillShown {
+            runtime: claude.clone(),
+            source: SkillSource::Project,
+            name: "review".into(),
+            shown: false,
+            project: None,
+        })
+        .await;
+    assert_eq!(refused, Err("Say which project the skill is in.".into()));
     let list: Vec<SkillInfo> =
         w.c.ok(Request::Skills {
             project: w.project,

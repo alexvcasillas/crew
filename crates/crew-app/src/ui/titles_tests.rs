@@ -145,18 +145,27 @@ fn a_title_shimmers_while_it_is_generated_then_comes_in(cx: &mut TestAppContext)
         "the first line shows meanwhile"
     );
     std::fs::write(tmp.path().join("title-go"), "").unwrap();
+    // The first line cross-fades into the title: it is kept for that.
+    let mut replaced = None;
     wait_until(cx, "the generated title", |cx| {
-        label_of(cx, window, "thread-title").as_deref() == Some(TITLE)
+        let shown = label_of(cx, window, "thread-title").as_deref() == Some(TITLE);
+        if shown {
+            replaced = ws.read_with(cx, |ws, _| {
+                ws.state().title_replaced(w.thread).map(String::from)
+            });
+        }
+        shown
     });
+    assert_eq!(replaced.as_deref(), Some("fix the login"));
     assert_eq!(description_of(cx, window, "thread-title"), None);
     assert_eq!(source(cx, &ws, w.thread), TitleSource::Generated);
-    assert!(ws.read_with(cx, |ws, _| ws.state().title_just_landed(w.thread)));
 
     // A channel card.
     std::fs::remove_file(tmp.path().join("title-go")).unwrap();
     let second: ThreadId = w.ask(Request::CreateThread {
         channel: w.channel,
         title: "second one".into(),
+        first_line: true,
     });
     click(cx, window, row_of(w.channel));
     let card = format!("thread-title-{second}");

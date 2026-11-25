@@ -264,13 +264,14 @@ const TITLE_BAND: u32 = 0xcfcfcf;
 /// A thread's title, inside an element that sets its size and cuts it.
 /// While a title is generated, the first line shows with a light band
 /// sweeping left to right (static under Reduce motion); the element gives
-/// it [`generating_title`]'s weight and colour. A title that has
-/// `just_landed` fades in.
+/// it [`generating_title`]'s weight and colour. When a generated title has
+/// just `replaced` the first line, the two cross-fade: the first line on
+/// top fades out as the title under it fades in, both cut the same way.
 pub fn thread_title_text(
     id: impl Into<SharedString>,
     title: &str,
     generating: bool,
-    just_landed: bool,
+    replaced: Option<&str>,
 ) -> AnyElement {
     let id: SharedString = id.into();
     if generating {
@@ -283,16 +284,34 @@ pub fn thread_title_text(
             .into_any_element();
     }
     let text = div().min_w_0().truncate().child(title.to_string());
-    if just_landed {
-        return text
-            .with_animation(
-                ElementId::Name(format!("{id}-fade-{title}").into()),
-                Animation::new(TITLE_FADE),
-                |el, t| el.opacity(t),
+    let Some(first_line) = replaced else {
+        return text.into_any_element();
+    };
+    let fade = |name: &str| ElementId::Name(format!("{id}-{name}-{title}").into());
+    div()
+        .relative()
+        .min_w_0()
+        .child(
+            text.with_animation(fade("in"), Animation::new(TITLE_FADE), |el, t| {
+                el.opacity(t)
+            }),
+        )
+        .child(
+            generating_title(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .min_w_0()
+                    .truncate(),
             )
-            .into_any_element();
-    }
-    text.into_any_element()
+            .child(first_line.to_string())
+            .with_animation(fade("out"), Animation::new(TITLE_FADE), |el, t| {
+                el.opacity(1. - t)
+            }),
+        )
+        .into_any_element()
 }
 
 /// A title being generated reads in medium tertiary grey.

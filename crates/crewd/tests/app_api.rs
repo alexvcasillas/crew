@@ -206,6 +206,7 @@ async fn thread(c: &mut Client, channel: ChannelId, title: &str) -> ThreadId {
     c.ok(Request::CreateThread {
         channel,
         title: title.into(),
+        first_line: false,
     })
     .await
 }

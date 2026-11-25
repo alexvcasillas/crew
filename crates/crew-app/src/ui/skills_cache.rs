@@ -62,13 +62,16 @@ impl SkillsCache {
             .or_else(|| of(|s| matches!(s, SkillSource::Plugin(_))))
     }
 
-    /// Sets `shown` on the skill with `key` in every project's list, and
-    /// gives each list that changed a new version, so menus take it.
-    pub fn mark_shown(&mut self, key: &str, shown: bool) {
-        for entry in self.projects.values_mut() {
+    /// Sets `shown` on the skill with `key`, a [`skill_key`] for
+    /// `project`, in every list it is in: a project's own skill only in
+    /// that project's, a global or plugin one in all. Each list that
+    /// changed gets a new version, so menus take it.
+    pub fn mark_shown(&mut self, project: ProjectId, key: &str, shown: bool) {
+        for (id, entry) in self.projects.iter_mut() {
             let mut changed = false;
             for skill in entry.list.iter_mut() {
-                if skill_key(&skill.runtime, &skill.source, &skill.name) == key
+                if skill_key(&skill.runtime, &skill.source, &skill.name, *id) == key
+                    && (skill.source != SkillSource::Project || *id == project)
                     && skill.shown != shown
                 {
                     skill.shown = shown;

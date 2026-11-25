@@ -349,6 +349,7 @@ async fn setup(c: &mut Client, root: &Path, mode: PermissionMode) -> ThreadId {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -1011,6 +1012,7 @@ async fn switching_to_codex_starts_a_fresh_thread() {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
@@ -1325,6 +1327,7 @@ async fn in_a_folder_of_repos_codex_writes_only_its_thread_folder() {
         .ok(Request::CreateThread {
             channel,
             title: "work".into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();

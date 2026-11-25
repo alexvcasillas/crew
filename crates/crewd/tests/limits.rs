@@ -196,6 +196,7 @@ async fn setup(c: &mut Client, root: &Path, n: usize) -> (AgentId, Vec<ThreadId>
             .ok(Request::CreateThread {
                 channel,
                 title: format!("thread {i}"),
+                first_line: false,
             })
             .await;
         c.call(Request::Subscribe { thread }).await.unwrap();

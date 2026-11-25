@@ -45,6 +45,7 @@ fn thread(w: &World, channel: ChannelId, title: &str) -> ThreadId {
     w.ask(Request::CreateThread {
         channel,
         title: title.into(),
+        first_line: false,
     })
 }
 

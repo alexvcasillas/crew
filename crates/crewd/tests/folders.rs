@@ -336,6 +336,7 @@ async fn new_thread(c: &mut Client, channel: ChannelId, title: &str) -> ThreadId
         .ok(Request::CreateThread {
             channel,
             title: title.into(),
+            first_line: false,
         })
         .await;
     c.call(Request::Subscribe { thread }).await.unwrap();
