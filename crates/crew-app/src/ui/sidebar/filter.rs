@@ -430,7 +430,7 @@ impl Workspace {
                             .aria_selected(prefs.agents)
                             .child(div().w(ui_px(12.)))
                             .child(div().flex_1().child("Show agents"))
-                            .child(toggle(prefs.agents))
+                            .child(crate::ui::common::switch(prefs.agents))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.set_sidebar_prefs(|p| p.agents = !p.agents, cx);
                             }))
@@ -597,21 +597,6 @@ fn radio(id: &'static str, label: &'static str, on: bool) -> Stateful<Div> {
                 }),
         )
         .child(label)
-}
-
-/// The board's small switch.
-fn toggle(on: bool) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .when(on, |t| t.justify_end())
-        .w(ui_px(28.))
-        .h(ui_px(16.))
-        .p(ui_px(2.))
-        .rounded_full()
-        .bg(color(if on { "text-primary" } else { "border-200" }))
-        .child(div().size(ui_px(12.)).rounded_full().bg(color("bg-100")))
 }
 
 #[cfg(test)]

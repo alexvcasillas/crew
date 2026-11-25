@@ -601,3 +601,101 @@ fn undo_after_deleting_the_chip_brings_the_skill_back(cx: &mut TestAppContext) {
     });
     assert_eq!(body, "the README", "without the chip's text");
 }
+
+fn settings_page(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> Option<super::settings::Page> {
+    ws.read_with(cx, |ws, _| ws.settings.as_ref().map(|s| s.page))
+}
+
+#[gpui_kit::test]
+fn the_skills_page_lists_skills_and_its_switch_hides_one_from_the_menu(cx: &mut TestAppContext) {
+    use super::settings::Page;
+    use super::settings::skills::INTRO;
+    use super::test_ui::bounds_of;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = daemon(tmp.path(), home.path());
+    let w = skills_world(tmp.path(), home.path(), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    // Manage skills in the "/" menu opens the page.
+    click(cx, window, "composer-input");
+    type_text(cx, window, "/zzz");
+    wait_to_show(cx, window, "No skills match.");
+    click(cx, window, "slash-manage");
+    assert_eq!(settings_page(cx, &ws), Some(Page::Skills));
+
+    // Skills sits between Appearance and Agents.
+    let y = |cx: &mut TestAppContext, id: &'static str| bounds_of(cx, window, id).unwrap().origin.y;
+    let (appearance, skills, agents) = (
+        y(cx, "settings-nav-appearance"),
+        y(cx, "settings-nav-skills"),
+        y(cx, "settings-nav-agents"),
+    );
+    assert!(appearance < skills && skills < agents);
+
+    assert!(shows(cx, window, INTRO));
+    wait_to_show(cx, window, "Claude Code 5 found");
+    for section in ["This project · demo", "Global"] {
+        assert!(shows(cx, window, section), "{section}");
+    }
+    assert!(!shows(cx, window, "Plugins"), "no plugins");
+    assert!(!has(cx, window, "skills-group-Codex"), "no Codex skills");
+    let place =
+        |cx: &mut TestAppContext, key: &str| label_of(cx, window, format!("skill-place-{key}"));
+    assert_eq!(
+        place(cx, "claude_code:project:bench").as_deref(),
+        Some("demo/.claude/skills/bench/SKILL.md")
+    );
+    let toggle =
+        |cx: &mut TestAppContext, key: &str| label_of(cx, window, format!("skill-toggle-{key}"));
+    assert_eq!(
+        toggle(cx, "claude_code:global:secret").as_deref(),
+        Some("Hidden /secret")
+    );
+    assert_eq!(
+        toggle(cx, "claude_code:global:tdd").as_deref(),
+        Some("Show in / /tdd")
+    );
+
+    // The runtime and the search narrow the list.
+    click(cx, window, "skills-runtime-codex");
+    assert!(shows(cx, window, "No skills match."));
+    click(cx, window, "skills-runtime-all");
+    click(cx, window, "skills-search");
+    type_text(cx, window, "bench");
+    assert!(has(cx, window, "skill-row-claude_code:project:bench"));
+    assert!(!has(cx, window, "skill-row-claude_code:global:tdd"));
+    press(cx, window, "cmd-a backspace");
+    assert!(has(cx, window, "skill-row-claude_code:global:tdd"));
+
+    // Turning /tdd off hides it from the menu at once, and crewd keeps it.
+    click(cx, window, "skill-toggle-claude_code:global:tdd");
+    assert_eq!(
+        toggle(cx, "claude_code:global:tdd").as_deref(),
+        Some("Hidden /tdd")
+    );
+    let listed: Vec<crew_proto::SkillInfo> = w.ask(Request::Skills {
+        project: w.project,
+        force_reload: false,
+    });
+    assert!(listed.iter().any(|s| s.name == "tdd" && !s.shown));
+    press(cx, window, "escape");
+    set_text(cx, window, &ws, "");
+    click(cx, window, "composer-slash");
+    wait_to_show(cx, window, "/unslop");
+    assert!(!in_menu(cx, window, "/tdd"), "hidden from the menu");
+
+    // And back on.
+    press(cx, window, "escape");
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| ws.open_settings(Page::Skills, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    click(cx, window, "skill-toggle-claude_code:global:tdd");
+    press(cx, window, "escape");
+    set_text(cx, window, &ws, "");
+    click(cx, window, "composer-slash");
+    wait_to_show(cx, window, "/tdd");
+}

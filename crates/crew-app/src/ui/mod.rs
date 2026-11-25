@@ -76,6 +76,8 @@ mod test_ui;
 mod thread_tests;
 #[cfg(test)]
 mod threads_sidebar_tests;
+#[cfg(test)]
+mod titles_tests;
 
 pub use crate::app::run;
 

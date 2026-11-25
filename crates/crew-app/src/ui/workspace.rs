@@ -255,7 +255,7 @@ impl Workspace {
                     ComposerEvent::Send(out) => this.send(out.clone(), window, cx),
                     ComposerEvent::SkillsWanted => this.skills_wanted(cx),
                     ComposerEvent::ManageSkills => {
-                        this.open_settings(Page::Runtimes, window, cx);
+                        this.open_settings(Page::Skills, window, cx);
                     }
                     ComposerEvent::Cancel => this.cancel_new_thread(window, cx),
                     ComposerEvent::OpenAgentSettings => {

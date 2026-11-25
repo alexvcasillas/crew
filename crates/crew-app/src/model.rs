@@ -10,7 +10,7 @@ use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId}
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
     ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
-    StoredProject, StoredRun, StoredThread, TitleSettings,
+    StoredProject, StoredRun, StoredThread, TitleSettings, TitleSource,
 };
 use crew_proto::{ServerMsg, TerminalSession};
 
@@ -202,6 +202,8 @@ pub struct State {
     /// but not yet reported back.
     titles: TitleSettings,
     sent_titles: Option<TitleSettings>,
+    /// When a generated title replaced each thread's first line.
+    titles_landed: HashMap<ThreadId, std::time::Instant>,
 }
 
 /// A handoff policy and budget, `None` for "fall back".
@@ -277,6 +279,14 @@ impl State {
                 self.channels.insert(channel.id, channel);
             }
             ServerMsg::ThreadCreated { thread, .. } | ServerMsg::ThreadChanged { thread } => {
+                let was_generating = self
+                    .threads
+                    .get(&thread.id)
+                    .is_some_and(|t| t.title_source == TitleSource::Generating);
+                if was_generating && thread.title_source == TitleSource::Generated {
+                    self.titles_landed
+                        .insert(thread.id, std::time::Instant::now());
+                }
                 let reported = (thread.handoff_policy, thread.handoff_budget);
                 if self.sent_thread_handoffs.get(&thread.id) == Some(&reported) {
                     self.sent_thread_handoffs.remove(&thread.id);
@@ -590,6 +600,14 @@ impl State {
     /// crewd reports them, else crewd's.
     pub fn titles(&self) -> TitleSettings {
         self.sent_titles.unwrap_or(self.titles)
+    }
+
+    /// Whether the thread's generated title came in the last second, so it
+    /// fades in.
+    pub fn title_just_landed(&self, thread: ThreadId) -> bool {
+        self.titles_landed
+            .get(&thread)
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
     }
 
     /// Notes title settings just sent to crewd.

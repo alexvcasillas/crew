@@ -7,7 +7,7 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun,
+    ApprovalKind, ApprovalStatus, Author, StoredApproval, StoredMessage, StoredRun, TitleSource,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{Icon, IconName, Sizable as _};
@@ -15,8 +15,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{
-    clock, elapsed, monogram, pulsing, runtime_badge, runtime_badge_for, runtime_chip,
-    with_font_probe,
+    clock, elapsed, generating_title, monogram, pulsing, runtime_badge, runtime_badge_for,
+    runtime_chip, thread_title_text, with_font_probe,
 };
 use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
 use super::markdown_view::{DocKey, render_doc};
@@ -39,6 +39,7 @@ impl Workspace {
         };
         let channel = state.channel(t.channel);
         let channel_name = channel.map(|c| c.name.clone()).unwrap_or_default();
+        let generating = t.title_source == TitleSource::Generating;
         let policy = state
             .thread_handoff(thread)
             .0
@@ -131,7 +132,15 @@ impl Workspace {
                                     .text_size(scale::text(14.))
                                     .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label(t.title.clone())
-                                    .child(t.title.clone())
+                                    .when(generating, |el| {
+                                        generating_title(el).aria_description("Generating a title")
+                                    })
+                                    .child(thread_title_text(
+                                        "thread-title",
+                                        &t.title,
+                                        generating,
+                                        state.title_just_landed(thread),
+                                    ))
                                     .test_support(),
                             )
                             .child(

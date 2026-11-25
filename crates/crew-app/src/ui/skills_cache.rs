@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crew_core::agent::Runtime;
 use crew_core::ids::{ProjectId, RunId};
-use crew_proto::{Request, SkillInfo, SkillSource};
+use crew_proto::{Request, SkillInfo, SkillSource, skill_key};
 use gpui_kit::*;
 
 use super::activity::ActivityRow;
@@ -60,6 +60,26 @@ impl SkillsCache {
         of(|s| *s == SkillSource::Project)
             .or_else(|| of(|s| *s == SkillSource::Global))
             .or_else(|| of(|s| matches!(s, SkillSource::Plugin(_))))
+    }
+
+    /// Sets `shown` on the skill with `key` in every project's list, and
+    /// gives each list that changed a new version, so menus take it.
+    pub fn mark_shown(&mut self, key: &str, shown: bool) {
+        for entry in self.projects.values_mut() {
+            let mut changed = false;
+            for skill in entry.list.iter_mut() {
+                if skill_key(&skill.runtime, &skill.source, &skill.name) == key
+                    && skill.shown != shown
+                {
+                    skill.shown = shown;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.next_rev += 1;
+                entry.rev = self.next_rev;
+            }
+        }
     }
 
     /// The size of the skill file at `path`, if known.
