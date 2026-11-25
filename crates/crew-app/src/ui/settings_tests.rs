@@ -208,8 +208,13 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
         Some("No limit"),
         "no limit by default"
     );
+    // The pick saves at once, with the text typed before it.
     pick_limit(cx, window, "1 h");
-    click(cx, window, "agent-save");
+    wait_until(cx, "the changes saved", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().agent(forge).unwrap().spec.max_run_minutes == 60
+        })
+    });
     wait_to_show(cx, window, "Saved");
     ws.read_with(cx, |ws, _| {
         let spec = &ws.state().agent(forge).unwrap().spec;
@@ -649,8 +654,8 @@ fn a_late_save_lands_only_on_its_own_form(cx: &mut TestAppContext) {
     }
     ws.read_with(cx, |ws, _| {
         let form = ws.settings.as_ref().unwrap().agents.form.as_ref().unwrap();
-        assert_eq!(form.editing, Some(forge));
-        assert!(!form.saved, "Scout's save isn't Forge's");
+        assert_eq!(form.editing, Some(forge), "Scout's save isn't Forge's");
+        assert!(!form.saving);
     });
 }
 

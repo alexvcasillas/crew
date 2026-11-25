@@ -37,6 +37,8 @@ pub mod workspace;
 #[cfg(test)]
 mod add_project_tests;
 #[cfg(test)]
+mod agent_autosave_tests;
+#[cfg(test)]
 mod appearance_tests;
 #[cfg(test)]
 mod auto_tests;

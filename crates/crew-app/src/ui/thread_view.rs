@@ -96,6 +96,8 @@ impl Workspace {
             }
         }
 
+        let header_line = scale::line(20.);
+        let label_drop = baseline_gap(cx, header_line);
         div()
             .id("thread-view")
             .size_full()
@@ -116,10 +118,12 @@ impl Workspace {
                         // Title and channel share one line, as on the board.
                         // A long title is cut with an ellipsis first; the
                         // channel label is cut only when big text leaves no
-                        // room at all.
+                        // room at all. Both sit in boxes of the same line
+                        // height, tops aligned, and the label drops by the
+                        // gap between the two baselines.
                         div()
                             .flex()
-                            .items_baseline()
+                            .items_start()
                             .gap(ui_px(10.))
                             .flex_1()
                             .min_w_0()
@@ -130,6 +134,7 @@ impl Workspace {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(scale::text(14.))
+                                    .line_height(header_line)
                                     .font_weight(weight(FontWeight::SEMIBOLD))
                                     .aria_label(t.title.clone())
                                     .when(generating, |el| {
@@ -147,7 +152,9 @@ impl Workspace {
                                 div()
                                     .min_w_0()
                                     .truncate()
+                                    .pt(label_drop)
                                     .text_size(scale::text(12.))
+                                    .line_height(header_line)
                                     .text_color(color("text-tertiary"))
                                     .child(format!("Thread in #{channel_name}")),
                             ),
@@ -449,6 +456,21 @@ impl Workspace {
 
 /// Size of a message avatar.
 const AVATAR: f32 = 32.;
+/// How far the 12 px channel label's baseline sits above the 14 px
+/// semibold title's, both set `line` tall. GPUI gives a text box no
+/// baseline of its own, so Taffy aligns "baselines" at each box's bottom
+/// edge; the header lines them up with this instead.
+fn baseline_gap(cx: &App, line: Pixels) -> Pixels {
+    let text = cx.text_system();
+    let mut title = font(ui_family());
+    title.weight = weight(FontWeight::SEMIBOLD);
+    let title = text.resolve_font(&title);
+    let label = text.resolve_font(&font(ui_family()));
+    let title = text.baseline_offset(title, scale::text(14.), line);
+    let label = text.baseline_offset(label, scale::text(12.), line);
+    (title - label).max(px(0.))
+}
+
 /// A flex shrink so much bigger than the rest's that the element shrinks
 /// to nothing before they shrink at all.
 const GIVES_WAY_FIRST: f32 = 1000.;

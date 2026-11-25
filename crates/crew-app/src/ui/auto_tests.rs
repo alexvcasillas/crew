@@ -12,7 +12,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::inspector_tests::{git_repo, run_of};
-use super::settings::agents::AUTO_NEEDS;
+use super::settings::agents::{AUTO_NEEDS, AUTOSAVE_PAUSE};
 use super::test_ui::{
     bounds_of, click, has, label_of, open_tall, press, shows, type_text, wait_until,
 };
@@ -155,7 +155,6 @@ fn auto_is_offered_only_for_models_that_support_it(cx: &mut TestAppContext) {
     pick_permission(cx, window, 1);
     assert_eq!(form_permission(cx, &ws), PermissionMode::Auto);
     assert!(shows(cx, window, AUTO_LABEL), "the picked option");
-    click(cx, window, "agent-save");
     wait_until(cx, "Forge in Auto", |cx| {
         ws.read_with(cx, |ws, _| {
             ws.state().agent(forge).is_some_and(|a| {
@@ -164,10 +163,10 @@ fn auto_is_offered_only_for_models_that_support_it(cx: &mut TestAppContext) {
         })
     });
 
-    // Back on an old model, the note comes back and saving says why.
+    // Back on an old model, the note comes back and the save says why.
     retype(cx, window, "agent-other-model", "claude-sonnet-4-5");
     wait_until(cx, "the note", |cx| has(cx, window, "agent-auto-needs"));
-    click(cx, window, "agent-save");
+    cx.executor().advance_clock(AUTOSAVE_PAUSE);
     wait_until(cx, "the error", |cx| {
         label_of(cx, window, "agent-error").as_deref() == Some(AUTO_NEEDS)
     });

@@ -223,6 +223,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.running = None;
+        self.flush_agent_save(cx);
         self.settings = None;
         if self.terminal.as_ref().is_some_and(|t| t.session == session) {
             cx.notify();
