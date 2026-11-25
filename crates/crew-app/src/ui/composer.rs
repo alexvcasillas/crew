@@ -225,6 +225,8 @@ pub struct Composer {
     pub(super) models: Vec<(Runtime, Vec<ModelInfo>)>,
     /// The agent a reply goes to.
     reply_to: Option<String>,
+    /// The skill whose chip was just deleted, for undo to bring back.
+    dropped: Option<Picked>,
     /// Where the composer's top was last drawn, in window px, so the
     /// mention menu knows if it fits above.
     pub(super) top: std::rc::Rc<std::cell::Cell<Option<f32>>>,
@@ -272,6 +274,7 @@ impl Composer {
             runs_menu: None,
             models: Vec::new(),
             reply_to: None,
+            dropped: None,
             top: Default::default(),
             _input_events: events,
         }
@@ -472,10 +475,39 @@ impl Composer {
 
     fn text_changed(&mut self, cx: &mut Context<Self>) {
         let input = self.input.read(cx);
-        // Deleting the chip drops the skill.
-        if self.skill.is_some() && input.tokens().is_empty() {
-            self.clear_skill();
-            cx.notify();
+        // Deleting the chip drops the skill; undo bringing the chip back
+        // brings the skill back, with who and what was picked for it.
+        let chip = input.tokens().first().map(|t| t.token().id().to_string());
+        match (&self.skill, chip) {
+            (Some(_), None) => {
+                self.dropped = self.picked();
+                self.clear_skill();
+                cx.notify();
+            }
+            (None, Some(key)) => {
+                let picked = match self.dropped.take() {
+                    Some(p) if p.skill.key() == key => Some(p),
+                    _ => self
+                        .skills
+                        .iter()
+                        .find(|e| e.key() == key)
+                        .map(|skill| Picked {
+                            skill: skill.clone(),
+                            runtime_choice: None,
+                            picked_agent: None,
+                            model_choice: None,
+                        }),
+                };
+                if let Some(p) = picked {
+                    self.skill = Some(p.skill);
+                    self.runtime_choice = p.runtime_choice;
+                    self.picked_agent = p.picked_agent;
+                    self.model_choice = p.model_choice;
+                    self.slash = None;
+                    cx.notify();
+                }
+            }
+            _ => {}
         }
         let input = self.input.read(cx);
         let text = input.value();

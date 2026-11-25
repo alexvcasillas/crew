@@ -557,3 +557,45 @@ fn a_failed_send_puts_back_the_skill_agent_and_model(cx: &mut TestAppContext) {
         assert!(ws.recents.skills.is_empty(), "Recent waits for a send");
     });
 }
+
+#[gpui_kit::test]
+fn undo_after_deleting_the_chip_brings_the_skill_back(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = daemon(tmp.path(), home.path());
+    let w = skills_world(tmp.path(), home.path(), &["Forge"]);
+    let (window, ws) = open_thread(cx, home.path(), &w);
+
+    click(cx, window, "composer-input");
+    type_text(cx, window, "/uns");
+    wait_to_show(cx, window, "/unslop");
+    press(cx, window, "enter");
+    press(cx, window, "backspace backspace");
+    assert_eq!(composer_skill(cx, &ws), None, "the chip is gone");
+    assert!(!has(cx, window, "runs-with"));
+
+    press(cx, window, "cmd-z");
+    assert!(has(cx, window, "composer-skill"), "undo brings the chip");
+    assert_eq!(composer_skill(cx, &ws).as_deref(), Some("unslop"));
+    assert!(has(cx, window, "runs-with"), "and its Runs with row");
+    assert!(!has(cx, window, "slash-menu"), "the menu stays closed");
+
+    type_text(cx, window, " the README");
+    assert!(!has(cx, window, "slash-menu"));
+    press(cx, window, "enter");
+    let runs = ended_runs(cx, &ws, w.thread, 1);
+    assert_eq!(
+        runs[0].skill.as_deref(),
+        Some("unslop"),
+        "the skill went out"
+    );
+    let body = ws.read_with(cx, |ws, _| {
+        ws.state()
+            .messages(w.thread)
+            .iter()
+            .find(|m| m.author == Author::You)
+            .map(|m| m.body.clone())
+            .unwrap()
+    });
+    assert_eq!(body, "the README", "without the chip's text");
+}
