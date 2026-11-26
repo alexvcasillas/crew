@@ -76,39 +76,46 @@ impl Workspace {
                     Runtime::Codex => "codex",
                 };
                 div()
-                    .id(SharedString::from(format!("runtime-row-{key}")))
-                    .flex()
-                    .items_center()
-                    .gap(ui_px(12.))
-                    .min_h(scale::row(52.))
-                    .border_b_1()
-                    .border_color(color("border-100"))
-                    .aria_label(format!("{name} {word}"))
-                    .child(provider_icon(&info.runtime, 16.))
+                    .id(SharedString::from(format!("field-runtimes-{key}")))
+                    .test_support()
                     .child(
                         div()
+                            .id(SharedString::from(format!("runtime-row-{key}")))
                             .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().font_weight(weight(FontWeight::MEDIUM)).child(name))
+                            .items_center()
+                            .gap(ui_px(12.))
+                            .min_h(scale::row(52.))
+                            .border_b_1()
+                            .border_color(color("border-100"))
+                            .aria_label(format!("{name} {word}"))
+                            .child(provider_icon(&info.runtime, 16.))
                             .child(
                                 div()
-                                    .truncate()
-                                    .text_size(scale::mono(12.))
-                                    .font_family(code_family())
-                                    .text_color(color("text-tertiary"))
-                                    .child(detail),
-                            ),
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div().font_weight(weight(FontWeight::MEDIUM)).child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(scale::mono(12.))
+                                            .font_family(code_family())
+                                            .text_color(color("text-tertiary"))
+                                            .child(detail),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(scale::text(12.))
+                                    .text_color(color(token))
+                                    .child(word),
+                            )
+                            .test_support(),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(scale::text(12.))
-                            .text_color(color(token))
-                            .child(word),
-                    )
-                    .test_support()
                     .into_any_element()
             })
             .collect();

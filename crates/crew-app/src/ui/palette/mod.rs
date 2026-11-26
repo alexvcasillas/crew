@@ -3,6 +3,7 @@
 //! actions come from what the app knows; threads and files from crewd,
 //! asked once typing pauses. Only the answer to the latest query shows.
 
+pub mod catalog;
 mod rows;
 
 use std::collections::HashSet;

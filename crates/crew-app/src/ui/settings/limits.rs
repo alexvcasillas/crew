@@ -180,24 +180,28 @@ impl Workspace {
                     .max_w(ui_px(760.))
                     .child(limit_row(
                         "limits-row-max-runs",
+                        "field-limits-max-runs",
                         "Agents at once",
                         AT_ONCE_HELP,
                         value("limits-max-runs-value", limits.max_runs, at_once),
                     ))
                     .child(limit_row(
                         "limits-row-new-runs",
+                        "field-limits-new-runs",
                         "New runs",
                         NEW_RUNS_HELP,
                         div().flex().child(segmented(runs).w(ui_px(240.))),
                     ))
                     .child(limit_row(
                         "limits-row-policy",
+                        "field-limits-policy",
                         "Bringing in other agents",
                         POLICY_HELP,
                         div().flex().child(segmented(policies).w(ui_px(320.))),
                     ))
                     .child(limit_row(
                         "limits-row-budget",
+                        "field-limits-budget",
                         "Handoffs per thread",
                         BUDGET_HELP,
                         value("limits-budget-value", limits.handoff_budget, budget),
@@ -217,6 +221,7 @@ impl Workspace {
 /// A form row, labelled with its label so tests can find it.
 fn limit_row(
     id: &'static str,
+    field_id: &'static str,
     label: &'static str,
     help: &'static str,
     content: impl IntoElement,
@@ -224,7 +229,7 @@ fn limit_row(
     div()
         .id(id)
         .aria_label(label)
-        .child(field(label, Some(help), content))
+        .child(field(field_id, label, Some(help), content))
         .test_support()
 }
 

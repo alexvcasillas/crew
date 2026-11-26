@@ -315,11 +315,13 @@ impl Workspace {
                     )
                     .child(self.render_title_fields(cx))
                     .child(general::board_row(field(
+                        "field-general-home",
                         "Crew home",
                         Some("Where crewd keeps its database, socket and worktrees."),
                         value_text("general-home", home_relative(&self.conn.crew_home), true),
                     )))
                     .child(general::board_row(field(
+                        "field-general-editor",
                         "Editor",
                         Some("Open in editor uses this app."),
                         div().w(ui_px(280.)).child(control(
@@ -477,13 +479,15 @@ pub(super) fn page_title(text: &'static str) -> impl IntoElement {
 }
 
 /// A form row: the label and its help on the left, the control on the
-/// right.
-pub(super) fn field(
+/// right. Its `id` starts with `field-`, so the palette can find it.
+pub(crate) fn field(
+    id: &'static str,
     label: &'static str,
     help: Option<&'static str>,
     content: impl IntoElement,
-) -> Div {
+) -> impl IntoElement + Styled {
     div()
+        .id(id)
         .flex()
         .gap(ui_px(24.))
         .py(scale::row(12.))
@@ -515,6 +519,7 @@ pub(super) fn field(
                 .gap(ui_px(6.))
                 .child(content),
         )
+        .test_support()
 }
 
 /// Read-only text, mono for paths.

@@ -266,6 +266,7 @@ impl Workspace {
             )
             .child(row(
                 "ui-size",
+                "field-appearance-ui-size",
                 "Interface text size",
                 Some("Messages, sidebar, buttons."),
                 sizes("appearance-ui-size", &UI_SIZES, a.ui_size, 13, |a, n| {
@@ -274,6 +275,7 @@ impl Workspace {
             ))
             .child(row(
                 "code-size",
+                "field-appearance-code-size",
                 "Code text size",
                 Some("Paths, commands, diffs, terminal."),
                 sizes(
@@ -286,12 +288,14 @@ impl Workspace {
             ))
             .child(row(
                 "fonts",
+                "field-appearance-fonts",
                 "Fonts",
                 Some("Any font installed on this Mac."),
                 self.render_font_selects(),
             ))
             .child(row(
                 "line-height",
+                "field-appearance-line-height",
                 "Line height",
                 None,
                 choices(
@@ -307,6 +311,7 @@ impl Workspace {
             ))
             .child(row(
                 "rendering",
+                "field-appearance-rendering",
                 "Text rendering",
                 Some("Crew already uses grayscale smoothing."),
                 div()
@@ -323,6 +328,7 @@ impl Workspace {
             ))
             .child(row(
                 "density",
+                "field-appearance-density",
                 "Density",
                 Some("Row heights and padding."),
                 choices(
@@ -337,12 +343,14 @@ impl Workspace {
             ))
             .child(row(
                 "sidebar",
+                "field-appearance-sidebar",
                 "Sidebar",
                 Some("Also switches from the button in the sidebar header."),
                 sidebar_modes(a.sidebar_mode),
             ))
             .child(row(
                 "zoom",
+                "field-appearance-zoom",
                 "Zoom",
                 Some("Scales the whole window."),
                 zoom(a.zoom),
@@ -395,6 +403,7 @@ impl Workspace {
 /// rows have a rule above each one.
 fn row(
     key: &'static str,
+    field_id: &'static str,
     label: &'static str,
     help: Option<&'static str>,
     content: impl IntoElement,
@@ -403,7 +412,7 @@ fn row(
         .id(SharedString::from(format!("appearance-row-{key}")))
         .aria_label(label)
         .child(
-            field(label, help, content)
+            field(field_id, label, help, content)
                 .py(scale::row(16.))
                 .border_b_0()
                 .border_t_1(),

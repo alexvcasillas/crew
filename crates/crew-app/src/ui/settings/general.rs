@@ -51,7 +51,7 @@ fn model_index(model: TitleModel) -> Option<IndexPath> {
 }
 
 /// A form row as the boards draw them: 16 above and below, a rule on top.
-pub(super) fn board_row(row: Div) -> Div {
+pub(super) fn board_row(row: impl Styled + IntoElement) -> impl IntoElement {
     row.py(scale::row(16.)).border_b_0().border_t_1()
 }
 
@@ -173,6 +173,7 @@ impl Workspace {
             .id("general-row-titles")
             .aria_label("Thread titles")
             .child(board_row(field(
+                "field-general-thread-titles",
                 "Thread titles",
                 Some("Set after the first message in a thread."),
                 div()
@@ -214,6 +215,7 @@ impl Workspace {
                 )
         };
         let comparison = board_row(field(
+            "general-titles-comparison",
             "First line, for comparison",
             Some("What the other option gives you."),
             div()

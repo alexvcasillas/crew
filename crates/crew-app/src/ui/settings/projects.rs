@@ -638,6 +638,7 @@ impl Workspace {
                         col.child(form_error("project-error", e))
                     })
                     .child(field(
+                        "field-project-channels",
                         "Channels",
                         Some("How handoffs run by default in each channel."),
                         div()
@@ -669,11 +670,13 @@ impl Workspace {
                             }),
                     ))
                     .child(field(
+                        "field-project-setup",
                         "Setup command",
                         Some("Runs in a new worktree before its first run."),
                         control("project-setup", Input::new(&form.setup)),
                     ))
                     .child(field(
+                        "field-project-files",
                         "Files to copy",
                         Some("One path per line, relative to the project. Copied into each new worktree, such as .env."),
                         div()

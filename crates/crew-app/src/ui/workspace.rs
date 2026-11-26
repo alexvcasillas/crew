@@ -30,8 +30,8 @@ use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
-    ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search, ShowRunning,
-    ShowThreads, StopAll,
+    AddProject, ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search,
+    ShowRunning, ShowThreads, StopAll,
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
@@ -1532,6 +1532,9 @@ impl Render for Workspace {
             )
             .on_action(
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &AddProject, window, cx| this.open_add_project(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {

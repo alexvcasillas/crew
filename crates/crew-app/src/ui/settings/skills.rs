@@ -472,6 +472,7 @@ impl Workspace {
             .gap(ui_px(8.))
             .child(
                 div()
+                    .id("field-skills-project")
                     .flex()
                     .items_center()
                     .gap(ui_px(8.))
@@ -481,7 +482,8 @@ impl Workspace {
                     .child(div().min_w(ui_px(160.)).child(control(
                         "skills-project",
                         Select::new(&page.projects).accessibility_label("Project skills from"),
-                    ))),
+                    )))
+                    .test_support(),
             )
             .child(segmented(runtimes))
             .child(div().flex_1())

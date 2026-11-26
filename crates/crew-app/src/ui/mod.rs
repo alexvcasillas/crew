@@ -59,6 +59,8 @@ mod motion_tests;
 #[cfg(test)]
 mod pages_tests;
 #[cfg(test)]
+mod palette_catalog_tests;
+#[cfg(test)]
 mod palette_tests;
 #[cfg(test)]
 mod running_tests;

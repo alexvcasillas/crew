@@ -1227,6 +1227,7 @@ impl Workspace {
                         )
                     })
                     .child(field(
+                        "field-agent-name",
                         "Name and role",
                         Some("You @mention the agent by its name."),
                         div()
@@ -1244,11 +1245,13 @@ impl Workspace {
                             ),
                     ))
                     .child(field(
+                        "field-agent-runtime",
                         "Runtime",
                         Some("The CLI that runs this agent."),
                         self.render_runtime_cards(&form.runtime, cx),
                     ))
                     .child(field(
+                        "field-agent-model",
                         "Model",
                         Some("Passed to the CLI as --model."),
                         div()
@@ -1259,6 +1262,7 @@ impl Workspace {
                             .child(control("agent-other-model", Input::new(&form.other_model))),
                     ))
                     .child(field(
+                        "field-agent-instructions",
                         "Instructions",
                         Some(INSTRUCTIONS_HELP),
                         div().font_family(code_family()).child(control(
@@ -1267,6 +1271,7 @@ impl Workspace {
                         )),
                     ))
                     .child(field(
+                        "field-agent-permission",
                         "What it can do",
                         Some("Edits stay in the thread's own worktree."),
                         div()
@@ -1287,12 +1292,14 @@ impl Workspace {
                     // Codex has no such list; it asks through its sandbox.
                     .when(form.runtime == Runtime::ClaudeCode, |col| {
                         col.child(field(
+                            "field-agent-tools",
                             "Always allow these tools",
                             Some("A comma list, passed as --allowedTools."),
                             control("agent-tools", Input::new(&form.allowed_tools)),
                         ))
                     })
                     .child(field(
+                        "field-agent-handoffs",
                         "Bringing in other agents",
                         Some("When this agent mentions another one."),
                         div()
