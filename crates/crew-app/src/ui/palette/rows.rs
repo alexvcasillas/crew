@@ -627,13 +627,18 @@ fn command_lead(c: &CommandEntry) -> Lead {
 /// the names of its choices.
 fn local_settings(i: &Inputs, query: &str) -> Vec<Row> {
     let state = i.state;
+    // By name, so rows keep their place whatever order crewd sent.
+    let mut agents = state.agents();
+    agents.sort_by_cached_key(|a| a.spec.name.to_lowercase());
+    let mut projects = state.projects();
+    projects.sort_by_cached_key(|p| p.name.to_lowercase());
     let mut rows = Vec::new();
     for entry in settings_entries() {
         let page = page_name(entry.page);
         match entry.scope {
             Scope::Global => rows.extend(setting_row(i, entry, None, &[page], query)),
             Scope::Agent => {
-                for a in state.agents() {
+                for a in &agents {
                     // Codex has no allowed-tools list.
                     if entry.field == "field-agent-tools" && a.spec.runtime != Runtime::ClaudeCode {
                         continue;
@@ -656,13 +661,15 @@ fn local_settings(i: &Inputs, query: &str) -> Vec<Row> {
                 }
             }
             Scope::Project => {
-                for p in state.projects() {
+                for p in &projects {
                     let item = Some(Item::Project(p.id));
                     rows.extend(setting_row(i, entry, item, &[page, &p.name], query));
                 }
             }
         }
     }
+    // A row that only offers the choice comes after the ones that hold it.
+    rows.sort_by_key(|row| row.sub_dim_from.is_some());
     rows
 }
 
