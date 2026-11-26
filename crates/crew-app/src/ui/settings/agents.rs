@@ -14,7 +14,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -821,6 +821,28 @@ impl Workspace {
         }));
     }
 
+    /// Drops the newest spec kept for an agent once crewd's copy holds it
+    /// and no save for it is waiting, so a change made elsewhere later
+    /// isn't hidden behind it.
+    pub(crate) fn forget_landed_specs(&mut self) {
+        let saves = &self.agent_saves;
+        let landed: Vec<AgentId> = saves
+            .latest
+            .iter()
+            .filter(|(agent, spec)| {
+                !saves.queued.iter().any(|q| q.agent == **agent)
+                    && self
+                        .state()
+                        .agent(**agent)
+                        .is_some_and(|a| a.spec == **spec)
+            })
+            .map(|(agent, _)| *agent)
+            .collect();
+        for agent in landed {
+            self.agent_saves.latest.remove(&agent);
+        }
+    }
+
     /// crewd answered `save`. The next edit waiting, if any, goes next.
     fn agent_save_answered(
         &mut self,
@@ -834,6 +856,7 @@ impl Workspace {
             // Refused: crewd's copy stays the one to start from.
             self.agent_saves.latest.remove(&save.agent);
         }
+        self.forget_landed_specs();
         if let Some(f) = self
             .agent_form_mut()
             .filter(|f| f.id() == save.form && !more)
@@ -1171,7 +1194,6 @@ impl Workspace {
                                     )
                                     .child(div().flex().child(sub)),
                             )
-                            .children(save_status(form))
                             .when(form.editing.is_some(), |row| {
                                 row.child(
                                     Button::new("agent-duplicate")
@@ -1535,43 +1557,6 @@ impl Workspace {
         .test_support()
         .into_any_element()
     }
-}
-
-/// How an existing agent's saving goes, beside Duplicate: `Saving…` or
-/// `Saved`. A refusal shows as the form's error. A new agent has its
-/// button instead.
-fn save_status(form: &AgentForm) -> Option<AnyElement> {
-    form.editing?;
-    let (text, check) = if form.saving {
-        ("Saving…", false)
-    } else if form.saved && form.error.is_none() {
-        ("Saved", true)
-    } else {
-        return None;
-    };
-    let token = "text-tertiary";
-    Some(
-        div()
-            .id("agent-status")
-            .role(Role::Status)
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(ui_px(6.))
-            .text_size(scale::text(12.))
-            .text_color(color(token))
-            .aria_label(text)
-            .when(check, |row| {
-                row.child(
-                    Icon::new(IconName::Check)
-                        .size(ui_px(12.))
-                        .text_color(color(token)),
-                )
-            })
-            .child(text)
-            .test_support()
-            .into_any_element(),
-    )
 }
 
 /// A radio card. Disabled cards are dimmed and do nothing.

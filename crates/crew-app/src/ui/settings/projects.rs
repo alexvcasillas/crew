@@ -1,6 +1,7 @@
 //! Settings › Projects: each project's channels and what a new worktree
 //! gets. Projects are added through the Add project dialog.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -14,6 +15,7 @@ use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::agents::AUTOSAVE_PAUSE;
 use super::{control, field, form_error, help, segment, segmented};
 use crate::theme::color;
 use crate::theme::scale::{self, code_family, ui_px, weight};
@@ -92,6 +94,47 @@ pub struct ProjectsPage {
     pub form: Option<ProjectForm>,
 }
 
+/// Saves of project setups, one at a time, so the last edit lands last.
+#[derive(Default)]
+pub struct ProjectSaves {
+    /// A save is in flight.
+    busy: bool,
+    /// Edits waiting for the save in flight, at most one per project: a
+    /// newer edit takes the place of its project's older one.
+    queued: Vec<ProjectSave>,
+    /// The newest setup sent or queued per project, until crewd's copy
+    /// matches it. A reopened form starts from it.
+    latest: HashMap<ProjectId, Setup>,
+    task: Option<Task<()>>,
+}
+
+impl ProjectSaves {
+    /// Nothing in flight and nothing waiting.
+    pub fn idle(&self) -> bool {
+        !self.busy && self.queued.is_empty()
+    }
+
+    fn queue(&mut self, save: ProjectSave) {
+        match self.queued.iter_mut().find(|q| q.project == save.project) {
+            Some(older) => *older = save,
+            None => self.queued.push(save),
+        }
+    }
+}
+
+/// What a project's new worktrees get, and the form it came from.
+#[derive(Clone, PartialEq)]
+struct Setup {
+    setup_command: Option<String>,
+    copy_files: Vec<String>,
+}
+
+struct ProjectSave {
+    project: ProjectId,
+    setup: Setup,
+    form: EntityId,
+}
+
 pub struct ProjectForm {
     pub project: ProjectId,
     pub setup: Entity<InputState>,
@@ -100,8 +143,27 @@ pub struct ProjectForm {
     pub error: Option<String>,
     pub channel_error: Option<String>,
     pub saving: bool,
+    /// Saved, and nothing changed since.
     pub saved: bool,
+    /// Typing that waits for its pause before it saves.
+    debounce: Option<Task<()>>,
+    /// The setup last sent, so the same one isn't sent twice.
+    sent: Option<Setup>,
     _edits: [Subscription; 2],
+}
+
+impl ProjectForm {
+    fn id(&self) -> EntityId {
+        self.setup.entity_id()
+    }
+
+    fn setup(&self, cx: &App) -> Setup {
+        let setup = self.setup.read(cx).value().trim().to_string();
+        Setup {
+            setup_command: (!setup.is_empty()).then_some(setup),
+            copy_files: copy_lines(&self.copy_files.read(cx).value()),
+        }
+    }
 }
 
 impl Workspace {
@@ -125,28 +187,49 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let open = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.projects.form.as_ref())
+            .is_some_and(|f| f.project == project);
+        if open {
+            return;
+        }
+        // What you typed in the open form goes first, so a form for the
+        // same project starts from it.
+        self.flush_project_save(cx);
         let Some(stored) = self.state().project(project).cloned() else {
             return;
         };
+        let stored_setup = Setup {
+            setup_command: stored.setup_command.clone(),
+            copy_files: stored.copy_files.clone(),
+        };
+        // crewd may not have caught up with the newest save yet.
+        let pending = match self.project_saves.latest.get(&project) {
+            Some(latest) if *latest == stored_setup => {
+                self.project_saves.latest.remove(&project);
+                None
+            }
+            latest => latest.cloned(),
+        };
+        let shown = pending.clone().unwrap_or(stored_setup);
         let setup = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("e.g. npm ci")
-                .default_value(stored.setup_command.clone().unwrap_or_default())
+                .default_value(shown.setup_command.clone().unwrap_or_default())
         });
         let copy_files = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(4)
                 .placeholder(".env")
-                .default_value(stored.copy_files.join("\n"))
+                .default_value(shown.copy_files.join("\n"))
         });
         let new_channel = cx.new(|cx| InputState::new(window, cx).placeholder("bugs"));
-        let edited = |this: &mut Self, event: &InputEvent, cx: &mut Context<Self>| {
-            if matches!(event, InputEvent::Change) {
-                if let Some(form) = this.projects_page().and_then(|p| p.form.as_mut()) {
-                    form.saved = false;
-                }
-                cx.notify();
-            }
+        let edited = |this: &mut Self, event: &InputEvent, cx: &mut Context<Self>| match event {
+            InputEvent::Change => this.project_changed(cx),
+            InputEvent::Blur => this.flush_project_save(cx),
+            _ => {}
         };
         let edits = [
             cx.subscribe(&setup, move |this, _, event, cx| edited(this, event, cx)),
@@ -164,16 +247,41 @@ impl Workspace {
                 error: None,
                 channel_error: None,
                 saving: false,
-                saved: false,
+                saved: true,
+                debounce: None,
+                sent: pending,
                 _edits: edits,
             });
         }
         cx.notify();
     }
 
+    /// Drops the newest setup kept for a project once crewd's copy holds
+    /// it and no save for it is waiting, so a change made elsewhere later
+    /// isn't hidden behind it.
+    fn forget_landed_setups(&mut self) {
+        let saves = &self.project_saves;
+        let landed: Vec<ProjectId> = saves
+            .latest
+            .iter()
+            .filter(|(project, setup)| {
+                !saves.queued.iter().any(|q| q.project == **project)
+                    && self.state().project(**project).is_some_and(|p| {
+                        p.setup_command == setup.setup_command && p.copy_files == setup.copy_files
+                    })
+            })
+            .map(|(project, _)| *project)
+            .collect();
+        for project in landed {
+            self.project_saves.latest.remove(&project);
+        }
+    }
+
     /// Fills the form of a project that was selected before crewd told
     /// the app about it.
     pub(crate) fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.forget_landed_setups();
+        self.forget_landed_specs();
         let Some(page) = self.settings.as_ref().map(|s| &s.projects) else {
             return;
         };
@@ -184,43 +292,134 @@ impl Workspace {
         }
     }
 
-    fn save_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The setup or files changed: saved after a pause in typing.
+    fn project_changed(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.projects_page().and_then(|p| p.form.as_mut()) else {
             return;
         };
-        if form.saving {
+        form.saved = false;
+        form.debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AUTOSAVE_PAUSE).await;
+            this.update(cx, |this, cx| this.autosave_project(cx)).ok();
+        }));
+        cx.notify();
+    }
+
+    /// Saves typed text that is still waiting for its pause: on blur, and
+    /// before the form goes away.
+    pub(crate) fn flush_project_save(&mut self, cx: &mut Context<Self>) {
+        let waiting = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.projects.form.as_ref())
+            .is_some_and(|f| f.debounce.is_some());
+        if waiting {
+            self.autosave_project(cx);
+        }
+    }
+
+    fn autosave_project(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.projects.form.as_ref())
+        else {
+            return;
+        };
+        let setup = form.setup(cx);
+        let Some(form) = self.projects_page().and_then(|p| p.form.as_mut()) else {
+            return;
+        };
+        form.debounce = None;
+        cx.notify();
+        if form.sent.as_ref() == Some(&setup) {
+            // Already sent; its answer says how it went.
+            form.saved = !form.saving && form.error.is_none();
             return;
         }
-        let setup = form.setup.read(cx).value().trim().to_string();
-        let copy_files = copy_lines(&form.copy_files.read(cx).value());
+        form.sent = Some(setup.clone());
         form.saving = true;
         form.error = None;
-        let id = form.setup.entity_id();
-        let req = Request::UpdateProject {
+        let save = ProjectSave {
             project: form.project,
-            setup_command: (!setup.is_empty()).then_some(setup),
-            copy_files,
+            setup,
+            form: form.id(),
         };
-        let answer = self.client.request(req);
-        self.spawn_request(window, cx, async move |this, cx| {
-            let result = answer.await;
-            this.update(cx, |this, cx| {
-                if let Some(form) = this
-                    .projects_page()
-                    .and_then(|p| p.form.as_mut())
-                    .filter(|f| f.setup.entity_id() == id)
-                {
-                    form.saving = false;
-                    match result {
-                        Ok(_) => form.saved = true,
-                        Err(e) => form.error = Some(e),
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-            Ok(())
+        self.send_project_save(save, cx);
+    }
+
+    /// Sends `save` now, or after the save in flight, in place of any
+    /// edit already waiting.
+    fn send_project_save(&mut self, save: ProjectSave, cx: &mut Context<Self>) {
+        self.project_saves
+            .latest
+            .insert(save.project, save.setup.clone());
+        if self.project_saves.busy {
+            self.project_saves.queue(save);
+            return;
+        }
+        self.project_saves.busy = true;
+        let answer = self.client.request(Request::UpdateProject {
+            project: save.project,
+            setup_command: save.setup.setup_command.clone(),
+            copy_files: save.setup.copy_files.clone(),
         });
+        self.project_saves.task = Some(cx.spawn(async move |this, cx| {
+            let result = answer.await;
+            this.update(cx, |this, cx| this.project_save_answered(save, result, cx))
+                .ok();
+        }));
+    }
+
+    /// crewd answered `save`. The next edit waiting, if any, goes next.
+    fn project_save_answered(
+        &mut self,
+        save: ProjectSave,
+        result: Result<serde_json::Value, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_saves.busy = false;
+        let more = self
+            .project_saves
+            .queued
+            .iter()
+            .any(|q| q.form == save.form);
+        if result.is_err() && self.project_saves.latest.get(&save.project) == Some(&save.setup) {
+            // Refused: crewd's copy stays the one to start from.
+            self.project_saves.latest.remove(&save.project);
+        }
+        self.forget_landed_setups();
+        // A form reopened from this save while it was in flight shows
+        // its refusal too.
+        if let Err(e) = &result
+            && let Some(f) = self
+                .projects_page()
+                .and_then(|p| p.form.as_mut())
+                .filter(|f| f.id() != save.form && f.project == save.project)
+                .filter(|f| f.sent.as_ref() == Some(&save.setup))
+        {
+            f.error = Some(e.clone());
+            f.sent = None;
+            f.saved = false;
+        }
+        if let Some(f) = self
+            .projects_page()
+            .and_then(|p| p.form.as_mut())
+            .filter(|f| f.id() == save.form && !more)
+        {
+            f.saving = false;
+            match result {
+                Ok(_) => f.saved = f.debounce.is_none(),
+                Err(e) => {
+                    f.error = Some(e);
+                    f.sent = None;
+                }
+            }
+        }
+        if !self.project_saves.queued.is_empty() {
+            let next = self.project_saves.queued.remove(0);
+            self.send_project_save(next, cx);
+        }
         cx.notify();
     }
 
@@ -434,27 +633,6 @@ impl Workspace {
                                         )
                                     })),
                             )
-                            .when(form.saved, |row| {
-                                row.child(
-                                    div()
-                                        .id("project-saved")
-                                        .text_size(scale::text(12.))
-                                        .text_color(color("success"))
-                                        .aria_label("Saved")
-                                        .child("Saved")
-                                        .test_support(),
-                                )
-                            })
-                            .child(
-                                Button::new("project-save")
-                                    .primary()
-                                    .small()
-                                    .label("Save project")
-                                    .disabled(form.saving)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_project(window, cx);
-                                    })),
-                            ),
                     )
                     .when_some(form.error.clone(), |col, e| {
                         col.child(form_error("project-error", e))

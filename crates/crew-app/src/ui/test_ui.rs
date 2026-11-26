@@ -82,6 +82,22 @@ pub fn wait_until(
     }
 }
 
+/// Waits until the open agent form is saved with nothing pending. The
+/// form shows no status for this, so tests read it.
+pub fn wait_saved(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
+    wait_until(cx, "the agent saved", |cx| saved(cx, ws));
+}
+
+/// Whether the open agent form is saved with nothing pending.
+pub fn saved(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> bool {
+    ws.read_with(cx, |ws, _| {
+        ws.settings
+            .as_ref()
+            .and_then(|s| s.agents.form.as_ref())
+            .is_some_and(|f| f.saved && !f.saving && f.error.is_none())
+    })
+}
+
 pub fn wait_to_show(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) {
     wait_until(cx, label, |cx| shows(cx, window, label));
 }

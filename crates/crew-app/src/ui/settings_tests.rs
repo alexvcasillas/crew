@@ -7,16 +7,17 @@ use std::rc::Rc;
 
 use crew_core::agent::{PermissionMode, Runtime};
 use crew_core::event::RunStatus;
+use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Task, TestAppContext};
 
 use super::first_launch::STARTER_NAME;
 use super::settings::Page;
-use super::settings::agents::{COMING_RUNTIMES, CREDENTIALS, INSTALL_CLAUDE};
+use super::settings::agents::{AUTOSAVE_PAUSE, COMING_RUNTIMES, CREDENTIALS, INSTALL_CLAUDE};
 use super::settings::runtimes::runtime_state;
 use super::test_ui::{
-    click, click_quickly, has, label_of, notifications, open_tall, press, shows, type_text,
-    wait_to_show, wait_until,
+    click, click_quickly, has, label_of, notifications, open_tall, press, saved, shows, type_text,
+    wait_saved, wait_to_show, wait_until,
 };
 use super::thread_tests::{live_run, world};
 use super::workspace::Workspace;
@@ -215,7 +216,7 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
             ws.state().agent(forge).unwrap().spec.max_run_minutes == 60
         })
     });
-    wait_to_show(cx, window, "Saved");
+    wait_saved(cx, &ws);
     ws.read_with(cx, |ws, _| {
         let spec = &ws.state().agent(forge).unwrap().spec;
         assert_eq!(spec.model, "opus");
@@ -229,7 +230,7 @@ fn editing_an_agent_changes_its_next_run(cx: &mut TestAppContext) {
     });
     click(cx, window, "agent-role");
     type_text(cx, window, " lead");
-    assert!(!shows(cx, window, "Saved"), "an edit since");
+    assert!(!saved(cx, &ws), "an edit since");
 
     w.post("@Forge look at the login");
     wait_until(cx, "the run's arguments", |_| {
@@ -431,6 +432,137 @@ fn deleting_a_busy_agent_shows_crewds_reason(cx: &mut TestAppContext) {
     press(cx, window, "cmd-shift-.");
 }
 
+/// Waits until the open project form is saved with nothing pending.
+fn wait_project_saved(cx: &mut TestAppContext, ws: &Entity<Workspace>) {
+    wait_until(cx, "the project saved", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.project_saves.idle()
+                && ws
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.projects.form.as_ref())
+                    .is_some_and(|f| f.saved && !f.saving && f.error.is_none())
+        })
+    });
+}
+
+fn setup_of(cx: &mut TestAppContext, ws: &Entity<Workspace>, project: ProjectId) -> Option<String> {
+    ws.read_with(cx, |ws, _| {
+        ws.state().project(project).unwrap().setup_command.clone()
+    })
+}
+
+#[gpui_kit::test]
+fn a_project_saves_typing_after_a_pause_and_before_you_leave(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let other_root = git_repo(&tmp.path().join("other"));
+    let other: ProjectId = w.ask(Request::CreateProject {
+        name: "other".into(),
+        root: other_root.to_string_lossy().into_owned(),
+        main_branch: "main".into(),
+        work_mode: None,
+        copy_files: vec![],
+        setup_command: None,
+    });
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "both projects", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().project(other).is_some())
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-projects");
+    click(cx, window, format!("settings-project-{}", w.project));
+
+    // Not while typing; after the pause.
+    click(cx, window, "project-setup");
+    type_text(cx, window, "npm ci");
+    cx.run_until_parked();
+    assert_eq!(setup_of(cx, &ws, w.project), None, "not while typing");
+    cx.executor().advance_clock(AUTOSAVE_PAUSE);
+    wait_until(cx, "the setup", |cx| {
+        setup_of(cx, &ws, w.project).as_deref() == Some("npm ci")
+    });
+
+    // Switching projects saves what you typed first, and coming back
+    // shows it.
+    type_text(cx, window, " --quiet");
+    click(cx, window, format!("settings-project-{other}"));
+    click(cx, window, format!("settings-project-{}", w.project));
+    let shown = ws.read_with(cx, |ws, cx| {
+        let form = ws
+            .settings
+            .as_ref()
+            .unwrap()
+            .projects
+            .form
+            .as_ref()
+            .unwrap();
+        form.setup.read(cx).value().to_string()
+    });
+    assert_eq!(shown, "npm ci --quiet");
+    wait_until(cx, "the switch saved", |cx| {
+        setup_of(cx, &ws, w.project).as_deref() == Some("npm ci --quiet")
+    });
+
+    // Leaving settings saves too.
+    click(cx, window, format!("settings-project-{other}"));
+    click(cx, window, "project-setup");
+    type_text(cx, window, "make");
+    click(cx, window, "settings-back");
+    wait_until(cx, "the other setup", |cx| {
+        setup_of(cx, &ws, other).as_deref() == Some("make")
+    });
+}
+
+#[gpui_kit::test]
+fn a_reopened_project_shows_a_change_made_elsewhere(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the project", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().project(w.project).is_some())
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-projects");
+    click(cx, window, "project-setup");
+    type_text(cx, window, "npm ci");
+    cx.executor().advance_clock(AUTOSAVE_PAUSE);
+    wait_project_saved(cx, &ws);
+    wait_until(cx, "the setup", |cx| {
+        setup_of(cx, &ws, w.project).as_deref() == Some("npm ci")
+    });
+    click(cx, window, "settings-back");
+
+    // Another client changes it.
+    let _: serde_json::Value = w.ask(Request::UpdateProject {
+        project: w.project,
+        setup_command: Some("make".into()),
+        copy_files: vec![],
+    });
+    wait_until(cx, "the change", |cx| {
+        setup_of(cx, &ws, w.project).as_deref() == Some("make")
+    });
+
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-projects");
+    let shown = ws.read_with(cx, |ws, cx| {
+        let form = ws
+            .settings
+            .as_ref()
+            .unwrap()
+            .projects
+            .form
+            .as_ref()
+            .unwrap();
+        form.setup.read(cx).value().to_string()
+    });
+    assert_eq!(shown, "make");
+}
+
 #[gpui_kit::test]
 fn project_setup_command_is_saved(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
@@ -454,7 +586,9 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
     type_text(cx, window, ".env");
     press(cx, window, "enter");
     type_text(cx, window, "config/local.toml");
-    click(cx, window, "project-save");
+    assert!(!has(cx, window, "project-save"), "no save button");
+    // Both save after a pause in typing.
+    cx.executor().advance_clock(AUTOSAVE_PAUSE);
     wait_until(cx, "the setup saved", |cx| {
         ws.read_with(cx, |ws, _| {
             let p = ws.state().project(w.project).unwrap();
@@ -463,7 +597,7 @@ fn project_setup_command_is_saved(cx: &mut TestAppContext) {
         })
     });
     // crewd's answer and its project update arrive apart.
-    wait_to_show(cx, window, "Saved");
+    wait_project_saved(cx, &ws);
 
     // Channels: add one, and set #general's handoffs.
     click(cx, window, "project-new-channel");
