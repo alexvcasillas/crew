@@ -15,7 +15,7 @@ use super::common::runtime_chip;
 use super::inspector_tests::run_of;
 use super::settings::agents::CODEX_LOGIN;
 use super::test_ui::{
-    click, has, label_of, open_tall, press, shows, type_text, wait_to_show, wait_until,
+    click, has, label_of, open_tall, press, shows, type_text, wait_saved, wait_to_show, wait_until,
 };
 use super::thread_tests::{go_to, world};
 use crate::test_support::{Daemon, fake_claude, fake_codex, short_home};
@@ -150,7 +150,7 @@ fn a_codex_agent_is_made_in_settings(cx: &mut TestAppContext) {
     click(cx, window, "agent-name");
     type_text(cx, window, "Nova");
     click(cx, window, "agent-save");
-    wait_to_show(cx, window, "Saved");
+    wait_saved(cx, &ws);
 
     let nova = ws.read_with(cx, |ws, _| {
         let agents = ws.state().agents();
@@ -215,7 +215,7 @@ fn a_signed_out_codex_cant_be_saved(cx: &mut TestAppContext) {
     // Claude Code is fine, so a Claude agent saves.
     click(cx, window, "runtime-claude");
     click(cx, window, "agent-save");
-    wait_to_show(cx, window, "Saved");
+    wait_saved(cx, &ws);
 }
 
 #[gpui_kit::test]
@@ -371,7 +371,7 @@ fn many_codex_models_go_in_a_menu(cx: &mut TestAppContext) {
     click(cx, window, "agent-name");
     type_text(cx, window, "Nova");
     click(cx, window, "agent-save");
-    wait_to_show(cx, window, "Saved");
+    wait_saved(cx, &ws);
     ws.read_with(cx, |ws, _| {
         let spec = &ws.state().agents()[0].spec;
         assert_eq!(spec.model, "gpt-6.1-terra");

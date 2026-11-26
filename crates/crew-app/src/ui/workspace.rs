@@ -218,6 +218,7 @@ pub struct Workspace {
     recents_task: Option<Task<()>>,
     /// Saves of existing agents from Settings › Agents.
     pub(super) agent_saves: super::settings::agents::AgentSaves,
+    pub(super) project_saves: super::settings::projects::ProjectSaves,
     /// Lays out again when the appearance settings change.
     _appearance: Subscription,
     /// The window's width as last drawn.
@@ -366,6 +367,7 @@ impl Workspace {
             skills: Default::default(),
             recents_task: None,
             agent_saves: Default::default(),
+            project_saves: Default::default(),
             _appearance: appearance,
             traffic_lights: None,
             window_width: px(f32::MAX),
@@ -922,6 +924,7 @@ impl Workspace {
     /// of the body.
     pub(super) fn leave_pages(&mut self, cx: &mut Context<Self>) {
         self.flush_agent_save(cx);
+        self.flush_project_save(cx);
         self.settings = None;
         self.running = None;
         self.drop_review(cx);
