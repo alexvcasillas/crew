@@ -871,6 +871,39 @@ fn codex_agents_have_no_tools_row(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn codex_agents_offer_no_claude_models(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let codex = create_agent(
+        &w,
+        crew_core::agent::AgentSpec {
+            runtime: crew_core::agent::Runtime::Codex,
+            model: String::new(),
+            ..agent("Scout", "Reads")
+        },
+    );
+    let (window, ws) = open(cx, home.path());
+    wait_for_agent(cx, &ws, codex);
+
+    open_palette(cx, window);
+    search(cx, window, "opus", "Agents › Forge › Model");
+    let rows = rows(cx, window);
+    assert!(
+        rows.iter()
+            .any(|(l, s)| l == "Agents › Forge › Model" && s.ends_with("has Opus")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(l, s)| l == "Agents › Scout › Model" && s.contains("has Opus")),
+        "{rows:?}"
+    );
+}
+
+#[gpui_kit::test]
 fn a_command_runs_its_action(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let home = short_home();

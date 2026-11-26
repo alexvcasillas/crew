@@ -1280,3 +1280,62 @@ fn jumping_to_a_gone_item_opens_its_page_only(cx: &mut TestAppContext) {
     assert_eq!(page(cx, &ws), Some(Page::Agents));
     assert_eq!(highlighted(cx, &ws), None);
 }
+
+#[gpui_kit::test]
+fn picking_another_agent_drops_the_highlight(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (forge, scout) = (w.agents[0], w.agents[1]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the agents", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(scout).is_some())
+    });
+
+    jump(
+        cx,
+        window,
+        "what it can do",
+        "Agents › Scout › What it can do",
+    );
+    assert_eq!(highlighted(cx, &ws), Some("field-agent-permission"));
+    click(cx, window, format!("settings-agent-{forge}"));
+    assert_eq!(agent_form_of(cx, &ws), Some(forge));
+    assert_eq!(
+        highlighted(cx, &ws),
+        None,
+        "Forge's row isn't the one jumped to"
+    );
+}
+
+#[gpui_kit::test]
+fn jumping_to_model_keeps_the_picked_model(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let forge = w.agents[0];
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the agent", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(forge).is_some())
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_setting("field-agent-model", Some(Item::Agent(forge)), window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let other_focused = cx
+        .update_window(window, |_, window, cx| {
+            let ws = ws.read(cx);
+            let form = ws.settings.as_ref()?.agents.form.as_ref()?;
+            Some(
+                gpui_kit::Focusable::focus_handle(form.other_model.read(cx), cx).is_focused(window),
+            )
+        })
+        .unwrap();
+    assert_eq!(other_focused, Some(false), "Other model isn't focused");
+}

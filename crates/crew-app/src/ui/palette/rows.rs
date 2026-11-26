@@ -638,6 +638,19 @@ fn local_settings(i: &Inputs, query: &str) -> Vec<Row> {
                     if entry.field == "field-agent-tools" && a.spec.runtime != Runtime::ClaudeCode {
                         continue;
                     }
+                    // Its model choices are Claude's: another runtime's
+                    // picker doesn't offer them.
+                    let claude_models = SettingEntry {
+                        options: &[],
+                        ..*entry
+                    };
+                    let entry = if entry.field == "field-agent-model"
+                        && a.spec.runtime != Runtime::ClaudeCode
+                    {
+                        &claude_models
+                    } else {
+                        entry
+                    };
                     let item = Some(Item::Agent(a.id));
                     rows.extend(setting_row(i, entry, item, &[page, &a.spec.name], query));
                 }

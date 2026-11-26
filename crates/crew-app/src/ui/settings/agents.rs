@@ -581,8 +581,9 @@ impl Workspace {
     }
 
     /// Focuses the text control of the open form's `field`, if it has
-    /// one. Runtime and What it can do are cards and a menu: they keep
-    /// focus where it was.
+    /// one. Runtime, Model and What it can do keep focus where it was:
+    /// they are cards, a picker and a menu, and typing in Model's "Other
+    /// model" box would replace the picked model.
     pub(super) fn focus_agent_field(
         &mut self,
         field: &str,
@@ -594,7 +595,6 @@ impl Workspace {
         };
         let input = match field {
             "field-agent-name" => &form.name,
-            "field-agent-model" => &form.other_model,
             "field-agent-tools" => &form.allowed_tools,
             "field-agent-handoffs" => &form.budget,
             "field-agent-instructions" => {
@@ -624,6 +624,8 @@ impl Workspace {
         let name = form.name.clone();
         if let Some(settings) = self.settings.as_mut() {
             settings.agents.form = Some(form);
+            // A jump highlights a field of the form it opened, not the next.
+            settings.drop_highlight();
         }
         // Only a new agent's name wants typing at once.
         let new = self

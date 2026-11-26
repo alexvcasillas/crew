@@ -139,6 +139,15 @@ impl SettingsView {
     }
 }
 
+impl SettingsView {
+    /// Stops a jump's highlight at once.
+    fn drop_highlight(&mut self) {
+        self.highlight = None;
+        self.fade = None;
+        self.scroll_to_highlight.set(false);
+    }
+}
+
 /// What a page needs to draw a jump from ⌘K: the field to tint and the
 /// column to scroll.
 #[derive(Clone, Default)]
@@ -306,8 +315,7 @@ impl Workspace {
         let Some(view) = self.settings.as_mut() else {
             return;
         };
-        view.fade = None;
-        view.highlight = None;
+        view.drop_highlight();
         if !shown {
             cx.notify();
             return;

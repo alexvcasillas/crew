@@ -237,6 +237,10 @@ impl Workspace {
                 edited(this, event, cx)
             }),
         ];
+        if let Some(settings) = self.settings.as_mut() {
+            // A jump highlights a field of the form it opened, not the next.
+            settings.drop_highlight();
+        }
         if let Some(page) = self.projects_page() {
             page.selected = Some(project);
             page.form = Some(ProjectForm {
