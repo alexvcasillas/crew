@@ -10,7 +10,7 @@ use gpui_kit::component::{Disableable as _, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{Page, field, form_error, page_scroll, page_title, segment, segmented};
+use super::{Jump, Page, field, form_error, page_scroll, page_title, segment, segmented};
 use crate::theme::scale::{self, ui_px};
 use crate::ui::workspace::Workspace;
 
@@ -64,6 +64,7 @@ impl Workspace {
     }
 
     pub(super) fn render_limits_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let jump = self.jump(cx);
         let limits = *self.state().limits();
         let budget_on = limits.handoff_policy == HandoffPolicy::Budget;
 
@@ -171,7 +172,7 @@ impl Workspace {
         })
         .collect();
 
-        page_scroll("settings-limits")
+        page_scroll("settings-limits", &jump)
             .child(page_title("Handoffs and limits"))
             .child(
                 div()
@@ -179,25 +180,33 @@ impl Workspace {
                     .flex_col()
                     .max_w(ui_px(760.))
                     .child(limit_row(
+                        &jump,
                         "limits-row-max-runs",
+                        "field-limits-max-runs",
                         "Agents at once",
                         AT_ONCE_HELP,
                         value("limits-max-runs-value", limits.max_runs, at_once),
                     ))
                     .child(limit_row(
+                        &jump,
                         "limits-row-new-runs",
+                        "field-limits-new-runs",
                         "New runs",
                         NEW_RUNS_HELP,
                         div().flex().child(segmented(runs).w(ui_px(240.))),
                     ))
                     .child(limit_row(
+                        &jump,
                         "limits-row-policy",
+                        "field-limits-policy",
                         "Bringing in other agents",
                         POLICY_HELP,
                         div().flex().child(segmented(policies).w(ui_px(320.))),
                     ))
                     .child(limit_row(
+                        &jump,
                         "limits-row-budget",
+                        "field-limits-budget",
                         "Handoffs per thread",
                         BUDGET_HELP,
                         value("limits-budget-value", limits.handoff_budget, budget),
@@ -216,7 +225,9 @@ impl Workspace {
 
 /// A form row, labelled with its label so tests can find it.
 fn limit_row(
+    jump: &Jump,
     id: &'static str,
+    field_id: &'static str,
     label: &'static str,
     help: &'static str,
     content: impl IntoElement,
@@ -224,7 +235,7 @@ fn limit_row(
     div()
         .id(id)
         .aria_label(label)
-        .child(field(label, Some(help), content))
+        .child(field(jump, field_id, label, Some(help), content))
         .test_support()
 }
 

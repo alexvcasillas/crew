@@ -21,7 +21,7 @@ use crew_proto::Request;
 const AUTO_LABEL: &str = "Auto: edit files, ask only before risky commands";
 
 /// crewd with the named agents, the app open on Settings › Agents and
-/// the first agent's form.
+/// the form of the first agent named.
 fn agents_page(
     cx: &mut TestAppContext,
     names: &[&str],
@@ -46,6 +46,9 @@ fn agents_page(
     });
     press(cx, window, "cmd-,");
     click(cx, window, "settings-nav-agents");
+    // The page opens on whichever agent it lists first; the tests mean
+    // the first one they made.
+    click(cx, window, format!("settings-agent-{}", w.agents[0]));
     (tmp, home, daemon, w, window, ws)
 }
 

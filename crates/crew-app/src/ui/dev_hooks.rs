@@ -10,8 +10,9 @@ use super::settings::Page;
 pub struct DevHooks {
     /// `CREW_APP_OPEN_THREAD`: opened once the thread is known.
     pub open_thread: Option<ThreadId>,
-    /// `CREW_APP_SHOW`: `running`, `settings[:page]`, `diff:<thread>` or
-    /// `terminal:<session>`.
+    /// `CREW_APP_SHOW`: `running`, `settings[:page]`, `diff:<thread>`,
+    /// `terminal:<session>`, `palette:<query>` or
+    /// `setting:<field>[:<name>]`.
     pub show: Option<String>,
     /// `CREW_APP_SHOW=diff:<thread>`: the thread's changes, opened once
     /// the thread is known.
@@ -23,6 +24,12 @@ pub struct DevHooks {
     /// `CREW_APP_SHOW=terminal:<session>`: a terminal session, opened
     /// once it is known.
     pub terminal: Option<String>,
+    /// `CREW_APP_SHOW=palette:<query>`: ⌘K with the query typed, once
+    /// the state is loaded.
+    pub palette: Option<String>,
+    /// `CREW_APP_SHOW=setting:<field>[:<agent or project name>]`: the
+    /// jump ⌘K makes to that settings field, once the name is known.
+    pub setting: Option<(String, Option<String>)>,
 }
 
 /// Reads the hooks through `var`, logging values it can't use.
@@ -38,6 +45,8 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
     let mut running = false;
     let mut settings = None;
     let mut terminal = None;
+    let mut palette = None;
+    let mut setting = None;
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
             "running" => running = true,
@@ -55,6 +64,17 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
                         eprintln!("crew: CREW_APP_SHOW={v} names no settings page, ignored");
                         None
                     }
+                }
+            }
+            _ if v.starts_with("palette:") => palette = Some(v["palette:".len()..].to_string()),
+            _ if v.starts_with("setting:") => {
+                let mut parts = v["setting:".len()..].splitn(2, ':');
+                let field = parts.next().unwrap_or_default().trim();
+                if field.is_empty() {
+                    eprintln!("crew: CREW_APP_SHOW={v} names no settings field, ignored");
+                } else {
+                    let name = parts.next().map(|n| n.trim().to_string());
+                    setting = Some((field.to_string(), name.filter(|n| !n.is_empty())));
                 }
             }
             _ if v.starts_with("terminal:") => {
@@ -87,6 +107,8 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         running,
         settings,
         terminal,
+        palette,
+        setting,
     }
 }
 
@@ -112,8 +134,23 @@ mod tests {
                 running: true,
                 settings: None,
                 terminal: None,
+                palette: None,
+                setting: None,
             }
         );
+        let setting = read(|k| {
+            (k == "CREW_APP_SHOW").then(|| "setting:field-project-files:demo".to_string())
+        });
+        assert_eq!(
+            setting.setting,
+            Some(("field-project-files".into(), Some("demo".into())))
+        );
+        let global =
+            read(|k| (k == "CREW_APP_SHOW").then(|| "setting:field-appearance-zoom".into()));
+        assert_eq!(global.setting, Some(("field-appearance-zoom".into(), None)));
+        assert_eq!(read(|_| Some("setting:".into())).setting, None);
+        let palette = read(|k| (k == "CREW_APP_SHOW").then(|| "palette:auto".to_string()));
+        assert_eq!(palette.palette.as_deref(), Some("auto"));
         let terminal = read(|k| (k == "CREW_APP_SHOW").then(|| "terminal:abc-1".to_string()));
         assert_eq!(terminal.terminal.as_deref(), Some("abc-1"));
         assert_eq!(read(|_| Some("terminal:".into())).terminal, None);

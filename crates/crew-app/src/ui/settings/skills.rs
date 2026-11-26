@@ -397,8 +397,9 @@ impl Workspace {
     }
 
     pub(super) fn render_skills_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let jump = self.jump(cx);
         let Some(page) = self.skills_page() else {
-            return page_scroll("settings-skills").into_any_element();
+            return page_scroll("settings-skills", &jump).into_any_element();
         };
         let project = page.project.and_then(|p| self.state().project(p));
         let query = page.search.read(cx).value().to_string();
@@ -472,6 +473,9 @@ impl Workspace {
             .gap(ui_px(8.))
             .child(
                 div()
+                    .id("field-skills-project")
+                    .relative()
+                    .children(jump.mark("field-skills-project"))
                     .flex()
                     .items_center()
                     .gap(ui_px(8.))
@@ -481,7 +485,8 @@ impl Workspace {
                     .child(div().min_w(ui_px(160.)).child(control(
                         "skills-project",
                         Select::new(&page.projects).accessibility_label("Project skills from"),
-                    ))),
+                    )))
+                    .test_support(),
             )
             .child(segmented(runtimes))
             .child(div().flex_1())
@@ -521,7 +526,7 @@ impl Workspace {
             );
         }
 
-        page_scroll("settings-skills")
+        page_scroll("settings-skills", &jump)
             .gap_0()
             .pb(ui_px(32.))
             .child(

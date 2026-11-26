@@ -12,7 +12,7 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{control, field, page_scroll, segment, segmented};
+use super::{Jump, control, field, page_column, segment, segmented};
 use crate::markdown;
 use crate::prefs::{
     Appearance, CODE_SIZES, DEFAULT_CODE_FONT, DEFAULT_UI_FONT, Density, LineHeight, SidebarMode,
@@ -232,6 +232,7 @@ impl Workspace {
 
     pub(super) fn render_appearance_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let a = scale::appearance(cx);
+        let jump = self.jump(cx);
         let form = div()
             .flex()
             .flex_col()
@@ -265,7 +266,9 @@ impl Workspace {
                     ),
             )
             .child(row(
+                &jump,
                 "ui-size",
+                "field-appearance-ui-size",
                 "Interface text size",
                 Some("Messages, sidebar, buttons."),
                 sizes("appearance-ui-size", &UI_SIZES, a.ui_size, 13, |a, n| {
@@ -273,7 +276,9 @@ impl Workspace {
                 }),
             ))
             .child(row(
+                &jump,
                 "code-size",
+                "field-appearance-code-size",
                 "Code text size",
                 Some("Paths, commands, diffs, terminal."),
                 sizes(
@@ -285,13 +290,17 @@ impl Workspace {
                 ),
             ))
             .child(row(
+                &jump,
                 "fonts",
+                "field-appearance-fonts",
                 "Fonts",
                 Some("Any font installed on this Mac."),
                 self.render_font_selects(),
             ))
             .child(row(
+                &jump,
                 "line-height",
+                "field-appearance-line-height",
                 "Line height",
                 None,
                 choices(
@@ -306,7 +315,9 @@ impl Workspace {
                 ),
             ))
             .child(row(
+                &jump,
                 "rendering",
+                "field-appearance-rendering",
                 "Text rendering",
                 Some("Crew already uses grayscale smoothing."),
                 div()
@@ -322,7 +333,9 @@ impl Workspace {
                     )),
             ))
             .child(row(
+                &jump,
                 "density",
+                "field-appearance-density",
                 "Density",
                 Some("Row heights and padding."),
                 choices(
@@ -336,13 +349,17 @@ impl Workspace {
                 ),
             ))
             .child(row(
+                &jump,
                 "sidebar",
+                "field-appearance-sidebar",
                 "Sidebar",
                 Some("Also switches from the button in the sidebar header."),
                 sidebar_modes(a.sidebar_mode),
             ))
             .child(row(
+                &jump,
                 "zoom",
+                "field-appearance-zoom",
                 "Zoom",
                 Some("Scales the whole window."),
                 zoom(a.zoom),
@@ -358,8 +375,9 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
+            .track_scroll(jump.scroll())
             .child(
-                page_scroll("settings-appearance")
+                page_column("settings-appearance")
                     .flex_grow(999.)
                     .flex_shrink(1.)
                     .flex_basis(ui_px(FORM_BASIS))
@@ -394,7 +412,9 @@ impl Workspace {
 /// A form row of the page, labelled so tests can find it. The board's
 /// rows have a rule above each one.
 fn row(
+    jump: &Jump,
     key: &'static str,
+    field_id: &'static str,
     label: &'static str,
     help: Option<&'static str>,
     content: impl IntoElement,
@@ -403,7 +423,7 @@ fn row(
         .id(SharedString::from(format!("appearance-row-{key}")))
         .aria_label(label)
         .child(
-            field(label, help, content)
+            field(jump, field_id, label, help, content)
                 .py(scale::row(16.))
                 .border_b_0()
                 .border_t_1(),

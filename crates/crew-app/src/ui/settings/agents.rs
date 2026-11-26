@@ -580,6 +580,33 @@ impl Workspace {
         self.set_agent_form(form, window, cx);
     }
 
+    /// Focuses the text control of the open form's `field`, if it has
+    /// one. Runtime, Model and What it can do keep focus where it was:
+    /// they are cards, a picker and a menu, and typing in Model's "Other
+    /// model" box would replace the picked model.
+    pub(super) fn focus_agent_field(
+        &mut self,
+        field: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(form) = self.settings.as_ref().and_then(|s| s.agents.form.as_ref()) else {
+            return;
+        };
+        let input = match field {
+            "field-agent-name" => &form.name,
+            "field-agent-tools" => &form.allowed_tools,
+            "field-agent-handoffs" => &form.budget,
+            "field-agent-instructions" => {
+                let textarea = form.instructions.clone();
+                textarea.update(cx, |t, cx| t.focus(window, cx));
+                return;
+            }
+            _ => return,
+        };
+        input.clone().update(cx, |i, cx| i.focus(window, cx));
+    }
+
     /// A new form holding what this one holds, as typed, named
     /// `<Name>-copy`.
     fn duplicate_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -597,6 +624,8 @@ impl Workspace {
         let name = form.name.clone();
         if let Some(settings) = self.settings.as_mut() {
             settings.agents.form = Some(form);
+            // A jump highlights a field of the form it opened, not the next.
+            settings.drop_highlight();
         }
         // Only a new agent's name wants typing at once.
         let new = self
@@ -1067,6 +1096,7 @@ impl Workspace {
     }
 
     fn render_agent_form(&self, form: &AgentForm, cx: &mut Context<Self>) -> impl IntoElement {
+        let jump = self.jump(cx);
         let name = form.name.read(cx).value().to_string();
         let title = if form.editing.is_none() && name.trim().is_empty() {
             "New agent".to_string()
@@ -1161,6 +1191,7 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
+            .track_scroll(jump.scroll())
             .px(ui_px(32.))
             .py(ui_px(24.))
             .child(
@@ -1227,6 +1258,8 @@ impl Workspace {
                         )
                     })
                     .child(field(
+                        &jump,
+                        "field-agent-name",
                         "Name and role",
                         Some("You @mention the agent by its name."),
                         div()
@@ -1244,11 +1277,15 @@ impl Workspace {
                             ),
                     ))
                     .child(field(
+                        &jump,
+                        "field-agent-runtime",
                         "Runtime",
                         Some("The CLI that runs this agent."),
                         self.render_runtime_cards(&form.runtime, cx),
                     ))
                     .child(field(
+                        &jump,
+                        "field-agent-model",
                         "Model",
                         Some("Passed to the CLI as --model."),
                         div()
@@ -1259,6 +1296,8 @@ impl Workspace {
                             .child(control("agent-other-model", Input::new(&form.other_model))),
                     ))
                     .child(field(
+                        &jump,
+                        "field-agent-instructions",
                         "Instructions",
                         Some(INSTRUCTIONS_HELP),
                         div().font_family(code_family()).child(control(
@@ -1267,6 +1306,8 @@ impl Workspace {
                         )),
                     ))
                     .child(field(
+                        &jump,
+                        "field-agent-permission",
                         "What it can do",
                         Some("Edits stay in the thread's own worktree."),
                         div()
@@ -1287,12 +1328,16 @@ impl Workspace {
                     // Codex has no such list; it asks through its sandbox.
                     .when(form.runtime == Runtime::ClaudeCode, |col| {
                         col.child(field(
+                            &jump,
+                            "field-agent-tools",
                             "Always allow these tools",
                             Some("A comma list, passed as --allowedTools."),
                             control("agent-tools", Input::new(&form.allowed_tools)),
                         ))
                     })
                     .child(field(
+                        &jump,
+                        "field-agent-handoffs",
                         "Bringing in other agents",
                         Some("When this agent mentions another one."),
                         div()

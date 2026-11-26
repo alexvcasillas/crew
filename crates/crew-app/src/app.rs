@@ -38,6 +38,9 @@ actions!(
         ZoomOut,
         /// Zoom the window back to 100% (⌘0).
         ResetZoom,
+        /// Ask for a folder to add as a project. No shortcut; the palette
+        /// runs it.
+        AddProject,
     ]
 );
 

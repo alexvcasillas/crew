@@ -738,3 +738,371 @@ fn name_hits_come_before_files(cx: &mut TestAppContext) {
     assert_eq!(files, 5, "capped");
     assert!(found.iter().any(|(l, _)| l == "Show all 7"));
 }
+
+/// The keys chip on row `row`, if it has its own.
+fn keys_of(cx: &mut TestAppContext, window: AnyWindowHandle, row: usize) -> Option<String> {
+    label_of(cx, window, ("palette-keys", row))
+}
+
+/// The section titles, top to bottom.
+fn section_titles(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<String> {
+    (0..60usize)
+        .filter_map(|pos| label_of(cx, window, format!("palette-section-{pos}")))
+        .collect()
+}
+
+fn create_agent(w: &super::thread_tests::World, spec: crew_core::agent::AgentSpec) -> AgentId {
+    w.ask(Request::CreateAgent { spec })
+}
+
+fn wait_for_agent(cx: &mut TestAppContext, ws: &Entity<Workspace>, agent: AgentId) {
+    wait_until(cx, "the agent", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(agent).is_some())
+    });
+}
+
+#[gpui_kit::test]
+fn typing_lists_commands_then_settings(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    wait_for_snapshot(cx, &ws, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "zoom", "Commands · 3");
+    assert!(shows_in_palette(cx, window, "Settings · 1"));
+    assert_eq!(
+        rows(cx, window),
+        [
+            ("Bigger".into(), "Zoom in, bigger text".into()),
+            ("Smaller".into(), "Zoom out, smaller text".into()),
+            ("Reset zoom".into(), String::new()),
+            ("Appearance › Zoom".into(), "100%".into()),
+            ("New thread in #general: “zoom”".into(), String::new()),
+        ]
+    );
+    assert_eq!(keys_of(cx, window, 0).as_deref(), Some("⌘="));
+    assert_eq!(keys_of(cx, window, 1).as_deref(), Some("⌘−"));
+    assert_eq!(keys_of(cx, window, 2).as_deref(), Some("⌘0"));
+
+    // Places come first.
+    press(cx, window, "cmd-a backspace");
+    search(cx, window, "gen", "Settings · 6");
+    assert_eq!(
+        section_titles(cx, window),
+        ["Channels · 1", "Settings · 6", "Actions"]
+    );
+    assert_eq!(
+        rows(cx, window)[..2],
+        [
+            ("general".into(), "demo".into()),
+            ("General › Thread titles".into(), "Generated".into()),
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn agent_settings_match_on_options(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let forge = create_agent(
+        &w,
+        crew_core::agent::AgentSpec {
+            permission_mode: PermissionMode::Auto,
+            ..agent("Forge", "Builds")
+        },
+    );
+    let scout = create_agent(
+        &w,
+        crew_core::agent::AgentSpec {
+            permission_mode: PermissionMode::ReadOnly,
+            ..agent("Scout", "Reads")
+        },
+    );
+    let (window, ws) = open(cx, home.path());
+    wait_for_agent(cx, &ws, forge);
+    wait_for_agent(cx, &ws, scout);
+
+    open_palette(cx, window);
+    search(cx, window, "auto", "Settings · 2");
+    assert_eq!(
+        rows(cx, window),
+        [
+            ("Agents › Forge › What it can do".into(), "Auto".into()),
+            (
+                "Agents › Scout › What it can do".into(),
+                "Read only · has Auto".into()
+            ),
+            ("New thread in #general: “auto”".into(), String::new()),
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn codex_agents_have_no_tools_row(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let codex = create_agent(
+        &w,
+        crew_core::agent::AgentSpec {
+            runtime: crew_core::agent::Runtime::Codex,
+            model: String::new(),
+            ..agent("Scout", "Reads")
+        },
+    );
+    let (window, ws) = open(cx, home.path());
+    wait_for_agent(cx, &ws, codex);
+
+    open_palette(cx, window);
+    search(cx, window, "always allow", "Settings · 1");
+    assert_eq!(
+        rows(cx, window)[0],
+        (
+            "Agents › Forge › Always allow these tools".into(),
+            String::new()
+        )
+    );
+}
+
+#[gpui_kit::test]
+fn codex_agents_offer_no_claude_models(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let codex = create_agent(
+        &w,
+        crew_core::agent::AgentSpec {
+            runtime: crew_core::agent::Runtime::Codex,
+            model: String::new(),
+            ..agent("Scout", "Reads")
+        },
+    );
+    let (window, ws) = open(cx, home.path());
+    wait_for_agent(cx, &ws, codex);
+
+    open_palette(cx, window);
+    search(cx, window, "opus", "Agents › Forge › Model");
+    let rows = rows(cx, window);
+    assert!(
+        rows.iter()
+            .any(|(l, s)| l == "Agents › Forge › Model" && s.ends_with("has Opus")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(l, s)| l == "Agents › Scout › Model" && s.contains("has Opus")),
+        "{rows:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_command_runs_its_action(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    wait_for_snapshot(cx, &ws, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "running now", "Commands · 1");
+    let running = row_index(cx, window, "Running now", "");
+    for _ in 0..running {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+    assert!(!has(cx, window, "palette"));
+    wait_until(cx, "Running now", |cx| {
+        ws.read_with(cx, |ws, _| ws.running.is_some())
+    });
+}
+
+#[gpui_kit::test]
+fn picking_add_project_opens_its_dialog(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    wait_for_snapshot(cx, &ws, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "add project", "Commands · 1");
+    let add = row_index(cx, window, "Add project…", "");
+    for _ in 0..add {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+    wait_until(cx, "the Add project dialog", |cx| {
+        has(cx, window, "add-project")
+    });
+    assert!(!palette_open(cx, &ws));
+}
+
+#[gpui_kit::test]
+fn context_commands_hide_without_context(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    wait_for_snapshot(cx, &ws, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "rename", "New thread in #general: “rename”");
+    assert!(!rows(cx, window).iter().any(|(l, _)| l == "Rename thread"));
+    assert!(!shows_in_palette(cx, window, "Stop all runs"));
+    press(cx, window, "escape");
+
+    super::dialog_tests::select_card(cx, window, &ws, &w, w.thread);
+    open_palette(cx, window);
+    search(cx, window, "rename", "Rename thread");
+    // Nothing waits on you, so nothing to approve.
+    press(cx, window, "cmd-a backspace");
+    search(cx, window, "approve", "New thread in #general: “approve”");
+    assert!(!shows_in_palette(cx, window, "Approve the newest request"));
+}
+
+#[gpui_kit::test]
+fn no_results(cx: &mut TestAppContext) {
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let (window, _ws) = open(cx, home.path());
+    open_palette(cx, window);
+    search(cx, window, "zzzz", "No results.");
+    assert!(rows(cx, window).is_empty());
+    assert!(shows_within(cx, window, "palette-footer", "esc close"));
+    assert!(!shows_within(cx, window, "palette-footer", "↑↓ move"));
+}
+
+#[gpui_kit::test]
+fn empty_query_is_unchanged(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge"]);
+    let (window, ws) = open(cx, home.path());
+    go_to(cx, window, &ws, w.channel, w.thread);
+
+    open_palette(cx, window);
+    assert_eq!(section_titles(cx, window), ["Recent", "Actions"]);
+    assert_eq!(
+        rows(cx, window),
+        [
+            ("fix the login".into(), "#general".into()),
+            ("general".into(), "demo · 0 active".into()),
+            ("New thread in #general".into(), String::new()),
+            ("Open Running now".into(), "0 running · 0 needs you".into()),
+            ("Add project…".into(), String::new()),
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn settings_cap_and_show_all(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    // Six agents and General › Thread titles, which picks a model too.
+    let names = ["Atlas", "Bolt", "Cog", "Dune", "Echo", "Flint"];
+    let w = world(home.path(), &tmp.path().join("repo"), &names);
+    let (window, ws) = open(cx, home.path());
+    wait_for_agent(cx, &ws, *w.agents.last().unwrap());
+
+    open_palette(cx, window);
+    search(cx, window, "model", "Settings · 7");
+    let settings = |cx: &mut TestAppContext| {
+        rows(cx, window)
+            .iter()
+            .filter(|(l, _)| l.contains(" › "))
+            .count()
+    };
+    assert_eq!(settings(cx), 5);
+    let show_all = row_index(cx, window, "Show all 7", "");
+    click(cx, window, ("palette-row", show_all));
+    assert_eq!(settings(cx), 7);
+    assert!(
+        rows(cx, window)
+            .iter()
+            .any(|(l, v)| l == "Agents › Flint › Model" && v == "claude-haiku-4-5")
+    );
+}
+
+/// Moves to the row `label` and presses ↵.
+fn pick(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str, sub: &str) {
+    let at = row_index(cx, window, label, sub);
+    for _ in 0..at {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+}
+
+#[gpui_kit::test]
+fn stop_all_and_approve_show_with_their_context(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(
+        home.path().to_path_buf(),
+        super::inspector_tests::waiting_claude(tmp.path()),
+    );
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (window, ws) = open(cx, home.path());
+    go_to(cx, window, &ws, w.channel, w.thread);
+    let run = super::inspector_tests::start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    open_palette(cx, window);
+    search(cx, window, "stop all", "Stop all runs");
+    assert!(!shows_in_palette(cx, window, "Approve the newest request"));
+    press(cx, window, "escape");
+
+    super::inspector_tests::hand_off(&w, run, "Scout", "check the edit");
+    super::inspector_tests::pending(cx, &ws, w.thread);
+    open_palette(cx, window);
+    search(cx, window, "approve", "Approve the newest request");
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+}
+
+#[gpui_kit::test]
+fn rename_and_archive_run_from_the_palette(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    super::dialog_tests::select_card(cx, window, &ws, &w, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "rename", "Rename thread");
+    pick(cx, window, "Rename thread", "");
+    wait_until(cx, "the rename dialog", |cx| {
+        has(cx, window, "dialog-confirm")
+    });
+    assert!(!palette_open(cx, &ws));
+    press(cx, window, "escape");
+    wait_until(cx, "the dialog to close", |cx| {
+        ws.read_with(cx, |ws, _| ws.dialog.is_none()) && !has(cx, window, "dialog-confirm")
+    });
+
+    open_palette(cx, window);
+    search(cx, window, "archive", "Archive thread");
+    pick(cx, window, "Archive thread", "");
+    wait_until(cx, "the archive dialog", |cx| {
+        has(cx, window, "archive-heading")
+    });
+    click(cx, window, "dialog-confirm");
+    wait_until(cx, "the thread archived", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .thread(w.thread)
+                .is_some_and(|t| t.archived_at.is_some())
+        })
+    });
+}

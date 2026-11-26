@@ -30,8 +30,8 @@ use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
-    ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search, ShowRunning,
-    ShowThreads, StopAll,
+    AddProject, ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search,
+    ShowRunning, ShowThreads, StopAll,
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
@@ -117,6 +117,12 @@ pub struct Workspace {
     /// A terminal session to open once it is known (debug builds'
     /// startup hook).
     terminal_pending: Option<String>,
+    /// ⌘K to open with this query once the state is loaded (debug
+    /// builds' startup hook).
+    palette_pending: Option<String>,
+    /// A settings field to jump to, with the name of its agent or project,
+    /// once that is known (debug builds' startup hook).
+    pub(super) setting_pending: Option<(String, Option<String>)>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Redraws the sidebar's terminal session times while a project's
@@ -317,6 +323,8 @@ impl Workspace {
             open_pending: hooks.review.or(hooks.open_thread),
             terminal: None,
             terminal_pending: hooks.terminal,
+            palette_pending: hooks.palette,
+            setting_pending: hooks.setting,
             ticker: None,
             terminal_ticker: None,
             requests: HashMap::new(),
@@ -462,6 +470,13 @@ impl Workspace {
     }
 
     fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.jump_if_known(window, cx);
+        if let Some(query) = self.palette_pending.take() {
+            self.open_palette(window, cx);
+            if let Some(palette) = self.palette.clone() {
+                palette.update(cx, |palette, cx| palette.type_query(&query, window, cx));
+            }
+        }
         if let Some(session) = &self.terminal_pending
             && self.state.terminal_session(session).is_some()
         {
@@ -1455,11 +1470,13 @@ struct StartupHooks {
     running: bool,
     settings: Option<Page>,
     terminal: Option<String>,
+    palette: Option<String>,
+    setting: Option<(String, Option<String>)>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and
-/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>`, in debug
-/// builds only.
+/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>|palette:<query>`,
+/// in debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
     {
@@ -1470,6 +1487,8 @@ fn dev_hooks() -> StartupHooks {
             running: hooks.running,
             settings: hooks.settings,
             terminal: hooks.terminal,
+            palette: hooks.palette,
+            setting: hooks.setting,
         }
     }
     #[cfg(not(debug_assertions))]
@@ -1532,6 +1551,9 @@ impl Render for Workspace {
             )
             .on_action(
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &AddProject, window, cx| this.open_add_project(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {

@@ -111,6 +111,9 @@ pub(super) fn world_named(
     let agents = agents
         .iter()
         .map(|name| {
+            // Agents list oldest first, by the millisecond: apart, they
+            // keep the order named here instead of a random tie-break.
+            std::thread::sleep(std::time::Duration::from_millis(2));
             ask(
                 &client,
                 Request::CreateAgent {

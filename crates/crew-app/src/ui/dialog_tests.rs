@@ -47,7 +47,7 @@ fn wait_label(cx: &mut TestAppContext, window: AnyWindowHandle, id: &str, want: 
 
 /// Opens the thread, then goes back to its channel, so its card is the
 /// selected one.
-fn select_card(
+pub(super) fn select_card(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
     ws: &Entity<Workspace>,

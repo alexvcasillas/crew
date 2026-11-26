@@ -1,8 +1,10 @@
 //! The ⌘K palette: recent places and actions at once, and as you type,
-//! threads, channels, agents and worktree files. Channels, agents and
-//! actions come from what the app knows; threads and files from crewd,
-//! asked once typing pauses. Only the answer to the latest query shows.
+//! threads, channels, agents, worktree files, commands and settings.
+//! Everything but threads and files comes from what the app knows; those
+//! two from crewd, asked once typing pauses. Only the answer to the latest
+//! query shows.
 
+pub mod catalog;
 mod rows;
 
 use std::collections::HashSet;
@@ -24,6 +26,7 @@ use crate::client::ClientHandle;
 use crate::theme::color;
 
 use crate::theme::scale::{self, code_family, ui_px, weight};
+use catalog::{CommandEntry, SettingEntry, commands, current_value};
 use rows::{Inputs, Lead, Row, Section, sections};
 pub(super) use rows::{Remote, SectionKind, Target, match_range};
 
@@ -59,6 +62,13 @@ const MATCH_ALPHA: f32 = 0.2;
 /// Under the local rows when crewd couldn't search.
 const SEARCH_DOWN: &str = "Search isn't available right now.";
 const PLACEHOLDER: &str = "Search threads, channels, agents, files…";
+/// The board's marks for the zoom commands and setting rows.
+const ZOOM_IN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14M5 7h4M7 5v4"/></svg>"#;
+const ZOOM_OUT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14M5 7h4"/></svg>"#;
+const FIND_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>"#;
+const GEAR_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></svg>"#;
+/// Shown when nothing matches.
+const NO_RESULTS: &str = "No results.";
 /// The board's pulse mark for Running now.
 const PULSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M1.5 8h3l2-5 3 10 2-5h3"/></svg>"#;
 
@@ -86,6 +96,8 @@ pub(super) struct Palette {
     /// The highlighted row, counted over every section.
     selected: usize,
     expanded: HashSet<SectionKind>,
+    /// What [`Target::Command`] indexes.
+    commands: Vec<CommandEntry>,
     /// crewd's answer to the latest search that came back.
     remote: Option<Remote>,
     /// Numbers the searches, so only the latest one's answer lands.
@@ -127,6 +139,7 @@ impl Palette {
             all_projects: home.is_none(),
             selected: 0,
             expanded: HashSet::new(),
+            commands: commands(),
             remote: None,
             seq: 0,
             search: None,
@@ -153,6 +166,14 @@ impl Palette {
         self.all_projects = true;
         self.schedule_search(cx);
         cx.notify();
+    }
+
+    /// Types `query` into the field, as the debug startup hook does.
+    pub(super) fn type_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(query.to_string(), window, cx)
+        });
+        self.set_query(query.to_string(), cx);
     }
 
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -281,14 +302,21 @@ impl Palette {
             return Vec::new();
         };
         let ws = ws.read(cx);
+        let state = ws.state();
+        let thread = ws.open_thread_id();
+        let value = |entry: &SettingEntry, item| current_value(ws, entry, item, cx);
         sections(&Inputs {
-            state: ws.state(),
+            state,
             query: &self.query,
             scope: self.scope(),
             recents: &ws.recents,
             channel: ws.palette_channel(),
             remote: self.remote.as_ref(),
             expanded: &self.expanded,
+            commands: &self.commands,
+            card: ws.card_for_shortcuts().is_some(),
+            pending_request: thread.is_some_and(|t| !state.pending_approvals(t).is_empty()),
+            value: &value,
         })
     }
 
@@ -322,6 +350,11 @@ impl Palette {
             cx.notify();
             return;
         }
+        // A command runs as its shortcut would, from where focus goes back.
+        let action = match &target {
+            Target::Command(n) => self.commands.get(*n).map(|c| c.action.boxed_clone()),
+            _ => None,
+        };
         window.close_dialog(cx);
         self.ws
             .update(cx, |ws, cx| {
@@ -329,6 +362,9 @@ impl Palette {
                 ws.palette_target(target, window, cx);
             })
             .ok();
+        if let Some(action) = action {
+            window.dispatch_action(action, cx);
+        }
     }
 
     /// ⌘C on a file row copies its full path; elsewhere the field copies.
@@ -416,9 +452,28 @@ impl Palette {
                 .text_color(color("danger"))
                 .into_any_element(),
             Lead::Folder => icon(IconName::Folder),
+            Lead::ZoomIn => svg_icon(ZOOM_IN_SVG, "text-secondary"),
+            Lead::ZoomOut => svg_icon(ZOOM_OUT_SVG, "text-secondary"),
+            Lead::Find => svg_icon(FIND_SVG, "text-secondary"),
+            Lead::Check => icon(IconName::Check),
+            Lead::Gear => svg_icon(GEAR_SVG, "text-tertiary"),
+            Lead::Command => div()
+                .text_size(scale::text(12.))
+                .text_color(color("text-secondary"))
+                .child("⌘")
+                .into_any_element(),
             Lead::None => div().into_any_element(),
         };
-        let keys = row.keys.or(selected.then_some("↵"));
+        let keys = row
+            .keys
+            .clone()
+            .or(selected.then(|| "↵".to_string()))
+            .map(|keys| key_chip(pos, keys, row.setting));
+        let text = if row.setting {
+            setting_text(row)
+        } else {
+            row_text(row)
+        };
         let target = row.target.clone();
         div()
             .id(("palette-row", pos))
@@ -448,32 +503,8 @@ impl Palette {
                     .justify_center()
                     .child(lead),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .max_w(ui_px(360.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .when(row.mono, |d| {
-                        d.font_family(code_family()).text_size(scale::mono(12.))
-                    })
-                    .text_color(color(if row.danger { "danger" } else { "text-primary" }))
-                    .child(highlighted(&row.label, row.highlight.clone())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(scale::text(12.))
-                    .when(row.mono || row.sub_mono, |d| {
-                        d.font_family(code_family()).text_size(scale::mono(12.))
-                    })
-                    .text_color(color("text-tertiary"))
-                    .child(row.sub.clone()),
-            )
-            .children(keys.map(key_chip))
+            .children(text)
+            .children(keys)
             .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
                 if this.pointer_moved(e.position) && this.selected != pos {
                     this.selected = pos;
@@ -488,6 +519,130 @@ impl Palette {
     }
 }
 
+/// The label, then grey text after it.
+fn row_text(row: &Row) -> Vec<AnyElement> {
+    let label = div()
+        .flex_none()
+        .max_w(ui_px(360.))
+        .overflow_hidden()
+        .text_ellipsis()
+        .when(row.mono, |d| {
+            d.font_family(code_family()).text_size(scale::mono(12.))
+        })
+        .text_color(color(if row.danger { "danger" } else { "text-primary" }))
+        .child(highlighted(&row.label, row.highlight.clone()));
+    let sub = div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .text_ellipsis()
+        .text_size(scale::text(12.))
+        .when(row.mono || row.sub_mono, |d| {
+            d.font_family(code_family()).text_size(scale::mono(12.))
+        })
+        .text_color(color("text-tertiary"))
+        .child(sub_text(row));
+    vec![label.into_any_element(), sub.into_any_element()]
+}
+
+/// A setting's path with its `›` dimmed, and its value on the right.
+fn setting_text(row: &Row) -> Vec<AnyElement> {
+    let path = div()
+        .flex_initial()
+        .min_w_0()
+        .overflow_hidden()
+        .text_ellipsis()
+        .text_color(color("text-primary"))
+        .child(path_text(&row.label, row.highlight.clone()));
+    let value = div()
+        .flex_none()
+        .ml_auto()
+        .pl(ui_px(12.))
+        .text_size(scale::text(12.))
+        .text_color(color("text-tertiary"))
+        .child(sub_text(row));
+    vec![path.into_any_element(), value.into_any_element()]
+}
+
+/// A row's grey text, its match tinted and its " · has" part dimmer.
+fn sub_text(row: &Row) -> StyledText {
+    let dim = HighlightStyle {
+        color: Some(color("text-gutter")),
+        ..Default::default()
+    };
+    let spans = sub_spans(row.sub.len(), row.sub_dim_from, row.sub_highlight.clone())
+        .into_iter()
+        .map(|(range, span)| match span {
+            Span::Dim => (range, dim),
+            Span::Match => (range, match_style()),
+        });
+    StyledText::new(row.sub.clone()).with_highlights(spans)
+}
+
+/// How a stretch of a row's grey text is styled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    Dim,
+    Match,
+}
+
+/// The styled stretches of grey text `len` bytes long: dim from
+/// `dim_from` to the end, with the match over it. Sorted, no overlaps.
+fn sub_spans(
+    len: usize,
+    dim_from: Option<usize>,
+    hit: Option<std::ops::Range<usize>>,
+) -> Vec<(std::ops::Range<usize>, Span)> {
+    let mut spans = Vec::new();
+    let dim = |range: std::ops::Range<usize>, spans: &mut Vec<_>| {
+        if range.start < range.end {
+            spans.push((range, Span::Dim));
+        }
+    };
+    match (dim_from, hit) {
+        (Some(from), Some(hit)) => {
+            dim(from..hit.start.max(from), &mut spans);
+            spans.push((hit.clone(), Span::Match));
+            dim(hit.end.max(from)..len, &mut spans);
+        }
+        (Some(from), None) => dim(from..len, &mut spans),
+        (None, Some(hit)) => spans.push((hit, Span::Match)),
+        (None, None) => {}
+    }
+    spans
+}
+
+/// "Page › Field" with each `›` dimmed and the match tinted.
+fn path_text(path: &str, range: Option<std::ops::Range<usize>>) -> StyledText {
+    let dim = HighlightStyle {
+        color: Some(color("text-disabled")),
+        ..Default::default()
+    };
+    let mut spans: Vec<(std::ops::Range<usize>, HighlightStyle)> = path
+        .match_indices('›')
+        .map(|(at, sep)| at..at + sep.len())
+        .filter(|sep| {
+            range
+                .as_ref()
+                .is_none_or(|r| sep.end <= r.start || sep.start >= r.end)
+        })
+        .map(|sep| (sep, dim))
+        .collect();
+    if let Some(range) = range {
+        spans.push((range, match_style()));
+    }
+    spans.sort_by_key(|(r, _)| r.start);
+    StyledText::new(path.to_string()).with_highlights(spans)
+}
+
+fn svg_icon(data: &'static [u8], token: &str) -> AnyElement {
+    Icon::default()
+        .data(data)
+        .size(ui_px(13.))
+        .text_color(color(token))
+        .into_any_element()
+}
+
 fn icon(name: IconName) -> AnyElement {
     Icon::new(name)
         .size(ui_px(13.))
@@ -495,11 +650,14 @@ fn icon(name: IconName) -> AnyElement {
         .into_any_element()
 }
 
-/// The board's `kbd` chip.
-fn key_chip(keys: &'static str) -> impl IntoElement {
+/// The board's `kbd` chip. After a setting's value it keeps a gap
+/// instead of pushing right.
+fn key_chip(pos: usize, keys: String, setting: bool) -> AnyElement {
     div()
+        .id(("palette-keys", pos))
         .flex_none()
-        .ml_auto()
+        .when(setting, |d| d.ml(ui_px(8.)))
+        .when(!setting, |d| d.ml_auto())
         .px(ui_px(5.))
         .rounded(ui_px(4.))
         .border_1()
@@ -507,22 +665,29 @@ fn key_chip(keys: &'static str) -> impl IntoElement {
         .font_family(code_family())
         .text_size(scale::mono(11.))
         .text_color(color("text-tertiary"))
+        .aria_label(keys.clone())
         .child(keys)
+        .test_support()
+        .into_any_element()
+}
+
+/// The match tint.
+fn match_style() -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color("text-primary")),
+        background_color: Some(color("accent-blue").opacity(MATCH_ALPHA)),
+        ..Default::default()
+    }
 }
 
 /// `label` with `range` on a blue tint.
 pub(super) fn highlighted(label: &str, range: Option<std::ops::Range<usize>>) -> StyledText {
-    let style = HighlightStyle {
-        color: Some(color("text-primary")),
-        background_color: Some(color("accent-blue").opacity(MATCH_ALPHA)),
-        ..Default::default()
-    };
-    StyledText::new(label.to_string()).with_highlights(range.map(|r| (r, style)))
+    StyledText::new(label.to_string()).with_highlights(range.map(|r| (r, match_style())))
 }
 
 /// "↑↓ move", "↵ open", "tab all projects", "esc close", and on a file
-/// row "⌘C copy path".
-fn footer(file: bool) -> impl IntoElement {
+/// row "⌘C copy path". With no rows, only "esc close".
+fn footer(file: bool, empty: bool) -> impl IntoElement {
     let hint = |keys: &'static str, text: &'static str| {
         div()
             .id(SharedString::from(format!("palette-hint-{text}")))
@@ -545,10 +710,12 @@ fn footer(file: bool) -> impl IntoElement {
         .border_color(color("border-100"))
         .text_size(scale::text(11.))
         .text_color(color("text-tertiary"))
-        .child(hint("↑↓", "move"))
-        .child(hint("↵", "open"))
-        .when(file, |f| f.child(hint("⌘C", "copy path")))
-        .child(hint("tab", "all projects"))
+        .when(!empty, |f| {
+            f.child(hint("↑↓", "move"))
+                .child(hint("↵", "open"))
+                .when(file, |f| f.child(hint("⌘C", "copy path")))
+                .child(hint("tab", "all projects"))
+        })
         .child(div().ml_auto().child(hint("esc", "close")))
         .test_support()
 }
@@ -602,11 +769,24 @@ impl Render for Palette {
             Some(SEARCH_DOWN)
         } else if searching {
             Some("Searching…")
-        } else if count == 0 {
-            Some("No matches")
         } else {
             None
         };
+        let empty = count == 0 && note.is_none();
+        if empty {
+            list = list.child(
+                div()
+                    .id("palette-note")
+                    .pt(scale::row(20.))
+                    .pb(scale::row(16.))
+                    .px(ui_px(16.))
+                    .font_weight(weight(FontWeight::MEDIUM))
+                    .text_color(color("text-primary"))
+                    .aria_label(NO_RESULTS)
+                    .child(NO_RESULTS)
+                    .test_support(),
+            );
+        }
         if let Some(note) = note {
             let padding = if count == 0 { 24. } else { 8. };
             list = list.child(
@@ -650,7 +830,7 @@ impl Render for Palette {
             }))
             .child(self.render_header(cx))
             .child(list)
-            .child(footer(on_file))
+            .child(footer(on_file, empty))
             .test_support()
     }
 }
@@ -777,7 +957,9 @@ impl Workspace {
             Target::AddProject => {
                 self.open_add_project(window, cx);
             }
-            Target::ShowAll(_) => {}
+            Target::Setting { field, item } => self.open_setting(field, item, window, cx),
+            // The palette runs commands itself; Show all stays in it.
+            Target::Command(_) | Target::ShowAll(_) => {}
         }
     }
 
@@ -805,5 +987,29 @@ impl Workspace {
                 (crate::editor::open_failed(app.as_deref()), None)
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Span, sub_spans};
+
+    #[test]
+    fn the_whole_has_tail_is_dim_under_the_match() {
+        // "Auto · has Read only", typed "read".
+        assert_eq!(
+            sub_spans(20, Some(4), Some(11..15)),
+            [
+                (4..11, Span::Dim),
+                (11..15, Span::Match),
+                (15..20, Span::Dim)
+            ]
+        );
+        assert_eq!(sub_spans(4, None, Some(0..4)), [(0..4, Span::Match)]);
+        assert_eq!(
+            sub_spans(8, Some(0), Some(4..8)),
+            [(0..4, Span::Dim), (4..8, Span::Match)]
+        );
+        assert!(sub_spans(4, None, None).is_empty());
     }
 }
