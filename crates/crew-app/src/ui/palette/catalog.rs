@@ -9,7 +9,8 @@ use crew_core::store::TitleMode;
 use gpui_kit::{Action, App, OperatingSystem};
 
 use crate::app::{
-    AddProject, ApproveLatest, ArchiveThread, RenameThread, StopAll, bindings as app_bindings,
+    AddProject, ApproveLatest, ArchiveThread, RenameThread, StopAll, ZoomIn, ZoomOut,
+    bindings as app_bindings,
 };
 use crate::prefs::{Density, LineHeight, SidebarMode};
 use crate::theme::scale;
@@ -361,6 +362,8 @@ pub enum Needs {
 /// One command: what it is called, its keys and what it runs.
 pub struct CommandEntry {
     pub label: &'static str,
+    /// Grey text after the label, which matches too.
+    pub sub: &'static str,
     /// The keys as the shortcuts page shows them, if it has any.
     pub keys: Option<String>,
     pub action: Box<dyn Action>,
@@ -376,6 +379,17 @@ fn needs(action: &dyn Action) -> Needs {
         Needs::ActiveRun
     } else {
         Needs::Nothing
+    }
+}
+
+/// What a command's label leaves out.
+fn sub(action: &dyn Action) -> &'static str {
+    if action.partial_eq(&ZoomIn) {
+        "Zoom in, bigger text"
+    } else if action.partial_eq(&ZoomOut) {
+        "Zoom out, smaller text"
+    } else {
+        ""
     }
 }
 
@@ -395,6 +409,7 @@ pub fn commands() -> Vec<CommandEntry> {
         let action = shortcut.binding.action().boxed_clone();
         let command = CommandEntry {
             label: shortcut.label,
+            sub: sub(action.as_ref()),
             keys: Some(pretty_keys(&keys)),
             needs: needs(action.as_ref()),
             action,
@@ -409,6 +424,7 @@ pub fn commands() -> Vec<CommandEntry> {
     }
     commands.push(CommandEntry {
         label: "Add project…",
+        sub: "",
         keys: None,
         action: Box::new(AddProject),
         needs: Needs::Nothing,

@@ -207,3 +207,31 @@ fn current_value_reads_the_page_state(cx: &mut TestAppContext) {
         Some("Running")
     );
 }
+
+#[test]
+fn number_options_are_the_pages_own() {
+    let names = |ns: &[String]| ns.to_vec();
+    let options = |field: &str| -> Vec<String> {
+        entry(field).options.iter().map(|o| o.to_string()).collect()
+    };
+    let ui: Vec<String> = crate::prefs::UI_SIZES
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    let code: Vec<String> = crate::prefs::CODE_SIZES
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    let at_once: Vec<String> = super::settings::limits::AGENTS_AT_ONCE
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    let budgets: Vec<String> = super::settings::limits::BUDGETS
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    assert_eq!(options("field-appearance-ui-size"), names(&ui));
+    assert_eq!(options("field-appearance-code-size"), names(&code));
+    assert_eq!(options("field-limits-max-runs"), names(&at_once));
+    assert_eq!(options("field-limits-budget"), names(&budgets));
+}

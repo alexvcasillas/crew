@@ -15,6 +15,7 @@ use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::palette::catalog::{Item, settings_entries};
 use super::title_bar::home_relative;
 use super::workspace::{EditorSelect, Workspace};
 use crate::app::bindings as app_bindings;
@@ -77,6 +78,14 @@ const PAGES: [(Page, &str, &str); 8] = [
     (Page::Shortcuts, "settings-nav-shortcuts", "Shortcuts"),
 ];
 
+/// What the settings sidebar calls `page`.
+pub fn page_name(page: Page) -> &'static str {
+    PAGES
+        .iter()
+        .find(|(p, _, _)| *p == page)
+        .map_or("", |(_, _, title)| title)
+}
+
 /// What settings shows.
 pub struct SettingsView {
     pub page: Page,
@@ -131,6 +140,7 @@ pub fn pretty_keys(keys: &str) -> String {
                 "escape" => "esc",
                 "up" => "↑",
                 "down" => "↓",
+                "-" => "−",
                 other => other,
             });
             if key.len() == 1 {
@@ -163,6 +173,21 @@ impl Workspace {
         self.page_opened(window, cx);
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Opens the settings page that holds `field`. `item` is the agent or
+    /// project it belongs to, if any.
+    pub(super) fn open_setting(
+        &mut self,
+        field: &'static str,
+        _item: Option<Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = settings_entries().iter().find(|e| e.field == field) else {
+            return;
+        };
+        self.open_settings(entry.page, window, cx);
     }
 
     /// Goes back to what was open before.
@@ -618,5 +643,6 @@ mod tests {
         assert_eq!(pretty_keys("cmd-enter"), "⌘↵");
         assert_eq!(pretty_keys("cmd-,"), "⌘,");
         assert_eq!(pretty_keys("escape"), "esc");
+        assert_eq!(pretty_keys("cmd--"), "⌘−", "a minus sign");
     }
 }

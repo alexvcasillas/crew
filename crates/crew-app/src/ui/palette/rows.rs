@@ -4,13 +4,20 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ChannelId, ProjectId, ThreadId};
 use crew_proto::{FileHit, SearchResults, ThreadState};
 
 use super::super::common::runtime_chip;
+use super::catalog::{CommandEntry, Item, Needs, Scope, SettingEntry, settings_entries};
+use crate::app::{
+    AddProject, ApproveLatest, NewThread, OpenSettings, ResetZoom, Search, ShowRunning, StopAll,
+    ZoomIn, ZoomOut,
+};
 use crate::model::{State, ThreadStatus};
 use crate::recents::Recents;
+use crate::ui::settings::page_name;
 
 /// Rows a section shows before "Show all {n}".
 pub const MAX_ROWS: usize = 5;
@@ -26,6 +33,8 @@ pub enum SectionKind {
     Agents,
     Files,
     Actions,
+    Commands,
+    Settings,
 }
 
 /// What ↵ on a row does.
@@ -44,6 +53,14 @@ pub enum Target {
     Running,
     StopAll,
     AddProject,
+    /// Runs the command at this index of [`super::catalog::commands`].
+    Command(usize),
+    /// Jumps to a settings field, of `item` on a per-agent or per-project
+    /// page.
+    Setting {
+        field: &'static str,
+        item: Option<Item>,
+    },
     /// Lists every row of the section.
     ShowAll(SectionKind),
 }
@@ -61,6 +78,15 @@ pub enum Lead {
     Pulse,
     Stop,
     Folder,
+    ZoomIn,
+    ZoomOut,
+    /// A magnifier.
+    Find,
+    Check,
+    /// A settings row's gear.
+    Gear,
+    /// Any other command.
+    Command,
     None,
 }
 
@@ -70,15 +96,21 @@ pub struct Row {
     pub label: String,
     /// The part of `label` that matches what you typed, in bytes.
     pub highlight: Option<Range<usize>>,
-    /// Grey text after the label.
+    /// Grey text after the label; a setting's value, on the right.
     pub sub: String,
+    /// The part of `sub` that matches what you typed, in bytes.
+    pub sub_highlight: Option<Range<usize>>,
+    /// Where `sub` turns dimmer, at a setting's " · has {option}".
+    pub sub_dim_from: Option<usize>,
+    /// A setting: `label` is a `Page › Field` path, `sub` its value.
+    pub setting: bool,
     /// Paths and branches are mono.
     pub mono: bool,
     /// Only the grey text is mono, as a project's path.
     pub sub_mono: bool,
     pub lead: Lead,
     /// The row's own shortcut.
-    pub keys: Option<&'static str>,
+    pub keys: Option<String>,
     pub danger: bool,
 }
 
@@ -89,6 +121,9 @@ impl Row {
             label: label.into(),
             highlight: None,
             sub: String::new(),
+            sub_highlight: None,
+            sub_dim_from: None,
+            setting: false,
             mono: false,
             sub_mono: false,
             lead,
@@ -102,8 +137,8 @@ impl Row {
         self
     }
 
-    fn keys(mut self, keys: &'static str) -> Row {
-        self.keys = Some(keys);
+    fn keys(mut self, keys: impl Into<String>) -> Row {
+        self.keys = Some(keys.into());
         self
     }
 
@@ -140,6 +175,13 @@ pub struct Inputs<'a> {
     pub remote: Option<&'a Remote>,
     /// Sections whose "Show all" you chose.
     pub expanded: &'a HashSet<SectionKind>,
+    /// Every command, as [`super::catalog::commands`] lists them.
+    pub commands: &'a [CommandEntry],
+    /// Whether a thread is open, and whether it waits on a request.
+    pub open_thread: bool,
+    pub pending_request: bool,
+    /// A setting's value now, when its page knows it.
+    pub value: &'a dyn Fn(&SettingEntry, Option<Item>) -> Option<String>,
 }
 
 /// The palette's sections, in order, empty ones left out.
@@ -158,6 +200,13 @@ pub fn sections(i: &Inputs) -> Vec<Section> {
         let projects = local_projects(i, query);
         let channels = local_channels(i, query);
         let agents = local_agents(i, query);
+        let commands = local_commands(i, query);
+        let settings = local_settings(i, query);
+        // The New thread command takes over from the typed row.
+        let new_thread = commands.iter().any(|row| match row.target {
+            Target::Command(n) => i.commands[n].action.partial_eq(&NewThread),
+            _ => false,
+        });
         vec![
             capped(i, SectionKind::Projects, "Projects", 0, projects, |row| {
                 row.matching(query)
@@ -186,7 +235,17 @@ pub fn sections(i: &Inputs) -> Vec<Section> {
                 files,
                 |hit| file_row(i, hit).matching(query),
             ),
-            typed_actions(i, query),
+            capped(i, SectionKind::Commands, "Commands", 0, commands, |row| row),
+            capped(i, SectionKind::Settings, "Settings", 0, settings, |row| row),
+            if new_thread {
+                Section {
+                    kind: SectionKind::Actions,
+                    title: "Actions".into(),
+                    rows: Vec::new(),
+                }
+            } else {
+                typed_actions(i, query)
+            },
         ]
     };
     out.retain(|s| !s.rows.is_empty());
@@ -505,6 +564,147 @@ fn local_agents(i: &Inputs, query: &str) -> Vec<Row> {
     hits.into_iter()
         .map(|(_, _, id)| agent_row(state, id))
         .collect()
+}
+
+/// The commands that match, in the shortcuts list's order, those whose
+/// context is missing left out.
+fn local_commands(i: &Inputs, query: &str) -> Vec<Row> {
+    let live = !i.state.running().is_empty();
+    i.commands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| match c.needs {
+            Needs::Nothing => true,
+            Needs::OpenThread => i.open_thread,
+            Needs::PendingRequest => i.pending_request,
+            Needs::ActiveRun => live,
+        })
+        .filter_map(|(n, c)| {
+            let on_label = rank(c.label, query).is_some();
+            if !on_label && rank(c.sub, query).is_none() {
+                return None;
+            }
+            let mut row = Row::new(Target::Command(n), c.label, command_lead(c)).sub(c.sub);
+            if on_label {
+                row.highlight = match_range(c.label, query);
+            } else {
+                row.sub_highlight = match_range(c.sub, query);
+            }
+            row.keys = c.keys.clone();
+            Some(row)
+        })
+        .collect()
+}
+
+fn command_lead(c: &CommandEntry) -> Lead {
+    let is = |action: &dyn gpui_kit::Action| c.action.partial_eq(action);
+    if is(&ZoomIn) {
+        Lead::ZoomIn
+    } else if is(&ZoomOut) {
+        Lead::ZoomOut
+    } else if is(&ResetZoom) || is(&Search) {
+        Lead::Find
+    } else if is(&NewThread) {
+        Lead::Plus
+    } else if is(&ShowRunning) {
+        Lead::Pulse
+    } else if is(&StopAll) {
+        Lead::Stop
+    } else if is(&AddProject) {
+        Lead::Folder
+    } else if is(&OpenSettings) {
+        Lead::Gear
+    } else if is(&ApproveLatest) {
+        Lead::Check
+    } else {
+        Lead::Command
+    }
+}
+
+/// The settings fields that match, in the pages' order, one per agent or
+/// project on their pages. A field matches on its path, its keywords or
+/// the names of its choices.
+fn local_settings(i: &Inputs, query: &str) -> Vec<Row> {
+    let state = i.state;
+    let mut rows = Vec::new();
+    for entry in settings_entries() {
+        let page = page_name(entry.page);
+        match entry.scope {
+            Scope::Global => rows.extend(setting_row(i, entry, None, &[page], query)),
+            Scope::Agent => {
+                for a in state.agents() {
+                    // Codex has no allowed-tools list.
+                    if entry.field == "field-agent-tools" && a.spec.runtime != Runtime::ClaudeCode {
+                        continue;
+                    }
+                    let item = Some(Item::Agent(a.id));
+                    rows.extend(setting_row(i, entry, item, &[page, &a.spec.name], query));
+                }
+            }
+            Scope::Project => {
+                for p in state.projects() {
+                    let item = Some(Item::Project(p.id));
+                    rows.extend(setting_row(i, entry, item, &[page, &p.name], query));
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// "Page › Item › Field" and its value, if `entry` matches `query`. The
+/// match shows where it is: in the path, in the value, or as
+/// "{value} · has {option}" when only another choice matched.
+fn setting_row(
+    i: &Inputs,
+    entry: &SettingEntry,
+    item: Option<Item>,
+    parents: &[&str],
+    query: &str,
+) -> Option<Row> {
+    let mut path = parents.join(" › ");
+    path.push_str(" › ");
+    path.push_str(entry.label);
+    let on_path = rank(&path, query).is_some();
+    let on_keyword = entry.keywords.iter().any(|k| rank(k, query).is_some());
+    let value = (i.value)(entry, item).unwrap_or_default();
+    let option = entry
+        .options
+        .iter()
+        .find(|o| rank(o, query).is_some() && !o.eq_ignore_ascii_case(&value));
+    let on_value = entry
+        .options
+        .iter()
+        .any(|o| o.eq_ignore_ascii_case(&value) && rank(o, query).is_some());
+    if !on_path && !on_keyword && !on_value && option.is_none() {
+        return None;
+    }
+    let target = Target::Setting {
+        field: entry.field,
+        item,
+    };
+    let mut row = Row::new(target, path, Lead::Gear);
+    row.setting = true;
+    if on_path {
+        row.highlight = match_range(&row.label, query);
+        row.sub = value;
+    } else if on_value {
+        row.sub_highlight = match_range(&value, query);
+        row.sub = value;
+    } else if let Some(option) = option {
+        let lead = if value.is_empty() {
+            String::new()
+        } else {
+            format!("{value} · ")
+        };
+        let at = lead.len() + "has ".len();
+        row.sub_highlight = match_range(option, query).map(|r| r.start + at..r.end + at);
+        row.sub_dim_from = Some(value.len());
+        row.sub = format!("{lead}has {option}");
+    } else {
+        row.sub = value;
+    }
+    Some(row)
 }
 
 /// Where a thread stands as the app knows it now.
