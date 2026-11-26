@@ -177,8 +177,9 @@ pub struct Inputs<'a> {
     pub expanded: &'a HashSet<SectionKind>,
     /// Every command, as [`super::catalog::commands`] lists them.
     pub commands: &'a [CommandEntry],
-    /// Whether a thread is open, and whether it waits on a request.
-    pub open_thread: bool,
+    /// Whether a card is there for Rename and Archive thread.
+    pub card: bool,
+    /// Whether the open thread waits on a request.
     pub pending_request: bool,
     /// A setting's value now, when its page knows it.
     pub value: &'a dyn Fn(&SettingEntry, Option<Item>) -> Option<String>,
@@ -575,7 +576,7 @@ fn local_commands(i: &Inputs, query: &str) -> Vec<Row> {
         .enumerate()
         .filter(|(_, c)| match c.needs {
             Needs::Nothing => true,
-            Needs::OpenThread => i.open_thread,
+            Needs::Card => i.card,
             Needs::PendingRequest => i.pending_request,
             Needs::ActiveRun => live,
         })

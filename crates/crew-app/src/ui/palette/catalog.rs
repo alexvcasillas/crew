@@ -351,8 +351,9 @@ pub fn settings_entries() -> &'static [SettingEntry] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Needs {
     Nothing,
-    /// A thread is open.
-    OpenThread,
+    /// A thread card is selected in the channel shown, as ⌘R and ⌘⌫
+    /// need.
+    Card,
     /// The open thread waits on a request.
     PendingRequest,
     /// Some run is live.
@@ -372,7 +373,7 @@ pub struct CommandEntry {
 
 fn needs(action: &dyn Action) -> Needs {
     if action.partial_eq(&RenameThread) || action.partial_eq(&ArchiveThread) {
-        Needs::OpenThread
+        Needs::Card
     } else if action.partial_eq(&ApproveLatest) {
         Needs::PendingRequest
     } else if action.partial_eq(&StopAll) {

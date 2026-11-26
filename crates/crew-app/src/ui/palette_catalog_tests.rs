@@ -112,7 +112,7 @@ fn commands_come_from_the_shortcuts_list() {
     assert_eq!(stop.keys.as_deref(), Some("⌘⇧."));
     assert_eq!(stop.needs, Needs::ActiveRun);
     let rename = all.iter().find(|c| c.label == "Rename thread").unwrap();
-    assert_eq!(rename.needs, Needs::OpenThread);
+    assert_eq!(rename.needs, Needs::Card);
     let approve = all
         .iter()
         .find(|c| c.label == "Approve the newest request")

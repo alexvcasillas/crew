@@ -389,12 +389,20 @@ impl Workspace {
     }
 
     /// The card the shortcuts act on: the selected one, else the one
-    /// under the pointer, while the channel's cards are shown.
+    /// under the pointer, while the channel's cards are shown and no
+    /// dialog is open.
     fn shortcut_card(&self, window: &mut Window, cx: &mut App) -> Option<ThreadId> {
+        if window.has_active_dialog(cx) {
+            return None;
+        }
+        self.card_for_shortcuts()
+    }
+
+    /// [`Self::shortcut_card`], dialogs aside: what ⌘R and ⌘⌫ from the
+    /// palette will act on once it closes.
+    pub(super) fn card_for_shortcuts(&self) -> Option<ThreadId> {
         self.shown_channel()?;
-        if self.composer_mode() != super::composer::ComposerMode::Reply
-            || window.has_active_dialog(cx)
-        {
+        if self.composer_mode() != super::composer::ComposerMode::Reply {
             return None;
         }
         let view = &self.channel_view;

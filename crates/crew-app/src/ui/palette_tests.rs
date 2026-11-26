@@ -929,7 +929,7 @@ fn context_commands_hide_without_context(cx: &mut TestAppContext) {
     assert!(!shows_in_palette(cx, window, "Stop all runs"));
     press(cx, window, "escape");
 
-    go_to(cx, window, &ws, w.channel, w.thread);
+    super::dialog_tests::select_card(cx, window, &ws, &w, w.thread);
     open_palette(cx, window);
     search(cx, window, "rename", "Rename thread");
     // Nothing waits on you, so nothing to approve.
@@ -1001,4 +1001,75 @@ fn settings_cap_and_show_all(cx: &mut TestAppContext) {
             .iter()
             .any(|(l, v)| l == "Agents › Flint › Model" && v == "claude-haiku-4-5")
     );
+}
+
+/// Moves to the row `label` and presses ↵.
+fn pick(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str, sub: &str) {
+    let at = row_index(cx, window, label, sub);
+    for _ in 0..at {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+}
+
+#[gpui_kit::test]
+fn stop_all_and_approve_show_with_their_context(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start_with(
+        home.path().to_path_buf(),
+        super::inspector_tests::waiting_claude(tmp.path()),
+    );
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (window, ws) = open(cx, home.path());
+    go_to(cx, window, &ws, w.channel, w.thread);
+    let run = super::inspector_tests::start_forge(cx, &ws, &w, "@Forge do it WAIT");
+
+    open_palette(cx, window);
+    search(cx, window, "stop all", "Stop all runs");
+    assert!(!shows_in_palette(cx, window, "Approve the newest request"));
+    press(cx, window, "escape");
+
+    super::inspector_tests::hand_off(&w, run, "Scout", "check the edit");
+    super::inspector_tests::pending(cx, &ws, w.thread);
+    open_palette(cx, window);
+    search(cx, window, "approve", "Approve the newest request");
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+}
+
+#[gpui_kit::test]
+fn rename_and_archive_run_from_the_palette(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open(cx, home.path());
+    super::dialog_tests::select_card(cx, window, &ws, &w, w.thread);
+
+    open_palette(cx, window);
+    search(cx, window, "rename", "Rename thread");
+    pick(cx, window, "Rename thread", "");
+    wait_until(cx, "the rename dialog", |cx| {
+        has(cx, window, "dialog-confirm")
+    });
+    assert!(!palette_open(cx, &ws));
+    press(cx, window, "escape");
+    wait_until(cx, "the dialog to close", |cx| {
+        ws.read_with(cx, |ws, _| ws.dialog.is_none()) && !has(cx, window, "dialog-confirm")
+    });
+
+    open_palette(cx, window);
+    search(cx, window, "archive", "Archive thread");
+    pick(cx, window, "Archive thread", "");
+    wait_until(cx, "the archive dialog", |cx| {
+        has(cx, window, "archive-heading")
+    });
+    click(cx, window, "dialog-confirm");
+    wait_until(cx, "the thread archived", |cx| {
+        ws.read_with(cx, |ws, _| {
+            ws.state()
+                .thread(w.thread)
+                .is_some_and(|t| t.archived_at.is_some())
+        })
+    });
 }

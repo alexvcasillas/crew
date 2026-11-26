@@ -10,8 +10,8 @@ use super::settings::Page;
 pub struct DevHooks {
     /// `CREW_APP_OPEN_THREAD`: opened once the thread is known.
     pub open_thread: Option<ThreadId>,
-    /// `CREW_APP_SHOW`: `running`, `settings[:page]`, `diff:<thread>` or
-    /// `terminal:<session>`.
+    /// `CREW_APP_SHOW`: `running`, `settings[:page]`, `diff:<thread>`,
+    /// `terminal:<session>` or `palette:<query>`.
     pub show: Option<String>,
     /// `CREW_APP_SHOW=diff:<thread>`: the thread's changes, opened once
     /// the thread is known.
@@ -23,6 +23,9 @@ pub struct DevHooks {
     /// `CREW_APP_SHOW=terminal:<session>`: a terminal session, opened
     /// once it is known.
     pub terminal: Option<String>,
+    /// `CREW_APP_SHOW=palette:<query>`: ⌘K with the query typed, once
+    /// the state is loaded.
+    pub palette: Option<String>,
 }
 
 /// Reads the hooks through `var`, logging values it can't use.
@@ -38,6 +41,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
     let mut running = false;
     let mut settings = None;
     let mut terminal = None;
+    let mut palette = None;
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
             "running" => running = true,
@@ -57,6 +61,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
                     }
                 }
             }
+            _ if v.starts_with("palette:") => palette = Some(v["palette:".len()..].to_string()),
             _ if v.starts_with("terminal:") => {
                 let id = v["terminal:".len()..].trim();
                 if id.is_empty() {
@@ -87,6 +92,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         running,
         settings,
         terminal,
+        palette,
     }
 }
 
@@ -112,8 +118,11 @@ mod tests {
                 running: true,
                 settings: None,
                 terminal: None,
+                palette: None,
             }
         );
+        let palette = read(|k| (k == "CREW_APP_SHOW").then(|| "palette:auto".to_string()));
+        assert_eq!(palette.palette.as_deref(), Some("auto"));
         let terminal = read(|k| (k == "CREW_APP_SHOW").then(|| "terminal:abc-1".to_string()));
         assert_eq!(terminal.terminal.as_deref(), Some("abc-1"));
         assert_eq!(read(|_| Some("terminal:".into())).terminal, None);

@@ -168,6 +168,14 @@ impl Palette {
         cx.notify();
     }
 
+    /// Types `query` into the field, as the debug startup hook does.
+    pub(super) fn type_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(query.to_string(), window, cx)
+        });
+        self.set_query(query.to_string(), cx);
+    }
+
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         if query == self.query {
             return;
@@ -306,7 +314,7 @@ impl Palette {
             remote: self.remote.as_ref(),
             expanded: &self.expanded,
             commands: &self.commands,
-            open_thread: thread.is_some(),
+            card: ws.card_for_shortcuts().is_some(),
             pending_request: thread.is_some_and(|t| !state.pending_approvals(t).is_empty()),
             value: &value,
         })
@@ -342,6 +350,11 @@ impl Palette {
             cx.notify();
             return;
         }
+        // A command runs as its shortcut would, from where focus goes back.
+        let action = match &target {
+            Target::Command(n) => self.commands.get(*n).map(|c| c.action.boxed_clone()),
+            _ => None,
+        };
         window.close_dialog(cx);
         self.ws
             .update(cx, |ws, cx| {
@@ -349,6 +362,9 @@ impl Palette {
                 ws.palette_target(target, window, cx);
             })
             .ok();
+        if let Some(action) = action {
+            window.dispatch_action(action, cx);
+        }
     }
 
     /// ⌘C on a file row copies its full path; elsewhere the field copies.
@@ -550,24 +566,50 @@ fn setting_text(row: &Row) -> Vec<AnyElement> {
 
 /// A row's grey text, its match tinted and its " · has" part dimmer.
 fn sub_text(row: &Row) -> StyledText {
-    let mut spans = Vec::new();
-    if let Some(from) = row.sub_dim_from {
-        let dim = HighlightStyle {
-            color: Some(color("text-gutter")),
-            ..Default::default()
-        };
-        let end = row
-            .sub_highlight
-            .as_ref()
-            .map_or(row.sub.len(), |r| r.start.max(from));
-        if from < end {
-            spans.push((from..end, dim));
-        }
-    }
-    if let Some(range) = row.sub_highlight.clone() {
-        spans.push((range, match_style()));
-    }
+    let dim = HighlightStyle {
+        color: Some(color("text-gutter")),
+        ..Default::default()
+    };
+    let spans = sub_spans(row.sub.len(), row.sub_dim_from, row.sub_highlight.clone())
+        .into_iter()
+        .map(|(range, span)| match span {
+            Span::Dim => (range, dim),
+            Span::Match => (range, match_style()),
+        });
     StyledText::new(row.sub.clone()).with_highlights(spans)
+}
+
+/// How a stretch of a row's grey text is styled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span {
+    Dim,
+    Match,
+}
+
+/// The styled stretches of grey text `len` bytes long: dim from
+/// `dim_from` to the end, with the match over it. Sorted, no overlaps.
+fn sub_spans(
+    len: usize,
+    dim_from: Option<usize>,
+    hit: Option<std::ops::Range<usize>>,
+) -> Vec<(std::ops::Range<usize>, Span)> {
+    let mut spans = Vec::new();
+    let dim = |range: std::ops::Range<usize>, spans: &mut Vec<_>| {
+        if range.start < range.end {
+            spans.push((range, Span::Dim));
+        }
+    };
+    match (dim_from, hit) {
+        (Some(from), Some(hit)) => {
+            dim(from..hit.start.max(from), &mut spans);
+            spans.push((hit.clone(), Span::Match));
+            dim(hit.end.max(from)..len, &mut spans);
+        }
+        (Some(from), None) => dim(from..len, &mut spans),
+        (None, Some(hit)) => spans.push((hit, Span::Match)),
+        (None, None) => {}
+    }
+    spans
 }
 
 /// "Page › Field" with each `›` dimmed and the match tinted.
@@ -915,13 +957,9 @@ impl Workspace {
             Target::AddProject => {
                 self.open_add_project(window, cx);
             }
-            Target::Command(n) => {
-                if let Some(command) = commands().into_iter().nth(n) {
-                    window.dispatch_action(command.action, cx);
-                }
-            }
             Target::Setting { field, item } => self.open_setting(field, item, window, cx),
-            Target::ShowAll(_) => {}
+            // The palette runs commands itself; Show all stays in it.
+            Target::Command(_) | Target::ShowAll(_) => {}
         }
     }
 
@@ -949,5 +987,29 @@ impl Workspace {
                 (crate::editor::open_failed(app.as_deref()), None)
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Span, sub_spans};
+
+    #[test]
+    fn the_whole_has_tail_is_dim_under_the_match() {
+        // "Auto · has Read only", typed "read".
+        assert_eq!(
+            sub_spans(20, Some(4), Some(11..15)),
+            [
+                (4..11, Span::Dim),
+                (11..15, Span::Match),
+                (15..20, Span::Dim)
+            ]
+        );
+        assert_eq!(sub_spans(4, None, Some(0..4)), [(0..4, Span::Match)]);
+        assert_eq!(
+            sub_spans(8, Some(0), Some(4..8)),
+            [(0..4, Span::Dim), (4..8, Span::Match)]
+        );
+        assert!(sub_spans(4, None, None).is_empty());
     }
 }

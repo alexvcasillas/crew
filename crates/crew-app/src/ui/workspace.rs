@@ -117,6 +117,9 @@ pub struct Workspace {
     /// A terminal session to open once it is known (debug builds'
     /// startup hook).
     terminal_pending: Option<String>,
+    /// ⌘K to open with this query once the state is loaded (debug
+    /// builds' startup hook).
+    palette_pending: Option<String>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Redraws the sidebar's terminal session times while a project's
@@ -317,6 +320,7 @@ impl Workspace {
             open_pending: hooks.review.or(hooks.open_thread),
             terminal: None,
             terminal_pending: hooks.terminal,
+            palette_pending: hooks.palette,
             ticker: None,
             terminal_ticker: None,
             requests: HashMap::new(),
@@ -462,6 +466,12 @@ impl Workspace {
     }
 
     fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(query) = self.palette_pending.take() {
+            self.open_palette(window, cx);
+            if let Some(palette) = self.palette.clone() {
+                palette.update(cx, |palette, cx| palette.type_query(&query, window, cx));
+            }
+        }
         if let Some(session) = &self.terminal_pending
             && self.state.terminal_session(session).is_some()
         {
@@ -1455,11 +1465,12 @@ struct StartupHooks {
     running: bool,
     settings: Option<Page>,
     terminal: Option<String>,
+    palette: Option<String>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and
-/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>`, in debug
-/// builds only.
+/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>|palette:<query>`,
+/// in debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
     {
@@ -1470,6 +1481,7 @@ fn dev_hooks() -> StartupHooks {
             running: hooks.running,
             settings: hooks.settings,
             terminal: hooks.terminal,
+            palette: hooks.palette,
         }
     }
     #[cfg(not(debug_assertions))]
