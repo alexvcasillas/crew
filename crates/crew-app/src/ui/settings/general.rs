@@ -130,6 +130,7 @@ impl Workspace {
 
     /// The board's Thread titles row and the comparison under it.
     pub(super) fn render_title_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let jump = self.jump(cx);
         let titles = self.state().titles();
         let modes: Vec<AnyElement> = [
             (TitleMode::Generated, "generated", "Generated"),
@@ -173,6 +174,7 @@ impl Workspace {
             .id("general-row-titles")
             .aria_label("Thread titles")
             .child(board_row(field(
+                &jump,
                 "field-general-thread-titles",
                 "Thread titles",
                 Some("Set after the first message in a thread."),
@@ -215,6 +217,7 @@ impl Workspace {
                 )
         };
         let comparison = board_row(field(
+            &jump,
             "general-titles-comparison",
             "First line, for comparison",
             Some("What the other option gives you."),

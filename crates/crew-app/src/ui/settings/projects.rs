@@ -256,6 +256,30 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Focuses the text control of the open form's `field`: the new
+    /// channel's name, the setup command or the files to copy.
+    pub(super) fn focus_project_field(
+        &mut self,
+        field: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(form) = self.projects_page().and_then(|p| p.form.as_ref()) else {
+            return;
+        };
+        let input = match field {
+            "field-project-channels" => form.new_channel.clone(),
+            "field-project-setup" => form.setup.clone(),
+            "field-project-files" => {
+                let textarea = form.copy_files.clone();
+                textarea.update(cx, |t, cx| t.focus(window, cx));
+                return;
+            }
+            _ => return,
+        };
+        input.update(cx, |i, cx| i.focus(window, cx));
+    }
+
     /// Drops the newest setup kept for a project once crewd's copy holds
     /// it and no save for it is waiting, so a change made elsewhere later
     /// isn't hidden behind it.
@@ -577,6 +601,7 @@ impl Workspace {
     }
 
     fn render_project_form(&self, form: &ProjectForm, cx: &mut Context<Self>) -> impl IntoElement {
+        let jump = self.jump(cx);
         let state = self.state();
         let Some(project) = state.project(form.project) else {
             return div().into_any_element();
@@ -594,6 +619,7 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
+            .track_scroll(jump.scroll())
             .px(ui_px(32.))
             .py(ui_px(24.))
             .child(
@@ -638,6 +664,7 @@ impl Workspace {
                         col.child(form_error("project-error", e))
                     })
                     .child(field(
+                        &jump,
                         "field-project-channels",
                         "Channels",
                         Some("How handoffs run by default in each channel."),
@@ -670,12 +697,14 @@ impl Workspace {
                             }),
                     ))
                     .child(field(
+                        &jump,
                         "field-project-setup",
                         "Setup command",
                         Some("Runs in a new worktree before its first run."),
                         control("project-setup", Input::new(&form.setup)),
                     ))
                     .child(field(
+                        &jump,
                         "field-project-files",
                         "Files to copy",
                         Some("One path per line, relative to the project. Copied into each new worktree, such as .env."),

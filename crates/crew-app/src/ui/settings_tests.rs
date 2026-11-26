@@ -4,20 +4,23 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crew_core::agent::{PermissionMode, Runtime};
 use crew_core::event::RunStatus;
-use crew_core::ids::ProjectId;
+use crew_core::ids::{AgentId, ProjectId};
 use crew_core::policy::HandoffPolicy;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Task, TestAppContext};
 
 use super::first_launch::STARTER_NAME;
-use super::settings::Page;
+use super::palette::DEBOUNCE as PALETTE_DEBOUNCE;
+use super::palette::catalog::Item;
 use super::settings::agents::{AUTOSAVE_PAUSE, COMING_RUNTIMES, CREDENTIALS, INSTALL_CLAUDE};
 use super::settings::runtimes::runtime_state;
+use super::settings::{JUMP_HIGHLIGHT, Page};
 use super::test_ui::{
-    click, click_quickly, has, label_of, notifications, open_tall, press, saved, shows, type_text,
-    wait_saved, wait_to_show, wait_until,
+    bounds_of, click, click_quickly, has, label_of, notifications, open_sized_tall, open_tall,
+    press, saved, shows, type_text, wait_saved, wait_to_show, wait_until,
 };
 use super::thread_tests::{live_run, world};
 use super::workspace::Workspace;
@@ -1078,4 +1081,202 @@ fn handoffs_and_limits_save_each_change(cx: &mut TestAppContext) {
     wait_until(cx, "the error", |cx| has(cx, window, "limits-error"));
     assert!(shows(cx, window, "Paused (selected)"));
     assert_eq!(notifications(cx, window), notes, "shown on the page only");
+}
+
+/// Opens ⌘K, types `query` and waits for the row `label`.
+fn palette_search(cx: &mut TestAppContext, window: AnyWindowHandle, query: &str, label: &str) {
+    press(cx, window, "cmd-k");
+    wait_until(cx, "the palette", |cx| has(cx, window, "palette"));
+    type_text(cx, window, query);
+    cx.executor()
+        .advance_clock(PALETTE_DEBOUNCE + Duration::from_millis(30));
+    wait_until(cx, label, |cx| palette_row(cx, window, label).is_some());
+}
+
+/// Where the palette row `label` is, top to bottom.
+fn palette_row(cx: &mut TestAppContext, window: AnyWindowHandle, label: &str) -> Option<usize> {
+    (0..60usize)
+        .map_while(|i| label_of(cx, window, ("palette-row", i)))
+        .position(|l| l == label)
+}
+
+/// Searches ⌘K for `query` and presses ↵ on the row `label`.
+fn jump(cx: &mut TestAppContext, window: AnyWindowHandle, query: &str, label: &str) {
+    palette_search(cx, window, query, label);
+    let at = palette_row(cx, window, label).unwrap();
+    for _ in 0..at {
+        press(cx, window, "down");
+    }
+    press(cx, window, "enter");
+}
+
+fn highlighted(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> Option<&'static str> {
+    ws.read_with(cx, |ws, _| {
+        ws.settings
+            .as_ref()
+            .and_then(|s| s.highlight)
+            .map(|(f, _)| f)
+    })
+}
+
+fn agent_form_of(cx: &mut TestAppContext, ws: &Entity<Workspace>) -> Option<AgentId> {
+    ws.read_with(cx, |ws, _| {
+        ws.settings
+            .as_ref()
+            .and_then(|s| s.agents.form.as_ref())
+            .and_then(|f| f.editing)
+    })
+}
+
+#[gpui_kit::test]
+fn jumping_selects_the_agent_and_highlights_the_field(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let scout = w.agents[1];
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the agents", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(scout).is_some())
+    });
+
+    jump(
+        cx,
+        window,
+        "what it can do",
+        "Agents › Scout › What it can do",
+    );
+    assert_eq!(page(cx, &ws), Some(Page::Agents));
+    assert_eq!(agent_form_of(cx, &ws), Some(scout), "Scout's form is open");
+    assert_eq!(highlighted(cx, &ws), Some("field-agent-permission"));
+    assert!(has(cx, window, "field-agent-permission"));
+
+    cx.executor().advance_clock(JUMP_HIGHLIGHT);
+    cx.run_until_parked();
+    assert_eq!(highlighted(cx, &ws), None, "faded out");
+}
+
+#[gpui_kit::test]
+fn jumping_flushes_typing_first(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Forge", "Scout"]);
+    let (forge, scout) = (w.agents[0], w.agents[1]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the agents", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().agent(scout).is_some())
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-agents");
+    click(cx, window, format!("settings-agent-{forge}"));
+    retype(cx, window, "agent-role", "Builds things");
+    let role = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.state().agent(forge).unwrap().spec.role.clone()
+        })
+    };
+    assert_eq!(role(cx), "Forge things", "not while typing");
+
+    // Straight from the form, so nothing blurs the field first.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.open_setting("field-agent-model", Some(Item::Agent(scout)), window, cx);
+        });
+    })
+    .unwrap();
+    assert_eq!(agent_form_of(cx, &ws), Some(scout));
+    wait_until(cx, "Forge's role", |cx| role(cx) == "Builds things");
+}
+
+#[gpui_kit::test]
+fn jumping_scrolls_to_a_field_below_the_fold(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &[]);
+    for name in ["bugs", "docs", "release"] {
+        let _: crew_core::ids::ChannelId = w.ask(Request::CreateChannel {
+            project: w.project,
+            name: name.into(),
+        });
+    }
+    let (window, ws) = open_sized_tall(cx, home.path(), 1440., 420.);
+    wait_until(cx, "the channels", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().channels(w.project).len() == 4)
+    });
+    press(cx, window, "cmd-,");
+    click(cx, window, "settings-nav-projects");
+    let form = bounds_of(cx, window, "project-form").unwrap();
+    let files = bounds_of(cx, window, "field-project-files").unwrap();
+    assert!(files.bottom() > form.bottom(), "starts below the fold");
+
+    jump(
+        cx,
+        window,
+        "files to copy",
+        "Projects › demo › Files to copy",
+    );
+    cx.run_until_parked();
+    let form = bounds_of(cx, window, "project-form").unwrap();
+    let files = bounds_of(cx, window, "field-project-files").unwrap();
+    assert!(
+        files.top() >= form.top() && files.bottom() <= form.bottom(),
+        "{files:?} shows in {form:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn jumping_focuses_the_control(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the project", |cx| {
+        ws.read_with(cx, |ws, _| !ws.state().projects().is_empty())
+    });
+
+    jump(
+        cx,
+        window,
+        "setup command",
+        "Projects › demo › Setup command",
+    );
+    type_text(cx, window, "make");
+    let setup = ws.read_with(cx, |ws, cx| {
+        let form = ws.settings.as_ref()?.projects.form.as_ref()?;
+        Some(form.setup.read(cx).value().to_string())
+    });
+    assert_eq!(setup.as_deref(), Some("make"));
+}
+
+#[gpui_kit::test]
+fn jumping_to_a_gone_item_opens_its_page_only(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let _w = world(home.path(), &tmp.path().join("repo"), &[]);
+    let (window, ws) = open_tall(cx, home.path());
+    wait_until(cx, "the project", |cx| {
+        ws.read_with(cx, |ws, _| !ws.state().projects().is_empty())
+    });
+
+    let jump_to = |cx: &mut TestAppContext, field: &'static str, item: Option<Item>| {
+        cx.update_window(window, |_, window, cx| {
+            ws.update(cx, |ws, cx| ws.open_setting(field, item, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    jump_to(
+        cx,
+        "field-project-setup",
+        Some(Item::Project(ProjectId::new())),
+    );
+    assert_eq!(page(cx, &ws), Some(Page::Projects));
+    assert_eq!(highlighted(cx, &ws), None);
+    jump_to(cx, "field-agent-model", None);
+    assert_eq!(page(cx, &ws), Some(Page::Agents));
+    assert_eq!(highlighted(cx, &ws), None);
 }

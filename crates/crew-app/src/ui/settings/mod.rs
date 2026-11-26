@@ -9,13 +9,17 @@ pub mod projects;
 pub mod runtimes;
 pub mod skills;
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::palette::catalog::{Item, settings_entries};
+use super::palette::catalog::{Item, Scope, settings_entries};
 use super::title_bar::home_relative;
 use super::workspace::{EditorSelect, Workspace};
 use crate::app::bindings as app_bindings;
@@ -36,6 +40,15 @@ actions!(
         CloseSettings,
     ]
 );
+
+/// How long a field jumped to from ⌘K stays tinted, fading at the end.
+pub const JUMP_HIGHLIGHT: Duration = Duration::from_millis(1500);
+/// The last part of [`JUMP_HIGHLIGHT`], when the tint fades out.
+const JUMP_FADE: Duration = Duration::from_millis(500);
+/// How often the fading tint is redrawn.
+const FADE_FRAME: Duration = Duration::from_millis(16);
+/// Space left above a field scrolled to.
+const JUMP_MARGIN: f32 = 24.;
 
 const SETTINGS_CONTEXT: &str = "Settings";
 /// The settings nav column.
@@ -98,6 +111,14 @@ pub struct SettingsView {
     pub skills: Option<SkillsPage>,
     /// The general page's controls, made when it first opens.
     pub general: Option<GeneralPage>,
+    /// The field a jump from ⌘K landed on, and when.
+    pub highlight: Option<(&'static str, Instant)>,
+    /// The open page's scrolling column.
+    scroll: ScrollHandle,
+    /// Set by a jump until its field is scrolled into view.
+    scroll_to_highlight: Rc<Cell<bool>>,
+    /// Fades the highlight out, then drops it.
+    fade: Option<Task<()>>,
 }
 
 impl SettingsView {
@@ -110,8 +131,81 @@ impl SettingsView {
             appearance: None,
             skills: None,
             general: None,
+            highlight: None,
+            scroll: ScrollHandle::new(),
+            scroll_to_highlight: Rc::default(),
+            fade: None,
         }
     }
+}
+
+/// What a page needs to draw a jump from ⌘K: the field to tint and the
+/// column to scroll.
+#[derive(Clone, Default)]
+pub(crate) struct Jump {
+    /// The field and its tint's opacity, from 1 down to 0.
+    target: Option<(&'static str, f32)>,
+    scroll: ScrollHandle,
+    scroll_pending: Rc<Cell<bool>>,
+}
+
+impl Jump {
+    /// The scroller a page's column tracks.
+    pub(super) fn scroll(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    /// The tint behind the row `id` while a jump has it highlighted. Laid
+    /// out absolutely, as the row's first child, so it paints under the
+    /// row; it also scrolls the row into view once.
+    pub(super) fn mark(&self, id: &str) -> Option<AnyElement> {
+        let (_, alpha) = self.target.filter(|(field, _)| *field == id)?;
+        let scroll = self.scroll.clone();
+        let pending = self.scroll_pending.clone();
+        let tint = canvas(
+            move |bounds, window, _| {
+                if pending.take() {
+                    scroll_into_view(&scroll, bounds);
+                    window.refresh();
+                }
+            },
+            move |bounds, (), window, _| {
+                window.paint_quad(quad(
+                    bounds,
+                    ui_px(8.),
+                    color("info-subtle").opacity(alpha),
+                    ui_px(1.),
+                    color("info-border").opacity(alpha),
+                    BorderStyle::Solid,
+                ));
+            },
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(ui_px(-12.))
+        .right(ui_px(-12.));
+        Some(tint.into_any_element())
+    }
+}
+
+/// Scrolls `scroll` so a row drawn at `row` shows, with a margin above it.
+fn scroll_into_view(scroll: &ScrollHandle, row: Bounds<Pixels>) {
+    let view = scroll.bounds();
+    if row.top() >= view.top() && row.bottom() <= view.bottom() {
+        return;
+    }
+    let offset = scroll.offset();
+    let max = scroll.max_offset();
+    let y = (row.top() - view.top() - offset.y - ui_px(JUMP_MARGIN)).min(max.y);
+    scroll.set_offset(point(offset.x, -y.max(px(0.))));
+}
+
+/// The tint's opacity `elapsed` into a jump: full, then fading to none.
+fn jump_alpha(elapsed: Duration) -> f32 {
+    let hold = JUMP_HIGHLIGHT - JUMP_FADE;
+    let fading = elapsed.saturating_sub(hold).as_secs_f32() / JUMP_FADE.as_secs_f32();
+    (1. - fading).clamp(0., 1.)
 }
 
 /// `cmd-shift-.` as `⌘⇧.`.
@@ -166,6 +260,9 @@ impl Workspace {
             .settings
             .take()
             .unwrap_or_else(|| SettingsView::new(page, cx.focus_handle()));
+        if view.page != page {
+            view.scroll.set_offset(Point::default());
+        }
         view.page = page;
         view.focus.focus(window, cx);
         self.limits_error = None;
@@ -175,12 +272,14 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the settings page that holds `field`. `item` is the agent or
-    /// project it belongs to, if any.
+    /// Opens the settings page that holds `field` on `item`, the agent or
+    /// project it belongs to, then highlights the field, scrolls to it and
+    /// focuses its text control if it has one. An item that is gone opens
+    /// just the page.
     pub(super) fn open_setting(
         &mut self,
         field: &'static str,
-        _item: Option<Item>,
+        item: Option<Item>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -188,6 +287,111 @@ impl Workspace {
             return;
         };
         self.open_settings(entry.page, window, cx);
+        let shown = match (entry.scope, item) {
+            (Scope::Global, _) => true,
+            (Scope::Agent, Some(Item::Agent(agent))) if self.state().agent(agent).is_some() => {
+                // Switching agents saves what you typed first, as a click
+                // in the list does.
+                self.edit_agent(agent, window, cx);
+                true
+            }
+            (Scope::Project, Some(Item::Project(project)))
+                if self.state().project(project).is_some() =>
+            {
+                self.select_project(project, window, cx);
+                true
+            }
+            _ => false,
+        };
+        let Some(view) = self.settings.as_mut() else {
+            return;
+        };
+        view.fade = None;
+        view.highlight = None;
+        if !shown {
+            cx.notify();
+            return;
+        }
+        let start = cx.background_executor().now();
+        view.highlight = Some((field, start));
+        view.scroll_to_highlight.set(true);
+        view.fade = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(JUMP_HIGHLIGHT - JUMP_FADE)
+                .await;
+            let end = start + JUMP_HIGHLIGHT;
+            loop {
+                let left = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        let left = end.saturating_duration_since(cx.background_executor().now());
+                        if left.is_zero()
+                            && let Some(view) = this.settings.as_mut()
+                        {
+                            view.highlight = None;
+                            view.scroll_to_highlight.set(false);
+                        }
+                        left
+                    })
+                    .unwrap_or_default();
+                if left.is_zero() {
+                    break;
+                }
+                cx.background_executor().timer(left.min(FADE_FRAME)).await;
+            }
+        }));
+        match entry.page {
+            Page::Agents => self.focus_agent_field(field, window, cx),
+            Page::Projects => self.focus_project_field(field, window, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Jumps to the field the debug startup hook names, once its agent or
+    /// project is known.
+    pub(super) fn jump_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((field, name)) = &self.setting_pending else {
+            return;
+        };
+        let Some(entry) = settings_entries().iter().find(|e| e.field == field) else {
+            eprintln!("crew: CREW_APP_SHOW=setting:{field} names no settings field, ignored");
+            self.setting_pending = None;
+            return;
+        };
+        let state = self.state();
+        let item = match (entry.scope, name) {
+            (Scope::Global, _) => None,
+            (Scope::Agent, Some(name)) => {
+                match state.agents().iter().find(|a| a.spec.name == *name) {
+                    Some(a) => Some(Item::Agent(a.id)),
+                    None => return,
+                }
+            }
+            (Scope::Project, Some(name)) => match state.projects().iter().find(|p| p.name == *name)
+            {
+                Some(p) => Some(Item::Project(p.id)),
+                None => return,
+            },
+            (_, None) => None,
+        };
+        self.setting_pending = None;
+        self.open_setting(entry.field, item, window, cx);
+    }
+
+    /// What the open settings page needs to draw a jump.
+    pub(super) fn jump(&self, cx: &App) -> Jump {
+        let Some(view) = &self.settings else {
+            return Jump::default();
+        };
+        let now = cx.background_executor().now();
+        Jump {
+            target: view
+                .highlight
+                .map(|(field, at)| (field, jump_alpha(now.saturating_duration_since(at)))),
+            scroll: view.scroll.clone(),
+            scroll_pending: view.scroll_to_highlight.clone(),
+        }
     }
 
     /// Goes back to what was open before.
@@ -209,6 +413,9 @@ impl Workspace {
 
     pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.settings.as_mut() {
+            if view.page != page {
+                view.scroll.set_offset(Point::default());
+            }
             view.page = page;
             self.limits_error = None;
             self.page_opened(window, cx);
@@ -280,7 +487,7 @@ impl Workspace {
             Page::Projects => self.render_projects_page(cx),
             Page::Runtimes => self.render_runtimes_page(cx),
             Page::Limits => self.render_limits_page(cx),
-            Page::Shortcuts => render_shortcuts().into_any_element(),
+            Page::Shortcuts => render_shortcuts(&self.jump(cx)).into_any_element(),
         };
         div()
             .id("settings")
@@ -322,7 +529,8 @@ impl Workspace {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        page_scroll("settings-general")
+        let jump = self.jump(cx);
+        page_scroll("settings-general", &jump)
             .gap_0()
             .pb(ui_px(32.))
             .child(
@@ -340,12 +548,14 @@ impl Workspace {
                     )
                     .child(self.render_title_fields(cx))
                     .child(general::board_row(field(
+                        &jump,
                         "field-general-home",
                         "Crew home",
                         Some("Where crewd keeps its database, socket and worktrees."),
                         value_text("general-home", home_relative(&self.conn.crew_home), true),
                     )))
                     .child(general::board_row(field(
+                        &jump,
                         "field-general-editor",
                         "Editor",
                         Some("Open in editor uses this app."),
@@ -423,7 +633,7 @@ impl Workspace {
     }
 }
 
-fn render_shortcuts() -> impl IntoElement {
+fn render_shortcuts(jump: &Jump) -> impl IntoElement {
     let rows = app_bindings().into_iter().map(|s| {
         let keys = s
             .binding
@@ -455,7 +665,7 @@ fn render_shortcuts() -> impl IntoElement {
             )
             .test_support()
     });
-    page_scroll("settings-shortcuts")
+    page_scroll("settings-shortcuts", jump)
         .child(page_title("Shortcuts"))
         .child(div().flex().flex_col().max_w(ui_px(560.)).children(rows))
 }
@@ -480,8 +690,15 @@ pub(super) fn nav_row(id: &'static str, selected: bool) -> Stateful<Div> {
         .hover(|row| row.bg(color("surface-200")))
 }
 
-/// A page's scrolling column.
-pub(super) fn page_scroll(id: &'static str) -> Stateful<Div> {
+/// A page's scrolling column, scrolled to a field jumped to.
+pub(super) fn page_scroll(id: &'static str, jump: &Jump) -> Stateful<Div> {
+    page_column(id)
+        .overflow_y_scroll()
+        .track_scroll(&jump.scroll)
+}
+
+/// A page's column, for a page that scrolls it inside something else.
+pub(super) fn page_column(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -489,7 +706,6 @@ pub(super) fn page_scroll(id: &'static str) -> Stateful<Div> {
         .flex_1()
         .min_w_0()
         .h_full()
-        .overflow_y_scroll()
         .px(ui_px(32.))
         .py(ui_px(24.))
         .gap(ui_px(16.))
@@ -504,8 +720,10 @@ pub(super) fn page_title(text: &'static str) -> impl IntoElement {
 }
 
 /// A form row: the label and its help on the left, the control on the
-/// right. Its `id` starts with `field-`, so the palette can find it.
+/// right. Its `id` starts with `field-`, so the palette can find it, and
+/// it is tinted while `jump` has it highlighted.
 pub(crate) fn field(
+    jump: &Jump,
     id: &'static str,
     label: &'static str,
     help: Option<&'static str>,
@@ -513,6 +731,8 @@ pub(crate) fn field(
 ) -> impl IntoElement + Styled {
     div()
         .id(id)
+        .relative()
+        .children(jump.mark(id))
         .flex()
         .gap(ui_px(24.))
         .py(scale::row(12.))
@@ -634,7 +854,19 @@ pub(super) fn help(text: impl Into<SharedString>) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_keys;
+    use std::time::Duration;
+
+    use super::{JUMP_HIGHLIGHT, jump_alpha, pretty_keys};
+
+    #[test]
+    fn a_jump_holds_its_tint_then_fades_it() {
+        let ms = Duration::from_millis;
+        assert_eq!(jump_alpha(ms(0)), 1.);
+        assert_eq!(jump_alpha(ms(1000)), 1.);
+        assert!((jump_alpha(ms(1250)) - 0.5).abs() < 0.01);
+        assert_eq!(jump_alpha(JUMP_HIGHLIGHT), 0.);
+        assert_eq!(jump_alpha(ms(4000)), 0.);
+    }
 
     #[test]
     fn shortcuts_read_as_mac_symbols() {

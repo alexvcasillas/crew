@@ -57,6 +57,7 @@ impl Workspace {
     }
 
     pub(super) fn render_runtimes_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let jump = self.jump(cx);
         let rows: Vec<AnyElement> = self
             .runtimes
             .iter()
@@ -75,8 +76,11 @@ impl Workspace {
                     Runtime::ClaudeCode => "claude",
                     Runtime::Codex => "codex",
                 };
+                let id = format!("field-runtimes-{key}");
                 div()
-                    .id(SharedString::from(format!("field-runtimes-{key}")))
+                    .relative()
+                    .children(jump.mark(&id))
+                    .id(SharedString::from(id))
                     .test_support()
                     .child(
                         div()
@@ -120,7 +124,7 @@ impl Workspace {
             })
             .collect();
         let empty = rows.is_empty();
-        page_scroll("settings-runtimes")
+        page_scroll("settings-runtimes", &jump)
             .child(
                 div()
                     .flex()

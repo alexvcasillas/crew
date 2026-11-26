@@ -120,6 +120,9 @@ pub struct Workspace {
     /// ⌘K to open with this query once the state is loaded (debug
     /// builds' startup hook).
     palette_pending: Option<String>,
+    /// A settings field to jump to, with the name of its agent or project,
+    /// once that is known (debug builds' startup hook).
+    pub(super) setting_pending: Option<(String, Option<String>)>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Redraws the sidebar's terminal session times while a project's
@@ -321,6 +324,7 @@ impl Workspace {
             terminal: None,
             terminal_pending: hooks.terminal,
             palette_pending: hooks.palette,
+            setting_pending: hooks.setting,
             ticker: None,
             terminal_ticker: None,
             requests: HashMap::new(),
@@ -466,6 +470,7 @@ impl Workspace {
     }
 
     fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.jump_if_known(window, cx);
         if let Some(query) = self.palette_pending.take() {
             self.open_palette(window, cx);
             if let Some(palette) = self.palette.clone() {
@@ -1466,6 +1471,7 @@ struct StartupHooks {
     settings: Option<Page>,
     terminal: Option<String>,
     palette: Option<String>,
+    setting: Option<(String, Option<String>)>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and
@@ -1482,6 +1488,7 @@ fn dev_hooks() -> StartupHooks {
             settings: hooks.settings,
             terminal: hooks.terminal,
             palette: hooks.palette,
+            setting: hooks.setting,
         }
     }
     #[cfg(not(debug_assertions))]
