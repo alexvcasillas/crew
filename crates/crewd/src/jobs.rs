@@ -5,11 +5,12 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, TimeZone, Weekday};
+use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, JobId, RunId, ThreadId};
 use crew_core::schedule::{Repeat, WeekdaySet, missed_between, next_after};
 use crew_core::scheduler::Job;
-use crew_core::store::{JobPatch, Missed, NewJob, RunFilter, StoreError, StoredJob};
+use crew_core::store::{Author, JobPatch, Missed, NewJob, RunFilter, StoreError, StoredJob};
 use crew_proto::{ServerMsg, SkillRef};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -181,6 +182,7 @@ impl Service {
             svc.schedule_unscheduled();
             loop {
                 let now = svc.clock().now();
+                svc.find_skills_due(now).await;
                 svc.fire_due(now);
                 let wait = svc.until_next_due(now);
                 tokio::select! {
@@ -211,6 +213,46 @@ impl Service {
             if let Err(e) = db.store.set_job_next_due(job.id, Some(next)) {
                 log(format!("couldn't schedule job {}: {e}", job.id));
             }
+        }
+    }
+
+    /// Looks up the Codex skills of the jobs due at `now`, so their runs
+    /// can name the skill's file.
+    async fn find_skills_due(&self, now: DateTime<Local>) {
+        let due: Vec<StoredJob> = match self.db().store.jobs() {
+            Ok(jobs) => jobs
+                .into_iter()
+                .filter(|j| j.enabled && j.next_due.is_some_and(|d| d <= now.timestamp_millis()))
+                .collect(),
+            Err(e) => return log(format!("couldn't read the jobs: {e}")),
+        };
+        for job in &due {
+            self.find_skill(job).await;
+        }
+    }
+
+    /// Looks up the skills of the job's project when its agent uses Codex
+    /// and the job's skill hasn't been found yet. Codex needs the skill's
+    /// file, which only a listing gives.
+    async fn find_skill(&self, job: &StoredJob) {
+        let Some(name) = &job.skill else { return };
+        let project = {
+            let db = self.db();
+            let codex = db
+                .store
+                .agent(job.agent)
+                .is_ok_and(|a| a.spec.runtime == Runtime::Codex);
+            match db.store.project_of_thread(job.thread) {
+                Ok(p) if codex => p.id,
+                _ => return,
+            }
+        };
+        if self
+            .cached_skill_path(project, &Runtime::Codex, name)
+            .is_empty()
+            && let Err(e) = self.skills(project, false).await
+        {
+            log(format!("couldn't list the skills of job {}: {e}", job.id));
         }
     }
 
@@ -302,7 +344,8 @@ impl Service {
 
     /// Queues a run of the job in its thread. No message is added: the
     /// run answers the job's newest message, and starts a session of its
-    /// own with the job's prompt.
+    /// own with the job's prompt. A Codex skill whose file wasn't found
+    /// fails the run at once, with a note in the thread.
     fn queue_job_run(
         &self,
         state: &mut State,
@@ -349,6 +392,24 @@ impl Service {
             .set_run_request(run, message, job.model_override.as_deref())
             .map_err(err)?;
         db.store.set_job_skipped(job.id, 0).map_err(err)?;
+        // Codex can't run a skill without its file: the slot fails, and
+        // the schedule goes on.
+        if let Some(skill) = skill
+            .as_ref()
+            .filter(|s| s.runtime == Runtime::Codex && s.path.is_empty())
+        {
+            db.store
+                .set_run_status(run, RunStatus::Failed)
+                .map_err(err)?;
+            self.publish_status(db, job.thread, run, RunStatus::Failed);
+            let note = format!(
+                "Couldn't find the skill /{}. Edit the job to pick another.",
+                skill.name
+            );
+            self.add_message(db, job.thread, Author::System, &note, Some(run))
+                .map_err(err)?;
+            return Ok(run);
+        }
         self.publish_status(db, job.thread, run, RunStatus::Queued);
         state.scheduler.enqueue(Job {
             run,
@@ -478,7 +539,9 @@ impl Service {
     }
 
     /// Runs the job now, outside its schedule, which stays as it was.
-    pub(crate) fn run_job_now(&self, id: JobId) -> Result<RunId, String> {
+    pub(crate) async fn run_job_now(&self, id: JobId) -> Result<RunId, String> {
+        let job = self.db().store.job(id).map_err(err)?;
+        self.find_skill(&job).await;
         let run = {
             let mut state = self.state();
             let mut db = self.db();
@@ -495,10 +558,10 @@ impl Service {
     }
 
     /// Creates the job turned off and runs it once.
-    pub(crate) fn test_job(&self, mut new: NewJob) -> Result<JobId, String> {
+    pub(crate) async fn test_job(&self, mut new: NewJob) -> Result<JobId, String> {
         new.enabled = false;
         let id = self.create_job(new)?;
-        self.run_job_now(id)?;
+        self.run_job_now(id).await?;
         Ok(id)
     }
 

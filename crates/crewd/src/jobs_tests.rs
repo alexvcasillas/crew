@@ -42,6 +42,90 @@ printf '{{"type":"result","subtype":"success","is_error":false,"result":"ok","du
     path
 }
 
+/// A `codex` that is signed in and runs `scenario-<n>.json` for its n-th
+/// app-server, logging what it reads to `messages-<n>.log`.
+fn fake_codex(dir: &Path) {
+    let path = dir.join("codex");
+    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../crew-core/tests/fake/codex_app_server.py");
+    let d = dir.display();
+    let body = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         --version) echo 'codex-cli 0.165.0' ;;\n\
+         login) exit 0 ;;\n\
+         app-server)\n\
+           n=$(cat '{d}/count' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{d}/count'\n\
+           exec python3 '{fake}' '{d}/scenario-'$n'.json' ;;\n\
+         *) exit 2 ;;\n\
+         esac\n",
+        fake = fake.display(),
+    );
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Writes the n-th app-server's scenario.
+fn scenario(dir: &Path, n: u32, steps: Vec<serde_json::Value>) {
+    let log = dir.join(format!("messages-{n}.log"));
+    let body = serde_json::json!({"log": log, "steps": steps});
+    std::fs::write(dir.join(format!("scenario-{n}.json")), body.to_string()).unwrap();
+}
+
+/// What the n-th app-server read.
+fn codex_messages(dir: &Path, n: u32) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join(format!("messages-{n}.log")))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// A skill listing with one `lint` skill.
+fn lint_listing() -> Vec<serde_json::Value> {
+    use serde_json::json;
+    vec![
+        json!({"expect": "initialize", "as": "init"}),
+        json!({"respond": "init", "result": {}}),
+        json!({"expect": "initialized"}),
+        json!({"expect": "skills/list", "as": "list"}),
+        json!({"respond": "list", "result": {"data": [
+            {"cwd": "/work/demo", "errors": [], "skills": [
+                {"name": "lint", "description": "", "path": "/s/lint/SKILL.md",
+                 "enabled": true, "scope": "repo"}
+            ]}
+        ]}}),
+    ]
+}
+
+/// A Codex run that answers once.
+fn codex_run() -> Vec<serde_json::Value> {
+    use serde_json::json;
+    const TID: &str = "00000000-0000-7000-8000-000000000001";
+    let send = |method: &str, params: serde_json::Value| json!({"send": {"method": method, "params": params}});
+    vec![
+        json!({"expect": "initialize", "as": "init"}),
+        json!({"respond": "init", "result": {"userAgent": "fake", "codexHome": "/work/codex", "platformFamily": "unix", "platformOs": "macos"}}),
+        json!({"expect": "initialized"}),
+        json!({"expect": "thread/start", "as": "open"}),
+        json!({"respond": "open", "result": {"thread": {"id": TID, "cwd": "/work/demo", "path": null}, "model": "gpt-test"}}),
+        send(
+            "thread/started",
+            json!({"thread": {"id": TID, "model": "gpt-test", "cwd": "/work/demo"}}),
+        ),
+        json!({"expect": "turn/start", "as": "turn", "match": {"threadId": TID}}),
+        json!({"respond": "turn", "result": {"turn": {"id": "turn-1", "status": "inProgress"}}}),
+        send(
+            "item/completed",
+            json!({"item": {"type": "agentMessage", "id": "msg-1", "text": "Linted.", "phase": "final_answer"}, "threadId": TID, "turnId": "turn-1"}),
+        ),
+        send(
+            "turn/completed",
+            json!({"threadId": TID, "turn": {"id": "turn-1", "status": "completed", "items": [], "durationMs": 5}}),
+        ),
+    ]
+}
+
 /// The arguments of each call, in order.
 fn logged_calls(dir: &Path) -> Vec<Vec<String>> {
     let text = std::fs::read_to_string(dir.join("args.log")).unwrap_or_default();
@@ -90,6 +174,7 @@ fn service(dir: &Path, store: Store) -> Service {
         4,
         CliBins {
             claude: Some(dir.join("claude-fake.sh")),
+            codex: Some(dir.join("codex")),
             no_title_runs: true,
             ..Default::default()
         },
@@ -106,6 +191,7 @@ fn setup_with(open: impl FnOnce(&Path) -> Store) -> Setup {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     fake_claude(&dir);
+    fake_codex(&dir);
     let root = dir.join("demo");
     std::fs::create_dir(&root).unwrap();
     let svc = service(&dir, open(&dir));
@@ -174,6 +260,32 @@ impl Setup {
         let mut runs = self.svc.db().store.job_runs(id, 100).unwrap();
         runs.reverse();
         runs
+    }
+
+    /// A Codex agent and a job of its that runs `/skill`, turned off.
+    async fn codex_job(&self, skill: &str) -> JobId {
+        let agent = self
+            .svc
+            .db()
+            .store
+            .create_agent(&AgentSpec {
+                name: "Cody".into(),
+                role: String::new(),
+                runtime: Runtime::Codex,
+                model: "gpt-test".into(),
+                instructions: String::new(),
+                permission_mode: PermissionMode::ReadOnly,
+                allowed_tools: vec![],
+                handoff_policy: None,
+                handoff_budget: None,
+                max_run_minutes: 0,
+            })
+            .unwrap();
+        let mut new = self.new_job("everything");
+        new.agent = agent;
+        new.skill = Some(skill.into());
+        new.enabled = false;
+        self.create(new).await
     }
 
     async fn until_ended(&self, run: RunId) {
@@ -587,4 +699,72 @@ async fn a_test_run_creates_the_job_off_and_runs_it() {
     let runs = s.runs(id);
     assert_eq!(runs.len(), 1);
     s.until_ended(runs[0].id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_skill_job_finds_its_skill_on_a_cold_start() {
+    let s = setup();
+    let id = s.codex_job("lint").await;
+    scenario(&s.dir, 1, lint_listing());
+    scenario(&s.dir, 2, codex_run());
+    let run: RunId =
+        serde_json::from_value(s.svc.handle(Request::RunJobNow { job: id }).await.unwrap())
+            .unwrap();
+    s.until_ended(run).await;
+    let asked = codex_messages(&s.dir, 2);
+    let turn = asked
+        .iter()
+        .find(|m| m["method"] == "turn/start")
+        .expect("the run started a turn");
+    assert_eq!(
+        turn["params"]["input"][1],
+        serde_json::json!({"type": "skill", "name": "lint", "path": "/s/lint/SKILL.md"})
+    );
+    assert_eq!(s.svc.db().store.run(run).unwrap().status, RunStatus::Done);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_skill_job_whose_skill_is_gone_fails_the_slot() {
+    let s = setup();
+    let id = s.codex_job("gone").await;
+    scenario(&s.dir, 1, lint_listing());
+    let run: RunId =
+        serde_json::from_value(s.svc.handle(Request::RunJobNow { job: id }).await.unwrap())
+            .unwrap();
+    let stored = s.svc.db().store.run(run).unwrap();
+    assert_eq!(stored.status, RunStatus::Failed);
+    let thread = s.job(id).thread;
+    let note = s
+        .svc
+        .db()
+        .store
+        .messages(thread)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.author == Author::System)
+        .expect("a note");
+    assert_eq!(
+        note.body,
+        "Couldn't find the skill /gone. Edit the job to pick another."
+    );
+    assert_eq!(note.run, Some(run));
+    // Only the listing ran, no Codex run.
+    assert_eq!(
+        std::fs::read_to_string(s.dir.join("count")).unwrap().trim(),
+        "1"
+    );
+
+    // On schedule, the slot fails the same way and the schedule goes on.
+    s.svc
+        .handle(Request::SetJobEnabled {
+            job: id,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    s.svc.fire_due(at(12, 15));
+    let runs = s.runs(id);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].status, RunStatus::Failed);
+    assert_eq!(s.job(id).next_due, due(at(12, 30)));
 }

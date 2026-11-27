@@ -523,8 +523,9 @@ impl Service {
 
     /// Handles every request except `Hello`, `Subscribe`, `SubscribeAll`
     /// and `PermissionAsk`, which belong to the connection. `ThreadDiff`,
-    /// `Commit`, `Discard` and `ChannelOverview` run git and `Runtimes`
-    /// runs the agent CLIs, so they can take a while.
+    /// `Commit`, `Discard` and `ChannelOverview` run git, and `Runtimes`,
+    /// `RunJobNow` and `TestJob` may run the agent CLIs, so they can take
+    /// a while.
     pub async fn handle(&self, req: Request) -> Reply {
         self.refuse_removed(&req)?;
         match req {
@@ -580,6 +581,8 @@ impl Service {
                 self.project_overview(project, light).await
             }
             Request::AgentProfile { agent } => self.agent_profile(agent).await,
+            Request::RunJobNow { job } => json(self.run_job_now(job).await?),
+            Request::TestJob { job } => json(self.test_job(job).await?),
             other => self.handle_now(other),
         }
     }
@@ -810,6 +813,8 @@ impl Service {
             | Request::Search { .. }
             | Request::ProjectOverview { .. }
             | Request::AgentProfile { .. }
+            | Request::RunJobNow { .. }
+            | Request::TestJob { .. }
             | Request::Skills { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::RenameProject { project, name } => {
@@ -849,8 +854,6 @@ impl Service {
                 self.set_job_enabled(job, enabled)?;
                 Ok(serde_json::Value::Null)
             }
-            Request::RunJobNow { job } => json(self.run_job_now(job)?),
-            Request::TestJob { job } => json(self.test_job(job)?),
             Request::Report { .. } => Err("Not yet.".into()),
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
@@ -934,7 +937,7 @@ impl Service {
     /// signed in. A Codex listing that failed or timed out isn't kept, so
     /// the next request tries it again. Plugin skills of Claude Code that
     /// a run's init line didn't list are left out, once a run has told.
-    async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
+    pub(crate) async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
         let cached = (!force_reload)
             .then(|| self.0.skills.lock().unwrap().get(&project).cloned())
             .flatten();
