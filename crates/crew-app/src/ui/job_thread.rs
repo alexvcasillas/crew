@@ -149,6 +149,21 @@ pub(super) fn job_message_head(
     Some(("Scheduled job", Some(time)))
 }
 
+/// `body` without the `/skill` it starts with, as an edited job message
+/// does, so a run's skill chip doesn't show it twice.
+pub(super) fn without_skill<'a>(body: &'a str, skill: &str) -> &'a str {
+    let Some(rest) = body.strip_prefix('/').and_then(|b| b.strip_prefix(skill)) else {
+        return body;
+    };
+    if rest.is_empty() {
+        rest
+    } else if let Some(rest) = rest.strip_prefix(' ') {
+        rest
+    } else {
+        body
+    }
+}
+
 /// Whether `message` is the reply of a job's run that found something.
 pub(super) fn found_reply(state: &State, message: &StoredMessage) -> bool {
     matches!(message.author, Author::Agent(_))

@@ -16,7 +16,7 @@ use gpui_kit::*;
 
 use super::approval_card::input_text;
 use super::common::{chip, clock, elapsed, monogram, now_ms, spinner, switch};
-use super::job_runs::{Tick, days_after, first_line, local_format, tick, tick_mark};
+use super::job_runs::{Tick, days_after, ended_words, first_line, local_format, tick, tick_mark};
 use super::running_view::local_midnight;
 use super::workspace::Workspace;
 use crate::model::State;
@@ -432,26 +432,27 @@ impl Workspace {
                 (last, RowAction::RunNow)
             }
             _ => {
+                // Worded and coloured as the job panel words its runs:
+                // the tick is green for any found run, the text only for
+                // one that said it found something.
                 let found = State::job_run_found(job, run);
-                let text = match (&run.summary, &run.status) {
-                    (Some(summary), _) => summary.to_string(),
-                    (None, RunStatus::Stopped) => "Stopped".into(),
-                    (None, RunStatus::Interrupted) => "Interrupted".into(),
-                    (None, _) if found => "Found something".into(),
-                    (None, _) => "Nothing new".into(),
+                let (words, green) = ended_words(job, run);
+                let (text, green) = match &run.summary {
+                    Some(summary) => (summary.to_string(), run.found == Some(true)),
+                    None => (words.to_string(), green),
                 };
                 let last = if run.missed > 0 {
                     Last::State {
                         tick: Some(if found { Tick::Found } else { Tick::Quiet }),
                         spinning: false,
                         text: format!("{text} · {}", clock(ended)),
-                        token: if found { "success" } else { "text-secondary" },
+                        token: if green { "success" } else { "text-secondary" },
                         detail: missed_line(run.missed),
                     }
                 } else {
                     Last::Strip {
                         text,
-                        found: run.found == Some(true),
+                        found: green,
                         time: Some(run_time(ended, now)),
                     }
                 };

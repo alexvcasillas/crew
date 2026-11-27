@@ -16,6 +16,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::common::{clock, now_ms};
+use super::job_runs::ended_words;
 use super::scheduled_view::{next_lines, run_time, summary_line};
 use super::sidebar::row_probe::status_of;
 use super::test_ui::{bounds_of, click, has, label_of, open, press, shows, type_text, wait_until};
@@ -427,6 +428,12 @@ fn page_lists_jobs_with_repeats_last_and_next(cx: &mut TestAppContext) {
     assert_eq!(
         label(cx, window, format!("job-strip-{}", weekly.id)),
         "found"
+    );
+    // Done, as the job panel says it, for a run that didn't say it found
+    // something.
+    assert_eq!(
+        label(cx, window, format!("job-last-{}", weekly.id)),
+        format!("Done · {}", run_time(weekly_done.ended_at.unwrap(), now))
     );
 
     // Rows are in the order the jobs were made.
@@ -968,4 +975,36 @@ fn old_runs_show_after_a_restart(cx: &mut TestAppContext) {
         label(cx, window, format!("job-detail-{weekly}")),
         "Codex isn't signed in. Run codex login."
     );
+}
+
+#[test]
+fn ended_runs_read_as_the_job_panel_reads_them() {
+    let mut every = StoredJob {
+        id: JobId::new(),
+        name: "Weekly".into(),
+        body: "Sum up".into(),
+        skill: None,
+        model_override: None,
+        agent: AgentId::new(),
+        channel: ChannelId::new(),
+        thread: ThreadId::new(),
+        repeat: Repeat::Daily { at: t(9, 0) },
+        tell: Tell::EveryRun,
+        on_ask: OnAsk::Wait,
+        missed: Missed::OnceOnWake,
+        enabled: true,
+        paused_reason: None,
+        paused_at: None,
+        next_due: None,
+        skipped: 0,
+        created_at: 0,
+    };
+    let done = run(&every, RunStatus::Done, None, MIN);
+    assert_eq!(ended_words(&every, &done), ("Done", false));
+    let found = run(&every, RunStatus::Done, Some(true), MIN);
+    assert_eq!(ended_words(&every, &found), ("Found something", true));
+    let stopped = run(&every, RunStatus::Stopped, Some(true), MIN);
+    assert_eq!(ended_words(&every, &stopped), ("Stopped", false));
+    every.tell = Tell::Changes;
+    assert_eq!(ended_words(&every, &done), ("Nothing new", false));
 }

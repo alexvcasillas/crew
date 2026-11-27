@@ -672,3 +672,43 @@ fn edit_keeps_a_repeat_with_only_days_or_only_hours(cx: &mut TestAppContext) {
         wait_until(cx, "the dialog to close", |cx| !dialog_open(cx, &ws));
     }
 }
+
+#[gpui_kit::test]
+fn the_startup_hook_opens_new_or_edit_once_known(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Scout"]);
+    let (window, ws) = open_world(cx, home.path(), &w);
+    let when_known = |cx: &mut TestAppContext, job: Option<JobId>| {
+        cx.update_window(window, |_, window, cx| {
+            ws.update(cx, |ws, cx| ws.open_job_form_when_known(job, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    when_known(cx, None);
+    assert_eq!(label(cx, window, "job-title"), "New scheduled job");
+    click(cx, window, "dialog-cancel");
+    wait_until(cx, "the form to close", |cx| !dialog_open(cx, &ws));
+
+    // Edit waits for its job.
+    let new = NewJob {
+        name: "Nightly".into(),
+        body: "Check the build".into(),
+        skill: None,
+        model_override: None,
+        agent: first_agent(cx, &ws),
+        channel: w.channel,
+        repeat: hourly(),
+        tell: Tell::Changes,
+        on_ask: OnAsk::Wait,
+        missed: Missed::OnceOnWake,
+        enabled: false,
+    };
+    let id: JobId = w.ask(Request::CreateJob { job: new });
+    when_known(cx, Some(id));
+    wait_until(cx, "the edit form", |cx| has(cx, window, "job-form"));
+    assert_eq!(label(cx, window, "job-title"), "Edit scheduled job");
+}

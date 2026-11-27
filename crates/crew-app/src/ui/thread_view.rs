@@ -19,7 +19,7 @@ use super::common::{
     runtime_chip, thread_title_text, with_font_probe,
 };
 use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
-use super::job_thread::{Quiet, found_reply, job_message_head, quiet_plan, tag};
+use super::job_thread::{Quiet, found_reply, job_message_head, quiet_plan, tag, without_skill};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
@@ -352,7 +352,9 @@ impl Workspace {
         } else {
             let (body, skill) = self.render_your_body(message, names);
             if let Some(skill) = skill {
-                label = format!("/{skill} {label}").trim_end().to_string();
+                label = format!("/{skill} {}", without_skill(&label, &skill))
+                    .trim_end()
+                    .to_string();
             }
             body
         };
@@ -415,7 +417,11 @@ impl Workspace {
             .flex_col()
             // The skill runs inline before the text, so long lines wrap
             // under it.
-            .child(skill_body(&skill, &message.body, names))
+            .child(skill_body(
+                &skill,
+                without_skill(&message.body, &skill),
+                names,
+            ))
             .child(
                 div()
                     .id(format!("message-ran-{id}"))

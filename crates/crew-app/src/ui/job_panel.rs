@@ -3,7 +3,6 @@
 //! as a strip, its recent runs, and Edit job, Pause and Delete job.
 
 use chrono::{Local, TimeZone as _};
-use crew_core::event::RunStatus;
 use crew_core::ids::{JobId, RunId};
 use crew_core::schedule::{describe, next_after};
 use crew_core::store::{Missed, StoredJob, StoredRun, Tell};
@@ -15,7 +14,7 @@ use gpui_kit::*;
 
 use super::common::{chip, elapsed, monogram, now_ms, runtime_chip, switch};
 use super::inspector::InspectorTab;
-use super::job_runs::{Tick, local_format, same_day, tick, tick_mark};
+use super::job_runs::{Tick, ended_words, local_format, same_day, tick, tick_mark};
 use super::scheduled_view::{AGENT_DELETED, CLOCK_SVG, run_time};
 use super::workspace::Workspace;
 use crate::model::State;
@@ -105,7 +104,8 @@ fn paused(job: &StoredJob) -> String {
     }
 }
 
-/// A recent run's line: its time, what it found and how long it took.
+/// A recent run's line: when it ended, what it found and how long it
+/// took.
 fn recent_run(
     state: &State,
     job: &StoredJob,
@@ -113,17 +113,11 @@ fn recent_run(
     now: i64,
 ) -> (Tick, String, String, String) {
     let t = tick(state, job, run);
-    let mut text = match (t, &run.status) {
-        (Tick::Running, _) => "Running".to_string(),
-        (Tick::Waiting, _) => "Waiting on you".to_string(),
-        (Tick::Failed, _) => "Failed".to_string(),
-        (_, RunStatus::Stopped) => "Stopped".to_string(),
-        (_, RunStatus::Interrupted) => "Interrupted".to_string(),
-        // A job that tells after every run marks each done run; only
-        // one that said it found something says so.
-        (Tick::Found, _) if run.found == Some(true) => "Found something".to_string(),
-        (Tick::Found, _) => "Done".to_string(),
-        _ => "Nothing new".to_string(),
+    let mut text = match t {
+        Tick::Running => "Running".to_string(),
+        Tick::Waiting => "Waiting on you".to_string(),
+        Tick::Failed => "Failed".to_string(),
+        Tick::Found | Tick::Quiet => ended_words(job, run).0.to_string(),
     };
     if run.missed > 0 {
         text.push_str(&format!(" · ran on wake, missed {}", run.missed));
@@ -132,7 +126,9 @@ fn recent_run(
         .ended_at
         .map(|end| elapsed(end - run.started_at))
         .unwrap_or_default();
-    (t, run_time(run.started_at, now), text, took)
+    // The time its reply was told: when it ended, or began while it runs.
+    let at = run.ended_at.unwrap_or(run.started_at);
+    (t, run_time(at, now), text, took)
 }
 
 impl Workspace {

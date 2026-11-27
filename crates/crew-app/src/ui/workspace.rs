@@ -125,6 +125,9 @@ pub struct Workspace {
     /// A settings field to jump to, with the name of its agent or project,
     /// once that is known (debug builds' startup hook).
     pub(super) setting_pending: Option<(String, Option<String>)>,
+    /// The job dialog to open, New or Edit for a job, once the state is
+    /// loaded and the job known (debug builds' startup hook).
+    job_form_pending: Option<Option<crew_core::ids::JobId>>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Redraws the sidebar's terminal session times while a project's
@@ -340,6 +343,7 @@ impl Workspace {
             terminal_pending: hooks.terminal,
             palette_pending: hooks.palette,
             setting_pending: hooks.setting,
+            job_form_pending: hooks.job_form,
             ticker: None,
             terminal_ticker: None,
             requests: HashMap::new(),
@@ -475,6 +479,19 @@ impl Workspace {
         self.terminal_ticker.is_some()
     }
 
+    /// Opens the job dialog, New or Edit for `job`, as soon as the state
+    /// is loaded and the job known, as the debug startup hook does.
+    #[cfg(test)]
+    pub(super) fn open_job_form_when_known(
+        &mut self,
+        job: Option<crew_core::ids::JobId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.job_form_pending = Some(job);
+        self.open_if_known(window, cx);
+    }
+
     /// Opens `thread` now if it is known, else as soon as it arrives, as
     /// the debug startup hook does.
     #[cfg(test)]
@@ -513,6 +530,13 @@ impl Workspace {
             let session = session.clone();
             self.terminal_pending = None;
             self.open_terminal(session, window, cx);
+        }
+        if let Some(job) = self.job_form_pending
+            && self.snapshot_seen
+            && job.is_none_or(|job| self.state.job(job).is_some())
+        {
+            self.job_form_pending = None;
+            self.open_job_form(job, None, window, cx);
         }
         if let Some(job) = self.job_open_pending
             && let Some(thread) = self.state.job(job).map(|j| j.thread)
@@ -1541,10 +1565,11 @@ struct StartupHooks {
     terminal: Option<String>,
     palette: Option<String>,
     setting: Option<(String, Option<String>)>,
+    job_form: Option<Option<crew_core::ids::JobId>>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and
-/// `CREW_APP_SHOW=diff:<thread>|running|scheduled|terminal:<session>|palette:<query>`,
+/// `CREW_APP_SHOW=diff:<thread>|running|scheduled|terminal:<session>|palette:<query>|job-form[:<job>]`,
 /// in debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
@@ -1559,6 +1584,7 @@ fn dev_hooks() -> StartupHooks {
             terminal: hooks.terminal,
             palette: hooks.palette,
             setting: hooks.setting,
+            job_form: hooks.job_form,
         }
     }
     #[cfg(not(debug_assertions))]

@@ -1,7 +1,7 @@
 //! Debug builds only: environment variables that put the window in a
 //! given state at startup, for screenshots and manual checks.
 
-use crew_core::ids::ThreadId;
+use crew_core::ids::{JobId, ThreadId};
 
 use super::settings::Page;
 
@@ -11,8 +11,8 @@ pub struct DevHooks {
     /// `CREW_APP_OPEN_THREAD`: opened once the thread is known.
     pub open_thread: Option<ThreadId>,
     /// `CREW_APP_SHOW`: `running`, `scheduled`, `settings[:page]`, `diff:<thread>`,
-    /// `terminal:<session>`, `palette:<query>` or
-    /// `setting:<field>[:<name>]`.
+    /// `terminal:<session>`, `palette:<query>`,
+    /// `setting:<field>[:<name>]` or `job-form[:<job>]`.
     pub show: Option<String>,
     /// `CREW_APP_SHOW=diff:<thread>`: the thread's changes, opened once
     /// the thread is known.
@@ -32,6 +32,10 @@ pub struct DevHooks {
     /// `CREW_APP_SHOW=setting:<field>[:<agent or project name>]`: the
     /// jump ⌘K makes to that settings field, once the name is known.
     pub setting: Option<(String, Option<String>)>,
+    /// `CREW_APP_SHOW=job-form`: the New scheduled job dialog, once the
+    /// state is loaded. `job-form:<job id>`: Edit for that job, once the
+    /// job is known.
+    pub job_form: Option<Option<JobId>>,
 }
 
 /// Reads the hooks through `var`, logging values it can't use.
@@ -50,11 +54,19 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
     let mut terminal = None;
     let mut palette = None;
     let mut setting = None;
+    let mut job_form = None;
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
             "running" => running = true,
             "scheduled" => scheduled = true,
             "settings" => settings = Some(Page::General),
+            "job-form" => job_form = Some(None),
+            _ if v.starts_with("job-form:") => {
+                match v["job-form:".len()..].trim().parse().map(JobId) {
+                    Ok(id) => job_form = Some(Some(id)),
+                    Err(_) => eprintln!("crew: CREW_APP_SHOW={v} is not job-form:<job id>"),
+                }
+            }
             _ if v.starts_with("settings:") => {
                 settings = match &v["settings:".len()..] {
                     "skills" => Some(Page::Skills),
@@ -114,13 +126,14 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         terminal,
         palette,
         setting,
+        job_form,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DevHooks, Page, read};
-    use crew_core::ids::ThreadId;
+    use crew_core::ids::{JobId, ThreadId};
 
     #[test]
     fn hooks_come_from_the_environment() {
@@ -142,6 +155,7 @@ mod tests {
                 terminal: None,
                 palette: None,
                 setting: None,
+                job_form: None,
             }
         );
         let setting = read(|k| {
@@ -174,5 +188,15 @@ mod tests {
         assert_eq!(read(|_| None), DevHooks::default());
         let bad = read(|k| (k == "CREW_APP_OPEN_THREAD").then(|| "nope".to_string()));
         assert_eq!(bad.open_thread, None);
+    }
+
+    #[test]
+    fn job_form_opens_new_or_edit() {
+        let show = |v: String| read(move |k| (k == "CREW_APP_SHOW").then(|| v.clone()));
+        assert_eq!(show("job-form".into()).job_form, Some(None));
+        let id = JobId::new();
+        assert_eq!(show(format!("job-form:{id}")).job_form, Some(Some(id)));
+        assert_eq!(show("job-form:nope".into()).job_form, None);
+        assert_eq!(show("scheduled".into()).job_form, None);
     }
 }

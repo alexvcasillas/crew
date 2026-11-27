@@ -65,6 +65,19 @@ pub(super) fn tick(state: &State, job: &StoredJob, run: &StoredRun) -> Tick {
     }
 }
 
+/// What an ended job run comes to, in words, and whether they read green.
+/// A job that tells after every run marks each done run found, so its
+/// tick is green, but only a run that said it found something says so.
+pub(super) fn ended_words(job: &StoredJob, run: &StoredRun) -> (&'static str, bool) {
+    match run.status {
+        RunStatus::Stopped => ("Stopped", false),
+        RunStatus::Interrupted => ("Interrupted", false),
+        _ if run.found == Some(true) => ("Found something", true),
+        _ if State::job_run_found(job, run) => ("Done", false),
+        _ => ("Nothing new", false),
+    }
+}
+
 /// One run in the strip, 3 by 12.
 pub(super) fn tick_mark(tick: Tick) -> Div {
     div()

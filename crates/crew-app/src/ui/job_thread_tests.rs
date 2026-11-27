@@ -11,6 +11,7 @@ use crew_core::store::{Author, Missed, NewJob, OnAsk, StoredJob, StoredMessage, 
 use crew_proto::{Request, ServerMsg};
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, px};
 
+use super::job_thread::without_skill;
 use super::palette::DEBOUNCE;
 use super::scheduled_tests::{job, job_msg, new_thread, open_world, run, run_msg, send};
 use super::test_ui::{
@@ -363,7 +364,8 @@ fn panel_shows_settings_next_three_and_recent_runs(cx: &mut TestAppContext) {
     let mut woke = run_at(&s.job, Some(false), at(0, 8, 14), 55);
     woke.missed = 6;
     msgs.push(run_msg(&woke));
-    msgs.push(run_msg(&run_at(&s.job, Some(false), at(0, 13, 0), 51)));
+    // It ended at 13:00, as its reply says, after starting at 12:58.
+    msgs.push(run_msg(&run_at(&s.job, Some(false), at(0, 12, 58), 171)));
     msgs.push(run_msg(&run_at(&s.job, Some(true), at(0, 14, 0), 64)));
     msgs.push(run_msg(&run_at(&s.job, Some(false), at(0, 15, 0), 48)));
     send(cx, &s.ws, msgs);
@@ -406,8 +408,8 @@ fn panel_shows_settings_next_three_and_recent_runs(cx: &mut TestAppContext) {
         runs,
         [
             "15:00 · Nothing new · 48s",
-            "14:00 · Found something · 1m 4s",
-            "13:00 · Nothing new · 51s",
+            "14:01 · Found something · 1m 4s",
+            "13:00 · Nothing new · 2m 51s",
             "08:14 · Nothing new · ran on wake, missed 6 · 55s",
         ]
     );
@@ -723,4 +725,15 @@ fn every_run_jobs_notify_and_read_done(cx: &mut TestAppContext) {
     open_thread(cx, s.window, &s.ws, every.thread);
     let run = label(cx, s.window, "job-panel-run-0");
     assert!(run.contains(" · Done · "), "{run}");
+}
+
+#[test]
+fn a_skill_in_the_message_shows_once_beside_its_chip() {
+    assert_eq!(
+        without_skill("/lint Check the build", "lint"),
+        "Check the build"
+    );
+    assert_eq!(without_skill("/lint", "lint"), "");
+    assert_eq!(without_skill("/linter all", "lint"), "/linter all");
+    assert_eq!(without_skill("Check the build", "lint"), "Check the build");
 }
