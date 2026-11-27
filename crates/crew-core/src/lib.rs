@@ -10,6 +10,7 @@ pub mod mention;
 pub mod policy;
 pub mod project_kind;
 pub mod review;
+pub mod schedule;
 pub mod scheduler;
 pub mod slug;
 pub mod snapshot;
