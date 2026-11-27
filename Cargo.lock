@@ -1356,6 +1356,7 @@ dependencies = [
  "libc",
  "nix",
  "notify 9.0.0",
+ "rusqlite",
  "serde",
  "serde_json",
  "shlex",

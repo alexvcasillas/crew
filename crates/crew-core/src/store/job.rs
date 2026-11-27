@@ -246,8 +246,13 @@ impl Store {
             .transpose()
     }
 
-    /// Applies the fields set in `patch`.
+    /// Applies the fields set in `patch`. A new name renames the job's
+    /// thread too.
     pub fn update_job(&self, id: JobId, patch: &JobPatch) -> Result<()> {
+        self.in_transaction(|s| s.update_job_now(id, patch))
+    }
+
+    fn update_job_now(&self, id: JobId, patch: &JobPatch) -> Result<()> {
         let job = self.job(id)?;
         self.conn.execute(
             "UPDATE jobs SET name = ?2, body = ?3, skill = ?4, model_override = ?5,
@@ -266,6 +271,9 @@ impl Store {
                 enum_text(&patch.missed.unwrap_or(job.missed))?,
             ],
         )?;
+        if let Some(name) = patch.name.as_ref().filter(|n| **n != job.name) {
+            self.rename_thread(job.thread, name)?;
+        }
         Ok(())
     }
 
@@ -291,12 +299,15 @@ impl Store {
         self.set_job_column(id, "next_due", next_due)
     }
 
-    /// Turns a job on or off. Turning it off notes when; turning it on
-    /// clears that.
+    /// Turns a job on or off. Turning it off notes when, unless it was
+    /// off already; turning it on clears that.
     pub fn set_job_enabled(&self, id: JobId, enabled: bool) -> Result<()> {
+        // Turning off a job that's already off keeps when it went off.
         let changed = self.conn.execute(
-            "UPDATE jobs SET enabled = ?2, paused_at = ?3 WHERE id = ?1",
-            params![id.to_string(), enabled, (!enabled).then(now_ms)],
+            "UPDATE jobs SET enabled = ?2,
+                 paused_at = CASE WHEN ?2 THEN NULL ELSE COALESCE(paused_at, ?3) END
+             WHERE id = ?1",
+            params![id.to_string(), enabled, now_ms()],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound("job"));
@@ -376,16 +387,26 @@ impl Store {
 
     /// What the job's newest `n` runs that found something said, newest
     /// first: when the run ended (when it started, if it never ended) in
-    /// Unix ms, and its summary, else the start of its reply.
+    /// Unix ms, and its summary, else the start of its reply. For a job
+    /// that tells of every run, a run that ended Done found something too.
     pub fn recent_found(&self, job: JobId, n: u32) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(ended_at, started_at), summary,
                     (SELECT body FROM messages
                      WHERE run_id = runs.id AND author_kind = 'agent'
                      ORDER BY ord DESC LIMIT 1)
-             FROM runs WHERE job_id = ?1 AND found = 1 ORDER BY ord DESC LIMIT ?2",
+             FROM runs WHERE job_id = ?1
+               AND (found = 1
+                    OR (status = ?3 AND (SELECT tell FROM jobs WHERE id = ?1) = ?4))
+             ORDER BY ord DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![job.to_string(), n], |r| {
+        let params = params![
+            job.to_string(),
+            n,
+            status_text(&RunStatus::Done)?,
+            enum_text(&Tell::EveryRun)?,
+        ];
+        let rows = stmt.query_map(params, |r| {
             let at: i64 = r.get(0)?;
             let summary: Option<String> = r.get(1)?;
             let reply: Option<String> = r.get(2)?;

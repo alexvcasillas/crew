@@ -1063,7 +1063,7 @@ impl Service {
     }
 
     /// Tells `SubscribeAll` clients the thread as it is now.
-    fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
+    pub(crate) fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
         let thread = db.store.thread(thread).map_err(|e| e.to_string())?;
         self.publish_global(db, ServerMsg::ThreadChanged { thread });
         Ok(())
@@ -1104,7 +1104,12 @@ impl Service {
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
         self.agent_changed(&mut db, agent)?;
-        self.pause_agent_jobs(&mut db, agent)
+        // The agent is gone already, so this doesn't fail the delete. A
+        // job left on just logs that its agent is gone at each slot.
+        if let Err(e) = self.pause_agent_jobs(&mut db, agent) {
+            log(format!("couldn't pause the jobs of agent {agent}: {e}"));
+        }
+        Ok(())
     }
 
     /// Adds a project, unless another one uses the folder. A removed

@@ -11,7 +11,8 @@ use crew_core::ids::{AgentId, JobId, RunId, ThreadId};
 use crew_core::schedule::{Repeat, WeekdaySet, missed_between, next_after};
 use crew_core::scheduler::Job;
 use crew_core::store::{
-    Author, JobPatch, Missed, NewJob, OnAsk, RunFilter, StoreError, StoredJob, StoredRun, Tell,
+    ApprovalKind, Author, JobPatch, Missed, NewJob, OnAsk, RunFilter, StoreError, StoredJob,
+    StoredRun, Tell,
 };
 use crew_proto::{ServerMsg, SkillRef};
 use tokio::sync::Notify;
@@ -145,6 +146,15 @@ fn check(db: &Db, job: &NewJob) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The text of an edited job message: the skill first, as typed in the
+/// composer, then the message.
+fn edited_message(body: &str, skill: Option<&str>) -> String {
+    match skill {
+        Some(skill) => format!("/{skill} {body}").trim_end().to_string(),
+        None => body.to_string(),
+    }
+}
+
 /// A skill name with blanks trimmed, and none for an empty one.
 fn tidy_skill(skill: Option<String>) -> Option<String> {
     skill
@@ -167,7 +177,8 @@ fn thread_busy(db: &Db, thread: ThreadId) -> Result<bool, StoreError> {
         .any(|r| matches!(r.status, RunStatus::Queued | RunStatus::Working)))
 }
 
-/// Whether the job's latest run waits on an answer from you.
+/// Whether the job's latest run waits on an answer from you. A blocked
+/// note doesn't hold the run, so it doesn't count.
 fn waiting_on_you(db: &Db, job: &StoredJob) -> Result<bool, StoreError> {
     let Some(last) = db.store.job_runs(job.id, 1)?.into_iter().next() else {
         return Ok(false);
@@ -176,7 +187,7 @@ fn waiting_on_you(db: &Db, job: &StoredJob) -> Result<bool, StoreError> {
         .store
         .pending_approvals(Some(job.thread))?
         .iter()
-        .any(|a| a.run == last.id))
+        .any(|a| a.run == last.id && !matches!(a.kind, ApprovalKind::Blocked { .. })))
 }
 
 /// Whether the run belongs to a job that denies what its runs ask.
@@ -412,17 +423,20 @@ impl Service {
             }
             None => None,
         };
+        // All or nothing: a queued run left behind unqueued would hold
+        // the thread busy for good.
         let run = db
             .store
-            .create_job_run(job.thread, job.agent, job.id, missed)
+            .in_transaction(|store| {
+                let run = store.create_job_run(job.thread, job.agent, job.id, missed)?;
+                if let Some(name) = &job.skill {
+                    store.set_run_skill(run, name)?;
+                }
+                store.set_run_request(run, message, job.model_override.as_deref())?;
+                store.set_job_skipped(job.id, 0)?;
+                Ok(run)
+            })
             .map_err(err)?;
-        if let Some(name) = &job.skill {
-            db.store.set_run_skill(run, name).map_err(err)?;
-        }
-        db.store
-            .set_run_request(run, message, job.model_override.as_deref())
-            .map_err(err)?;
-        db.store.set_job_skipped(job.id, 0).map_err(err)?;
         // Codex can't run a skill without its file: the slot fails, and
         // the schedule goes on.
         if let Some(skill) = skill
@@ -496,7 +510,8 @@ impl Service {
     }
 
     /// Changes the job. A new message or skill is posted to its thread
-    /// for later runs to answer. A new repeat moves the next time.
+    /// for later runs to answer, the skill before the text. A new name
+    /// renames its thread. A new repeat moves the next time.
     pub(crate) fn update_job(&self, id: JobId, mut patch: JobPatch) -> Result<(), String> {
         if let Some(model) = patch.model_override.take() {
             patch.model_override = Some(tidy_model_override(model)?);
@@ -525,11 +540,12 @@ impl Service {
         };
         check(&db, &new)?;
         db.store.update_job(id, &patch).map_err(err)?;
+        if new.name != old.name {
+            self.thread_changed(&mut db, old.thread)?;
+        }
         if new.body != old.body || new.skill != old.skill {
-            let message = db
-                .store
-                .add_job_message(old.thread, &new.body)
-                .map_err(err)?;
+            let text = edited_message(&new.body, new.skill.as_deref());
+            let message = db.store.add_job_message(old.thread, &text).map_err(err)?;
             self.publish_message(&mut db, old.thread, message)
                 .map_err(err)?;
         }
@@ -651,12 +667,32 @@ impl Service {
         Ok(run)
     }
 
-    /// Creates the job turned off and runs it once.
+    /// Creates the job turned off and runs it once. A run that can't
+    /// start takes the job with it, and archives its thread.
     pub(crate) async fn test_job(&self, mut new: NewJob) -> Result<JobId, String> {
         new.enabled = false;
         let id = self.create_job(new)?;
-        self.run_job_now(id).await?;
+        if let Err(e) = self.run_job_now(id).await {
+            self.drop_test_job(id);
+            return Err(e);
+        }
         Ok(id)
+    }
+
+    /// Deletes a test job whose run didn't start, and archives its thread.
+    fn drop_test_job(&self, id: JobId) {
+        let mut db = self.db();
+        let thread = match db.store.job(id) {
+            Ok(job) => job.thread,
+            Err(e) => return log(format!("couldn't drop test job {id}: {e}")),
+        };
+        if let Err(e) = self.delete_thread_job(&mut db, thread) {
+            return log(format!("couldn't drop test job {id}: {e}"));
+        }
+        match db.store.set_thread_archived(thread, true) {
+            Ok(()) => self.thread_changed_or_log(&mut db, thread),
+            Err(e) => log(format!("couldn't archive thread {thread}: {e}")),
+        }
     }
 
     /// Turns off the jobs of a deleted agent, saying why.

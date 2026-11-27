@@ -1123,3 +1123,177 @@ async fn prune_drops_old_quiet_replies() {
     );
     assert_eq!(s.runs(id).len(), 1, "the run stays");
 }
+
+/// A setup whose store is a file, so a second connection can rig it.
+fn setup_on_file() -> Setup {
+    setup_with(|dir| Store::open(&dir.join("crew.db")).unwrap())
+}
+
+impl Setup {
+    /// Makes every write to the jobs' column `column` fail.
+    fn break_job_column(&self, column: &str) {
+        let conn = rusqlite::Connection::open(self.dir.join("crew.db")).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER broken BEFORE UPDATE OF {column} ON jobs
+             BEGIN SELECT RAISE(ABORT, 'broken'); END;"
+        ))
+        .unwrap();
+    }
+
+    fn mend(&self) {
+        let conn = rusqlite::Connection::open(self.dir.join("crew.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER broken;").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_blocked_note_doesnt_hold_the_next_slot() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around")).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].clone();
+    s.until_ended(run.id).await;
+    s.svc
+        .db()
+        .store
+        .create_approval(
+            run.thread,
+            run.id,
+            &ApprovalKind::Blocked {
+                tool: "Bash".into(),
+                input: serde_json::json!({"command": "rm -rf build"}),
+                reason: String::new(),
+            },
+        )
+        .unwrap();
+
+    s.svc.fire_due(at(12, 30));
+    assert_eq!(s.runs(id).len(), 2, "the blocked note didn't skip it");
+    assert_eq!(s.job(id).skipped, 0);
+}
+
+#[tokio::test]
+async fn a_run_that_cant_be_queued_leaves_no_run_behind() {
+    let s = setup_on_file();
+    let mut new = s.new_job("Look around");
+    new.enabled = false;
+    let id = s.create(new).await;
+    s.break_job_column("skipped");
+    let reply = s.svc.handle(Request::RunJobNow { job: id }).await;
+    assert!(reply.is_err());
+    assert!(s.runs(id).is_empty(), "no queued run holds the thread");
+
+    s.mend();
+    let run: RunId =
+        serde_json::from_value(s.svc.handle(Request::RunJobNow { job: id }).await.unwrap())
+            .unwrap();
+    s.until_ended(run).await;
+}
+
+#[tokio::test]
+async fn a_test_run_that_cant_start_takes_its_job_with_it() {
+    let s = setup_on_file();
+    s.break_job_column("skipped");
+    let mut notices = s.svc.notices();
+    let reply = s
+        .svc
+        .handle(Request::TestJob {
+            job: s.new_job("Look around"),
+        })
+        .await;
+    assert!(reply.is_err());
+    assert!(s.svc.db().store.jobs().unwrap().is_empty());
+    let notes: Vec<_> = std::iter::from_fn(|| notices.try_recv().ok()).collect();
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n.msg, ServerMsg::JobRemoved { .. }))
+    );
+    assert!(notes.iter().any(
+        |n| matches!(&n.msg, ServerMsg::ThreadChanged { thread } if thread.archived_at.is_some())
+    ));
+}
+
+#[tokio::test]
+async fn deleting_the_agent_goes_on_when_its_jobs_cant_pause() {
+    let s = setup_on_file();
+    let id = s.create(s.new_job("Look around")).await;
+    s.break_job_column("paused_reason");
+    s.svc
+        .handle(Request::DeleteAgent { agent: s.agent })
+        .await
+        .unwrap();
+    assert!(
+        s.svc
+            .db()
+            .store
+            .agent(s.agent)
+            .unwrap()
+            .deleted_at
+            .is_some()
+    );
+    assert!(s.job(id).enabled, "the pause failed, and was only logged");
+}
+
+#[tokio::test]
+async fn a_skill_edit_posts_the_skill_with_the_message() {
+    let s = setup();
+    let id = s.create(s.new_job("Check the build")).await;
+    let thread = s.job(id).thread;
+    let job_messages = || {
+        s.svc
+            .db()
+            .store
+            .messages(thread)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.job_message)
+            .map(|m| m.body)
+            .collect::<Vec<_>>()
+    };
+    let patch = JobPatch {
+        skill: Some(Some("lint".into())),
+        ..Default::default()
+    };
+    s.svc
+        .handle(Request::UpdateJob { job: id, patch })
+        .await
+        .unwrap();
+    assert_eq!(job_messages(), ["Check the build", "/lint Check the build"]);
+
+    let patch = JobPatch {
+        skill: Some(Some("lint".into())),
+        body: Some("Check the build".into()),
+        ..Default::default()
+    };
+    s.svc
+        .handle(Request::UpdateJob { job: id, patch })
+        .await
+        .unwrap();
+    assert_eq!(job_messages().len(), 2, "nothing changed, nothing posted");
+}
+
+#[tokio::test]
+async fn renaming_a_job_renames_its_thread() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around")).await;
+    let thread = s.job(id).thread;
+    let mut notices = s.svc.notices();
+    let patch = JobPatch {
+        name: Some("Morning sweep".into()),
+        ..Default::default()
+    };
+    s.svc
+        .handle(Request::UpdateJob { job: id, patch })
+        .await
+        .unwrap();
+    assert_eq!(
+        s.svc.db().store.thread(thread).unwrap().title,
+        "Morning sweep"
+    );
+    let told = std::iter::from_fn(|| notices.try_recv().ok()).any(|n| {
+        matches!(&n.msg, ServerMsg::ThreadChanged { thread: t }
+            if t.id == thread && t.title == "Morning sweep")
+    });
+    assert!(told, "clients hear of the new title");
+}

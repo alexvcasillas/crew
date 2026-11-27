@@ -2226,6 +2226,50 @@ fn recent_found_returns_summary_or_reply_start() {
 }
 
 #[test]
+fn recent_found_counts_done_runs_of_an_every_run_job() {
+    let (store, a, c) = job_setup();
+    let mut every = new_job(a, c, "Every run");
+    every.tell = Tell::EveryRun;
+    let id = store.create_job(&every).unwrap();
+    let thread = store.job(id).unwrap().thread;
+
+    let done = store.create_job_run(thread, a, id, 0).unwrap();
+    store
+        .add_message(thread, Author::Agent(a), "All clear.", Some(done))
+        .unwrap();
+    store.set_run_status(done, RunStatus::Done).unwrap();
+    let failed = store.create_job_run(thread, a, id, 0).unwrap();
+    store.set_run_status(failed, RunStatus::Failed).unwrap();
+
+    let found = store.recent_found(id, 5).unwrap();
+    assert_eq!(
+        found.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        ["All clear."]
+    );
+
+    // A job that tells only of changes doesn't count a plain Done run.
+    let changes = store.create_job(&new_job(a, c, "Changes")).unwrap();
+    let thread = store.job(changes).unwrap().thread;
+    let run = store.create_job_run(thread, a, changes, 0).unwrap();
+    store.set_run_status(run, RunStatus::Done).unwrap();
+    assert!(store.recent_found(changes, 5).unwrap().is_empty());
+}
+
+#[test]
+fn turning_off_an_off_job_keeps_when_it_went_off() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    store.set_job_enabled(id, false).unwrap();
+    let first = store.job(id).unwrap().paused_at;
+    assert!(first.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.set_job_enabled(id, false).unwrap();
+    assert_eq!(store.job(id).unwrap().paused_at, first);
+    store.set_job_enabled(id, true).unwrap();
+    assert_eq!(store.job(id).unwrap().paused_at, None);
+}
+
+#[test]
 fn deleting_a_job_keeps_its_thread() {
     let (store, a, c) = job_setup();
     let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
