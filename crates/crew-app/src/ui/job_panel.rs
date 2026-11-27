@@ -4,18 +4,19 @@
 
 use chrono::{Local, TimeZone as _};
 use crew_core::event::RunStatus;
-use crew_core::ids::JobId;
+use crew_core::ids::{JobId, RunId};
 use crew_core::schedule::{describe, next_after};
 use crew_core::store::{Missed, StoredJob, StoredRun, Tell};
 use crew_proto::Request;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Icon, Sizable as _};
+use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::common::{chip, elapsed, monogram, now_ms, runtime_chip, switch};
+use super::inspector::InspectorTab;
 use super::job_runs::{Tick, local_format, same_day, tick, tick_mark};
-use super::scheduled_view::{CLOCK_SVG, run_time};
+use super::scheduled_view::{AGENT_DELETED, CLOCK_SVG, run_time};
 use super::workspace::Workspace;
 use crate::model::State;
 use crate::theme::color;
@@ -26,7 +27,7 @@ const PANEL_WIDTH: f32 = 360.;
 /// Runs the strip shows.
 const STRIP_RUNS: usize = 24;
 /// Runs the Recent runs list shows.
-const RECENT_RUNS: usize = 5;
+const RECENT_RUNS: usize = 4;
 /// Next runs listed.
 const NEXT_RUNS: usize = 3;
 /// The settings' label column.
@@ -64,7 +65,7 @@ fn missed(missed: Missed) -> &'static str {
 /// the day isn't today's or the one before it.
 fn next_runs(job: &StoredJob, now: i64) -> String {
     let Some(due) = job.next_due.filter(|_| job.enabled) else {
-        return "Paused".into();
+        return paused(job);
     };
     let mut times = vec![due];
     while times.len() < NEXT_RUNS {
@@ -91,6 +92,19 @@ fn next_runs(job: &StoredJob, now: i64) -> String {
         .join(" · ")
 }
 
+/// Why a job doesn't run, as the Scheduled page says it: "Paused by
+/// you · 21 Nov", or what crewd paused it for.
+fn paused(job: &StoredJob) -> String {
+    match job.paused_reason.as_deref() {
+        Some(AGENT_DELETED) => "Paused until you pick another agent".into(),
+        Some(reason) => reason.into(),
+        None => match job.paused_at {
+            Some(at) => format!("Paused by you · {}", local_format(at, "%-d %b")),
+            None => "Paused by you".into(),
+        },
+    }
+}
+
 /// A recent run's line: its time, what it found and how long it took.
 fn recent_run(
     state: &State,
@@ -105,7 +119,10 @@ fn recent_run(
         (Tick::Failed, _) => "Failed".to_string(),
         (_, RunStatus::Stopped) => "Stopped".to_string(),
         (_, RunStatus::Interrupted) => "Interrupted".to_string(),
-        (Tick::Found, _) => "Found something".to_string(),
+        // A job that tells after every run marks each done run; only
+        // one that said it found something says so.
+        (Tick::Found, _) if run.found == Some(true) => "Found something".to_string(),
+        (Tick::Found, _) => "Done".to_string(),
         _ => "Nothing new".to_string(),
     };
     if run.missed > 0 {
@@ -119,6 +136,44 @@ fn recent_run(
 }
 
 impl Workspace {
+    /// Shows `run`'s activity in the inspector, in place of the job panel.
+    pub(super) fn show_job_run(&mut self, run: RunId, window: &mut Window, cx: &mut Context<Self>) {
+        self.job_run_shown = Some(run);
+        self.inspector.picked = Some(run);
+        self.show_tab(InspectorTab::Activity, window, cx);
+    }
+
+    /// Back from a run's activity to the job panel.
+    pub(super) fn back_to_job_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.job_run_shown = None;
+        self.inspector.picked = None;
+        self.sync_inspector(window, cx);
+        cx.notify();
+    }
+
+    /// The bar over a job run's activity that leads back to the panel.
+    pub(super) fn render_back_to_job(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .id("inspector-back-to-job")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(ui_px(4.))
+            .h(scale::row(32.))
+            .px(ui_px(12.))
+            .border_b_1()
+            .border_color(color("border-100"))
+            .cursor_pointer()
+            .text_size(scale::text(12.))
+            .text_color(color("text-secondary"))
+            .hover(|el| el.text_color(color("text-primary")))
+            .aria_label("Scheduled job")
+            .on_click(cx.listener(|this, _, window, cx| this.back_to_job_panel(window, cx)))
+            .child(Icon::new(IconName::ChevronLeft).size(ui_px(14.)))
+            .child("Scheduled job")
+            .test_support()
+    }
+
     /// The job panel, in place of the inspector beside a job's thread.
     pub(super) fn render_job_panel(&self, job: JobId, cx: &mut Context<Self>) -> AnyElement {
         let state = self.state();
@@ -137,7 +192,7 @@ impl Workspace {
             .iter()
             .rev()
             .take(RECENT_RUNS)
-            .map(|r| recent_run(state, job, r, now))
+            .map(|r| (r.id, recent_run(state, job, r, now)))
             .collect();
         let (agent, chip_text) = state.agent(job.agent).map_or_else(
             || ("Agent deleted".to_string(), None),
@@ -194,71 +249,69 @@ impl Workspace {
                     .test_support(),
             );
 
-        let body = div()
-            .id("job-panel-body")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pt(scale::row(8.))
-            .pb(scale::row(16.))
-            .px(ui_px(16.))
-            .child(text_kv("repeats", "Repeats", false, repeats(job)))
-            .child(kv(
-                "agent",
-                "Agent",
-                true,
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(ui_px(6.))
-                    .min_w_0()
-                    .child(monogram(&agent, 18.))
-                    .child(div().min_w_0().truncate().child(agent.clone()))
-                    .children(chip_text.map(chip))
-                    .into_any_element(),
-                agent_label,
-            ))
-            .child(text_kv("tell", "Tells you", true, tells(job.tell).into()))
-            .child(text_kv(
-                "missed",
-                "Missed runs",
-                true,
-                missed(job.missed).into(),
-            ))
-            .child({
-                let next = next_runs(job, now);
-                kv(
-                    "next",
-                    "Next",
+        let body =
+            div()
+                .id("job-panel-body")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .pt(scale::row(8.))
+                .pb(scale::row(16.))
+                .px(ui_px(16.))
+                .child(text_kv("repeats", "Repeats", false, repeats(job)))
+                .child(kv(
+                    "agent",
+                    "Agent",
                     true,
                     div()
-                        .font_family(code_family())
-                        .text_size(scale::mono(12.))
-                        .child(next.clone())
+                        .flex()
+                        .items_center()
+                        .gap(ui_px(6.))
+                        .min_w_0()
+                        .child(monogram(&agent, 18.))
+                        .child(div().min_w_0().truncate().child(agent.clone()))
+                        .children(chip_text.map(chip))
                         .into_any_element(),
-                    next,
-                )
-            })
-            .child(section_label("job-panel-strip-title", "Last 24 runs", 8.))
-            .child(div().flex().items_center().gap(ui_px(3.)).children(
-                strip.into_iter().enumerate().map(|(i, t)| {
-                    div()
-                        .id(SharedString::from(format!("job-panel-tick-{i}")))
-                        .flex_none()
-                        .w(ui_px(8.))
-                        .h(ui_px(20.))
-                        .rounded(ui_px(1.))
-                        .bg(color(t.token()))
-                        .aria_label(t.word())
-                        .test_support()
-                }),
-            ))
-            .child(section_label("job-panel-recent-title", "Recent runs", 4.))
-            .children(
-                recent
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (t, time, text, took))| {
+                    agent_label,
+                ))
+                .child(text_kv("tell", "Tells you", true, tells(job.tell).into()))
+                .child(text_kv(
+                    "missed",
+                    "Missed runs",
+                    true,
+                    missed(job.missed).into(),
+                ))
+                .child({
+                    let next = next_runs(job, now);
+                    kv(
+                        "next",
+                        "Next",
+                        true,
+                        div()
+                            .font_family(code_family())
+                            .text_size(scale::mono(12.))
+                            .child(next.clone())
+                            .into_any_element(),
+                        next,
+                    )
+                })
+                .child(section_label("job-panel-strip-title", "Last 24 runs", 8.))
+                .child(div().flex().items_center().gap(ui_px(3.)).children(
+                    strip.into_iter().enumerate().map(|(i, t)| {
+                        div()
+                            .id(SharedString::from(format!("job-panel-tick-{i}")))
+                            .flex_none()
+                            .w(ui_px(8.))
+                            .h(ui_px(20.))
+                            .rounded(ui_px(1.))
+                            .bg(color(t.token()))
+                            .aria_label(t.word())
+                            .test_support()
+                    }),
+                ))
+                .child(section_label("job-panel-recent-title", "Recent runs", 4.))
+                .children(recent.into_iter().enumerate().map(
+                    |(i, (run, (t, time, text, took)))| {
                         let label = [time.clone(), text.clone(), took.clone()]
                             .into_iter()
                             .filter(|s| !s.is_empty())
@@ -273,7 +326,13 @@ impl Workspace {
                             .text_size(scale::text(12.))
                             .text_color(color("text-secondary"))
                             .whitespace_nowrap()
+                            .rounded(ui_px(4.))
+                            .cursor_pointer()
+                            .hover(|row| row.bg(color("surface-100")))
                             .aria_label(label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_job_run(run, window, cx);
+                            }))
                             .child(tick_mark(t))
                             .child(mono(time).w(ui_px(44.)))
                             .child(
@@ -281,13 +340,15 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .when(t == Tick::Found, |d| d.text_color(color("success")))
+                                    .when(text.starts_with("Found something"), |d| {
+                                        d.text_color(color("success"))
+                                    })
                                     .child(text),
                             )
                             .child(mono(took))
                             .test_support()
-                    }),
-            );
+                    },
+                ));
 
         let footer = div()
             .flex()

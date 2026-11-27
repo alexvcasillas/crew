@@ -43,7 +43,7 @@ const STRIP_RUNS: usize = 20;
 const WEEKDAY_DAYS: i64 = 6;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-const AGENT_DELETED: &str = "Agent deleted";
+pub(super) const AGENT_DELETED: &str = "Agent deleted";
 const EMPTY_TITLE: &str = "No scheduled jobs yet";
 const EMPTY_TEXT: &str = "An agent can check something on a schedule and tell you when it changes.";
 const AWAKE_NOTE: &str = "Jobs run while your Mac is awake.";

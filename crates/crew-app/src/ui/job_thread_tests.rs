@@ -14,7 +14,7 @@ use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, px};
 use super::palette::DEBOUNCE;
 use super::scheduled_tests::{job, job_msg, new_thread, open_world, run, run_msg, send};
 use super::test_ui::{
-    bounds_of, click, has, label_of, notifications, press, shows, type_text, wait_until,
+    bounds_of, click, has, label_of, notifications, open_sized, press, shows, type_text, wait_until,
 };
 use super::thread_tests::{World, world};
 use super::workspace::Workspace;
@@ -213,8 +213,23 @@ fn header_shows_repeat_and_next(cx: &mut TestAppContext) {
     let mut paused = s.job.clone();
     paused.enabled = false;
     paused.next_due = None;
+    paused.paused_at = Some(at(1, 9, 0));
     send(cx, &s.ws, vec![job_msg(&paused)]);
     assert_eq!(label(cx, s.window, "thread-job-tag"), "Every hour · paused");
+    let day = Local
+        .timestamp_millis_opt(at(1, 9, 0))
+        .unwrap()
+        .format("%-d %b");
+    assert_eq!(
+        label(cx, s.window, "job-panel-next"),
+        format!("Paused by you · {day}")
+    );
+    paused.paused_reason = Some("Agent deleted".into());
+    send(cx, &s.ws, vec![job_msg(&paused)]);
+    assert_eq!(
+        label(cx, s.window, "job-panel-next"),
+        "Paused until you pick another agent"
+    );
     // A thread that isn't a job's has no tag.
     open_thread(cx, s.window, &s.ws, s.w.thread);
     assert!(!has(cx, s.window, "thread-job-tag"));
@@ -344,6 +359,7 @@ fn panel_shows_settings_next_three_and_recent_runs(cx: &mut TestAppContext) {
     let _daemon = Daemon::start(home.path().to_path_buf());
     let s = scene(cx, home.path(), tmp.path());
     let mut msgs = Vec::new();
+    msgs.push(run_msg(&run_at(&s.job, Some(false), at(0, 7, 0), 50)));
     let mut woke = run_at(&s.job, Some(false), at(0, 8, 14), 55);
     woke.missed = 6;
     msgs.push(run_msg(&woke));
@@ -377,11 +393,11 @@ fn panel_shows_settings_next_three_and_recent_runs(cx: &mut TestAppContext) {
         "16:00 · 17:00 · 18:00"
     );
     assert_eq!(label(cx, s.window, "job-panel-strip-title"), "Last 24 runs");
-    let ticks: Vec<String> = (0..4)
+    let ticks: Vec<String> = (0..5)
         .map(|i| label(cx, s.window, format!("job-panel-tick-{i}")))
         .collect();
-    assert_eq!(ticks, ["quiet", "quiet", "found", "quiet"]);
-    assert!(!has(cx, s.window, "job-panel-tick-4"));
+    assert_eq!(ticks, ["quiet", "quiet", "quiet", "found", "quiet"]);
+    assert!(!has(cx, s.window, "job-panel-tick-5"));
     // Newest first.
     let runs: Vec<String> = (0..4)
         .map(|i| label(cx, s.window, format!("job-panel-run-{i}")))
@@ -395,6 +411,8 @@ fn panel_shows_settings_next_three_and_recent_runs(cx: &mut TestAppContext) {
             "08:14 · Nothing new · ran on wake, missed 6 · 55s",
         ]
     );
+    // The board lists the latest four.
+    assert!(!has(cx, s.window, "job-panel-run-4"));
 }
 
 #[gpui_kit::test]
@@ -488,7 +506,8 @@ fn finish(job: &StoredJob, found: bool, body: &str) -> (Vec<ServerMsg>, Vec<Serv
         Some(live.id),
         live.started_at + 30_000,
     );
-    reply.quiet = !found;
+    // As crewd marks it: quiet when the job tells only of changes.
+    reply.quiet = !found && job.tell == Tell::Changes;
     (start, vec![msg(reply), run_msg(&live)])
 }
 
@@ -623,4 +642,85 @@ fn archiving_a_job_thread_warns(cx: &mut TestAppContext) {
     open_archive(cx, w.thread);
     assert!(has(cx, window, "archive-heading"));
     assert!(!has(cx, window, "archive-job-note"));
+}
+
+#[gpui_kit::test]
+fn panel_shows_even_after_activity_was_hidden(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let s = scene(cx, home.path(), tmp.path());
+    // You hid the activity in another thread.
+    open_thread(cx, s.window, &s.ws, s.w.thread);
+    click(cx, s.window, "toggle-activity");
+    assert!(!has(cx, s.window, "inspector"));
+    open_thread(cx, s.window, &s.ws, s.job.thread);
+    assert!(has(cx, s.window, "job-panel"), "wide, the panel shows");
+    assert!(!has(cx, s.window, "toggle-activity"), "as on the board");
+}
+
+#[gpui_kit::test]
+fn narrow_job_threads_toggle_the_panel(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Scout"]);
+    let (window, ws) = open_sized(cx, home.path(), 1000.);
+    let stock = real_job(cx, &w, &ws);
+    open_thread(cx, window, &ws, stock.thread);
+    assert!(!has(cx, window, "job-panel"));
+    click(cx, window, "toggle-activity");
+    assert!(has(cx, window, "job-panel"));
+    click(cx, window, "toggle-activity");
+    assert!(!has(cx, window, "job-panel"));
+}
+
+#[gpui_kit::test]
+fn a_recent_run_opens_its_activity_and_back_returns(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let s = scene(cx, home.path(), tmp.path());
+    let (found, found_reply) = reply(&s.job, true, at(0, 14, 0), "A VPS-2 is in stock.");
+    send(cx, &s.ws, vec![run_msg(&found), msg(found_reply)]);
+
+    click(cx, s.window, "job-panel-run-0");
+    assert!(!has(cx, s.window, "job-panel"));
+    assert!(has(cx, s.window, "inspector"), "the run's activity");
+    assert_eq!(
+        s.ws.read_with(cx, |ws, _| ws.shown_run(s.job.thread).map(|r| r.id)),
+        Some(found.id)
+    );
+    assert_eq!(
+        label(cx, s.window, "inspector-back-to-job"),
+        "Scheduled job"
+    );
+    click(cx, s.window, "inspector-back-to-job");
+    assert!(has(cx, s.window, "job-panel"));
+    assert!(!has(cx, s.window, "inspector-back-to-job"));
+}
+
+#[gpui_kit::test]
+fn every_run_jobs_notify_and_read_done(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let s = scene(cx, home.path(), tmp.path());
+    let mut every = s.job.clone();
+    every.tell = Tell::EveryRun;
+    take_in(cx, s.window, &s.ws, vec![job_msg(&every)]);
+    // Looking elsewhere, a reply that found nothing still tells you.
+    open_thread(cx, s.window, &s.ws, s.w.thread);
+    let (start, end) = finish(&every, false, "Here is the weekly summary.");
+    take_in(cx, s.window, &s.ws, start);
+    take_in(cx, s.window, &s.ws, end);
+    assert_eq!(notifications(cx, s.window), 1);
+    assert_eq!(
+        label(cx, s.window, "job-notice-text"),
+        "Scout: Here is the weekly summary."
+    );
+    // Its run reads Done, not Found something.
+    open_thread(cx, s.window, &s.ws, every.thread);
+    let run = label(cx, s.window, "job-panel-run-0");
+    assert!(run.contains(" · Done · "), "{run}");
 }

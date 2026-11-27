@@ -200,8 +200,16 @@ impl Workspace {
                             }),
                     )
                     .when_some(run_now, |header, run_now| header.child(run_now))
-                    .when(!is_job, |header| {
-                        header.children(self.render_thread_controls(thread, policy, cx))
+                    .map(|header| {
+                        if is_job {
+                            // The board is wide; narrower, the panel needs
+                            // the toggle.
+                            header.when(!self.wide(), |header| {
+                                header.child(self.render_activity_toggle(cx))
+                            })
+                        } else {
+                            header.children(self.render_thread_controls(thread, policy, cx))
+                        }
                     }),
             )
             .child(
@@ -231,27 +239,13 @@ impl Workspace {
         policy: Option<HandoffPolicy>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let (label, icon) = if self.inspector_shown {
-            ("Hide activity", IconName::PanelRightClose)
-        } else {
-            ("Show activity", IconName::PanelRightOpen)
-        };
         let handoffs = format!(
             "Handoffs: {}",
             policy_name(policy.unwrap_or(HandoffPolicy::AskFirst))
         );
         let mut controls: Vec<AnyElement> = self.render_mode_chip(thread).into_iter().collect();
         controls.push(self.render_participants(thread).into_any_element());
-        controls.push(
-            Button::new("toggle-activity")
-                .ghost()
-                .small()
-                .icon(icon)
-                .tooltip(label)
-                .accessibility_label(label)
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
-                .into_any_element(),
-        );
+        controls.push(self.render_activity_toggle(cx).into_any_element());
         controls.push(
             div()
                 .id("thread-handoffs")
@@ -265,6 +259,22 @@ impl Workspace {
                 .into_any_element(),
         );
         controls
+    }
+
+    /// Shows or hides the column beside the thread.
+    fn render_activity_toggle(&self, cx: &mut Context<Self>) -> Button {
+        let (label, icon) = if self.inspector_shown {
+            ("Hide activity", IconName::PanelRightClose)
+        } else {
+            ("Show activity", IconName::PanelRightOpen)
+        };
+        Button::new("toggle-activity")
+            .ghost()
+            .small()
+            .icon(icon)
+            .tooltip(label)
+            .accessibility_label(label)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
     }
 
     /// The main area while you write the first message of a new thread.

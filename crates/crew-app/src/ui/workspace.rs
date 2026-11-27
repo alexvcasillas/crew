@@ -178,6 +178,9 @@ pub struct Workspace {
     /// A job whose thread opens once it and its thread are known, after
     /// a test run.
     job_open_pending: Option<crew_core::ids::JobId>,
+    /// The run of the open job's thread shown in the inspector, in place
+    /// of the job panel.
+    pub(super) job_run_shown: Option<crew_core::ids::RunId>,
     /// Folds of quiet job runs you opened, by their first reply.
     pub(super) job_folds_open: HashSet<crew_core::ids::MessageId>,
     /// A Stop all request is waiting for its answer.
@@ -363,6 +366,7 @@ impl Workspace {
             scheduled: None,
             job_open_pending: None,
             job_folds_open: HashSet::new(),
+            job_run_shown: None,
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
@@ -1201,6 +1205,7 @@ impl Workspace {
             self.nav.thread_viewed.insert(open, super::common::now_ms());
             self.unwatch_thread(open);
             self.inspector.reset();
+            self.job_run_shown = None;
             self.editing = None;
         }
     }
@@ -1585,13 +1590,23 @@ fn working_hint(names: &[String]) -> Option<String> {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_width = window.viewport_size().width;
-        let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
+        let wide = self.wide();
         let lights = crate::app::traffic_lights();
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
             window.set_traffic_light_position(lights);
         }
-        self.inspector_shown = self.inspector_open.unwrap_or(wide);
+        // A job's panel shows whenever the window is wide; narrower, the
+        // header's toggle opens it.
+        let job_thread = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread_job(t).is_some());
+        self.inspector_shown = if job_thread {
+            wide || self.inspector_open == Some(true)
+        } else {
+            self.inspector_open.unwrap_or(wide)
+        };
         self.refresh_channel_rows(cx);
         self.refresh_sidebars(cx);
         let root = div().id("workspace");
@@ -1677,8 +1692,10 @@ impl Workspace {
                 self.inspector_thread()
                     .filter(|_| self.inspector_shown)
                     .map(|t| match self.state.thread_job(t).map(|j| j.id) {
-                        Some(job) => self.render_job_panel(job, cx).into_any_element(),
-                        None => self.render_inspector(t, cx).into_any_element(),
+                        Some(job) if self.job_run_shown.is_none() => {
+                            self.render_job_panel(job, cx).into_any_element()
+                        }
+                        _ => self.render_inspector(t, cx).into_any_element(),
                     }),
             )
             .into_any_element()
@@ -1686,6 +1703,11 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// Whether the window is wide enough for the inspector by default.
+    pub(super) fn wide(&self) -> bool {
+        self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW)
+    }
+
     /// Shows the inspector if it is hidden, or hides it.
     pub(super) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_open = Some(!self.inspector_shown);
