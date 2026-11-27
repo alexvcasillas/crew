@@ -9,3 +9,6 @@ crew-core = { path = "../crew-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

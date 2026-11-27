@@ -85,6 +85,15 @@ pub struct NewJob {
     pub enabled: bool,
 }
 
+/// Reads a present `null` as `Some(None)`, so a cleared field survives JSON.
+/// A missing field still gives `None` through `#[serde(default)]`.
+fn some_even_if_null<'de, D>(d: D) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
+}
+
 /// The fields of a job that can change. `None` leaves a field alone; for
 /// `skill` and `model_override`, `Some(None)` clears it. The channel is
 /// not editable.
@@ -94,9 +103,17 @@ pub struct JobPatch {
     pub name: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "some_even_if_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub skill: Option<Option<String>>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "some_even_if_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model_override: Option<Option<String>>,
     #[serde(default)]
     pub agent: Option<AgentId>,

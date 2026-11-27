@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crew_core::agent::PermissionMode;
 use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus, ToolKind};
-use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, JobId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
-    StoredProject, StoredRun, StoredThread, TitleSettings, TitleSource,
+    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredJob,
+    StoredMessage, StoredProject, StoredRun, StoredThread, TitleSettings, TitleSource,
 };
 use crew_proto::{ServerMsg, TerminalSession};
 
@@ -190,6 +190,8 @@ pub struct State {
     sent_thread_handoffs: HashMap<ThreadId, Handoff>,
     /// Claude Code sessions run in a terminal, by id.
     terminal: HashMap<String, TerminalSession>,
+    /// Scheduled jobs.
+    jobs: HashMap<JobId, StoredJob>,
     /// One log per watched terminal session.
     terminal_logs: HashMap<String, TerminalLog>,
     /// crewd's global limits, as last reported.
@@ -242,7 +244,9 @@ impl State {
                 terminal_sessions,
                 limits,
                 titles,
+                jobs,
             } => {
+                self.jobs = jobs.into_iter().map(|j| (j.id, j)).collect();
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
                 self.limits_changed(limits);
                 self.titles_changed(titles);
@@ -254,6 +258,12 @@ impl State {
                 for log in self.terminal_logs.values_mut() {
                     log.clear();
                 }
+            }
+            ServerMsg::JobChanged { job } => {
+                self.jobs.insert(job.id, *job);
+            }
+            ServerMsg::JobRemoved { job } => {
+                self.jobs.remove(&job);
             }
             ServerMsg::TerminalSessionChanged { session } => {
                 self.terminal.insert(session.id.clone(), session);
@@ -1225,6 +1235,7 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
         });
         (state, p, c, t)
     }
@@ -1630,6 +1641,7 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -1953,6 +1965,7 @@ mod tests {
             terminal_sessions: vec![],
             limits: stored,
             titles: Default::default(),
+            jobs: vec![],
         });
         assert_eq!(*state.limits(), stored);
 
@@ -1988,6 +2001,7 @@ mod tests {
             terminal_sessions: vec![],
             limits: other,
             titles: Default::default(),
+            jobs: vec![],
         });
         assert_eq!(*state.limits(), other);
         // A failed request goes back to crewd's copy.
@@ -2073,6 +2087,7 @@ mod tests {
             ],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -2166,6 +2181,7 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

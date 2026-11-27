@@ -802,6 +802,13 @@ impl Service {
                 self.project_changed(&mut db, project)?;
                 Ok(serde_json::Value::Null)
             }
+            Request::CreateJob { .. }
+            | Request::UpdateJob { .. }
+            | Request::DeleteJob { .. }
+            | Request::SetJobEnabled { .. }
+            | Request::RunJobNow { .. }
+            | Request::TestJob { .. }
+            | Request::Report { .. } => Err("Not yet.".into()),
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -1417,6 +1424,7 @@ impl Service {
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
             titles: db.store.title_settings()?,
+            jobs: vec![],
         };
         Ok((msg, db.serial))
     }

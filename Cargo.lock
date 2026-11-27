@@ -1338,6 +1338,7 @@ dependencies = [
 name = "crew-proto"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crew-core",
  "serde",
  "serde_json",
