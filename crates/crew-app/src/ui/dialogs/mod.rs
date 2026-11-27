@@ -31,7 +31,7 @@ pub(crate) use add_project::{repos_line, setup_file_in, short_remote, size_label
 use discard::discard_label;
 pub(crate) use job::JobForm;
 #[cfg(test)]
-pub(crate) use job::next_times;
+pub(crate) use job::{ROW_PAD, TITLE_GAP, TITLE_LINE, next_times};
 pub(crate) use project::REMOVE_BODY;
 
 /// The dialogs' width.

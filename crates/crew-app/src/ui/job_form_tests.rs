@@ -10,10 +10,10 @@ use crew_proto::Request;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
-use super::dialogs::next_times;
+use super::dialogs::{ROW_PAD, TITLE_GAP, TITLE_LINE, next_times};
 use super::scheduled_view::JobPrefill;
 use super::sidebar::row_probe::row_of;
-use super::test_ui::{click, has, label_of, open_tall, press, type_text, wait_until};
+use super::test_ui::{bounds_of, click, has, label_of, open_tall, press, type_text, wait_until};
 use super::thread_tests::{World, world};
 use super::workspace::Workspace;
 use crate::test_support::{Daemon, short_home};
@@ -572,5 +572,103 @@ fn suggestion_prefills(cx: &mut TestAppContext) {
         wait_until(cx, "the form to close", |cx| {
             !dialog_open(cx, &ws) && !has(cx, window, "job-form")
         });
+    }
+}
+
+#[gpui_kit::test]
+fn the_title_sits_close_to_the_first_row(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Scout"]);
+    let (window, ws) = open_world(cx, home.path(), &w);
+    open_form(cx, window, &ws, None, None);
+    let title = bounds_of(cx, window, "job-title").unwrap();
+    let name = bounds_of(cx, window, "job-name").unwrap();
+    // The title's line, then 8 under it and the row's 14: 22 in all,
+    // as the board has it.
+    let gap = f32::from(name.origin.y - title.origin.y) - TITLE_LINE;
+    assert_eq!(gap, TITLE_GAP + ROW_PAD);
+}
+
+#[gpui_kit::test]
+fn edit_keeps_a_repeat_with_only_days_or_only_hours(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Scout"]);
+    let (window, ws) = open_world(cx, home.path(), &w);
+    let agent = first_agent(cx, &ws);
+    let weekdays = Some(WeekdaySet::from_days(&WEEKDAYS));
+    let hours = Some((t(8, 0), t(18, 0)));
+    for (days, window_) in [(weekdays, None), (None, hours)] {
+        let id: JobId = w.ask(Request::CreateJob {
+            job: NewJob {
+                name: "Half".into(),
+                body: "Look".into(),
+                skill: None,
+                model_override: None,
+                agent,
+                channel: w.channel,
+                repeat: Repeat::Every {
+                    minutes: 60,
+                    days,
+                    window: window_,
+                },
+                tell: Tell::Changes,
+                on_ask: OnAsk::Wait,
+                missed: Missed::OnceOnWake,
+                enabled: true,
+            },
+        });
+        wait_until(cx, "the job", |cx| jobs(cx, &ws).iter().any(|j| j.id == id));
+        open_form(cx, window, &ws, Some(id), None);
+        assert_eq!(label(cx, window, "job-only-on"), "Only on (on)");
+        let patch =
+            |cx: &mut TestAppContext| ws.read_with(cx, |ws, cx| ws.job_form().unwrap().request(cx));
+
+        // Only the name changed: the repeat isn't sent.
+        fill(cx, window, "job-name", "Renamed");
+        assert_eq!(
+            patch(cx),
+            Ok(Request::UpdateJob {
+                job: id,
+                patch: JobPatch {
+                    name: Some("Renamed".into()),
+                    ..JobPatch::default()
+                },
+            })
+        );
+
+        // A new interval keeps the missing half missing.
+        pick(cx, window, "job-interval", 1);
+        let half = Repeat::Every {
+            minutes: 30,
+            days,
+            window: window_,
+        };
+        assert_eq!(drafted(cx, &ws).unwrap().repeat, half);
+        click(cx, window, "dialog-confirm");
+        wait_until(cx, "the saved job", |cx| {
+            jobs(cx, &ws).iter().any(|j| j.id == id && j.repeat == half)
+        });
+        wait_until(cx, "the dialog to close", |cx| !dialog_open(cx, &ws));
+
+        // Turned off and on again, both apply.
+        open_form(cx, window, &ws, Some(id), None);
+        click(cx, window, "job-only-on");
+        click(cx, window, "job-only-on");
+        let both = drafted(cx, &ws).unwrap().repeat;
+        let Repeat::Every {
+            days: on_days,
+            window: on_hours,
+            ..
+        } = both
+        else {
+            panic!("{both:?}");
+        };
+        assert!(on_days.is_some() && on_hours.is_some(), "{both:?}");
+        click(cx, window, "dialog-cancel");
+        wait_until(cx, "the dialog to close", |cx| !dialog_open(cx, &ws));
     }
 }

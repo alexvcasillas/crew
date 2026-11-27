@@ -10,7 +10,7 @@ use crew_proto::Request;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
+use gpui_kit::component::{Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -27,6 +27,14 @@ pub(super) const WIDTH: f32 = 680.;
 /// How far down the window the dialog sits.
 pub(super) const TOP: f32 = 56.;
 const LABEL_COL: f32 = 150.;
+/// The title's line, as tall as a 16px heading's normal line.
+pub(crate) const TITLE_LINE: f32 = 20.;
+/// Space under the title; the first row's own padding follows it.
+pub(crate) const TITLE_GAP: f32 = 8.;
+/// Space above and below each row's content.
+pub(crate) const ROW_PAD: f32 = 14.;
+/// Moves the Name label down level with the text in its field.
+const NAME_LABEL_PAD: f32 = 3.;
 
 const NEW_TITLE: &str = "New scheduled job";
 const EDIT_TITLE: &str = "Edit scheduled job";
@@ -84,6 +92,28 @@ pub(crate) struct JobForm {
     tell: Tell,
     on_ask: OnAsk,
     missed: Missed,
+    /// With Only on, whether the days and the hours apply. A stored job
+    /// can have one without the other; both apply once you pick a day or
+    /// turn Only on on.
+    has_days: bool,
+    has_hours: bool,
+    /// The repeat controls as they opened, to tell if you changed them.
+    opened: Controls,
+}
+
+/// The repeat controls' values, to compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Controls {
+    kind: RepeatKind,
+    every: u16,
+    only_on: bool,
+    has_days: bool,
+    has_hours: bool,
+    every_days: [bool; 7],
+    weekly_days: [bool; 7],
+    from: String,
+    to: String,
+    at: String,
 }
 
 /// What a form starts from.
@@ -282,6 +312,7 @@ impl JobForm {
         let (mut kind, mut every, mut only_on) = (RepeatKind::Every, 60, false);
         let (mut every_days, mut weekly_days) = (WEEKDAYS, WEEKDAYS);
         let (mut from, mut to, mut at) = (time(9, 0), time(19, 0), time(9, 0));
+        let (mut has_days, mut has_hours) = (true, true);
         match start.repeat {
             Repeat::Every {
                 minutes,
@@ -290,6 +321,9 @@ impl JobForm {
             } => {
                 every = minutes;
                 only_on = days.is_some() || window.is_some();
+                if only_on {
+                    (has_days, has_hours) = (days.is_some(), window.is_some());
+                }
                 if let Some(days) = days {
                     every_days = days_of(days);
                 }
@@ -316,7 +350,7 @@ impl JobForm {
                 .rows(4)
                 .default_value(what_text)
         });
-        Self {
+        let mut form = Self {
             editing,
             name,
             what,
@@ -333,6 +367,47 @@ impl JobForm {
             tell: start.tell,
             on_ask: start.on_ask,
             missed: start.missed,
+            has_days,
+            has_hours,
+            opened: Controls {
+                kind,
+                every,
+                only_on,
+                has_days,
+                has_hours,
+                every_days,
+                weekly_days,
+                from: String::new(),
+                to: String::new(),
+                at: String::new(),
+            },
+        };
+        form.opened = form.controls(cx);
+        form
+    }
+
+    fn controls(&self, cx: &App) -> Controls {
+        let text = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        Controls {
+            kind: self.kind,
+            every: self.every,
+            only_on: self.only_on,
+            has_days: self.has_days,
+            has_hours: self.has_hours,
+            every_days: self.every_days,
+            weekly_days: self.weekly_days,
+            from: text(&self.from),
+            to: text(&self.to),
+            at: text(&self.at),
+        }
+    }
+
+    /// Turns Only on on or off. Turned on, both the days and the hours
+    /// apply.
+    fn toggle_only_on(&mut self) {
+        self.only_on = !self.only_on;
+        if self.only_on {
+            (self.has_days, self.has_hours) = (true, true);
         }
     }
 
@@ -349,6 +424,13 @@ impl JobForm {
 
     /// How the job repeats, as picked.
     fn repeat(&self, cx: &App) -> Result<Repeat, &'static str> {
+        // An edited job you didn't change the repeat of keeps it as is.
+        let now = self.controls(cx);
+        if let Some(was) = &self.editing
+            && now == self.opened
+        {
+            return Ok(was.repeat);
+        }
         let at = || parse_time(&self.at.read(cx).value()).ok_or(BAD_AT);
         match self.kind {
             RepeatKind::Every if !self.only_on => Ok(Repeat::Every {
@@ -357,15 +439,28 @@ impl JobForm {
                 window: None,
             }),
             RepeatKind::Every => {
-                if !self.every_days.contains(&true) {
-                    return Err(NO_DAYS);
-                }
-                let from = parse_time(&self.from.read(cx).value()).ok_or(BAD_HOURS)?;
-                let to = parse_time(&self.to.read(cx).value()).ok_or(BAD_HOURS)?;
+                // Typing new hours makes them apply.
+                let hours =
+                    self.has_hours || now.from != self.opened.from || now.to != self.opened.to;
+                let days = if self.has_days {
+                    if !self.every_days.contains(&true) {
+                        return Err(NO_DAYS);
+                    }
+                    Some(days_set(&self.every_days))
+                } else {
+                    None
+                };
+                let window = if hours {
+                    let from = parse_time(&now.from).ok_or(BAD_HOURS)?;
+                    let to = parse_time(&now.to).ok_or(BAD_HOURS)?;
+                    Some((from, to))
+                } else {
+                    None
+                };
                 Ok(Repeat::Every {
                     minutes: self.every,
-                    days: Some(days_set(&self.every_days)),
-                    window: Some((from, to)),
+                    days,
+                    window,
                 })
             }
             RepeatKind::Daily => Ok(Repeat::Daily { at: at()? }),
@@ -578,9 +673,9 @@ impl Workspace {
             .child(
                 div()
                     .id("job-title")
-                    .pb(scale::row(8.))
+                    .pb(scale::row(TITLE_GAP))
                     .text_size(scale::text(16.))
-                    .line_height(scale::line(24.))
+                    .line_height(scale::line(TITLE_LINE))
                     .font_weight(weight(FontWeight::SEMIBOLD))
                     .aria_label(title)
                     .child(title)
@@ -736,7 +831,7 @@ impl Workspace {
                 )
             })
             .when(agent.is_none(), |b| b.label("Pick an agent"))
-            .icon(IconName::ChevronDown)
+            .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 agents.iter().fold(menu, |menu, (id, name)| {
                     let this = agent_this.clone();
@@ -772,15 +867,11 @@ impl Workspace {
                 .child(div().text_color(color("indent-guide-active")).child("/"))
                 .child(
                     div()
-                        .flex()
-                        .child(
-                            div()
-                                .font_family(code_family())
-                                .text_color(color("text-tertiary"))
-                                .child("#"),
-                        )
-                        .child(name.clone()),
+                        .font_family(code_family())
+                        .text_color(color("text-tertiary"))
+                        .child("#"),
                 )
+                .child(name.clone())
         };
         let channel_label = picked_channel
             .as_ref()
@@ -814,7 +905,7 @@ impl Workspace {
                 .accessibility_label(format!("Channel: {channel_label}"))
                 .when_some(picked_channel.as_ref(), |b, c| b.child(channel_face(c)))
                 .when(picked_channel.is_none(), |b| b.label("Pick a channel"))
-                .icon(IconName::ChevronDown)
+                .dropdown_caret(true)
                 .dropdown_menu(move |menu, _, _| {
                     channels.iter().fold(menu, |menu, (id, text)| {
                         let this = this.clone();
@@ -875,9 +966,14 @@ impl Workspace {
                 .flex_wrap()
                 .items_center()
                 .gap(ui_px(8.))
-                .child(day_buttons(&form.weekly_days, true, this.clone(), |f| {
-                    &mut f.weekly_days
-                }))
+                .child(day_buttons(
+                    &form.weekly_days,
+                    true,
+                    this.clone(),
+                    |f, ix| {
+                        f.weekly_days[ix] = !f.weekly_days[ix];
+                    },
+                ))
                 .child("at")
                 .child(time_input("job-at", &form.at))
                 .into_any_element(),
@@ -926,7 +1022,7 @@ impl Workspace {
         let interval = Button::new("job-interval")
             .outline()
             .label(interval_label(every))
-            .icon(IconName::ChevronDown)
+            .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 intervals.iter().fold(menu, |menu, minutes| {
                     let this = interval_this.clone();
@@ -985,15 +1081,17 @@ impl Workspace {
                                 let this = this.clone();
                                 move |_, _, cx| {
                                     this.update(cx, |ws, cx| {
-                                        ws.edit_job_form(cx, |f| f.only_on = !f.only_on);
+                                        ws.edit_job_form(cx, JobForm::toggle_only_on);
                                     })
                                     .ok();
                                 }
                             })
                             .test_support(),
                     )
-                    .child(day_buttons(&form.every_days, on, this, |f| {
-                        &mut f.every_days
+                    .child(day_buttons(&form.every_days, on, this, |f, ix| {
+                        f.every_days[ix] = !f.every_days[ix];
+                        // Picking a day makes the days apply.
+                        f.has_days = true;
                     }))
                     .child(
                         div()
@@ -1034,7 +1132,7 @@ fn row(
     div()
         .flex()
         .gap(ui_px(20.))
-        .py(scale::row(14.))
+        .py(scale::row(ROW_PAD))
         .when(!first, |r| r.border_t_1().border_color(color("border-100")))
         .child(
             div()
@@ -1042,7 +1140,7 @@ fn row(
                 .flex_col()
                 .flex_none()
                 .w(ui_px(LABEL_COL))
-                .when(first, |c| c.pt(scale::row(7.)))
+                .when(first, |c| c.pt(scale::row(NAME_LABEL_PAD)))
                 .child(
                     div()
                         .text_size(scale::text(13.))
@@ -1182,7 +1280,7 @@ fn day_buttons(
     days: &[bool; 7],
     enabled: bool,
     this: WeakEntity<Workspace>,
-    pick: fn(&mut JobForm) -> &mut [bool; 7],
+    toggle: fn(&mut JobForm, usize),
 ) -> Div {
     div()
         .flex()
@@ -1223,10 +1321,7 @@ fn day_buttons(
                         return;
                     }
                     this.update(cx, |ws, cx| {
-                        ws.edit_job_form(cx, |f| {
-                            let days = pick(f);
-                            days[ix] = !days[ix];
-                        });
+                        ws.edit_job_form(cx, |f| toggle(f, ix));
                     })
                     .ok();
                 })
