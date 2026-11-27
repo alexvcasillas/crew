@@ -448,20 +448,22 @@ impl Workspace {
             };
             return (last, RowAction::Edit);
         }
-        let Some(run) = latest else {
-            let text = if job.enabled {
-                "No runs yet"
-            } else {
-                "Paused by you"
+        // Off by your hand: that says more than its last run.
+        if !job.enabled {
+            let last = Last::Strip {
+                text: "Paused by you".into(),
+                found: false,
+                time: job.paused_at.map(|at| local_format(at, "%-d %b")),
             };
-            return (
-                Last::Strip {
-                    text: text.into(),
-                    found: false,
-                    time: None,
-                },
-                RowAction::RunNow,
-            );
+            return (last, RowAction::RunNow);
+        }
+        let Some(run) = latest else {
+            let last = Last::Strip {
+                text: "No runs yet".into(),
+                found: false,
+                time: None,
+            };
+            return (last, RowAction::RunNow);
         };
         let ended = run.ended_at.unwrap_or(run.started_at);
         match run.status {
@@ -515,12 +517,6 @@ impl Workspace {
                         text: format!("{text} · {}", clock(ended)),
                         token: if found { "success" } else { "text-secondary" },
                         detail: missed_line(run.missed),
-                    }
-                } else if !job.enabled {
-                    Last::Strip {
-                        text: "Paused by you".into(),
-                        found: false,
-                        time: None,
                     }
                 } else {
                     Last::Strip {

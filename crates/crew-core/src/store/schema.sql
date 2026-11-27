@@ -79,6 +79,7 @@ CREATE TABLE jobs (
     missed TEXT NOT NULL,
     enabled INTEGER NOT NULL,
     paused_reason TEXT,
+    paused_at INTEGER,
     next_due INTEGER,
     skipped INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL

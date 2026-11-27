@@ -61,6 +61,9 @@ pub struct StoredJob {
     pub enabled: bool,
     /// Why crewd turned the job off by itself, if it did.
     pub paused_reason: Option<String>,
+    /// Unix milliseconds of when the job was last turned off, while off.
+    #[serde(default)]
+    pub paused_at: Option<i64>,
     /// Unix milliseconds of the next run. `None` when the job is off.
     pub next_due: Option<i64>,
     /// Slots skipped since you last looked.
@@ -129,7 +132,7 @@ pub struct JobPatch {
 
 const JOB_COLUMNS: &str = "SELECT id, name, body, skill, model_override, agent_id, channel_id,
      thread_id, repeat_json, tell, on_ask, missed, enabled, paused_reason, next_due, skipped,
-     created_at FROM jobs";
+     created_at, paused_at FROM jobs";
 
 fn read_job(r: &Row) -> rusqlite::Result<Result<StoredJob>> {
     let id = JobId(uuid_col(r, 0)?);
@@ -140,7 +143,7 @@ fn read_job(r: &Row) -> rusqlite::Result<Result<StoredJob>> {
         (r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?);
     let (name, body, skill, model_override) = (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
     let (enabled, paused_reason, next_due) = (r.get(12)?, r.get(13)?, r.get(14)?);
-    let (skipped, created_at) = (r.get(15)?, r.get(16)?);
+    let (skipped, created_at, paused_at) = (r.get(15)?, r.get(16)?, r.get(17)?);
     Ok((|| {
         Ok(StoredJob {
             id,
@@ -157,6 +160,7 @@ fn read_job(r: &Row) -> rusqlite::Result<Result<StoredJob>> {
             missed: parse_enum(&missed)?,
             enabled,
             paused_reason,
+            paused_at,
             next_due,
             skipped,
             created_at,
@@ -176,8 +180,8 @@ impl Store {
             s.conn.execute(
                 "INSERT INTO jobs (id, name, body, skill, model_override, agent_id, channel_id,
                                    thread_id, repeat_json, tell, on_ask, missed, enabled,
-                                   created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                   created_at, paused_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     id.to_string(),
                     new.name,
@@ -193,6 +197,7 @@ impl Store {
                     enum_text(&new.missed)?,
                     new.enabled,
                     now_ms(),
+                    (!new.enabled).then(now_ms),
                 ],
             )?;
             Ok(id)
@@ -286,9 +291,17 @@ impl Store {
         self.set_job_column(id, "next_due", next_due)
     }
 
-    /// Turns a job on or off.
+    /// Turns a job on or off. Turning it off notes when; turning it on
+    /// clears that.
     pub fn set_job_enabled(&self, id: JobId, enabled: bool) -> Result<()> {
-        self.set_job_column(id, "enabled", enabled)
+        let changed = self.conn.execute(
+            "UPDATE jobs SET enabled = ?2, paused_at = ?3 WHERE id = ?1",
+            params![id.to_string(), enabled, (!enabled).then(now_ms)],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("job"));
+        }
+        Ok(())
     }
 
     pub fn set_job_skipped(&self, id: JobId, skipped: u32) -> Result<()> {

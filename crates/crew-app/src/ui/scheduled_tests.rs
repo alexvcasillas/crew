@@ -2,13 +2,13 @@
 //! crewd on a temp home. Jobs and their runs that crewd would only make
 //! over hours are handed to the window's state as crewd would send them.
 
-use chrono::{NaiveTime, Weekday};
+use chrono::{Local, NaiveTime, TimeZone as _, Weekday};
 use crew_core::agent::Runtime;
 use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, ApprovalId, ChannelId, JobId, MessageId, RunId, ThreadId};
 use crew_core::schedule::{Repeat, WeekdaySet};
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, Missed, NewJob, OnAsk, StoredApproval, StoredJob,
+    ApprovalKind, ApprovalStatus, Author, Missed, NewJob, OnAsk, Store, StoredApproval, StoredJob,
     StoredMessage, StoredRun, Tell,
 };
 use crew_proto::{Request, ServerMsg};
@@ -64,6 +64,7 @@ fn job(name: &str, body: &str, agent: AgentId, w: &World, thread: ThreadId) -> S
         missed: Missed::OnceOnWake,
         enabled: true,
         paused_reason: None,
+        paused_at: None,
         next_due: Some(now_ms() + 30 * MIN),
         skipped: 0,
         created_at: now_ms(),
@@ -482,10 +483,18 @@ fn paused_jobs_have_their_own_section(cx: &mut TestAppContext) {
     );
     notes.enabled = false;
     notes.next_due = None;
+    notes.paused_at = Some(
+        Local
+            .with_ymd_and_hms(2026, 11, 21, 10, 0, 0)
+            .unwrap()
+            .timestamp_millis(),
+    );
     notes.repeat = Repeat::Weekly {
         days: WeekdaySet::from_days(&[Weekday::Fri]),
         at: t(17, 0),
     };
+    // Its last run failed; being off says more.
+    let failed = run(&notes, RunStatus::Failed, None, MIN);
     let mut on = job(
         "OVH VPS stock",
         "Check ovhcloud.com",
@@ -494,7 +503,11 @@ fn paused_jobs_have_their_own_section(cx: &mut TestAppContext) {
         w.thread,
     );
     on.created_at += 1;
-    send(cx, &ws, vec![job_msg(&notes), job_msg(&on)]);
+    send(
+        cx,
+        &ws,
+        vec![job_msg(&notes), job_msg(&on), run_msg(&failed)],
+    );
     show_scheduled(cx, window, &ws);
 
     assert_eq!(label(cx, window, "scheduled-paused".into()), "Paused · 1");
@@ -506,7 +519,12 @@ fn paused_jobs_have_their_own_section(cx: &mut TestAppContext) {
         "paused under it"
     );
     let n = notes.id;
-    assert_eq!(label(cx, window, format!("job-last-{n}")), "Paused by you");
+    assert_eq!(
+        label(cx, window, format!("job-last-{n}")),
+        "Paused by you · 21 Nov"
+    );
+    assert!(!has(cx, window, format!("job-state-{n}")), "not Failed");
+    assert_eq!(label(cx, window, format!("job-strip-{n}")), "failed");
     assert_eq!(label(cx, window, format!("job-next-{n}")), "—");
     assert_eq!(label(cx, window, format!("job-toggle-{n}")), "Off");
     assert_eq!(
@@ -610,6 +628,16 @@ fn toggle_sends_set_job_enabled(cx: &mut TestAppContext) {
     wait_until(cx, "the job off", |cx| enabled(cx) == Some(false));
     assert_eq!(label(cx, window, "scheduled-paused".into()), "Paused · 1");
     assert_eq!(label(cx, window, format!("job-toggle-{id}")), "Off");
+    let paused_at = ws.read_with(cx, |ws, _| ws.state().job(id).and_then(|j| j.paused_at));
+    let day = Local
+        .timestamp_millis_opt(paused_at.expect("crewd notes when"))
+        .unwrap()
+        .format("%-d %b")
+        .to_string();
+    assert_eq!(
+        label(cx, window, format!("job-last-{id}")),
+        format!("Paused by you · {day}")
+    );
     assert!(
         has(cx, window, "scheduled"),
         "the toggle doesn't open the thread"
@@ -827,4 +855,102 @@ fn quiet_replies_dont_count_unread(cx: &mut TestAppContext) {
         vec![message(thread, scout, "A VPS-2 is in stock.", None, false)],
     );
     assert_eq!(label(cx, window, status_of(watchers)), "1 unread");
+}
+
+/// A job that doesn't come due during a test.
+fn sunday_job(w: &World, name: &str) -> JobId {
+    w.ask(Request::CreateJob {
+        job: NewJob {
+            name: name.into(),
+            body: "Look around".into(),
+            skill: None,
+            model_override: None,
+            agent: w.agents[0],
+            channel: w.channel,
+            repeat: Repeat::Weekly {
+                days: WeekdaySet::from_days(&[Weekday::Sun]),
+                at: t(3, 0),
+            },
+            tell: Tell::Changes,
+            on_ask: OnAsk::Wait,
+            missed: Missed::Skip,
+            enabled: true,
+        },
+    })
+}
+
+#[gpui_kit::test]
+fn old_runs_show_after_a_restart(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = short_home();
+    let _daemon = Daemon::start(home.path().to_path_buf());
+    let w = world(home.path(), &tmp.path().join("repo"), &["Scout"]);
+    let prs = sunday_job(&w, "PRs waiting for my review");
+    let weekly = sunday_job(&w, "Weekly work summary");
+
+    // Runs from hours ago, which the last hour of runs leaves out.
+    let db = home.path().join("crew.db");
+    let store = Store::open(&db).unwrap();
+    let job = |id: JobId| store.job(id).unwrap();
+    let ended = |store: &Store, job: &StoredJob, status: RunStatus| {
+        // Apart by the millisecond, so they keep this order.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let run = store
+            .create_job_run(job.thread, job.agent, job.id, 0)
+            .unwrap();
+        store.set_run_status(run, status).unwrap();
+        run
+    };
+    let (p, k) = (job(prs), job(weekly));
+    ended(&store, &p, RunStatus::Failed);
+    let quiet = ended(&store, &p, RunStatus::Done);
+    store.set_run_report(quiet, false, None).unwrap();
+    let found = ended(&store, &p, RunStatus::Done);
+    store
+        .set_run_report(found, true, Some("2 new PRs"))
+        .unwrap();
+    let failed = ended(&store, &k, RunStatus::Failed);
+    store
+        .add_message(
+            k.thread,
+            Author::System,
+            "Codex isn't signed in. Run `codex login`.",
+            Some(failed),
+        )
+        .unwrap();
+    let hours = 3 * 60 * MIN;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE runs SET started_at = started_at - ?1, ended_at = ended_at - ?1
+             WHERE job_id IS NOT NULL",
+            [hours],
+        )
+        .unwrap();
+    let found_end = store.run(found).unwrap().ended_at.unwrap();
+    let failed_end = store.run(failed).unwrap().ended_at.unwrap();
+    drop(store);
+
+    let (window, ws) = open_world(cx, home.path(), &w);
+    wait_until(cx, "the jobs", |cx| {
+        ws.read_with(cx, |ws, _| ws.state().jobs().len() == 2)
+    });
+    show_scheduled(cx, window, &ws);
+
+    assert_eq!(
+        label(cx, window, format!("job-strip-{prs}")),
+        "failed quiet found"
+    );
+    assert_eq!(
+        label(cx, window, format!("job-last-{prs}")),
+        format!("2 new PRs · {}", run_time(found_end, now_ms()))
+    );
+    assert_eq!(
+        label(cx, window, format!("job-state-{weekly}")),
+        format!("Failed · {}", clock(failed_end))
+    );
+    assert_eq!(
+        label(cx, window, format!("job-detail-{weekly}")),
+        "Codex isn't signed in. Run codex login."
+    );
 }

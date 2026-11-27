@@ -444,6 +444,7 @@ fn the_prompt_lists_earlier_reports_newest_first() {
         missed: Missed::OnceOnWake,
         enabled: true,
         paused_reason: None,
+        paused_at: None,
         next_due: None,
         skipped: 0,
         created_at: 0,
@@ -622,6 +623,7 @@ async fn deleting_the_agent_pauses_its_jobs() {
     let job = s.job(id);
     assert!(!job.enabled);
     assert_eq!(job.paused_reason.as_deref(), Some("Agent deleted"));
+    assert!(job.paused_at.is_some(), "it notes when");
     assert_eq!(job.next_due, None);
     s.svc.fire_due(at(13, 0));
     assert!(s.runs(id).is_empty());
@@ -935,6 +937,56 @@ async fn failed_is_never_quiet() {
     let messages = s.run_messages(id, run);
     assert!(!messages.is_empty(), "the failure is noted");
     assert!(messages.iter().all(|m| !m.quiet), "{messages:?}");
+}
+
+#[tokio::test]
+async fn turning_a_job_off_notes_when_and_on_clears_it() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around")).await;
+    assert_eq!(s.job(id).paused_at, None);
+    s.svc
+        .handle(Request::SetJobEnabled {
+            job: id,
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    assert!(s.job(id).paused_at.is_some());
+    s.svc
+        .handle(Request::SetJobEnabled {
+            job: id,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(s.job(id).paused_at, None);
+}
+
+#[tokio::test]
+async fn a_snapshot_carries_job_runs_and_their_notes() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around FAIL")).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    let (snapshot, _) = s.svc.snapshot().unwrap();
+    let ServerMsg::Snapshot { job_history, .. } = snapshot else {
+        panic!("not a snapshot");
+    };
+    let crew_proto::JobHistory {
+        job_runs,
+        job_notes,
+    } = *job_history;
+    assert_eq!(
+        job_runs.iter().map(|r| (r.id, r.job)).collect::<Vec<_>>(),
+        [(run, Some(id))]
+    );
+    assert!(!job_notes.is_empty(), "the failure's note");
+    assert!(
+        job_notes
+            .iter()
+            .all(|m| m.author == Author::System && m.run == Some(run))
+    );
 }
 
 const JOB_DENIED: &str = "Scheduled job: denied while you're away.";

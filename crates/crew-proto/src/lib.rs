@@ -920,6 +920,20 @@ pub struct PermissionAnswer {
     pub message: Option<String>,
 }
 
+/// How many of each job's latest runs a snapshot carries.
+pub const SNAPSHOT_JOB_RUNS: u32 = 24;
+
+/// What a snapshot carries about jobs' past runs, which the last hour of
+/// runs would leave out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobHistory {
+    /// Each job's last [`SNAPSHOT_JOB_RUNS`] runs, newest first.
+    pub job_runs: Vec<StoredRun>,
+    /// crewd's notes about those runs, such as why one failed.
+    pub job_notes: Vec<StoredMessage>,
+}
+
 /// A message from crewd.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -978,6 +992,10 @@ pub enum ServerMsg {
         /// Every scheduled job.
         #[serde(default)]
         jobs: Vec<StoredJob>,
+        /// Jobs' recent runs and crewd's notes about them, as the
+        /// `job_runs` and `job_notes` fields. Boxed to keep messages small.
+        #[serde(flatten)]
+        job_history: Box<JobHistory>,
     },
     /// A scheduled job was created or changed.
     JobChanged { job: Box<StoredJob> },
@@ -1570,6 +1588,7 @@ mod tests {
             missed: new.missed,
             enabled: true,
             paused_reason: None,
+            paused_at: None,
             next_due: Some(5),
             skipped: 0,
             created_at: 1,
@@ -1637,15 +1656,23 @@ mod tests {
             limits: Limits::default(),
             titles: TitleSettings::default(),
             jobs: vec![job.clone()],
+            job_history: Box::new(JobHistory {
+                job_runs: vec![],
+                job_notes: vec![],
+            }),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
         let old = r#"{"type":"snapshot","projects":[],"channels":[],"threads":[],
             "agents":[],"runs":[],"approvals":[]}"#;
-        let ServerMsg::Snapshot { jobs, .. } = serde_json::from_str(old).unwrap() else {
+        let ServerMsg::Snapshot {
+            jobs, job_history, ..
+        } = serde_json::from_str(old).unwrap()
+        else {
             panic!("not a snapshot");
         };
         assert!(jobs.is_empty());
+        assert_eq!(*job_history, JobHistory::default());
     }
 
     #[tokio::test]

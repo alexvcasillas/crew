@@ -245,9 +245,22 @@ impl State {
                 limits,
                 titles,
                 jobs,
+                job_history,
             } => {
                 self.jobs = jobs.into_iter().map(|j| (j.id, j)).collect();
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
+                // Jobs' older runs and crewd's notes about them, for the
+                // Scheduled page; what the snapshot already has wins.
+                let crew_proto::JobHistory {
+                    job_runs,
+                    job_notes,
+                } = *job_history;
+                for run in job_runs {
+                    self.runs.entry(run.id).or_insert(run);
+                }
+                for note in job_notes {
+                    self.add_message(note.thread, note);
+                }
                 self.limits_changed(limits);
                 self.titles_changed(titles);
                 self.terminal = terminal_sessions
@@ -1301,6 +1314,7 @@ mod tests {
             limits: Default::default(),
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         (state, p, c, t)
     }
@@ -1707,6 +1721,7 @@ mod tests {
             limits: Default::default(),
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -2031,6 +2046,7 @@ mod tests {
             limits: stored,
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(*state.limits(), stored);
 
@@ -2067,6 +2083,7 @@ mod tests {
             limits: other,
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(*state.limits(), other);
         // A failed request goes back to crewd's copy.
@@ -2153,6 +2170,7 @@ mod tests {
             limits: Default::default(),
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -2247,6 +2265,7 @@ mod tests {
             limits: Default::default(),
             titles: Default::default(),
             jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

@@ -5,7 +5,7 @@
 //! another lock. No lock is held across an `.await`, nor while git, a
 //! setup command or a file read runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -1476,6 +1476,19 @@ impl Service {
         let runs = with_asked_runs(db.store.recent_runs(since)?, &approvals, |r| {
             db.store.run(r)
         })?;
+        let jobs = db.store.jobs()?;
+        let mut job_runs = Vec::new();
+        let mut job_notes = Vec::new();
+        for job in &jobs {
+            let runs = db.store.job_runs(job.id, crew_proto::SNAPSHOT_JOB_RUNS)?;
+            let ids: HashSet<RunId> = runs.iter().map(|r| r.id).collect();
+            if !ids.is_empty() {
+                job_notes.extend(db.store.messages(job.thread)?.into_iter().filter(|m| {
+                    m.author == Author::System && m.run.is_some_and(|r| ids.contains(&r))
+                }));
+            }
+            job_runs.extend(runs);
+        }
         let msg = ServerMsg::Snapshot {
             projects,
             channels,
@@ -1486,7 +1499,11 @@ impl Service {
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
             titles: db.store.title_settings()?,
-            jobs: db.store.jobs()?,
+            jobs,
+            job_history: Box::new(crew_proto::JobHistory {
+                job_runs,
+                job_notes,
+            }),
         };
         Ok((msg, db.serial))
     }
