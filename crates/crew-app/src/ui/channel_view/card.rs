@@ -345,6 +345,11 @@ impl Workspace {
                     .gap(ui_px(8.))
                     .h(scale::row(24.))
                     .child(pill(id, card.status))
+                    .when(state.thread_job(id).is_some(), |row| {
+                        row.child(super::super::common::job_clock(format!(
+                            "thread-clock-{id}"
+                        )))
+                    })
                     .child(
                         div()
                             .id(SharedString::from(format!("thread-title-{id}")))

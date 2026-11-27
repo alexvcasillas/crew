@@ -764,6 +764,11 @@ impl State {
         self.jobs.get(&job)
     }
 
+    /// The job whose thread `thread` is, if it is one's.
+    pub fn thread_job(&self, thread: ThreadId) -> Option<&StoredJob> {
+        self.jobs.values().find(|j| j.thread == thread)
+    }
+
     /// Jobs turned on.
     pub fn jobs_on(&self) -> usize {
         self.jobs.values().filter(|j| j.enabled).count()

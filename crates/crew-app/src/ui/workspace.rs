@@ -178,6 +178,8 @@ pub struct Workspace {
     /// A job whose thread opens once it and its thread are known, after
     /// a test run.
     job_open_pending: Option<crew_core::ids::JobId>,
+    /// Folds of quiet job runs you opened, by their first reply.
+    pub(super) job_folds_open: HashSet<crew_core::ids::MessageId>,
     /// A Stop all request is waiting for its answer.
     pub(super) stopping_all: bool,
     /// The agent CLIs crewd found, as last asked.
@@ -360,6 +362,7 @@ impl Workspace {
             running,
             scheduled: None,
             job_open_pending: None,
+            job_folds_open: HashSet::new(),
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
@@ -554,6 +557,17 @@ impl Workspace {
         })
     }
 
+    /// Takes in `events` as if the client had sent them, as tests do.
+    #[cfg(test)]
+    pub(super) fn take_in(
+        &mut self,
+        events: Vec<ClientEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply(events, window, cx);
+    }
+
     fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let mut connected = false;
         let mut snapshot = false;
@@ -562,9 +576,11 @@ impl Workspace {
         let mut removed = Vec::new();
         let mut touched = Vec::new();
         let mut stale = Vec::new();
+        let mut job_runs_ended = Vec::new();
         for event in events {
             if let ClientEvent::Msg(msg) = &event {
                 touched.extend(touched_thread(msg));
+                job_runs_ended.extend(self.job_runs_ending(msg));
             }
             if let ClientEvent::Msg(crew_proto::ServerMsg::ChannelOverviewStale { channel }) =
                 &event
@@ -618,6 +634,9 @@ impl Workspace {
         if run_ended || snapshot {
             self.refresh_usage(cx);
             self.refresh_history(cx);
+        }
+        for run in job_runs_ended {
+            self.notify_found_run(run, window, cx);
         }
         self.threads_touched(&touched, &stale, snapshot, cx);
         self.channel_touched(&touched, &stale, snapshot);
@@ -761,7 +780,13 @@ impl Workspace {
             .nav
             .thread
             .and_then(|t| super::folder::queue_hint(&self.state, t));
-        let hint = if live.is_empty() {
+        let job_thread = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread_job(t).is_some());
+        let hint = if live.is_empty() && job_thread {
+            Some(super::job_thread::JOB_HINT.to_string())
+        } else if live.is_empty() {
             self.last_agent().map(|name| reply_hint(&name))
         } else {
             queued.or_else(|| working_hint(&working))
@@ -1651,7 +1676,10 @@ impl Workspace {
             .children(
                 self.inspector_thread()
                     .filter(|_| self.inspector_shown)
-                    .map(|t| self.render_inspector(t, cx)),
+                    .map(|t| match self.state.thread_job(t).map(|j| j.id) {
+                        Some(job) => self.render_job_panel(job, cx).into_any_element(),
+                        None => self.render_inspector(t, cx).into_any_element(),
+                    }),
             )
             .into_any_element()
     }

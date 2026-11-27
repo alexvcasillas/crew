@@ -1085,13 +1085,25 @@ impl Workspace {
             )
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(ui_px(6.))
                     .min_w_0()
-                    .truncate()
-                    .text_size(scale::text(13.))
-                    .line_height(scale::line(18.))
-                    .font_weight(weight(FontWeight::MEDIUM))
-                    .text_color(color("text-primary"))
-                    .child(highlighted(&stored.title, range)),
+                    .when(state.thread_job(thread).is_some(), |line| {
+                        line.child(super::super::common::job_clock(format!(
+                            "thread-row-clock-{id}"
+                        )))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(scale::text(13.))
+                            .line_height(scale::line(18.))
+                            .font_weight(weight(FontWeight::MEDIUM))
+                            .text_color(color("text-primary"))
+                            .child(highlighted(&stored.title, range)),
+                    ),
             )
             .child(
                 div()

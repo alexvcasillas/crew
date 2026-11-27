@@ -425,7 +425,13 @@ fn thread_row_in(
     if !word.is_empty() {
         parts.push(word);
     }
-    Row::new(Target::Thread(thread), title, Lead::Dot(token)).sub(parts.join(" · "))
+    // A job's thread leads with the clock.
+    let lead = if state.thread_job(thread).is_some() {
+        Lead::Clock
+    } else {
+        Lead::Dot(token)
+    };
+    Row::new(Target::Thread(thread), title, lead).sub(parts.join(" · "))
 }
 
 /// "# name" + "{project} · {n} active".

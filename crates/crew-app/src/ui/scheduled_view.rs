@@ -3,7 +3,6 @@
 //! the job does, its agent, how it repeats, its last runs as a strip and
 //! when it runs next; hovered, it offers Run now and a menu.
 
-use chrono::{Local, TimeZone as _};
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::{JobId, ThreadId};
 use crew_core::schedule::describe;
@@ -17,6 +16,7 @@ use gpui_kit::*;
 
 use super::approval_card::input_text;
 use super::common::{chip, clock, elapsed, monogram, now_ms, spinner, switch};
+use super::job_runs::{Tick, days_after, first_line, local_format, tick, tick_mark};
 use super::running_view::local_midnight;
 use super::workspace::Workspace;
 use crate::model::State;
@@ -73,38 +73,6 @@ pub(super) struct ScheduledView {
     hovered: Option<JobId>,
     /// The row whose menu is open, which keeps its actions.
     menu_open: Option<JobId>,
-}
-
-/// One run in the strip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tick {
-    Quiet,
-    Found,
-    Waiting,
-    Failed,
-    Running,
-}
-
-impl Tick {
-    fn token(self) -> &'static str {
-        match self {
-            Tick::Quiet => "border-200",
-            Tick::Found => "success",
-            Tick::Waiting => "warning",
-            Tick::Failed => "danger",
-            Tick::Running => "accent-blue",
-        }
-    }
-
-    fn word(self) -> &'static str {
-        match self {
-            Tick::Quiet => "quiet",
-            Tick::Found => "found",
-            Tick::Waiting => "waiting",
-            Tick::Failed => "failed",
-            Tick::Running => "running",
-        }
-    }
 }
 
 /// What the Last runs column shows.
@@ -195,27 +163,6 @@ pub fn summary_line(on: usize, next: Option<i64>, now: i64) -> String {
     line
 }
 
-/// How many local days `ms` is after the day holding `now`.
-fn days_after(ms: i64, now: i64) -> i64 {
-    let day = |t: i64| {
-        Local
-            .timestamp_millis_opt(t)
-            .single()
-            .map(|t| t.date_naive())
-    };
-    match (day(ms), day(now)) {
-        (Some(a), Some(b)) => (a - b).num_days(),
-        _ => 0,
-    }
-}
-
-fn local_format(ms: i64, format: &str) -> String {
-    Local
-        .timestamp_millis_opt(ms)
-        .single()
-        .map_or_else(String::new, |t| t.format(format).to_string())
-}
-
 /// "Missed 6 runs while the Mac slept, ran once on wake".
 fn missed_line(n: u32) -> String {
     let runs = if n == 1 { "run" } else { "runs" };
@@ -242,15 +189,6 @@ fn awake_note() -> String {
         Some(zone) => format!("{AWAKE_NOTE} Times are in {zone}."),
         None => AWAKE_NOTE.to_string(),
     }
-}
-
-/// The first line of the job's instructions.
-fn first_line(body: &str) -> String {
-    body.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or_default()
-        .to_string()
 }
 
 impl Workspace {
@@ -324,7 +262,12 @@ impl Workspace {
         self.request(Request::CreateJob { job: copy }, window, cx);
     }
 
-    fn open_job_thread(&mut self, thread: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_job_thread(
+        &mut self,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state().thread(thread).is_none() {
             return;
         }
@@ -618,26 +561,6 @@ impl Workspace {
     }
 }
 
-/// The strip's tick for `run` of `job`.
-fn tick(state: &State, job: &StoredJob, run: &StoredRun) -> Tick {
-    match run.status {
-        RunStatus::Queued | RunStatus::Working => {
-            let waiting = state
-                .pending_approvals(run.thread)
-                .iter()
-                .any(|a| a.run == run.id && !matches!(a.kind, ApprovalKind::Blocked { .. }));
-            if waiting {
-                Tick::Waiting
-            } else {
-                Tick::Running
-            }
-        }
-        RunStatus::Failed => Tick::Failed,
-        _ if State::job_run_found(job, run) => Tick::Found,
-        _ => Tick::Quiet,
-    }
-}
-
 /// "Scheduled", the jobs on and the next run, and New job.
 fn render_page_header(summary: Option<String>, cx: &mut Context<Workspace>) -> impl IntoElement {
     div()
@@ -743,16 +666,6 @@ fn sub() -> Div {
     div()
         .text_size(scale::text(12.))
         .text_color(color("text-tertiary"))
-}
-
-/// One run in the strip, 3 by 12.
-fn tick_mark(tick: Tick) -> Div {
-    div()
-        .flex_none()
-        .w(ui_px(3.))
-        .h(ui_px(12.))
-        .rounded(ui_px(1.))
-        .bg(color(tick.token()))
 }
 
 /// `text` with its backticked parts in mono, on one line.

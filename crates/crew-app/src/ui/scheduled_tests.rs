@@ -44,7 +44,13 @@ fn t(h: u32, m: u32) -> NaiveTime {
 }
 
 /// A job as crewd would send it, in `thread`.
-fn job(name: &str, body: &str, agent: AgentId, w: &World, thread: ThreadId) -> StoredJob {
+pub(super) fn job(
+    name: &str,
+    body: &str,
+    agent: AgentId,
+    w: &World,
+    thread: ThreadId,
+) -> StoredJob {
     StoredJob {
         id: JobId::new(),
         name: name.into(),
@@ -72,7 +78,7 @@ fn job(name: &str, body: &str, agent: AgentId, w: &World, thread: ThreadId) -> S
 }
 
 /// A run of `job` that started `ago` ms ago, ended unless live.
-fn run(job: &StoredJob, status: RunStatus, found: Option<bool>, ago: i64) -> StoredRun {
+pub(super) fn run(job: &StoredJob, status: RunStatus, found: Option<bool>, ago: i64) -> StoredRun {
     let started_at = now_ms() - ago;
     let live = matches!(status, RunStatus::Working | RunStatus::Queued);
     StoredRun {
@@ -96,7 +102,7 @@ fn run(job: &StoredJob, status: RunStatus, found: Option<bool>, ago: i64) -> Sto
 }
 
 /// Hands `msgs` to the window's state, as if crewd had sent them.
-fn send(cx: &mut TestAppContext, ws: &Entity<Workspace>, msgs: Vec<ServerMsg>) {
+pub(super) fn send(cx: &mut TestAppContext, ws: &Entity<Workspace>, msgs: Vec<ServerMsg>) {
     ws.update(cx, |ws, cx| {
         for msg in msgs {
             ws.state_mut().apply(msg);
@@ -106,13 +112,13 @@ fn send(cx: &mut TestAppContext, ws: &Entity<Workspace>, msgs: Vec<ServerMsg>) {
     cx.run_until_parked();
 }
 
-fn job_msg(job: &StoredJob) -> ServerMsg {
+pub(super) fn job_msg(job: &StoredJob) -> ServerMsg {
     ServerMsg::JobChanged {
         job: Box::new(job.clone()),
     }
 }
 
-fn run_msg(run: &StoredRun) -> ServerMsg {
+pub(super) fn run_msg(run: &StoredRun) -> ServerMsg {
     ServerMsg::RunStatus {
         thread: run.thread,
         run: run.id,
@@ -163,7 +169,7 @@ fn ask(run: &StoredRun, command: &str) -> ServerMsg {
     }
 }
 
-fn new_thread(w: &World, title: &str) -> ThreadId {
+pub(super) fn new_thread(w: &World, title: &str) -> ThreadId {
     w.ask(Request::CreateThread {
         channel: w.channel,
         title: title.into(),
@@ -172,7 +178,7 @@ fn new_thread(w: &World, title: &str) -> ThreadId {
 }
 
 /// Opens the window and waits for the world's channel in the sidebar.
-fn open_world(
+pub(super) fn open_world(
     cx: &mut TestAppContext,
     home: &std::path::Path,
     w: &World,

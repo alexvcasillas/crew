@@ -14,6 +14,9 @@ pub mod diff_view;
 mod first_launch;
 mod folder;
 mod inspector;
+mod job_panel;
+mod job_runs;
+mod job_thread;
 mod markdown_view;
 mod mention_menu;
 pub mod palette;
@@ -57,6 +60,8 @@ mod folder_tests;
 mod inspector_tests;
 #[cfg(test)]
 mod job_form_tests;
+#[cfg(test)]
+mod job_thread_tests;
 #[cfg(test)]
 mod motion_tests;
 #[cfg(test)]
