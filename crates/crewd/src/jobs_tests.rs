@@ -9,9 +9,9 @@ use crew_core::ids::{AgentId, ChannelId, JobId, RunId, ThreadId};
 use crew_core::schedule::Repeat;
 use crew_core::store::{
     ApprovalKind, ApprovalStatus, Author, JobPatch, Missed, NewJob, OnAsk, Store, StoredJob,
-    StoredRun, Tell,
+    StoredMessage, StoredRun, Tell,
 };
-use crew_proto::{Request, ServerMsg};
+use crew_proto::{PermissionAnswer, Request, ServerMsg};
 use tempfile::TempDir;
 
 use crate::jobs::job_prompt;
@@ -21,7 +21,8 @@ const WAIT: Duration = Duration::from_secs(10);
 
 /// A fake claude. It logs its arguments to `args.log` (each argument ends
 /// with byte 0x1e, each call with 0x1f). A prompt with `WAIT` in it waits
-/// until the file `go` exists.
+/// until the file `go` exists. One with `FAIL` in it exits with an error
+/// before it answers.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude-fake.sh");
     let script = format!(
@@ -32,6 +33,9 @@ printf '\037' >> '{dir}/args.log'
 printf '{{"type":"system","subtype":"init","cwd":"/work/demo","session_id":"s","model":"m","tools":[]}}\n'
 case "$last" in
   *WAIT*) while [ ! -e '{dir}/go' ]; do sleep 0.02; done ;;
+esac
+case "$last" in
+  *FAIL*) exit 1 ;;
 esac
 printf '{{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1,"num_turns":1,"permission_denials":[],"session_id":"s"}}\n'
 "#,
@@ -169,6 +173,11 @@ struct Setup {
 }
 
 fn service(dir: &Path, store: Store) -> Service {
+    service_wired(dir, store, None)
+}
+
+/// A service whose runs get crew-mcp, if `crew_mcp` names it.
+fn service_wired(dir: &Path, store: Store, crew_mcp: Option<(PathBuf, PathBuf)>) -> Service {
     let svc = Service::new(
         store,
         4,
@@ -179,7 +188,7 @@ fn service(dir: &Path, store: Store) -> Service {
             ..Default::default()
         },
         dir.join("worktrees"),
-        None,
+        crew_mcp,
         Duration::from_secs(60),
         256,
     );
@@ -188,13 +197,23 @@ fn service(dir: &Path, store: Store) -> Service {
 }
 
 fn setup_with(open: impl FnOnce(&Path) -> Store) -> Setup {
+    setup_full(open, false)
+}
+
+/// A setup whose runs get crew-mcp.
+fn setup_wired() -> Setup {
+    setup_full(|_| Store::open_in_memory().unwrap(), true)
+}
+
+fn setup_full(open: impl FnOnce(&Path) -> Store, wired: bool) -> Setup {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     fake_claude(&dir);
     fake_codex(&dir);
     let root = dir.join("demo");
     std::fs::create_dir(&root).unwrap();
-    let svc = service(&dir, open(&dir));
+    let mcp = wired.then(|| (dir.join("crew-mcp"), dir.join("home")));
+    let svc = service_wired(&dir, open(&dir), mcp);
     let (channel, agent) = {
         let db = svc.db();
         let p = db.store.create_project("demo", &root, "main").unwrap();
@@ -298,6 +317,44 @@ impl Setup {
             assert!(started.elapsed() < WAIT, "run {run} never ended");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Waits until the run's process is up.
+    async fn until_live(&self, run: RunId) {
+        let started = Instant::now();
+        while !self.svc.live_run_pids().iter().any(|(_, r)| *r == run) {
+            assert!(started.elapsed() < WAIT, "run {run} never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The messages of the job's thread made by `run`.
+    fn run_messages(&self, id: JobId, run: RunId) -> Vec<StoredMessage> {
+        let thread = self.job(id).thread;
+        let messages = self.svc.db().store.messages(thread).unwrap();
+        messages
+            .into_iter()
+            .filter(|m| m.run == Some(run))
+            .collect()
+    }
+
+    /// The agent's reply of `run`.
+    fn reply(&self, id: JobId, run: RunId) -> StoredMessage {
+        self.run_messages(id, run)
+            .into_iter()
+            .find(|m| m.author == Author::Agent(self.agent))
+            .expect("a reply")
+    }
+
+    async fn report(&self, run: RunId, found: bool, summary: Option<&str>) -> Result<(), String> {
+        self.svc
+            .handle(Request::Report {
+                run,
+                found,
+                summary: summary.map(String::from),
+            })
+            .await
+            .map(|_| ())
     }
 
     fn go(&self) {
@@ -767,4 +824,250 @@ async fn a_codex_skill_job_whose_skill_is_gone_fails_the_slot() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1].status, RunStatus::Failed);
     assert_eq!(s.job(id).next_due, due(at(12, 30)));
+}
+
+#[tokio::test]
+async fn report_found_keeps_the_reply_loud() {
+    let s = setup();
+    let id = s.create(s.new_job("Look for new issues WAIT")).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_live(run).await;
+    s.report(run, true, Some("  Two new issues  "))
+        .await
+        .unwrap();
+    s.go();
+    s.until_ended(run).await;
+
+    let stored = s.svc.db().store.run(run).unwrap();
+    assert_eq!(stored.status, RunStatus::Done);
+    assert_eq!(stored.found, Some(true));
+    assert_eq!(stored.summary.as_deref(), Some("Two new issues"));
+    assert!(!s.reply(id, run).quiet);
+}
+
+#[tokio::test]
+async fn report_is_refused_outside_a_live_job_run() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around")).await;
+    let thread = s.job(id).thread;
+    s.svc.post_message(thread, "@Forge hi", None, None).unwrap();
+    let mine = s.svc.db().store.runs(Default::default()).unwrap()[0].id;
+    s.until_ended(mine).await;
+    assert!(s.report(mine, true, None).await.is_err(), "not a job run");
+
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    assert!(s.report(run, true, None).await.is_err(), "already ended");
+    assert_eq!(s.svc.db().store.run(run).unwrap().found, None);
+}
+
+#[tokio::test]
+async fn no_report_is_quiet() {
+    let s = setup();
+    let id = s.create(s.new_job("Look for new issues")).await;
+    let mut notices = s.svc.notices();
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    let reply = s.reply(id, run);
+    assert!(reply.quiet, "nothing reported, so quiet");
+
+    // Clients only ever see it quiet, and hear the job changed after.
+    let mut seen = Vec::new();
+    while let Ok(n) = notices.try_recv() {
+        seen.push(n.msg);
+    }
+    let published: Vec<&StoredMessage> = seen
+        .iter()
+        .filter_map(|m| match m {
+            ServerMsg::Message { message, .. } if message.id == reply.id => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(!published.is_empty());
+    assert!(published.iter().all(|m| m.quiet), "{published:?}");
+    let at_reply = seen
+        .iter()
+        .position(|m| matches!(m, ServerMsg::Message { message, .. } if message.id == reply.id))
+        .unwrap();
+    assert!(
+        seen[at_reply..]
+            .iter()
+            .any(|m| matches!(m, ServerMsg::JobChanged { job } if job.id == id)),
+        "the job page hears the run ended"
+    );
+
+    // Reporting nothing found is quiet too.
+    let id = s.create(s.new_job("Look again WAIT")).await;
+    s.svc.run_job_now(id).await.unwrap();
+    let run = s.runs(id)[0].id;
+    s.until_live(run).await;
+    s.report(run, false, None).await.unwrap();
+    s.go();
+    s.until_ended(run).await;
+    assert_eq!(s.svc.db().store.run(run).unwrap().found, Some(false));
+    assert!(s.reply(id, run).quiet);
+}
+
+#[tokio::test]
+async fn every_run_is_never_quiet_when_done() {
+    let s = setup();
+    let mut new = s.new_job("Summarize the day");
+    new.tell = Tell::EveryRun;
+    let id = s.create(new).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    assert_eq!(s.svc.db().store.run(run).unwrap().status, RunStatus::Done);
+    assert!(!s.reply(id, run).quiet);
+}
+
+#[tokio::test]
+async fn failed_is_never_quiet() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around FAIL")).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    assert_eq!(s.svc.db().store.run(run).unwrap().status, RunStatus::Failed);
+    let messages = s.run_messages(id, run);
+    assert!(!messages.is_empty(), "the failure is noted");
+    assert!(messages.iter().all(|m| !m.quiet), "{messages:?}");
+}
+
+const JOB_DENIED: &str = "Scheduled job: denied while you're away.";
+
+#[tokio::test]
+async fn deny_answers_without_a_card() {
+    let s = setup();
+    let mut new = s.new_job("Tidy up WAIT");
+    new.on_ask = OnAsk::Deny;
+    let id = s.create(new).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_live(run).await;
+
+    let wait = s
+        .svc
+        .ask_permission(
+            run,
+            "Bash",
+            serde_json::json!({"command": "rm -rf x"}),
+            None,
+        )
+        .unwrap();
+    assert_eq!(wait.approval, None);
+    assert_eq!(
+        wait.answer.await.unwrap(),
+        PermissionAnswer {
+            allow: false,
+            message: Some(JOB_DENIED.into()),
+        }
+    );
+    let thread = s.job(id).thread;
+    assert!(s.svc.db().store.approvals(thread).unwrap().is_empty());
+    assert!(
+        s.svc
+            .db()
+            .store
+            .messages(thread)
+            .unwrap()
+            .iter()
+            .all(|m| m.approval.is_none())
+    );
+    s.go();
+    s.until_ended(run).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deny_answers_without_a_card_for_codex() {
+    use serde_json::json;
+    let s = setup();
+    let id = s.codex_job("lint").await;
+    let patch = JobPatch {
+        on_ask: Some(OnAsk::Deny),
+        ..Default::default()
+    };
+    s.svc
+        .handle(Request::UpdateJob { job: id, patch })
+        .await
+        .unwrap();
+    scenario(&s.dir, 1, lint_listing());
+    // The run asks to run a command before it answers; a decline must
+    // come back at once.
+    let mut steps = codex_run();
+    let ask = json!({"request": "item/commandExecution/requestApproval", "id": 0,
+        "params": {"threadId": "00000000-0000-7000-8000-000000000001", "turnId": "turn-1",
+                   "itemId": "exec-1", "command": "rm -rf x", "cwd": "/work/demo", "commandActions": []},
+        "reply": {"decision": "decline"}});
+    let at = steps.len() - 2;
+    steps.insert(at, ask);
+    scenario(&s.dir, 2, steps);
+    let run: RunId =
+        serde_json::from_value(s.svc.handle(Request::RunJobNow { job: id }).await.unwrap())
+            .unwrap();
+    s.until_ended(run).await;
+    assert_eq!(s.svc.db().store.run(run).unwrap().status, RunStatus::Done);
+    let thread = s.job(id).thread;
+    assert!(s.svc.db().store.approvals(thread).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn report_is_only_served_to_job_runs() {
+    let s = setup_wired();
+    let id = s.create(s.new_job("Look around")).await;
+    let thread = s.job(id).thread;
+    s.svc.post_message(thread, "@Forge hi", None, None).unwrap();
+    let mine = s.svc.db().store.runs(Default::default()).unwrap()[0].id;
+    s.until_ended(mine).await;
+    s.svc.fire_due(at(12, 15));
+    s.until_ended(s.runs(id)[0].id).await;
+
+    let calls = logged_calls(&s.dir);
+    assert_eq!(calls.len(), 2);
+    let config = |call: &[String]| flag(call, "--mcp-config").unwrap().to_string();
+    let allowed = |call: &[String]| flag(call, "--allowedTools").unwrap_or("").to_string();
+    assert!(
+        !config(&calls[0]).contains("report"),
+        "{}",
+        config(&calls[0])
+    );
+    assert!(!allowed(&calls[0]).contains("report"));
+    assert!(
+        config(&calls[1]).contains(r#""--tools","handoff,approve,report""#),
+        "{}",
+        config(&calls[1])
+    );
+    assert!(
+        allowed(&calls[1]).contains("mcp__crew_run__report"),
+        "{}",
+        allowed(&calls[1])
+    );
+}
+
+#[tokio::test]
+async fn prune_drops_old_quiet_replies() {
+    let s = setup();
+    let id = s.create(s.new_job("Look around")).await;
+    s.svc.fire_due(at(12, 15));
+    let run = s.runs(id)[0].id;
+    s.until_ended(run).await;
+    assert!(s.reply(id, run).quiet);
+
+    let now = Local::now();
+    s.svc.clock().set(now + chrono::Duration::days(6));
+    s.svc.prune_quiet_replies();
+    assert!(s.reply(id, run).quiet, "kept for a week");
+
+    s.svc.clock().set(now + chrono::Duration::days(8));
+    s.svc.prune_quiet_replies();
+    assert!(
+        s.run_messages(id, run)
+            .iter()
+            .all(|m| m.author != Author::Agent(s.agent)),
+        "the quiet reply is gone"
+    );
+    assert_eq!(s.runs(id).len(), 1, "the run stays");
 }

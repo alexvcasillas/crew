@@ -20,6 +20,13 @@ pub const APPROVE_TOOL: &str = "mcp__crew_run__approve";
 /// The handoff tool crew-mcp serves. Every wired agent may use it.
 pub const HANDOFF_TOOL: &str = "mcp__crew_run__handoff";
 
+/// The tool a job run reports what it found with.
+pub const REPORT_TOOL: &str = "mcp__crew_run__report";
+
+/// The crew-mcp tools a Claude job run gets: what every run gets, and
+/// `report`.
+const JOB_TOOLS: &str = "handoff,approve,report";
+
 /// Edits an `EditFiles` agent may make without asking when crew-mcp is
 /// wired: only under its working folder. Edits anywhere else ask.
 const EDIT_TOOLS: [&str; 4] = [
@@ -118,6 +125,8 @@ pub struct McpWiring {
     pub crew_mcp_bin: PathBuf,
     pub run: RunId,
     pub crew_home: PathBuf,
+    /// A job run, which also gets the `report` tool.
+    pub report: bool,
 }
 
 #[derive(Serialize)]
@@ -138,7 +147,7 @@ struct StdioServer<'a> {
     #[serde(rename = "type")]
     kind: &'a str,
     command: String,
-    args: [String; 2],
+    args: Vec<String>,
     env: CrewEnv,
 }
 
@@ -151,12 +160,16 @@ struct CrewEnv {
 impl McpWiring {
     /// The `--mcp-config` value: one stdio server named [`MCP_SERVER`].
     pub fn config_json(&self) -> String {
+        let mut args = vec!["--run".into(), self.run.to_string()];
+        if self.report {
+            args.extend(["--tools".into(), JOB_TOOLS.into()]);
+        }
         let config = McpConfig {
             mcp_servers: McpServers {
                 crew: StdioServer {
                     kind: "stdio",
                     command: self.crew_mcp_bin.to_string_lossy().into_owned(),
-                    args: ["--run".into(), self.run.to_string()],
+                    args,
                     env: CrewEnv {
                         crew_home: self.crew_home.to_string_lossy().into_owned(),
                     },
@@ -408,7 +421,7 @@ pub fn build_claude(
         args.push(system);
     }
     let mut allowed = agent.allowed_tools.clone();
-    if mcp.is_some() {
+    if let Some(mcp) = &mcp {
         // The agent's own list first, then what wiring adds, each once.
         // A bare edit rule reaches outside the working folder, so it is
         // scoped like the ones wiring adds.
@@ -419,6 +432,7 @@ pub fn build_claude(
             .map(|t| scoped_edit(t))
             .chain(extra.iter().copied())
             .chain([HANDOFF_TOOL])
+            .chain(mcp.report.then_some(REPORT_TOOL))
         {
             if !merged.iter().any(|t| t == tool) {
                 merged.push(tool.to_string());
@@ -620,6 +634,7 @@ mod tests {
             crew_mcp_bin: PathBuf::from("/work/bin/crew-mcp"),
             run,
             crew_home: PathBuf::from("/work/crew \"home\""),
+            report: false,
         }
     }
 
@@ -627,6 +642,7 @@ mod tests {
     fn tool_names_use_the_server_name() {
         assert_eq!(APPROVE_TOOL, format!("mcp__{MCP_SERVER}__approve"));
         assert_eq!(HANDOFF_TOOL, format!("mcp__{MCP_SERVER}__handoff"));
+        assert_eq!(REPORT_TOOL, format!("mcp__{MCP_SERVER}__report"));
     }
 
     fn expected_mcp_config(run: RunId) -> String {

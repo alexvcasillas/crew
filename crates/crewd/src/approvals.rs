@@ -78,7 +78,7 @@ fn running(state: &State, run: RunId) -> bool {
 
 impl Service {
     /// Saves a permission ask of a live run and tells the thread. A run
-    /// that is stopping is denied at once.
+    /// that is stopping, or of a job that denies asks, is denied at once.
     pub(crate) fn ask_permission(
         &self,
         run: RunId,
@@ -100,6 +100,17 @@ impl Service {
         }
         let mut db = self.db();
         let stored = db.store.run(run).map_err(store_err)?;
+        // Nobody is there to answer: a job that denies asks says so at once.
+        if crate::jobs::denies_asks(&db, &stored) {
+            let _ = tx.send(PermissionAnswer {
+                allow: false,
+                message: Some(crate::jobs::JOB_DENIED.into()),
+            });
+            return Ok(PermissionWait {
+                approval: None,
+                answer: rx,
+            });
+        }
         let agents = db.store.agents().map_err(store_err)?;
         let name = spec_of(&agents, stored.agent)
             .map_err(store_err)?

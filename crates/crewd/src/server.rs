@@ -208,6 +208,7 @@ pub async fn serve_until(
     service.clean_snapshots();
     let sweeper = service.sweep_blocked();
     let jobs = service.run_jobs();
+    let pruner = service.prune_quiet();
     let (stop_terminal, terminal_stopped) = tokio::sync::oneshot::channel();
     if let Some(home) = &opts.claude_home {
         service.set_claude_home(home.clone());
@@ -240,6 +241,7 @@ pub async fn serve_until(
     log("shutting down, stopping all runs");
     sweeper.abort();
     jobs.abort();
+    pruner.abort();
     drop(listener);
     // We still hold the lock, so the socket is ours to remove.
     if let Err(e) = std::fs::remove_file(&sock) {

@@ -10,7 +10,9 @@ use crew_core::event::RunStatus;
 use crew_core::ids::{AgentId, JobId, RunId, ThreadId};
 use crew_core::schedule::{Repeat, WeekdaySet, missed_between, next_after};
 use crew_core::scheduler::Job;
-use crew_core::store::{Author, JobPatch, Missed, NewJob, RunFilter, StoreError, StoredJob};
+use crew_core::store::{
+    Author, JobPatch, Missed, NewJob, OnAsk, RunFilter, StoreError, StoredJob, StoredRun, Tell,
+};
 use crew_proto::{ServerMsg, SkillRef};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -31,6 +33,12 @@ const REPORTS_SHOWN: u32 = 3;
 const AGENT_DELETED: &str = "Agent deleted";
 const AGENT_GONE: &str = "That agent no longer exists. Pick another.";
 pub(crate) const ALREADY_RUNNING: &str = "This job is already running.";
+/// What a job run is told when it asks while its job denies asks.
+pub(crate) const JOB_DENIED: &str = "Scheduled job: denied while you're away.";
+/// How long quiet replies are kept.
+const QUIET_KEPT_DAYS: i64 = 7;
+/// How often old quiet replies are deleted.
+const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The line that tells a job run how to report.
 const REPORT_LINE: &str = "When you're done, call the `report` tool once: found=true only if there is something new the user hasn't been told about above, with a one-line summary. Otherwise found=false.";
 
@@ -169,6 +177,29 @@ fn waiting_on_you(db: &Db, job: &StoredJob) -> Result<bool, StoreError> {
         .pending_approvals(Some(job.thread))?
         .iter()
         .any(|a| a.run == last.id))
+}
+
+/// Whether the run belongs to a job that denies what its runs ask.
+pub(crate) fn denies_asks(db: &Db, run: &StoredRun) -> bool {
+    run.job
+        .and_then(|job| db.store.job(job).ok())
+        .is_some_and(|job| job.on_ask == OnAsk::Deny)
+}
+
+/// Whether the reply of a run that ended `status` is quiet: a job run
+/// that ended Done without reporting it found something, when its job
+/// tells only of changes. Failed and stopped runs are never quiet.
+pub(crate) fn quiet_reply(db: &Db, run: RunId, status: &RunStatus) -> bool {
+    if *status != RunStatus::Done {
+        return false;
+    }
+    let Ok(run) = db.store.run(run) else {
+        return false;
+    };
+    let Some(job) = run.job.and_then(|job| db.store.job(job).ok()) else {
+        return false;
+    };
+    job.tell == Tell::Changes && run.found != Some(true)
 }
 
 impl Service {
@@ -528,6 +559,69 @@ impl Service {
         }
         db.store.set_job_enabled(id, enabled).map_err(err)?;
         self.job_changed(&mut db, id)
+    }
+
+    /// Saves what the live job run `run` found. A blank summary is none.
+    pub(crate) fn report(
+        &self,
+        run: RunId,
+        found: bool,
+        summary: Option<String>,
+    ) -> Result<(), String> {
+        let state = self.state();
+        if !state.live.contains_key(&run) {
+            return Err("That run isn't running.".into());
+        }
+        let db = self.db();
+        if db.store.run(run).map_err(err)?.job.is_none() {
+            return Err("Only a scheduled job's run can report.".into());
+        }
+        let summary = summary
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        db.store
+            .set_run_report(run, found, summary.as_deref())
+            .map_err(err)
+    }
+
+    /// Tells the job page that a run of its job ended.
+    pub(crate) fn job_run_ended(&self, db: &mut Db, run: RunId) {
+        let Some(job) = db.store.run(run).ok().and_then(|r| r.job) else {
+            return;
+        };
+        // The job may be gone, as when its thread was archived.
+        if db.store.job(job).is_ok()
+            && let Err(e) = self.job_changed(db, job)
+        {
+            log(format!("couldn't tell of job {job}: {e}"));
+        }
+    }
+
+    /// Deletes quiet replies older than a week, now and then every hour.
+    pub fn prune_quiet(&self) -> JoinHandle<()> {
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PRUNE_EVERY);
+            loop {
+                tick.tick().await;
+                svc.prune_quiet_replies();
+            }
+        })
+    }
+
+    /// Deletes quiet replies older than a week. Their runs stay. A client
+    /// that has one keeps it until it loads the thread again.
+    pub(crate) fn prune_quiet_replies(&self) {
+        let before = self.clock().now() - chrono::Duration::days(QUIET_KEPT_DAYS);
+        match self
+            .db()
+            .store
+            .delete_quiet_messages_before(before.timestamp_millis())
+        {
+            Ok(0) => {}
+            Ok(n) => log(format!("deleted {n} quiet replies older than a week")),
+            Err(e) => log(format!("couldn't delete old quiet replies: {e}")),
+        }
     }
 
     /// Deletes the job. Its thread stays as a normal thread.

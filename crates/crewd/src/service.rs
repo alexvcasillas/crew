@@ -854,7 +854,14 @@ impl Service {
                 self.set_job_enabled(job, enabled)?;
                 Ok(serde_json::Value::Null)
             }
-            Request::Report { .. } => Err("Not yet.".into()),
+            Request::Report {
+                run,
+                found,
+                summary,
+            } => {
+                self.report(run, found, summary)?;
+                Ok(serde_json::Value::Null)
+            }
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -2367,6 +2374,7 @@ impl Service {
             crew_mcp_bin: bin.clone(),
             run: job.run,
             crew_home: home.clone(),
+            report: job_run,
         });
         let context = CrewContext {
             in_place,
@@ -2620,9 +2628,15 @@ impl Service {
         };
         db.store.set_run_status(run, status.clone())?;
         if !body.is_empty() {
-            self.add_message(&mut db, thread, author, &body, Some(run))?;
+            let id = db.store.add_message(thread, author, &body, Some(run))?;
+            // Quiet before anyone hears of it, so it never notifies.
+            if crate::jobs::quiet_reply(&db, run, &status) {
+                db.store.set_message_quiet(id)?;
+            }
+            self.publish_message(&mut db, thread, id)?;
         }
         self.publish_status(&mut db, thread, run, status);
+        self.job_run_ended(&mut db, run);
         if done && !state.shutting_down {
             self.reply_handoffs(&mut state, &mut db, run, agent, &reply, &handed)?;
         }
