@@ -2062,6 +2062,14 @@ fn a_job_creates_its_thread_and_first_message() {
     assert_eq!(job.next_due, Some(1234));
     assert_eq!(job.skipped, 3);
     assert_eq!(job.paused_reason.as_deref(), Some("Ada was deleted"));
+    store.set_job_enabled(id, false).unwrap();
+    assert!(!store.job(id).unwrap().enabled);
+    store.set_job_enabled(id, true).unwrap();
+    assert!(store.job(id).unwrap().enabled);
+    assert!(matches!(
+        store.set_job_enabled(crew_core::ids::JobId::new(), true),
+        Err(StoreError::NotFound("job"))
+    ));
     store.set_job_paused(id, None).unwrap();
     assert_eq!(store.job(id).unwrap().paused_reason, None);
 

@@ -269,6 +269,11 @@ impl Store {
         self.set_job_column(id, "next_due", next_due)
     }
 
+    /// Turns a job on or off.
+    pub fn set_job_enabled(&self, id: JobId, enabled: bool) -> Result<()> {
+        self.set_job_column(id, "enabled", enabled)
+    }
+
     pub fn set_job_skipped(&self, id: JobId, skipped: u32) -> Result<()> {
         self.set_job_column(id, "skipped", skipped)
     }
