@@ -1350,6 +1350,7 @@ name = "crewd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crew-core",
  "crew-proto",
  "libc",

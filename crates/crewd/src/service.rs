@@ -95,20 +95,20 @@ struct SkillCache {
 }
 
 /// What a queued run needs besides its job.
-struct Pending {
+pub(crate) struct Pending {
     /// The skill the run is for, and the model to use for this run alone.
-    skill: Option<SkillRef>,
-    model_override: Option<String>,
+    pub(crate) skill: Option<SkillRef>,
+    pub(crate) model_override: Option<String>,
     /// The message that asked for the run.
-    message: MessageId,
+    pub(crate) message: MessageId,
     /// The prompt to use if the run starts a new session.
-    fresh: String,
+    pub(crate) fresh: String,
 }
 
 pub(crate) struct State {
     pub(crate) scheduler: Scheduler,
     pub(crate) live: HashMap<RunId, (ThreadId, RunHandle)>,
-    pending: HashMap<RunId, Pending>,
+    pub(crate) pending: HashMap<RunId, Pending>,
     /// One task per started run, so shutdown can wait for them.
     watchers: JoinSet<()>,
     /// Set once crewd is shutting down. Nothing starts after that.
@@ -172,6 +172,8 @@ struct Inner {
     claude_listed: Mutex<HashMap<ProjectId, std::collections::HashSet<String>>>,
     /// Title runs under way. Shutdown drops them.
     titles: Mutex<JoinSet<()>>,
+    /// The time scheduled jobs go by. Tests set it.
+    clock: crate::jobs::Clock,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -281,6 +283,7 @@ impl Service {
             skills: Mutex::new(HashMap::new()),
             claude_listed: Mutex::new(HashMap::new()),
             titles: Mutex::new(JoinSet::new()),
+            clock: crate::jobs::Clock::default(),
         }))
     }
 
@@ -293,6 +296,33 @@ impl Service {
     /// A receiver for all notifications from now on.
     pub fn notices(&self) -> broadcast::Receiver<Notice> {
         self.0.tx.subscribe()
+    }
+
+    /// The file of a skill found earlier in the project, or an empty path
+    /// when it hasn't been looked for since crewd started.
+    pub(crate) fn cached_skill_path(
+        &self,
+        project: ProjectId,
+        runtime: &Runtime,
+        name: &str,
+    ) -> String {
+        let skills = self.0.skills.lock().unwrap_or_else(PoisonError::into_inner);
+        skills
+            .get(&project)
+            .and_then(|cache| {
+                cache
+                    .claude
+                    .iter()
+                    .chain(cache.codex.iter().flatten())
+                    .find(|f| f.runtime == *runtime && f.name == name)
+                    .map(|f| f.path.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The time scheduled jobs go by.
+    pub(crate) fn clock(&self) -> &crate::jobs::Clock {
+        &self.0.clock
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
@@ -646,6 +676,10 @@ impl Service {
                     .set_thread_archived(thread, archived)
                     .map_err(|e| e.to_string())?;
                 self.thread_changed(&mut db, thread)?;
+                // An archived thread's job stops for good.
+                if archived {
+                    self.delete_thread_job(&mut db, thread)?;
+                }
                 drop(db);
                 // An archived thread's runs are no longer undone.
                 if archived {
@@ -802,13 +836,22 @@ impl Service {
                 self.project_changed(&mut db, project)?;
                 Ok(serde_json::Value::Null)
             }
-            Request::CreateJob { .. }
-            | Request::UpdateJob { .. }
-            | Request::DeleteJob { .. }
-            | Request::SetJobEnabled { .. }
-            | Request::RunJobNow { .. }
-            | Request::TestJob { .. }
-            | Request::Report { .. } => Err("Not yet.".into()),
+            Request::CreateJob { job } => json(self.create_job(job)?),
+            Request::UpdateJob { job, patch } => {
+                self.update_job(job, patch)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::DeleteJob { job } => {
+                self.delete_job(job)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::SetJobEnabled { job, enabled } => {
+                self.set_job_enabled(job, enabled)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::RunJobNow { job } => json(self.run_job_now(job)?),
+            Request::TestJob { job } => json(self.test_job(job)?),
+            Request::Report { .. } => Err("Not yet.".into()),
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
             Request::ListApprovals { thread } => json(
                 self.db()
@@ -1051,7 +1094,7 @@ impl Service {
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
         self.agent_changed(&mut db, agent)?;
-        Ok(())
+        self.pause_agent_jobs(&mut db, agent)
     }
 
     /// Adds a project, unless another one uses the folder. A removed
@@ -1229,6 +1272,15 @@ impl Service {
             }
             drop(terminal);
             self.publish_global(&mut db, ServerMsg::ProjectRemoved { project });
+            // Its channels are gone, and so are the jobs in them.
+            for thread in &threads {
+                if let Err(e) = self.delete_thread_job(&mut db, thread.id) {
+                    log(format!(
+                        "couldn't delete the job of thread {}: {e}",
+                        thread.id
+                    ));
+                }
+            }
             let mut dirs: Vec<PathBuf> = crate::folders::project_checkouts(&stored)
                 .into_iter()
                 .map(|(dir, _)| dir)
@@ -1424,7 +1476,7 @@ impl Service {
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
             titles: db.store.title_settings()?,
-            jobs: vec![],
+            jobs: db.store.jobs()?,
         };
         Ok((msg, db.serial))
     }
@@ -1440,18 +1492,7 @@ impl Service {
         skill: Option<SkillRef>,
         model_override: Option<String>,
     ) -> Result<MessageId, String> {
-        let model_override = model_override
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
-        // The override goes to the CLI as an argument: refuse anything
-        // that could pass for a flag or break the value.
-        if let Some(m) = &model_override
-            && (m.starts_with('-')
-                || m.chars().any(|c| c.is_whitespace() || c.is_control())
-                || m.chars().count() > 128)
-        {
-            return Err("That model name isn't valid. Pick one from the list.".into());
-        }
+        let model_override = tidy_model_override(model_override)?;
         let (id, title_run) = {
             let mut state = self.state();
             let mut db = self.db();
@@ -2257,8 +2298,15 @@ impl Service {
         // Resume the agent's latest run here that really started a session
         // with the CLI it uses now. A run that failed before its CLI came up
         // has nothing to resume, and one CLI can't resume another's session.
+        // A job's run always starts a session of its own.
+        let job_run = db.store.run(job.run)?.job.is_some();
+        let earlier = if job_run {
+            Vec::new()
+        } else {
+            db.store.runs(filter)?
+        };
         let mut previous = None;
-        for run in db.store.runs(filter)?.into_iter().rev() {
+        for run in earlier.into_iter().rev() {
             if run.agent != job.agent || run.session_id.is_empty() || run.runtime != spec.runtime {
                 continue;
             }
@@ -2275,6 +2323,7 @@ impl Service {
         // The prompt for a new session: the chat so far, then the prompt.
         let fresh = match &pending {
             Some(p) => p.fresh.clone(),
+            None if job_run => job.prompt.clone(),
             // A handoff: the whole thread so far, then the brief.
             None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
         };
@@ -2652,7 +2701,7 @@ impl Service {
         self.publish_message(db, thread, id)
     }
 
-    fn publish_message(
+    pub(crate) fn publish_message(
         &self,
         db: &mut Db,
         thread: ThreadId,
@@ -2816,6 +2865,23 @@ fn with_asked_runs(
         }
     }
     Ok(runs)
+}
+
+/// A model override with blanks trimmed, none for an empty one. It goes
+/// to the CLI as an argument: anything that could pass for a flag or break
+/// the value is refused.
+pub(crate) fn tidy_model_override(model: Option<String>) -> Result<Option<String>, String> {
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    if let Some(m) = &model
+        && (m.starts_with('-')
+            || m.chars().any(|c| c.is_whitespace() || c.is_control())
+            || m.chars().count() > 128)
+    {
+        return Err("That model name isn't valid. Pick one from the list.".into());
+    }
+    Ok(model)
 }
 
 /// Now, in Unix ms.

@@ -8,6 +8,7 @@ license.workspace = true
 crew-core = { path = "../crew-core" }
 crew-proto = { path = "../crew-proto" }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
