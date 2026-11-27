@@ -196,6 +196,12 @@ impl Workspace {
                 .test_support()
                 .into_any_element()
         };
+        if self.scheduled.is_some() {
+            return vec![
+                slash().into_any_element(),
+                crumb("title-scheduled", "Scheduled".into()),
+            ];
+        }
         // A page shows where it is: `/ project` or `/ Agents / Name`.
         if let Some(project) = self.page_project().and_then(|p| state.project(p)) {
             return vec![

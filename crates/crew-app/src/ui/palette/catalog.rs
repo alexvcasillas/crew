@@ -9,8 +9,8 @@ use crew_core::store::TitleMode;
 use gpui_kit::{Action, App, OperatingSystem};
 
 use crate::app::{
-    AddProject, ApproveLatest, ArchiveThread, RenameThread, StopAll, ZoomIn, ZoomOut,
-    bindings as app_bindings,
+    AddProject, ApproveLatest, ArchiveThread, NewScheduledJob, RenameThread, ShowScheduled,
+    StopAll, ZoomIn, ZoomOut, bindings as app_bindings,
 };
 use crate::prefs::{Density, LineHeight, SidebarMode};
 use crate::theme::scale;
@@ -394,7 +394,8 @@ fn sub(action: &dyn Action) -> &'static str {
     }
 }
 
-/// The shortcuts list as commands, plus Add project…. An action with two
+/// The shortcuts list as commands, plus Add project…, New scheduled job…
+/// and Scheduled. An action with two
 /// shortcuts shows once, with the later one, which for Running now is
 /// ⌘⇧R.
 pub fn commands() -> Vec<CommandEntry> {
@@ -428,6 +429,22 @@ pub fn commands() -> Vec<CommandEntry> {
         sub: "",
         keys: None,
         action: Box::new(AddProject),
+        needs: Needs::Nothing,
+    });
+    commands.push(CommandEntry {
+        label: "New scheduled job…",
+        sub: "",
+        keys: None,
+        action: Box::new(NewScheduledJob),
+        needs: Needs::Nothing,
+    });
+    // Its row says how many jobs are on, which changes; see
+    // `rows::local_commands`.
+    commands.push(CommandEntry {
+        label: "Scheduled",
+        sub: "",
+        keys: None,
+        action: Box::new(ShowScheduled),
         needs: Needs::Nothing,
     });
     commands

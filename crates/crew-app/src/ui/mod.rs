@@ -21,6 +21,7 @@ mod project_view;
 mod run_card;
 pub mod running_view;
 mod runs_with;
+mod scheduled_view;
 mod service_control;
 pub mod settings;
 pub(crate) mod sidebar;
@@ -64,6 +65,8 @@ mod palette_catalog_tests;
 mod palette_tests;
 #[cfg(test)]
 mod running_tests;
+#[cfg(test)]
+mod scheduled_tests;
 #[cfg(test)]
 mod settings_tests;
 #[cfg(test)]

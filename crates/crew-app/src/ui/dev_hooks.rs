@@ -10,7 +10,7 @@ use super::settings::Page;
 pub struct DevHooks {
     /// `CREW_APP_OPEN_THREAD`: opened once the thread is known.
     pub open_thread: Option<ThreadId>,
-    /// `CREW_APP_SHOW`: `running`, `settings[:page]`, `diff:<thread>`,
+    /// `CREW_APP_SHOW`: `running`, `scheduled`, `settings[:page]`, `diff:<thread>`,
     /// `terminal:<session>`, `palette:<query>` or
     /// `setting:<field>[:<name>]`.
     pub show: Option<String>,
@@ -19,6 +19,8 @@ pub struct DevHooks {
     pub review: Option<ThreadId>,
     /// `CREW_APP_SHOW=running`: Running now.
     pub running: bool,
+    /// `CREW_APP_SHOW=scheduled`: Scheduled.
+    pub scheduled: bool,
     /// `CREW_APP_SHOW=settings` or `settings:skills|agents|projects|runtimes|limits|shortcuts`.
     pub settings: Option<Page>,
     /// `CREW_APP_SHOW=terminal:<session>`: a terminal session, opened
@@ -43,6 +45,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
     });
     let mut review = None;
     let mut running = false;
+    let mut scheduled = false;
     let mut settings = None;
     let mut terminal = None;
     let mut palette = None;
@@ -50,6 +53,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
     let show = var("CREW_APP_SHOW").map(|v| {
         match v.as_str() {
             "running" => running = true,
+            "scheduled" => scheduled = true,
             "settings" => settings = Some(Page::General),
             _ if v.starts_with("settings:") => {
                 settings = match &v["settings:".len()..] {
@@ -105,6 +109,7 @@ pub fn read(var: impl Fn(&str) -> Option<String>) -> DevHooks {
         show,
         review,
         running,
+        scheduled,
         settings,
         terminal,
         palette,
@@ -132,6 +137,7 @@ mod tests {
                 show: Some("running".into()),
                 review: None,
                 running: true,
+                scheduled: false,
                 settings: None,
                 terminal: None,
                 palette: None,
@@ -156,6 +162,8 @@ mod tests {
         assert_eq!(read(|_| Some("terminal:".into())).terminal, None);
         let page = read(|k| (k == "CREW_APP_SHOW").then(|| "settings:agents".to_string()));
         assert_eq!(page.settings, Some(Page::Agents));
+        let scheduled = read(|k| (k == "CREW_APP_SHOW").then(|| "scheduled".to_string()));
+        assert!(scheduled.scheduled);
         let general = read(|k| (k == "CREW_APP_SHOW").then(|| "settings".to_string()));
         assert_eq!(general.settings, Some(Page::General));
         let diff = format!("diff:{id}");

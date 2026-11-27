@@ -209,6 +209,75 @@ pub(crate) struct ProjectLook {
 }
 
 impl Workspace {
+    /// "Scheduled" above Pinned: a green count of jobs that found
+    /// something you haven't read, or an amber one of jobs waiting on
+    /// you, which wins. It opens the Scheduled page.
+    pub(super) fn render_scheduled_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (found, waiting) = self.scheduled_counts();
+        let jobs = |n: usize| if n == 1 { "job" } else { "jobs" };
+        let count = if waiting > 0 {
+            Some((
+                waiting,
+                format!("{waiting} {} waiting on you", jobs(waiting)),
+                "warning-subtle",
+                "warning",
+            ))
+        } else if found > 0 {
+            Some((
+                found,
+                format!("{found} {} found something", jobs(found)),
+                "success-subtle",
+                "success",
+            ))
+        } else {
+            None
+        };
+        let selected = self.scheduled.is_some();
+        div().px(ui_px(8.)).pb(ui_px(4.)).child(
+            sidebar_row("sidebar-scheduled".into())
+                .gap(ui_px(8.))
+                .when(selected, |row| row.bg(color("surface-300")))
+                .text_color(color("text-primary"))
+                .aria_label("Scheduled")
+                .aria_selected(selected)
+                .child(
+                    Icon::default()
+                        .data(super::super::scheduled_view::CLOCK_SVG)
+                        .size(ui_px(13.)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(count.is_some() || selected, |name| {
+                            name.font_weight(weight(FontWeight::MEDIUM))
+                        })
+                        .child("Scheduled"),
+                )
+                .child(match count {
+                    Some((n, label, bg, token)) => {
+                        super::super::scheduled_view::count_pill(n.to_string(), bg, token)
+                            .id("sidebar-scheduled-count")
+                            .aria_label(label)
+                            .test_support()
+                            .into_any_element()
+                    }
+                    None => div()
+                        .id("sidebar-scheduled-count")
+                        .flex_none()
+                        .text_size(scale::text(12.))
+                        .text_color(color("text-tertiary"))
+                        .aria_label("Nothing new")
+                        .child("Nothing new")
+                        .test_support()
+                        .into_any_element(),
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.show_scheduled(window, cx)))
+                .test_support(),
+        )
+    }
+
     /// A project's row: a chevron (or room for one when it has a single
     /// channel), its name, the hint for a clashing name, and its status.
     /// It opens and closes, or opens its one channel.

@@ -500,6 +500,7 @@ impl Workspace {
             .border_r_1()
             .border_color(color("border-100"))
             .child(self.render_sidebar_bar(cx))
+            .child(self.render_scheduled_row(cx))
             .child(
                 div()
                     .id("sidebar-list")

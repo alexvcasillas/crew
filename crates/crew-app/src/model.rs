@@ -738,8 +738,73 @@ impl State {
             .iter()
             .filter(|t| self.threads.get(t).is_some_and(|t| t.archived_at.is_none()))
             .flat_map(|t| self.messages(*t))
-            .filter(|m| m.created_at > since && m.author != Author::You)
+            .filter(|m| m.created_at > since && m.author != Author::You && !m.quiet)
             .count()
+    }
+
+    /// Every scheduled job, oldest first.
+    pub fn jobs(&self) -> Vec<&StoredJob> {
+        sorted(self.jobs.values(), |j| (j.created_at, j.id.0))
+    }
+
+    pub fn job(&self, job: JobId) -> Option<&StoredJob> {
+        self.jobs.get(&job)
+    }
+
+    /// Jobs turned on.
+    pub fn jobs_on(&self) -> usize {
+        self.jobs.values().filter(|j| j.enabled).count()
+    }
+
+    /// The job's known runs, oldest first.
+    pub fn job_runs(&self, job: JobId) -> Vec<&StoredRun> {
+        sorted(self.runs.values().filter(|r| r.job == Some(job)), |r| {
+            (r.started_at, r.id.0)
+        })
+    }
+
+    /// Whether the job's latest run waits on you to answer an ask.
+    pub fn job_waiting(&self, job: JobId) -> bool {
+        let waiting = self.waiting_runs();
+        self.job_runs(job)
+            .last()
+            .is_some_and(|r| waiting.contains(&r.id))
+    }
+
+    /// Whether `run` of `job` found something: it said so, or its job
+    /// tells you after every run and it ended done.
+    pub fn job_run_found(job: &StoredJob, run: &StoredRun) -> bool {
+        run.found == Some(true)
+            || (job.tell == crew_core::store::Tell::EveryRun && run.status == RunStatus::Done)
+    }
+
+    /// When the job's latest run that found something ended, in Unix ms.
+    pub fn job_found_at(&self, job: JobId) -> Option<i64> {
+        let stored = self.jobs.get(&job)?;
+        self.job_runs(job)
+            .into_iter()
+            .rev()
+            .find(|r| Self::job_run_found(stored, r))
+            .map(|r| r.ended_at.unwrap_or(r.started_at))
+    }
+
+    /// The Scheduled row's counts: jobs that found something since
+    /// `seen` says you last looked at their thread, and jobs waiting on
+    /// you.
+    pub fn scheduled_counts(&self, seen: impl Fn(ThreadId) -> i64) -> (usize, usize) {
+        let mut found = 0;
+        let mut waiting = 0;
+        for job in self.jobs.values() {
+            if self.job_waiting(job.id) {
+                waiting += 1;
+            } else if self
+                .job_found_at(job.id)
+                .is_some_and(|at| at > seen(job.thread))
+            {
+                found += 1;
+            }
+        }
+        (found, waiting)
     }
 
     /// What counts as running everywhere: every working run, by start

@@ -30,8 +30,8 @@ use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
-    AddProject, ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search,
-    ShowRunning, ShowThreads, StopAll,
+    AddProject, ApproveLatest, ArchiveThread, NewScheduledJob, NewThread, OpenSettings,
+    RenameThread, Search, ShowRunning, ShowScheduled, ShowThreads, StopAll,
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
@@ -64,6 +64,8 @@ pub(super) struct Nav {
     pub(super) drafting: bool,
     /// When you last looked at each channel, in Unix ms.
     pub(super) viewed: HashMap<ChannelId, i64>,
+    /// When you last had each thread open, in Unix ms.
+    pub(super) thread_viewed: HashMap<ThreadId, i64>,
     pub(super) scroll: ScrollHandle,
     /// Messages in the open thread when last drawn, to scroll on new ones.
     seen_messages: usize,
@@ -171,6 +173,14 @@ pub struct Workspace {
     pub(super) diff_seq: u64,
     /// Running now, shown in place of the body.
     pub(super) running: Option<RunningView>,
+    /// Scheduled, shown in place of the body beside the sidebar.
+    pub(super) scheduled: Option<super::scheduled_view::ScheduledView>,
+    /// The job form asked for last: which job, if any, and what it
+    /// starts from.
+    pub(super) job_form_asked: Option<(
+        Option<crew_core::ids::JobId>,
+        Option<super::scheduled_view::JobPrefill>,
+    )>,
     /// A Stop all request is waiting for its answer.
     pub(super) stopping_all: bool,
     /// The agent CLIs crewd found, as last asked.
@@ -287,6 +297,9 @@ impl Workspace {
         let bundled_crewd = std::env::current_exe()
             .ok()
             .and_then(|exe| crate::launchd::bundled_crewd(&exe));
+        if hooks.scheduled {
+            cx.defer_in(window, |this, window, cx| this.show_scheduled(window, cx));
+        }
         if bundled_crewd.is_some() {
             // Loads crewd's LaunchAgent, which starts it if needed.
             cx.defer_in(window, |this, window, cx| {
@@ -348,6 +361,8 @@ impl Workspace {
             repo_messages: HashMap::new(),
             diff_seq: 0,
             running,
+            scheduled: None,
+            job_form_asked: None,
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
@@ -814,6 +829,7 @@ impl Workspace {
             && !folder_ticks
             && !threads_ticks
             && !self.channel_ticks()
+            && !self.scheduled_ticks()
         {
             self.ticker = None;
         } else if self.ticker.is_none() {
@@ -866,6 +882,7 @@ impl Workspace {
         self.stash_draft(cx);
         self.close_thread(cx);
         self.page = None;
+        self.scheduled = None;
         self.nav.drafting = false;
         self.look_at(Some(channel));
         if self.recents.visited_channel(channel) {
@@ -891,6 +908,10 @@ impl Workspace {
     ) {
         self.stash_draft(cx);
         self.page = None;
+        self.scheduled = None;
+        self.nav
+            .thread_viewed
+            .insert(thread, super::common::now_ms());
         if self.nav.thread != Some(thread) {
             self.close_thread(cx);
             self.watch_thread(thread);
@@ -935,13 +956,14 @@ impl Workspace {
         }
     }
 
-    /// Closes settings, Running now and the review, which show in place
-    /// of the body.
+    /// Closes settings, Running now, Scheduled and the review, which show
+    /// in place of the body.
     pub(super) fn leave_pages(&mut self, cx: &mut Context<Self>) {
         self.flush_agent_save(cx);
         self.flush_project_save(cx);
         self.settings = None;
         self.running = None;
+        self.scheduled = None;
         self.drop_review(cx);
         cx.notify();
     }
@@ -1127,6 +1149,7 @@ impl Workspace {
         self.stash_draft(cx);
         self.close_thread(cx);
         self.page = None;
+        self.scheduled = None;
         self.nav.drafting = false;
         self.look_at(None);
         self.sync(cx);
@@ -1136,6 +1159,7 @@ impl Workspace {
         self.close_terminal();
         self.drop_review(cx);
         if let Some(open) = self.nav.thread.take() {
+            self.nav.thread_viewed.insert(open, super::common::now_ms());
             self.unwatch_thread(open);
             self.inspector.reset();
             self.editing = None;
@@ -1468,6 +1492,7 @@ struct StartupHooks {
     open_thread: Option<ThreadId>,
     review: Option<ThreadId>,
     running: bool,
+    scheduled: bool,
     settings: Option<Page>,
     terminal: Option<String>,
     palette: Option<String>,
@@ -1475,7 +1500,7 @@ struct StartupHooks {
 }
 
 /// `CREW_APP_OPEN_THREAD` and
-/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>|palette:<query>`,
+/// `CREW_APP_SHOW=diff:<thread>|running|scheduled|terminal:<session>|palette:<query>`,
 /// in debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
@@ -1485,6 +1510,7 @@ fn dev_hooks() -> StartupHooks {
             open_thread: hooks.open_thread,
             review: hooks.review,
             running: hooks.running,
+            scheduled: hooks.scheduled,
             settings: hooks.settings,
             terminal: hooks.terminal,
             palette: hooks.palette,
@@ -1553,6 +1579,12 @@ impl Render for Workspace {
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
             .on_action(
+                cx.listener(|this, _: &ShowScheduled, window, cx| this.show_scheduled(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewScheduledJob, window, cx| {
+                this.open_job_form(None, None, window, cx)
+            }))
+            .on_action(
                 cx.listener(|this, _: &AddProject, window, cx| this.open_add_project(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
@@ -1575,6 +1607,8 @@ impl Render for Workspace {
                 self.render_running(cx)
             } else if self.review.is_some() {
                 self.render_review(cx)
+            } else if self.scheduled.is_some() {
+                self.render_scheduled(cx)
             } else if self.first_launch.is_some() && self.inspector_connected() {
                 self.render_first_launch(cx)
             } else {
@@ -1624,10 +1658,13 @@ impl Workspace {
         )
     }
 
-    /// Leaves settings and Running now for the threads.
+    /// Leaves settings, Running now and Scheduled for the threads.
     fn show_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_settings(window, cx);
         self.close_running(window, cx);
+        if self.scheduled.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The thread the inspector shows: the open one, while connected.

@@ -195,7 +195,7 @@ impl Workspace {
     }
 
     /// Stops the agents working in `thread`.
-    pub(super) fn stop_thread(
+    pub(in crate::ui) fn stop_thread(
         &mut self,
         thread: ThreadId,
         window: &mut Window,
