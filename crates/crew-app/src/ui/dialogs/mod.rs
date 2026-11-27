@@ -1,11 +1,12 @@
-//! The dialogs: add project, rename, archive, discard the worktree, and
-//! channel settings. One is open at a time; what it shows lives in
+//! The dialogs: add project, rename, archive, discard the worktree,
+//! channel settings and the scheduled job form. One is open at a time; what it shows lives in
 //! [`OpenDialog`] so an answer from crewd can land in it.
 
 mod add_project;
 mod archive;
 mod channel_settings;
 mod discard;
+mod job;
 mod project;
 mod rename;
 
@@ -28,6 +29,9 @@ use crate::theme::scale::{self, ui_px, weight};
 pub(crate) use add_project::NOT_A_FOLDER;
 pub(crate) use add_project::{repos_line, setup_file_in, short_remote, size_label};
 use discard::discard_label;
+pub(crate) use job::JobForm;
+#[cfg(test)]
+pub(crate) use job::next_times;
 pub(crate) use project::REMOVE_BODY;
 
 /// The dialogs' width.
@@ -80,6 +84,7 @@ pub(super) enum DialogKind {
     RemoveProject {
         project: ProjectId,
     },
+    Job(Box<JobForm>),
 }
 
 impl Workspace {
@@ -91,9 +96,10 @@ impl Workspace {
             busy: false,
             task: None,
         });
-        let width = match self.dialog.as_ref().map(|d| &d.kind) {
-            Some(DialogKind::AddProject(_)) => add_project::WIDTH,
-            _ => WIDTH,
+        let (width, top) = match self.dialog.as_ref().map(|d| &d.kind) {
+            Some(DialogKind::AddProject(_)) => (add_project::WIDTH, None),
+            Some(DialogKind::Job(_)) => (job::WIDTH, Some(job::TOP)),
+            _ => (WIDTH, None),
         };
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -103,6 +109,7 @@ impl Workspace {
                 .w(ui_px(width))
                 .px(ui_px(PADDING_X))
                 .pb(ui_px(FOOTER_Y))
+                .when_some(top, |d, top| d.margin_top(ui_px(top)))
                 // ↵ confirms. The dialog closes once crewd says it's done.
                 .on_ok(move |_, window, cx| {
                     confirmed
@@ -116,13 +123,13 @@ impl Workspace {
             let Some(ws) = this.upgrade() else {
                 return dialog;
             };
-            ws.read(cx).build_dialog(dialog, this.clone())
+            ws.read(cx).build_dialog(dialog, this.clone(), cx)
         });
         cx.notify();
     }
 
     /// The open dialog, drawn from what [`OpenDialog`] holds now.
-    fn build_dialog(&self, dialog: Dialog, this: WeakEntity<Self>) -> Dialog {
+    fn build_dialog(&self, dialog: Dialog, this: WeakEntity<Self>, cx: &App) -> Dialog {
         let Some(open) = &self.dialog else {
             return dialog;
         };
@@ -145,6 +152,7 @@ impl Workspace {
             } => self.new_channel_body(*project, name, description),
             DialogKind::RenameProject { name, .. } => self.rename_project_body(name),
             DialogKind::RemoveProject { project } => self.remove_project_body(*project),
+            DialogKind::Job(form) => self.job_form_body(form, this.clone(), cx),
         };
         let (confirm, danger) = match &open.kind {
             DialogKind::AddProject(_) => ("Add project".to_string(), false),
@@ -158,11 +166,17 @@ impl Workspace {
             DialogKind::NewChannel { .. } => ("Create channel".to_string(), false),
             DialogKind::RenameProject { .. } => ("Rename".to_string(), false),
             DialogKind::RemoveProject { .. } => ("Remove".to_string(), true),
+            DialogKind::Job(form) if form.editing().is_some() => ("Save".to_string(), false),
+            DialogKind::Job(_) => ("Create job".to_string(), false),
         };
         let busy = open.busy;
-        let off =
-            busy || (matches!(open.kind, DialogKind::AddProject(_)) && !self.add_project_ready());
+        // The job form: whether it can be sent, and whether it is new.
+        let job = self.job_form_ready(cx);
+        let off = busy
+            || (matches!(open.kind, DialogKind::AddProject(_)) && !self.add_project_ready())
+            || job.is_some_and(|(ready, _)| !ready);
         let cancel = this.clone();
+        let test_run = this.clone();
         dialog
             .when(danger, |d| d.border_color(color("danger-border")))
             .child(
@@ -191,9 +205,31 @@ impl Workspace {
                     .pt(ui_px(FOOTER_Y))
                     .border_t_1()
                     .border_color(color("border-100"))
+                    // A new job can be tried first, on the left.
+                    .when_some(job.filter(|(_, new)| *new), |footer, (ready, _)| {
+                        footer
+                            .child(
+                                Button::new("job-test-run")
+                                    .ghost()
+                                    .label("Test run now")
+                                    .disabled(busy || !ready)
+                                    .on_click(move |_, window, cx| {
+                                        test_run
+                                            .update(cx, |ws, cx| ws.test_run_job(window, cx))
+                                            .ok();
+                                    }),
+                            )
+                            .child(div().flex_1())
+                    })
                     .child(
                         Button::new("dialog-cancel")
-                            .ghost()
+                            .map(|b| {
+                                if job.is_some() {
+                                    b.outline()
+                                } else {
+                                    b.ghost()
+                                }
+                            })
                             .label("Cancel")
                             .on_click(move |_, window, cx| {
                                 cancel.update(cx, |ws, _| ws.dialog = None).ok();
@@ -305,6 +341,12 @@ impl Workspace {
             DialogKind::RemoveProject { project } => {
                 Ok(Request::RemoveProject { project: *project })
             }
+            DialogKind::Job(form) => {
+                if !form.ready(cx) {
+                    return;
+                }
+                form.request(cx)
+            }
         };
         let request = match checked {
             Ok(request) => request,
@@ -383,6 +425,7 @@ impl Workspace {
             Some(DialogKind::ChannelSettings { name, .. }) => name.clone(),
             Some(DialogKind::NewChannel { name, .. }) => name.clone(),
             Some(DialogKind::RenameProject { name, .. }) => name.clone(),
+            Some(DialogKind::Job(form)) => form.name.clone(),
             _ => return,
         };
         field.update(cx, |input, cx| input.focus(window, cx));

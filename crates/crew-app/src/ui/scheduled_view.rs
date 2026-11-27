@@ -267,19 +267,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the job form: `job` to edit, or a new job, filled from
-    /// `prefill`.
-    pub(super) fn open_job_form(
-        &mut self,
-        job: Option<JobId>,
-        prefill: Option<JobPrefill>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.job_form_asked = Some((job, prefill));
-        cx.notify();
-    }
-
     /// When you last looked at `thread`, in Unix ms. The thread open now
     /// counts as read.
     pub(super) fn thread_seen(&self, thread: ThreadId) -> i64 {

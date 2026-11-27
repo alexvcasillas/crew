@@ -16,7 +16,7 @@ use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext};
 
 use super::common::{clock, now_ms};
-use super::scheduled_view::{JobPrefill, next_lines, run_time, summary_line};
+use super::scheduled_view::{next_lines, run_time, summary_line};
 use super::sidebar::row_probe::status_of;
 use super::test_ui::{bounds_of, click, has, label_of, open, press, shows, type_text, wait_until};
 use super::thread_tests::{World, go_to, world};
@@ -797,30 +797,39 @@ fn empty_page_suggestions(cx: &mut TestAppContext) {
         window,
         "An agent can check something on a schedule and tell you when it changes."
     ));
-    let asked = |cx: &mut TestAppContext| ws.read_with(cx, |ws, _| ws.job_form_asked);
-    for (id, text, prefill) in [
+    // Each opens the job form, filled from the suggestion.
+    let opened = |cx: &mut TestAppContext| {
+        ws.read_with(cx, |ws, cx| {
+            ws.job_form()
+                .map(|f| (f.editing(), f.name.read(cx).value().to_string()))
+        })
+    };
+    for (id, text, name) in [
         (
             "scheduled-suggest-page",
             "Check a page every hour",
-            JobPrefill::PageCheck,
+            "Page check",
         ),
         (
             "scheduled-suggest-prs",
             "Review my PRs each morning",
-            JobPrefill::PrMorning,
+            "PRs waiting for my review",
         ),
         (
             "scheduled-suggest-weekly",
             "Weekly summary of my work",
-            JobPrefill::WeeklySummary,
+            "Weekly work summary",
         ),
     ] {
         assert_eq!(label(cx, window, id.into()), text);
         click(cx, window, id);
-        assert_eq!(asked(cx), Some((None, Some(prefill))), "{text}");
+        assert_eq!(opened(cx), Some((None, name.to_string())), "{text}");
+        click(cx, window, "dialog-cancel");
+        wait_until(cx, "the form to close", |cx| opened(cx).is_none());
     }
     click(cx, window, "scheduled-empty-new");
-    assert_eq!(asked(cx), Some((None, None)));
+    assert_eq!(opened(cx), Some((None, String::new())));
+    click(cx, window, "dialog-cancel");
     assert!(!has(cx, window, "scheduled-paused"));
 }
 

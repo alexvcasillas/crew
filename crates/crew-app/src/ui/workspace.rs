@@ -175,12 +175,9 @@ pub struct Workspace {
     pub(super) running: Option<RunningView>,
     /// Scheduled, shown in place of the body beside the sidebar.
     pub(super) scheduled: Option<super::scheduled_view::ScheduledView>,
-    /// The job form asked for last: which job, if any, and what it
-    /// starts from.
-    pub(super) job_form_asked: Option<(
-        Option<crew_core::ids::JobId>,
-        Option<super::scheduled_view::JobPrefill>,
-    )>,
+    /// A job whose thread opens once it and its thread are known, after
+    /// a test run.
+    job_open_pending: Option<crew_core::ids::JobId>,
     /// A Stop all request is waiting for its answer.
     pub(super) stopping_all: bool,
     /// The agent CLIs crewd found, as last asked.
@@ -362,7 +359,7 @@ impl Workspace {
             diff_seq: 0,
             running,
             scheduled: None,
-            job_form_asked: None,
+            job_open_pending: None,
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
@@ -484,6 +481,17 @@ impl Workspace {
         self.open_if_known(window, cx);
     }
 
+    /// Opens `job`'s thread once the job and its thread are known.
+    pub(super) fn open_job_thread_when_known(
+        &mut self,
+        job: crew_core::ids::JobId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.job_open_pending = Some(job);
+        self.open_if_known(window, cx);
+    }
+
     fn open_if_known(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.jump_if_known(window, cx);
         if let Some(query) = self.palette_pending.take() {
@@ -498,6 +506,12 @@ impl Workspace {
             let session = session.clone();
             self.terminal_pending = None;
             self.open_terminal(session, window, cx);
+        }
+        if let Some(job) = self.job_open_pending
+            && let Some(thread) = self.state.job(job).map(|j| j.thread)
+        {
+            self.job_open_pending = None;
+            self.open_pending = Some(thread);
         }
         if let Some(thread) = self.open_pending
             && self.state.thread(thread).is_some()

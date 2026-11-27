@@ -56,6 +56,8 @@ mod folder_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]
+mod job_form_tests;
+#[cfg(test)]
 mod motion_tests;
 #[cfg(test)]
 mod pages_tests;
