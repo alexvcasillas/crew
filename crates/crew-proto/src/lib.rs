@@ -910,7 +910,7 @@ pub enum ServerMsg {
         run: RunId,
         status: RunStatus,
         /// The run as saved after the change.
-        details: StoredRun,
+        details: Box<StoredRun>,
     },
     /// A message was added to a thread.
     Message {

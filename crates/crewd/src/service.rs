@@ -1359,7 +1359,7 @@ impl Service {
                 thread,
                 run: run.id,
                 status: run.status.clone(),
-                details: run,
+                details: Box::new(run),
             });
         }
         // Each approval comes just before the first message about it, as
@@ -2611,7 +2611,7 @@ impl Service {
                 thread,
                 run,
                 status,
-                details,
+                details: Box::new(details),
             },
         );
     }
@@ -2838,6 +2838,10 @@ mod tests {
             skill: None,
             model_override: None,
             message: None,
+            job: None,
+            found: None,
+            summary: None,
+            missed: 0,
         }
     }
 

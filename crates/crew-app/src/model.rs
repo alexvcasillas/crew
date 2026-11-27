@@ -305,7 +305,7 @@ impl State {
             ServerMsg::AgentChanged { agent } => {
                 self.agents.insert(agent.id, agent);
             }
-            ServerMsg::RunStatus { details, .. } => self.run_changed(details),
+            ServerMsg::RunStatus { details, .. } => self.run_changed(*details),
             ServerMsg::Message { thread, message } => self.add_message(thread, message),
             ServerMsg::Approval { approval, .. } => self.add_approval(approval),
             ServerMsg::Event {
@@ -1144,6 +1144,10 @@ mod tests {
             skill: None,
             model_override: None,
             message: None,
+            job: None,
+            found: None,
+            summary: None,
+            missed: 0,
         }
     }
 
@@ -1156,6 +1160,8 @@ mod tests {
             created_at,
             run: None,
             approval: None,
+            quiet: false,
+            job_message: false,
         }
     }
 
@@ -1189,7 +1195,7 @@ mod tests {
             thread: run.thread,
             run: run.id,
             status: run.status.clone(),
-            details: run.clone(),
+            details: Box::new(run.clone()),
         }
     }
 

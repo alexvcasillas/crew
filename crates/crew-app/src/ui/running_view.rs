@@ -1632,6 +1632,10 @@ mod tests {
             skill: None,
             model_override: None,
             message: None,
+            job: None,
+            found: None,
+            summary: None,
+            missed: 0,
         };
         let (a, b, c) = (run(30), run(20), run(20));
         let mut known = vec![a.clone(), b.clone()];

@@ -2,6 +2,7 @@
 //! runs and approvals.
 
 mod approval;
+mod job;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,7 +14,7 @@ use uuid::Uuid;
 
 use crate::agent::{AgentSpec, Runtime};
 use crate::event::{Event, RunStatus};
-use crate::ids::{AgentId, ApprovalId, ChannelId, MessageId, ProjectId, RunId, ThreadId};
+use crate::ids::{AgentId, ApprovalId, ChannelId, JobId, MessageId, ProjectId, RunId, ThreadId};
 use crate::policy::HandoffPolicy;
 use crate::project_kind::{ProjectKind, WorkMode};
 
@@ -21,11 +22,12 @@ pub use approval::{
     ApprovalKind, ApprovalStatus, OUTSIDE_SANDBOX, StoredApproval, blocked_text, handoff_ask_text,
     paused_text, permission_text, short_ask, short_input,
 };
+pub use job::{JobPatch, Missed, NewJob, OnAsk, StoredJob, Tell};
 
 const SCHEMA: &str = include_str!("schema.sql");
 /// Why a write into a removed project is refused.
 pub const REMOVED: &str = "That project was removed.";
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 /// `MIGRATIONS[n]` moves a database from version `n + 1` to `n + 2`.
 const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v2.sql"),
@@ -41,6 +43,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_v12.sql"),
     include_str!("migrate_v13.sql"),
     include_str!("migrate_v14.sql"),
+    include_str!("migrate_v15.sql"),
 ];
 
 /// How a new thread gets its title.
@@ -195,6 +198,13 @@ pub struct StoredMessage {
     /// The approval a system note is about, if any.
     #[serde(default)]
     pub approval: Option<ApprovalId>,
+    /// An agent reply a job's run marked as nothing to report. Pruned
+    /// after a while; the run stays.
+    #[serde(default)]
+    pub quiet: bool,
+    /// The message that holds a scheduled job's instructions.
+    #[serde(default)]
+    pub job_message: bool,
 }
 
 /// An agent as saved in the store. Deleted agents stay, so their past
@@ -341,6 +351,18 @@ pub struct StoredRun {
     /// The message that asked for the run, if one did.
     #[serde(default)]
     pub message: Option<MessageId>,
+    /// The scheduled job that started the run, if one did.
+    #[serde(default)]
+    pub job: Option<JobId>,
+    /// For a job's run: whether it found something to report.
+    #[serde(default)]
+    pub found: Option<bool>,
+    /// For a job's run: a line about what it found.
+    #[serde(default)]
+    pub summary: Option<Box<str>>,
+    /// For a job's run: how many due slots it stands for after a wake.
+    #[serde(default)]
+    pub missed: u32,
 }
 
 fn claude_code() -> Runtime {
@@ -1284,7 +1306,12 @@ impl Store {
         body: &str,
         run: Option<RunId>,
     ) -> Result<MessageId> {
-        self.insert_message(t, author, body, run, None)
+        self.insert_message(t, author, body, run, None, false)
+    }
+
+    /// Saves a You message that holds a scheduled job's instructions.
+    pub fn add_job_message(&self, t: ThreadId, body: &str) -> Result<MessageId> {
+        self.insert_message(t, Author::You, body, None, None, true)
     }
 
     /// Saves a system note about `approval`, asked by run `run`.
@@ -1295,7 +1322,7 @@ impl Store {
         run: RunId,
         approval: ApprovalId,
     ) -> Result<MessageId> {
-        self.insert_message(t, Author::System, body, Some(run), Some(approval))
+        self.insert_message(t, Author::System, body, Some(run), Some(approval), false)
     }
 
     fn insert_message(
@@ -1305,6 +1332,7 @@ impl Store {
         body: &str,
         run: Option<RunId>,
         approval: Option<ApprovalId>,
+        job_message: bool,
     ) -> Result<MessageId> {
         let id = MessageId::new();
         let (kind, agent) = match author {
@@ -1314,8 +1342,8 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO messages (id, thread_id, author_kind, author_agent, body, created_at, run_id,
-                                   approval_id, ord)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                                   approval_id, job_message, ord)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                      (SELECT COALESCE(MAX(ord) + 1, 0) FROM messages WHERE thread_id = ?2))",
             params![
                 id.to_string(),
@@ -1325,15 +1353,36 @@ impl Store {
                 body,
                 now_ms(),
                 run.map(|r| r.to_string()),
-                approval.map(|a| a.to_string())
+                approval.map(|a| a.to_string()),
+                job_message
             ],
         )?;
         Ok(id)
     }
 
+    /// Marks a message as a quiet reply: a job run found nothing.
+    pub fn set_message_quiet(&self, id: MessageId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE messages SET quiet = 1 WHERE id = ?1",
+            [id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound("message"));
+        }
+        Ok(())
+    }
+
+    /// Deletes quiet messages made before `ms` (Unix ms). Returns how many.
+    pub fn delete_quiet_messages_before(&self, ms: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM messages WHERE quiet = 1 AND created_at < ?1",
+            [ms],
+        )?)
+    }
+
     pub fn messages(&self, t: ThreadId) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_kind, author_agent, body, created_at, run_id, approval_id
+            "SELECT id, author_kind, author_agent, body, created_at, run_id, approval_id, quiet, job_message
              FROM messages WHERE thread_id = ?1 ORDER BY ord",
         )?;
         let rows = stmt.query_map([t.to_string()], |r| {
@@ -1358,6 +1407,8 @@ impl Store {
                     .get::<_, Option<String>>(6)?
                     .map(|_| uuid_col(r, 6).map(ApprovalId))
                     .transpose()?,
+                quiet: r.get(7)?,
+                job_message: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1807,7 +1858,8 @@ fn read_thread(r: &Row) -> rusqlite::Result<Result<StoredThread>> {
 
 const RUN_COLUMNS: &str =
     "SELECT id, thread_id, agent_id, session_id, status, started_at, ended_at, runtime,
-     waiting_for, skill, model_override, message_id FROM runs";
+     waiting_for, skill, model_override, message_id, job_id, found, summary, missed
+     FROM runs";
 
 fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
     let status: String = r.get(4)?;
@@ -1830,6 +1882,13 @@ fn read_run(r: &Row) -> rusqlite::Result<Result<StoredRun>> {
             .get::<_, Option<String>>(11)?
             .and_then(|m| Uuid::parse_str(&m).ok())
             .map(MessageId),
+        job: r
+            .get::<_, Option<String>>(12)?
+            .and_then(|j| Uuid::parse_str(&j).ok())
+            .map(JobId),
+        found: r.get(13)?,
+        summary: r.get(14)?,
+        missed: r.get(15)?,
     };
     let runtime: String = r.get(7)?;
     Ok(parse_status(&status).and_then(|status| {
