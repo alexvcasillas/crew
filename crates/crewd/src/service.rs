@@ -5,7 +5,7 @@
 //! another lock. No lock is held across an `.await`, nor while git, a
 //! setup command or a file read runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -95,20 +95,20 @@ struct SkillCache {
 }
 
 /// What a queued run needs besides its job.
-struct Pending {
+pub(crate) struct Pending {
     /// The skill the run is for, and the model to use for this run alone.
-    skill: Option<SkillRef>,
-    model_override: Option<String>,
+    pub(crate) skill: Option<SkillRef>,
+    pub(crate) model_override: Option<String>,
     /// The message that asked for the run.
-    message: MessageId,
+    pub(crate) message: MessageId,
     /// The prompt to use if the run starts a new session.
-    fresh: String,
+    pub(crate) fresh: String,
 }
 
 pub(crate) struct State {
     pub(crate) scheduler: Scheduler,
     pub(crate) live: HashMap<RunId, (ThreadId, RunHandle)>,
-    pending: HashMap<RunId, Pending>,
+    pub(crate) pending: HashMap<RunId, Pending>,
     /// One task per started run, so shutdown can wait for them.
     watchers: JoinSet<()>,
     /// Set once crewd is shutting down. Nothing starts after that.
@@ -172,6 +172,8 @@ struct Inner {
     claude_listed: Mutex<HashMap<ProjectId, std::collections::HashSet<String>>>,
     /// Title runs under way. Shutdown drops them.
     titles: Mutex<JoinSet<()>>,
+    /// The time scheduled jobs go by. Tests set it.
+    clock: crate::jobs::Clock,
 }
 
 /// Holds the store, the scheduler and the live runs.
@@ -281,6 +283,7 @@ impl Service {
             skills: Mutex::new(HashMap::new()),
             claude_listed: Mutex::new(HashMap::new()),
             titles: Mutex::new(JoinSet::new()),
+            clock: crate::jobs::Clock::default(),
         }))
     }
 
@@ -293,6 +296,33 @@ impl Service {
     /// A receiver for all notifications from now on.
     pub fn notices(&self) -> broadcast::Receiver<Notice> {
         self.0.tx.subscribe()
+    }
+
+    /// The file of a skill found earlier in the project, or an empty path
+    /// when it hasn't been looked for since crewd started.
+    pub(crate) fn cached_skill_path(
+        &self,
+        project: ProjectId,
+        runtime: &Runtime,
+        name: &str,
+    ) -> String {
+        let skills = self.0.skills.lock().unwrap_or_else(PoisonError::into_inner);
+        skills
+            .get(&project)
+            .and_then(|cache| {
+                cache
+                    .claude
+                    .iter()
+                    .chain(cache.codex.iter().flatten())
+                    .find(|f| f.runtime == *runtime && f.name == name)
+                    .map(|f| f.path.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The time scheduled jobs go by.
+    pub(crate) fn clock(&self) -> &crate::jobs::Clock {
+        &self.0.clock
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
@@ -493,8 +523,9 @@ impl Service {
 
     /// Handles every request except `Hello`, `Subscribe`, `SubscribeAll`
     /// and `PermissionAsk`, which belong to the connection. `ThreadDiff`,
-    /// `Commit`, `Discard` and `ChannelOverview` run git and `Runtimes`
-    /// runs the agent CLIs, so they can take a while.
+    /// `Commit`, `Discard` and `ChannelOverview` run git, and `Runtimes`,
+    /// `RunJobNow` and `TestJob` may run the agent CLIs, so they can take
+    /// a while.
     pub async fn handle(&self, req: Request) -> Reply {
         self.refuse_removed(&req)?;
         match req {
@@ -550,6 +581,8 @@ impl Service {
                 self.project_overview(project, light).await
             }
             Request::AgentProfile { agent } => self.agent_profile(agent).await,
+            Request::RunJobNow { job } => json(self.run_job_now(job).await?),
+            Request::TestJob { job } => json(self.test_job(job).await?),
             other => self.handle_now(other),
         }
     }
@@ -646,6 +679,10 @@ impl Service {
                     .set_thread_archived(thread, archived)
                     .map_err(|e| e.to_string())?;
                 self.thread_changed(&mut db, thread)?;
+                // An archived thread's job stops for good.
+                if archived {
+                    self.delete_thread_job(&mut db, thread)?;
+                }
                 drop(db);
                 // An archived thread's runs are no longer undone.
                 if archived {
@@ -776,6 +813,8 @@ impl Service {
             | Request::Search { .. }
             | Request::ProjectOverview { .. }
             | Request::AgentProfile { .. }
+            | Request::RunJobNow { .. }
+            | Request::TestJob { .. }
             | Request::Skills { .. }
             | Request::Runtimes => Err("This request is slow and is handled elsewhere.".into()),
             Request::RenameProject { project, name } => {
@@ -800,6 +839,27 @@ impl Service {
                     .pin_project(project, pinned)
                     .map_err(|e| e.to_string())?;
                 self.project_changed(&mut db, project)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::CreateJob { job } => json(self.create_job(job)?),
+            Request::UpdateJob { job, patch } => {
+                self.update_job(job, patch)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::DeleteJob { job } => {
+                self.delete_job(job)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::SetJobEnabled { job, enabled } => {
+                self.set_job_enabled(job, enabled)?;
+                Ok(serde_json::Value::Null)
+            }
+            Request::Report {
+                run,
+                found,
+                summary,
+            } => {
+                self.report(run, found, summary)?;
                 Ok(serde_json::Value::Null)
             }
             Request::Handoff { run, agent, brief } => json(self.handoff(run, &agent, brief)?),
@@ -884,7 +944,7 @@ impl Service {
     /// signed in. A Codex listing that failed or timed out isn't kept, so
     /// the next request tries it again. Plugin skills of Claude Code that
     /// a run's init line didn't list are left out, once a run has told.
-    async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
+    pub(crate) async fn skills(&self, project: ProjectId, force_reload: bool) -> Reply {
         let cached = (!force_reload)
             .then(|| self.0.skills.lock().unwrap().get(&project).cloned())
             .flatten();
@@ -1003,7 +1063,7 @@ impl Service {
     }
 
     /// Tells `SubscribeAll` clients the thread as it is now.
-    fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
+    pub(crate) fn thread_changed(&self, db: &mut Db, thread: ThreadId) -> Result<(), String> {
         let thread = db.store.thread(thread).map_err(|e| e.to_string())?;
         self.publish_global(db, ServerMsg::ThreadChanged { thread });
         Ok(())
@@ -1044,6 +1104,11 @@ impl Service {
         }
         db.store.delete_agent(agent).map_err(|e| e.to_string())?;
         self.agent_changed(&mut db, agent)?;
+        // The agent is gone already, so this doesn't fail the delete. A
+        // job left on just logs that its agent is gone at each slot.
+        if let Err(e) = self.pause_agent_jobs(&mut db, agent) {
+            log(format!("couldn't pause the jobs of agent {agent}: {e}"));
+        }
         Ok(())
     }
 
@@ -1222,6 +1287,15 @@ impl Service {
             }
             drop(terminal);
             self.publish_global(&mut db, ServerMsg::ProjectRemoved { project });
+            // Its channels are gone, and so are the jobs in them.
+            for thread in &threads {
+                if let Err(e) = self.delete_thread_job(&mut db, thread.id) {
+                    log(format!(
+                        "couldn't delete the job of thread {}: {e}",
+                        thread.id
+                    ));
+                }
+            }
             let mut dirs: Vec<PathBuf> = crate::folders::project_checkouts(&stored)
                 .into_iter()
                 .map(|(dir, _)| dir)
@@ -1359,7 +1433,7 @@ impl Service {
                 thread,
                 run: run.id,
                 status: run.status.clone(),
-                details: run,
+                details: Box::new(run),
             });
         }
         // Each approval comes just before the first message about it, as
@@ -1407,6 +1481,19 @@ impl Service {
         let runs = with_asked_runs(db.store.recent_runs(since)?, &approvals, |r| {
             db.store.run(r)
         })?;
+        let jobs = db.store.jobs()?;
+        let mut job_runs = Vec::new();
+        let mut job_notes = Vec::new();
+        for job in &jobs {
+            let runs = db.store.job_runs(job.id, crew_proto::SNAPSHOT_JOB_RUNS)?;
+            let ids: HashSet<RunId> = runs.iter().map(|r| r.id).collect();
+            if !ids.is_empty() {
+                job_notes.extend(db.store.messages(job.thread)?.into_iter().filter(|m| {
+                    m.author == Author::System && m.run.is_some_and(|r| ids.contains(&r))
+                }));
+            }
+            job_runs.extend(runs);
+        }
         let msg = ServerMsg::Snapshot {
             projects,
             channels,
@@ -1417,6 +1504,11 @@ impl Service {
             terminal_sessions: self.terminal().sessions(),
             limits: db.store.limits()?,
             titles: db.store.title_settings()?,
+            jobs,
+            job_history: Box::new(crew_proto::JobHistory {
+                job_runs,
+                job_notes,
+            }),
         };
         Ok((msg, db.serial))
     }
@@ -1432,18 +1524,7 @@ impl Service {
         skill: Option<SkillRef>,
         model_override: Option<String>,
     ) -> Result<MessageId, String> {
-        let model_override = model_override
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
-        // The override goes to the CLI as an argument: refuse anything
-        // that could pass for a flag or break the value.
-        if let Some(m) = &model_override
-            && (m.starts_with('-')
-                || m.chars().any(|c| c.is_whitespace() || c.is_control())
-                || m.chars().count() > 128)
-        {
-            return Err("That model name isn't valid. Pick one from the list.".into());
-        }
+        let model_override = tidy_model_override(model_override)?;
         let (id, title_run) = {
             let mut state = self.state();
             let mut db = self.db();
@@ -2249,8 +2330,15 @@ impl Service {
         // Resume the agent's latest run here that really started a session
         // with the CLI it uses now. A run that failed before its CLI came up
         // has nothing to resume, and one CLI can't resume another's session.
+        // A job's run always starts a session of its own.
+        let job_run = db.store.run(job.run)?.job.is_some();
+        let earlier = if job_run {
+            Vec::new()
+        } else {
+            db.store.runs(filter)?
+        };
         let mut previous = None;
-        for run in db.store.runs(filter)?.into_iter().rev() {
+        for run in earlier.into_iter().rev() {
             if run.agent != job.agent || run.session_id.is_empty() || run.runtime != spec.runtime {
                 continue;
             }
@@ -2267,6 +2355,7 @@ impl Service {
         // The prompt for a new session: the chat so far, then the prompt.
         let fresh = match &pending {
             Some(p) => p.fresh.clone(),
+            None if job_run => job.prompt.clone(),
             // A handoff: the whole thread so far, then the brief.
             None => with_context(&db.store.messages(job.thread)?, &agents, &job.prompt),
         };
@@ -2307,6 +2396,7 @@ impl Service {
             crew_mcp_bin: bin.clone(),
             run: job.run,
             crew_home: home.clone(),
+            report: job_run,
         });
         let context = CrewContext {
             in_place,
@@ -2560,9 +2650,15 @@ impl Service {
         };
         db.store.set_run_status(run, status.clone())?;
         if !body.is_empty() {
-            self.add_message(&mut db, thread, author, &body, Some(run))?;
+            let id = db.store.add_message(thread, author, &body, Some(run))?;
+            // Quiet before anyone hears of it, so it never notifies.
+            if crate::jobs::quiet_reply(&db, run, &status) {
+                db.store.set_message_quiet(id)?;
+            }
+            self.publish_message(&mut db, thread, id)?;
         }
         self.publish_status(&mut db, thread, run, status);
+        self.job_run_ended(&mut db, run);
         if done && !state.shutting_down {
             self.reply_handoffs(&mut state, &mut db, run, agent, &reply, &handed)?;
         }
@@ -2611,7 +2707,7 @@ impl Service {
                 thread,
                 run,
                 status,
-                details,
+                details: Box::new(details),
             },
         );
     }
@@ -2644,7 +2740,7 @@ impl Service {
         self.publish_message(db, thread, id)
     }
 
-    fn publish_message(
+    pub(crate) fn publish_message(
         &self,
         db: &mut Db,
         thread: ThreadId,
@@ -2810,6 +2906,23 @@ fn with_asked_runs(
     Ok(runs)
 }
 
+/// A model override with blanks trimmed, none for an empty one. It goes
+/// to the CLI as an argument: anything that could pass for a flag or break
+/// the value is refused.
+pub(crate) fn tidy_model_override(model: Option<String>) -> Result<Option<String>, String> {
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    if let Some(m) = &model
+        && (m.starts_with('-')
+            || m.chars().any(|c| c.is_whitespace() || c.is_control())
+            || m.chars().count() > 128)
+    {
+        return Err("That model name isn't valid. Pick one from the list.".into());
+    }
+    Ok(model)
+}
+
 /// Now, in Unix ms.
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -2838,6 +2951,10 @@ mod tests {
             skill: None,
             model_override: None,
             message: None,
+            job: None,
+            found: None,
+            summary: None,
+            missed: 0,
         }
     }
 

@@ -41,6 +41,11 @@ actions!(
         /// Ask for a folder to add as a project. No shortcut; the palette
         /// runs it.
         AddProject,
+        /// Show the scheduled jobs. No shortcut; the palette and the
+        /// sidebar open it.
+        ShowScheduled,
+        /// Start a new scheduled job. No shortcut; the palette runs it.
+        NewScheduledJob,
     ]
 );
 

@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveTime;
 use crew_core::agent::{AgentSpec, PermissionMode, Runtime};
 use crew_core::event::{Event, RunStatus};
 use crew_core::ids::ProjectId;
 use crew_core::policy::HandoffPolicy;
 use crew_core::project_kind::{ProjectKind, WorkMode};
+use crew_core::schedule::Repeat;
 use crew_core::store::{
-    ApprovalKind, ApprovalStatus, Author, Limits, RepoWorktree, RunFilter, Store, StoreError,
-    ThreadWorktree, TitleMode, TitleModel, TitleSettings, TitleSource,
+    ApprovalKind, ApprovalStatus, Author, JobPatch, Limits, Missed, NewJob, OnAsk, RepoWorktree,
+    RunFilter, Store, StoreError, Tell, ThreadWorktree, TitleMode, TitleModel, TitleSettings,
+    TitleSource,
 };
 
 fn spec(name: &str) -> AgentSpec {
@@ -418,7 +421,7 @@ fn migrates_v1_db_to_latest_keeping_rows() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -795,7 +798,7 @@ fn migrates_v2_db_to_v3_keeping_agents() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let broken: Vec<String> = migrated
         .prepare("PRAGMA foreign_key_check")
         .unwrap()
@@ -849,7 +852,7 @@ fn migrates_v3_db_to_v4_runs_were_claude_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
     let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
@@ -882,7 +885,7 @@ fn migrates_v4_db_to_v5_with_runs_by_session() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     assert!(index_names(&migrated).contains(&"runs_by_session".to_string()));
     // Session lookups use it.
     let mut stmt = migrated
@@ -955,7 +958,7 @@ fn migrates_v5_db_to_v6_dropping_the_old_run_limit() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -994,7 +997,7 @@ fn migrates_v6_db_to_v7_keeping_data_and_adding_settings() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1225,7 +1228,7 @@ fn migrates_v7_db_to_v8_keeping_threads_and_channels() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1375,7 +1378,7 @@ fn migrates_v8_db_to_v9_keeping_runs() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1643,7 +1646,7 @@ fn migrates_v9_db_to_v10_as_a_repo_with_its_own_copies() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1718,7 +1721,7 @@ fn migrates_v10_db_to_v11_with_no_pins() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1777,7 +1780,7 @@ fn migrates_v11_db_to_v12_with_runs_of_no_skill() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1831,7 +1834,7 @@ fn migrates_v12_db_to_v13_with_runs_asked_by_no_message() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1897,7 +1900,7 @@ fn migrates_v13_db_to_v14_with_titles_from_the_first_line() {
     let version: i64 = migrated
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let fresh_path = dir.path().join("fresh.db");
     drop(Store::open(&fresh_path).unwrap());
@@ -1982,4 +1985,340 @@ fn title_settings_default_to_generated_on_haiku_and_round_trip() {
     assert_eq!(store.title_settings().unwrap(), set);
     store.set_setting("title_model", "bogus").unwrap();
     assert_eq!(store.title_settings().unwrap().model, TitleModel::Haiku);
+}
+
+const SCHEMA_V14: &str = include_str!("../src/store/schema_v14.sql");
+
+fn daily() -> Repeat {
+    Repeat::Daily {
+        at: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+    }
+}
+
+fn new_job(
+    agent: crew_core::ids::AgentId,
+    channel: crew_core::ids::ChannelId,
+    name: &str,
+) -> NewJob {
+    NewJob {
+        name: name.into(),
+        body: "Check the build.".into(),
+        skill: None,
+        model_override: None,
+        agent,
+        channel,
+        repeat: daily(),
+        tell: Tell::Changes,
+        on_ask: OnAsk::Wait,
+        missed: Missed::OnceOnWake,
+        enabled: true,
+    }
+}
+
+fn job_setup() -> (Store, crew_core::ids::AgentId, crew_core::ids::ChannelId) {
+    let store = Store::open_in_memory().unwrap();
+    let p = store
+        .create_project("demo", Path::new("/work/demo"), "main")
+        .unwrap();
+    let c = store.create_channel(p, "general").unwrap();
+    let a = store.create_agent(&spec("Ada")).unwrap();
+    (store, a, c)
+}
+
+#[test]
+fn a_job_creates_its_thread_and_first_message() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly check")).unwrap();
+    let job = store.job(id).unwrap();
+    assert_eq!(job.name, "Nightly check");
+    assert_eq!(job.body, "Check the build.");
+    assert_eq!(job.agent, a);
+    assert_eq!(job.channel, c);
+    assert_eq!(job.repeat, daily());
+    assert!(job.enabled);
+    assert_eq!(job.next_due, None);
+    assert_eq!(job.skipped, 0);
+    assert_eq!(job.paused_reason, None);
+    let thread = store.thread(job.thread).unwrap();
+    assert_eq!(thread.title, "Nightly check");
+    assert_eq!(thread.channel, c);
+    let messages = store.messages(job.thread).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].author, Author::You);
+    assert_eq!(messages[0].body, "Check the build.");
+    assert!(messages[0].job_message);
+    assert!(!messages[0].quiet);
+    assert_eq!(
+        store.job_for_thread(job.thread).unwrap().map(|j| j.id),
+        Some(id)
+    );
+    assert_eq!(store.jobs_for_agent(a).unwrap().len(), 1);
+    assert_eq!(store.jobs().unwrap(), vec![job.clone()]);
+
+    store.set_job_next_due(id, Some(1234)).unwrap();
+    store.set_job_skipped(id, 3).unwrap();
+    store.set_job_paused(id, Some("Ada was deleted")).unwrap();
+    let job = store.job(id).unwrap();
+    assert_eq!(job.next_due, Some(1234));
+    assert_eq!(job.skipped, 3);
+    assert_eq!(job.paused_reason.as_deref(), Some("Ada was deleted"));
+    store.set_job_enabled(id, false).unwrap();
+    assert!(!store.job(id).unwrap().enabled);
+    store.set_job_enabled(id, true).unwrap();
+    assert!(store.job(id).unwrap().enabled);
+    assert!(matches!(
+        store.set_job_enabled(crew_core::ids::JobId::new(), true),
+        Err(StoreError::NotFound("job"))
+    ));
+    store.set_job_paused(id, None).unwrap();
+    assert_eq!(store.job(id).unwrap().paused_reason, None);
+
+    store
+        .update_job(
+            id,
+            &JobPatch {
+                name: Some("Morning check".into()),
+                body: Some("Check the deploy.".into()),
+                skill: Some(Some("tdd".into())),
+                model_override: Some(Some("claude-opus".into())),
+                repeat: Some(Repeat::Daily {
+                    at: NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
+                }),
+                tell: Some(Tell::EveryRun),
+                on_ask: Some(OnAsk::Deny),
+                missed: Some(Missed::Skip),
+                ..JobPatch::default()
+            },
+        )
+        .unwrap();
+    let job = store.job(id).unwrap();
+    assert_eq!(job.name, "Morning check");
+    assert_eq!(job.body, "Check the deploy.");
+    assert_eq!(job.skill.as_deref(), Some("tdd"));
+    assert_eq!(job.model_override.as_deref(), Some("claude-opus"));
+    assert_eq!(job.tell, Tell::EveryRun);
+    assert_eq!(job.on_ask, OnAsk::Deny);
+    assert_eq!(job.missed, Missed::Skip);
+    assert_eq!(job.agent, a);
+    store
+        .update_job(
+            id,
+            &JobPatch {
+                skill: Some(None),
+                ..JobPatch::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(store.job(id).unwrap().skill, None);
+    assert_eq!(store.job(id).unwrap().name, "Morning check");
+
+    let edit = store
+        .add_job_message(job.thread, "Check the deploy.")
+        .unwrap();
+    assert!(
+        store
+            .messages(job.thread)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == edit && m.job_message)
+    );
+    assert!(matches!(
+        store.job(crew_core::ids::JobId::new()),
+        Err(StoreError::NotFound("job"))
+    ));
+}
+
+#[test]
+fn job_runs_and_reports_round_trip() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    let job = store.job(id).unwrap();
+    let first = store.create_job_run(job.thread, a, id, 2).unwrap();
+    let second = store.create_job_run(job.thread, a, id, 0).unwrap();
+    let plain = store.create_run(job.thread, a).unwrap();
+    let stored = store.run(first).unwrap();
+    assert_eq!(stored.job, Some(id));
+    assert_eq!(stored.missed, 2);
+    assert_eq!(stored.found, None);
+    assert_eq!(stored.summary, None);
+    assert_eq!(store.run(plain).unwrap().job, None);
+
+    store
+        .set_run_report(first, true, Some("Two tests fail."))
+        .unwrap();
+    store.set_run_report(second, false, None).unwrap();
+    let first = store.run(first).unwrap();
+    assert_eq!(first.found, Some(true));
+    assert_eq!(first.summary.as_deref(), Some("Two tests fail."));
+    assert_eq!(store.run(second).unwrap().found, Some(false));
+
+    let runs = store.job_runs(id, 10).unwrap();
+    assert_eq!(
+        runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![second, first.id]
+    );
+    assert_eq!(store.job_runs(id, 1).unwrap().len(), 1);
+}
+
+#[test]
+fn quiet_messages_prune_after_cutoff_but_runs_stay() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    let thread = store.job(id).unwrap().thread;
+    let run = store.create_job_run(thread, a, id, 0).unwrap();
+    let quiet = store
+        .add_message(thread, Author::Agent(a), "All clear.", Some(run))
+        .unwrap();
+    let loud = store
+        .add_message(thread, Author::Agent(a), "Found a bug.", Some(run))
+        .unwrap();
+    store.set_message_quiet(quiet).unwrap();
+    assert!(
+        store
+            .messages(thread)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == quiet && m.quiet)
+    );
+
+    assert_eq!(store.delete_quiet_messages_before(0).unwrap(), 0);
+    assert_eq!(store.delete_quiet_messages_before(i64::MAX).unwrap(), 1);
+    let left: Vec<_> = store
+        .messages(thread)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(!left.contains(&quiet));
+    assert!(left.contains(&loud));
+    assert_eq!(store.job_runs(id, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn recent_found_returns_summary_or_reply_start() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    let thread = store.job(id).unwrap().thread;
+
+    let with_summary = store.create_job_run(thread, a, id, 0).unwrap();
+    store
+        .set_run_report(with_summary, true, Some("Short summary"))
+        .unwrap();
+
+    let long_reply = store.create_job_run(thread, a, id, 0).unwrap();
+    let long = "é".repeat(400);
+    store
+        .add_message(thread, Author::Agent(a), &long, Some(long_reply))
+        .unwrap();
+    store.set_run_report(long_reply, true, None).unwrap();
+
+    let nothing = store.create_job_run(thread, a, id, 0).unwrap();
+    store
+        .set_run_report(nothing, false, Some("ignored"))
+        .unwrap();
+
+    let found = store.recent_found(id, 5).unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].1, "é".repeat(300));
+    assert_eq!(found[1].1, "Short summary");
+    assert!(found[0].0 >= found[1].0);
+    assert_eq!(store.recent_found(id, 1).unwrap().len(), 1);
+}
+
+#[test]
+fn recent_found_counts_done_runs_of_an_every_run_job() {
+    let (store, a, c) = job_setup();
+    let mut every = new_job(a, c, "Every run");
+    every.tell = Tell::EveryRun;
+    let id = store.create_job(&every).unwrap();
+    let thread = store.job(id).unwrap().thread;
+
+    let done = store.create_job_run(thread, a, id, 0).unwrap();
+    store
+        .add_message(thread, Author::Agent(a), "All clear.", Some(done))
+        .unwrap();
+    store.set_run_status(done, RunStatus::Done).unwrap();
+    let failed = store.create_job_run(thread, a, id, 0).unwrap();
+    store.set_run_status(failed, RunStatus::Failed).unwrap();
+
+    let found = store.recent_found(id, 5).unwrap();
+    assert_eq!(
+        found.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        ["All clear."]
+    );
+
+    // A job that tells only of changes doesn't count a plain Done run.
+    let changes = store.create_job(&new_job(a, c, "Changes")).unwrap();
+    let thread = store.job(changes).unwrap().thread;
+    let run = store.create_job_run(thread, a, changes, 0).unwrap();
+    store.set_run_status(run, RunStatus::Done).unwrap();
+    assert!(store.recent_found(changes, 5).unwrap().is_empty());
+}
+
+#[test]
+fn turning_off_an_off_job_keeps_when_it_went_off() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    store.set_job_enabled(id, false).unwrap();
+    let first = store.job(id).unwrap().paused_at;
+    assert!(first.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.set_job_enabled(id, false).unwrap();
+    assert_eq!(store.job(id).unwrap().paused_at, first);
+    store.set_job_enabled(id, true).unwrap();
+    assert_eq!(store.job(id).unwrap().paused_at, None);
+}
+
+#[test]
+fn deleting_a_job_keeps_its_thread() {
+    let (store, a, c) = job_setup();
+    let id = store.create_job(&new_job(a, c, "Nightly")).unwrap();
+    let thread = store.job(id).unwrap().thread;
+    let run = store.create_job_run(thread, a, id, 0).unwrap();
+    store.delete_job(id).unwrap();
+    assert!(matches!(store.job(id), Err(StoreError::NotFound("job"))));
+    assert!(store.jobs().unwrap().is_empty());
+    assert_eq!(store.job_for_thread(thread).unwrap(), None);
+    assert_eq!(store.thread(thread).unwrap().title, "Nightly");
+    assert_eq!(store.messages(thread).unwrap().len(), 1);
+    assert_eq!(store.run(run).unwrap().job, None);
+}
+
+#[test]
+fn v14_database_migrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crew.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V14).unwrap();
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, main_branch, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000a1', 'demo', '/work/demo', 'main', 1);
+             INSERT INTO channels (id, project_id, name, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000b1', '00000000-0000-7000-8000-0000000000a1', 'general', 1);
+             INSERT INTO threads (id, channel_id, title, created_at)
+             VALUES ('00000000-0000-7000-8000-0000000000c1', '00000000-0000-7000-8000-0000000000b1', 'old', 1);
+             INSERT INTO messages (id, thread_id, author_kind, body, created_at, ord)
+             VALUES ('00000000-0000-7000-8000-0000000000d1', '00000000-0000-7000-8000-0000000000c1', 'you', 'hi', 1, 0);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let thread = store.open_threads(None).unwrap().remove(0);
+    let messages = store.messages(thread.id).unwrap();
+    assert!(!messages[0].quiet);
+    assert!(!messages[0].job_message);
+    assert!(store.jobs().unwrap().is_empty());
+    drop(store);
+    let migrated = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 15);
+    let fresh_path = dir.path().join("fresh.db");
+    drop(Store::open(&fresh_path).unwrap());
+    let fresh = rusqlite::Connection::open(&fresh_path).unwrap();
+    assert_eq!(index_names(&migrated), index_names(&fresh));
+    assert_eq!(table_shapes(&migrated), table_shapes(&fresh));
 }

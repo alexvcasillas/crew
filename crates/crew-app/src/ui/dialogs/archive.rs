@@ -14,6 +14,11 @@ pub fn archive_body(title: &str, channel: &str) -> String {
     format!("“{title}” moves to Archived in #{channel}. You can bring it back any time.")
 }
 
+/// Said when the thread is a scheduled job's.
+pub fn job_note(job: &str) -> String {
+    format!("Its scheduled job, {job}, will be deleted too.")
+}
+
 /// Said when the worktree has `files` uncommitted files.
 pub fn uncommitted_note(files: u32) -> String {
     let files = if files == 1 {
@@ -54,6 +59,7 @@ impl Workspace {
             Some(WorktreeState::Uncommitted { files }) if t.worktree.is_some() => Some(files),
             _ => None,
         };
+        let job = state.thread_job(thread).map(|j| job_note(&j.name));
         div()
             .flex()
             .flex_col()
@@ -64,22 +70,25 @@ impl Workspace {
                 Some(body.clone().into_any_element()),
                 format!("Archive this thread? {body}"),
             ))
-            .children(uncommitted.map(|files| {
-                let note = uncommitted_note(files);
-                div()
-                    .id("archive-note")
-                    .px(ui_px(12.))
-                    .py(scale::row(10.))
-                    .border_1()
-                    .border_color(color("border-100"))
-                    .rounded(ui_px(6.))
-                    .text_size(scale::text(12.))
-                    .line_height(scale::line(18.))
-                    .text_color(color("text-secondary"))
-                    .aria_label(note.clone())
-                    .child(note)
-                    .test_support()
-            }))
+            .children(job.map(|note| note_box("archive-job-note", note)))
+            .children(uncommitted.map(|files| note_box("archive-note", uncommitted_note(files))))
             .into_any_element()
     }
+}
+
+/// A note under the heading, in a hairline box.
+fn note_box(id: &'static str, note: String) -> impl IntoElement {
+    div()
+        .id(id)
+        .px(ui_px(12.))
+        .py(scale::row(10.))
+        .border_1()
+        .border_color(color("border-100"))
+        .rounded(ui_px(6.))
+        .text_size(scale::text(12.))
+        .line_height(scale::line(18.))
+        .text_color(color("text-secondary"))
+        .aria_label(note.clone())
+        .child(note)
+        .test_support()
 }

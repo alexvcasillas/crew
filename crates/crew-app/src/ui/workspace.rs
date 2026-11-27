@@ -30,8 +30,8 @@ use super::settings::projects::{PickFolder, native_file_picker, native_picker};
 use super::settings::{Page, SettingsView, editor_items};
 use super::terminal_view::TerminalView;
 use crate::app::{
-    AddProject, ApproveLatest, ArchiveThread, NewThread, OpenSettings, RenameThread, Search,
-    ShowRunning, ShowThreads, StopAll,
+    AddProject, ApproveLatest, ArchiveThread, NewScheduledJob, NewThread, OpenSettings,
+    RenameThread, Search, ShowRunning, ShowScheduled, ShowThreads, StopAll,
 };
 use crate::client::{self, ClientEvent, ClientHandle};
 use crate::connection::{ConnectionConfig, ConnectionState};
@@ -64,6 +64,8 @@ pub(super) struct Nav {
     pub(super) drafting: bool,
     /// When you last looked at each channel, in Unix ms.
     pub(super) viewed: HashMap<ChannelId, i64>,
+    /// When you last had each thread open, in Unix ms.
+    pub(super) thread_viewed: HashMap<ThreadId, i64>,
     pub(super) scroll: ScrollHandle,
     /// Messages in the open thread when last drawn, to scroll on new ones.
     seen_messages: usize,
@@ -123,6 +125,9 @@ pub struct Workspace {
     /// A settings field to jump to, with the name of its agent or project,
     /// once that is known (debug builds' startup hook).
     pub(super) setting_pending: Option<(String, Option<String>)>,
+    /// The job dialog to open, New or Edit for a job, once the state is
+    /// loaded and the job known (debug builds' startup hook).
+    job_form_pending: Option<Option<crew_core::ids::JobId>>,
     /// Redraws the open thread's timers once a second while a run works.
     ticker: Option<Task<()>>,
     /// Redraws the sidebar's terminal session times while a project's
@@ -171,6 +176,16 @@ pub struct Workspace {
     pub(super) diff_seq: u64,
     /// Running now, shown in place of the body.
     pub(super) running: Option<RunningView>,
+    /// Scheduled, shown in place of the body beside the sidebar.
+    pub(super) scheduled: Option<super::scheduled_view::ScheduledView>,
+    /// A job whose thread opens once it and its thread are known, after
+    /// a test run.
+    job_open_pending: Option<crew_core::ids::JobId>,
+    /// The run of the open job's thread shown in the inspector, in place
+    /// of the job panel.
+    pub(super) job_run_shown: Option<crew_core::ids::RunId>,
+    /// Folds of quiet job runs you opened, by their first reply.
+    pub(super) job_folds_open: HashSet<crew_core::ids::MessageId>,
     /// A Stop all request is waiting for its answer.
     pub(super) stopping_all: bool,
     /// The agent CLIs crewd found, as last asked.
@@ -287,6 +302,9 @@ impl Workspace {
         let bundled_crewd = std::env::current_exe()
             .ok()
             .and_then(|exe| crate::launchd::bundled_crewd(&exe));
+        if hooks.scheduled {
+            cx.defer_in(window, |this, window, cx| this.show_scheduled(window, cx));
+        }
         if bundled_crewd.is_some() {
             // Loads crewd's LaunchAgent, which starts it if needed.
             cx.defer_in(window, |this, window, cx| {
@@ -325,6 +343,7 @@ impl Workspace {
             terminal_pending: hooks.terminal,
             palette_pending: hooks.palette,
             setting_pending: hooks.setting,
+            job_form_pending: hooks.job_form,
             ticker: None,
             terminal_ticker: None,
             requests: HashMap::new(),
@@ -348,6 +367,10 @@ impl Workspace {
             repo_messages: HashMap::new(),
             diff_seq: 0,
             running,
+            scheduled: None,
+            job_open_pending: None,
+            job_folds_open: HashSet::new(),
+            job_run_shown: None,
             stopping_all: false,
             runtimes: Vec::new(),
             runtimes_task: None,
@@ -456,6 +479,19 @@ impl Workspace {
         self.terminal_ticker.is_some()
     }
 
+    /// Opens the job dialog, New or Edit for `job`, as soon as the state
+    /// is loaded and the job known, as the debug startup hook does.
+    #[cfg(test)]
+    pub(super) fn open_job_form_when_known(
+        &mut self,
+        job: Option<crew_core::ids::JobId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.job_form_pending = Some(job);
+        self.open_if_known(window, cx);
+    }
+
     /// Opens `thread` now if it is known, else as soon as it arrives, as
     /// the debug startup hook does.
     #[cfg(test)]
@@ -466,6 +502,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.open_pending = Some(thread);
+        self.open_if_known(window, cx);
+    }
+
+    /// Opens `job`'s thread once the job and its thread are known.
+    pub(super) fn open_job_thread_when_known(
+        &mut self,
+        job: crew_core::ids::JobId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.job_open_pending = Some(job);
         self.open_if_known(window, cx);
     }
 
@@ -483,6 +530,19 @@ impl Workspace {
             let session = session.clone();
             self.terminal_pending = None;
             self.open_terminal(session, window, cx);
+        }
+        if let Some(job) = self.job_form_pending
+            && self.snapshot_seen
+            && job.is_none_or(|job| self.state.job(job).is_some())
+        {
+            self.job_form_pending = None;
+            self.open_job_form(job, None, window, cx);
+        }
+        if let Some(job) = self.job_open_pending
+            && let Some(thread) = self.state.job(job).map(|j| j.thread)
+        {
+            self.job_open_pending = None;
+            self.open_pending = Some(thread);
         }
         if let Some(thread) = self.open_pending
             && self.state.thread(thread).is_some()
@@ -525,6 +585,17 @@ impl Workspace {
         })
     }
 
+    /// Takes in `events` as if the client had sent them, as tests do.
+    #[cfg(test)]
+    pub(super) fn take_in(
+        &mut self,
+        events: Vec<ClientEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply(events, window, cx);
+    }
+
     fn apply(&mut self, events: Vec<ClientEvent>, window: &mut Window, cx: &mut Context<Self>) {
         let mut connected = false;
         let mut snapshot = false;
@@ -533,9 +604,11 @@ impl Workspace {
         let mut removed = Vec::new();
         let mut touched = Vec::new();
         let mut stale = Vec::new();
+        let mut job_runs_ended = Vec::new();
         for event in events {
             if let ClientEvent::Msg(msg) = &event {
                 touched.extend(touched_thread(msg));
+                job_runs_ended.extend(self.job_runs_ending(msg));
             }
             if let ClientEvent::Msg(crew_proto::ServerMsg::ChannelOverviewStale { channel }) =
                 &event
@@ -589,6 +662,9 @@ impl Workspace {
         if run_ended || snapshot {
             self.refresh_usage(cx);
             self.refresh_history(cx);
+        }
+        for run in job_runs_ended {
+            self.notify_found_run(run, window, cx);
         }
         self.threads_touched(&touched, &stale, snapshot, cx);
         self.channel_touched(&touched, &stale, snapshot);
@@ -732,7 +808,13 @@ impl Workspace {
             .nav
             .thread
             .and_then(|t| super::folder::queue_hint(&self.state, t));
-        let hint = if live.is_empty() {
+        let job_thread = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread_job(t).is_some());
+        let hint = if live.is_empty() && job_thread {
+            Some(super::job_thread::JOB_HINT.to_string())
+        } else if live.is_empty() {
             self.last_agent().map(|name| reply_hint(&name))
         } else {
             queued.or_else(|| working_hint(&working))
@@ -814,6 +896,7 @@ impl Workspace {
             && !folder_ticks
             && !threads_ticks
             && !self.channel_ticks()
+            && !self.scheduled_ticks()
         {
             self.ticker = None;
         } else if self.ticker.is_none() {
@@ -866,6 +949,7 @@ impl Workspace {
         self.stash_draft(cx);
         self.close_thread(cx);
         self.page = None;
+        self.scheduled = None;
         self.nav.drafting = false;
         self.look_at(Some(channel));
         if self.recents.visited_channel(channel) {
@@ -891,6 +975,10 @@ impl Workspace {
     ) {
         self.stash_draft(cx);
         self.page = None;
+        self.scheduled = None;
+        self.nav
+            .thread_viewed
+            .insert(thread, super::common::now_ms());
         if self.nav.thread != Some(thread) {
             self.close_thread(cx);
             self.watch_thread(thread);
@@ -935,13 +1023,14 @@ impl Workspace {
         }
     }
 
-    /// Closes settings, Running now and the review, which show in place
-    /// of the body.
+    /// Closes settings, Running now, Scheduled and the review, which show
+    /// in place of the body.
     pub(super) fn leave_pages(&mut self, cx: &mut Context<Self>) {
         self.flush_agent_save(cx);
         self.flush_project_save(cx);
         self.settings = None;
         self.running = None;
+        self.scheduled = None;
         self.drop_review(cx);
         cx.notify();
     }
@@ -1127,6 +1216,7 @@ impl Workspace {
         self.stash_draft(cx);
         self.close_thread(cx);
         self.page = None;
+        self.scheduled = None;
         self.nav.drafting = false;
         self.look_at(None);
         self.sync(cx);
@@ -1136,8 +1226,10 @@ impl Workspace {
         self.close_terminal();
         self.drop_review(cx);
         if let Some(open) = self.nav.thread.take() {
+            self.nav.thread_viewed.insert(open, super::common::now_ms());
             self.unwatch_thread(open);
             self.inspector.reset();
+            self.job_run_shown = None;
             self.editing = None;
         }
     }
@@ -1468,14 +1560,16 @@ struct StartupHooks {
     open_thread: Option<ThreadId>,
     review: Option<ThreadId>,
     running: bool,
+    scheduled: bool,
     settings: Option<Page>,
     terminal: Option<String>,
     palette: Option<String>,
     setting: Option<(String, Option<String>)>,
+    job_form: Option<Option<crew_core::ids::JobId>>,
 }
 
 /// `CREW_APP_OPEN_THREAD` and
-/// `CREW_APP_SHOW=diff:<thread>|running|terminal:<session>|palette:<query>`,
+/// `CREW_APP_SHOW=diff:<thread>|running|scheduled|terminal:<session>|palette:<query>|job-form[:<job>]`,
 /// in debug builds only.
 fn dev_hooks() -> StartupHooks {
     #[cfg(debug_assertions)]
@@ -1485,10 +1579,12 @@ fn dev_hooks() -> StartupHooks {
             open_thread: hooks.open_thread,
             review: hooks.review,
             running: hooks.running,
+            scheduled: hooks.scheduled,
             settings: hooks.settings,
             terminal: hooks.terminal,
             palette: hooks.palette,
             setting: hooks.setting,
+            job_form: hooks.job_form,
         }
     }
     #[cfg(not(debug_assertions))]
@@ -1520,13 +1616,23 @@ fn working_hint(names: &[String]) -> Option<String> {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_width = window.viewport_size().width;
-        let wide = self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW);
+        let wide = self.wide();
         let lights = crate::app::traffic_lights();
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
             window.set_traffic_light_position(lights);
         }
-        self.inspector_shown = self.inspector_open.unwrap_or(wide);
+        // A job's panel shows whenever the window is wide; narrower, the
+        // header's toggle opens it.
+        let job_thread = self
+            .nav
+            .thread
+            .is_some_and(|t| self.state.thread_job(t).is_some());
+        self.inspector_shown = if job_thread {
+            wide || self.inspector_open == Some(true)
+        } else {
+            self.inspector_open.unwrap_or(wide)
+        };
         self.refresh_channel_rows(cx);
         self.refresh_sidebars(cx);
         let root = div().id("workspace");
@@ -1553,6 +1659,12 @@ impl Render for Workspace {
                 cx.listener(|this, _: &ShowThreads, window, cx| this.show_threads(window, cx)),
             )
             .on_action(
+                cx.listener(|this, _: &ShowScheduled, window, cx| this.show_scheduled(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewScheduledJob, window, cx| {
+                this.open_job_form(None, None, window, cx)
+            }))
+            .on_action(
                 cx.listener(|this, _: &AddProject, window, cx| this.open_add_project(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Search, window, cx| this.open_palette(window, cx)))
@@ -1575,6 +1687,8 @@ impl Render for Workspace {
                 self.render_running(cx)
             } else if self.review.is_some() {
                 self.render_review(cx)
+            } else if self.scheduled.is_some() {
+                self.render_scheduled(cx)
             } else if self.first_launch.is_some() && self.inspector_connected() {
                 self.render_first_launch(cx)
             } else {
@@ -1603,13 +1717,23 @@ impl Workspace {
             .children(
                 self.inspector_thread()
                     .filter(|_| self.inspector_shown)
-                    .map(|t| self.render_inspector(t, cx)),
+                    .map(|t| match self.state.thread_job(t).map(|j| j.id) {
+                        Some(job) if self.job_run_shown.is_none() => {
+                            self.render_job_panel(job, cx).into_any_element()
+                        }
+                        _ => self.render_inspector(t, cx).into_any_element(),
+                    }),
             )
             .into_any_element()
     }
 }
 
 impl Workspace {
+    /// Whether the window is wide enough for the inspector by default.
+    pub(super) fn wide(&self) -> bool {
+        self.window_width >= scale::chrome(INSPECTOR_MIN_WINDOW)
+    }
+
     /// Shows the inspector if it is hidden, or hides it.
     pub(super) fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_open = Some(!self.inspector_shown);
@@ -1624,10 +1748,13 @@ impl Workspace {
         )
     }
 
-    /// Leaves settings and Running now for the threads.
+    /// Leaves settings, Running now and Scheduled for the threads.
     fn show_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_settings(window, cx);
         self.close_running(window, cx);
+        if self.scheduled.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// The thread the inspector shows: the open one, while connected.

@@ -363,7 +363,7 @@ async fn until_run(c: &mut Client, thread: ThreadId, want: RunStatus) -> StoredR
         })
         .await;
     match seen.last() {
-        Some(ServerMsg::RunStatus { details, .. }) => details.clone(),
+        Some(ServerMsg::RunStatus { details, .. }) => (**details).clone(),
         _ => unreachable!(),
     }
 }

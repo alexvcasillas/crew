@@ -496,6 +496,72 @@ async fn tools_flag_limits_the_tools() {
     assert_eq!(reply["error"]["code"], -32602);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn report_is_served_only_when_named() {
+    let (_tmp, home) = home();
+    let mut mcp = Mcp::start_with(&home, &["--tools", "handoff,report"]);
+    let reply = mcp.request(1, "tools/list", json!({})).await;
+    let tools = reply["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["handoff", "report"]);
+    let report = tools.iter().find(|t| t["name"] == "report").unwrap();
+    assert_eq!(
+        report["description"],
+        "Tell Crew whether this run found something worth telling the user about. Call it once, at the end."
+    );
+    assert_eq!(report["inputSchema"]["required"], json!(["found"]));
+    let props = &report["inputSchema"]["properties"];
+    assert_eq!(props["found"]["type"], "boolean");
+    assert_eq!(props["summary"]["type"], "string");
+
+    // Without --tools, a run gets handoff and approve only.
+    let mut plain = Mcp::start(&home);
+    let reply = plain
+        .request(
+            2,
+            "tools/call",
+            json!({"name": "report", "arguments": {"found": true}}),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], -32602);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_forwards_to_crewd() {
+    let (_tmp, home) = home();
+    let mut seen = fake_crewd(&home, Duration::ZERO, answer(|_| Ok(Value::Null)));
+    let mut mcp = Mcp::start_with(&home, &["--tools", "handoff,report"]);
+    let (text, is_error) = mcp
+        .call(
+            1,
+            "report",
+            json!({"found": true, "summary": "Two new issues"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        seen.recv().await.unwrap(),
+        Request::Report {
+            run: mcp.run,
+            found: true,
+            summary: Some("Two new issues".into()),
+        }
+    );
+    let (_, is_error) = mcp.call(2, "report", json!({"found": false})).await;
+    assert!(!is_error);
+    assert_eq!(
+        seen.recv().await.unwrap(),
+        Request::Report {
+            run: mcp.run,
+            found: false,
+            summary: None,
+        }
+    );
+    let (text, is_error) = mcp.call(3, "report", json!({"summary": "x"})).await;
+    assert!(is_error);
+    assert_eq!(text, "report needs found, true or false.");
+}
+
 #[test]
 fn unknown_tools_are_refused() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_crew-mcp"))

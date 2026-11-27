@@ -340,6 +340,21 @@ pub fn switch(on: bool) -> Div {
         })))
 }
 
+/// The clock a scheduled job's thread shows wherever threads are
+/// listed, 12 px, queryable as `id`.
+pub fn job_clock(id: String) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .flex_none()
+        .child(
+            Icon::default()
+                .data(super::scheduled_view::CLOCK_SVG)
+                .size(ui_px(12.))
+                .text_color(color("text-tertiary")),
+        )
+        .test_support()
+}
+
 /// A small round dot in the colour token `token`.
 pub fn dot(token: &str) -> Div {
     div()

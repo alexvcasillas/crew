@@ -1,8 +1,9 @@
 //! `crew-mcp`: the MCP server crewd passes to each agent run.
 //!
 //! Speaks newline-delimited JSON-RPC on stdio and serves two tools,
-//! `handoff` and `approve`, or those named with `--tools`. Each call opens
-//! its own connection to crewd.
+//! `handoff` and `approve`, or those named with `--tools`. A job run is
+//! also given `report` that way. Each call opens its own connection to
+//! crewd.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -30,6 +31,8 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 const UNREACHABLE: &str = "Crew isn't reachable right now.";
 /// Tools of this server, which `approve` lets through without asking.
 const OWN_TOOLS: &str = "mcp__crew_run__";
+/// The tools served when `--tools` names none.
+const DEFAULT_TOOLS: [&str; 2] = ["handoff", "approve"];
 
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
@@ -41,8 +44,9 @@ struct Args {
     /// The run this server belongs to.
     #[arg(long)]
     run: Uuid,
-    /// Serve only these tools, comma separated. All of them by default.
-    #[arg(long, value_delimiter = ',', value_parser = ["handoff", "approve"])]
+    /// Serve only these tools, comma separated. `handoff` and `approve`
+    /// by default.
+    #[arg(long, value_delimiter = ',', value_parser = ["handoff", "approve", "report"])]
     tools: Vec<String>,
 }
 
@@ -50,13 +54,17 @@ struct Args {
 struct Ctx {
     home: PathBuf,
     run: RunId,
-    /// The tools served. Empty means all.
+    /// The tools served. Empty means [`DEFAULT_TOOLS`].
     tools: Vec<String>,
 }
 
 impl Ctx {
     fn serves(&self, tool: &str) -> bool {
-        self.tools.is_empty() || self.tools.iter().any(|t| t == tool)
+        if self.tools.is_empty() {
+            DEFAULT_TOOLS.contains(&tool)
+        } else {
+            self.tools.iter().any(|t| t == tool)
+        }
     }
 }
 
@@ -241,6 +249,18 @@ fn tools(ctx: &Ctx) -> Value {
                 "required": ["tool_name", "input"],
             },
         },
+        {
+            "name": "report",
+            "description": "Tell Crew whether this run found something worth telling the user about. Call it once, at the end.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "found": {"type": "boolean", "description": "Whether there is something new to tell the user."},
+                    "summary": {"type": "string", "description": "What was found, in one line."},
+                },
+                "required": ["found"],
+            },
+        },
     ]);
     let served = all
         .as_array()
@@ -269,6 +289,20 @@ async fn call_tool(ctx: &Ctx, id: Value, params: &Value) -> Value {
             match ask(&ctx.home, req).await {
                 Ok(Value::String(s)) => text(id, &s, false),
                 Ok(other) => text(id, &other.to_string(), false),
+                Err(e) => text(id, &e, true),
+            }
+        }
+        Some("report") => {
+            let Some(found) = args.get("found").and_then(Value::as_bool) else {
+                return text(id, "report needs found, true or false.", true);
+            };
+            let req = Request::Report {
+                run: ctx.run,
+                found,
+                summary: str_arg("summary"),
+            };
+            match ask(&ctx.home, req).await {
+                Ok(_) => text(id, "Reported.", false),
                 Err(e) => text(id, &e, true),
             }
         }

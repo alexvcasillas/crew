@@ -44,7 +44,7 @@ type RunSelect = SelectState<Vec<SharedString>>;
 pub(super) struct Inspector {
     pub(super) tab: InspectorTab,
     /// The run you picked, if any. Otherwise the latest is shown.
-    picked: Option<RunId>,
+    pub(super) picked: Option<RunId>,
     pub(super) list: ListState,
     /// The shown run's activity.
     pub(super) rows: Vec<ActivityRow>,
@@ -507,6 +507,10 @@ impl Workspace {
             .h_full()
             .border_l_1()
             .border_color(color("border-100"))
+            .when(
+                self.job_run_shown.is_some() && self.state().thread_job(thread).is_some(),
+                |col| col.child(self.render_back_to_job(cx)),
+            )
             .child(self.render_inspector_header(thread, cx))
             .child(self.render_tabs(cx))
             .child(div().flex().flex_col().flex_1().min_h_0().child(body))

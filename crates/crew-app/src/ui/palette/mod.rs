@@ -457,6 +457,11 @@ impl Palette {
             Lead::Find => svg_icon(FIND_SVG, "text-secondary"),
             Lead::Check => icon(IconName::Check),
             Lead::Gear => svg_icon(GEAR_SVG, "text-tertiary"),
+            Lead::Clock => div()
+                .id(("palette-clock", pos))
+                .child(svg_icon(super::scheduled_view::CLOCK_SVG, "text-secondary"))
+                .test_support()
+                .into_any_element(),
             Lead::Command => div()
                 .text_size(scale::text(12.))
                 .text_color(color("text-secondary"))

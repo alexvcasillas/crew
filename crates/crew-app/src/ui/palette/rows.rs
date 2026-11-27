@@ -12,8 +12,8 @@ use crew_proto::{FileHit, SearchResults, ThreadState};
 use super::super::common::runtime_chip;
 use super::catalog::{CommandEntry, Item, Needs, Scope, SettingEntry, settings_entries};
 use crate::app::{
-    AddProject, ApproveLatest, NewThread, OpenSettings, ResetZoom, Search, ShowRunning, StopAll,
-    ZoomIn, ZoomOut,
+    AddProject, ApproveLatest, NewScheduledJob, NewThread, OpenSettings, ResetZoom, Search,
+    ShowRunning, ShowScheduled, StopAll, ZoomIn, ZoomOut,
 };
 use crate::model::{State, ThreadStatus};
 use crate::recents::Recents;
@@ -85,6 +85,8 @@ pub enum Lead {
     Check,
     /// A settings row's gear.
     Gear,
+    /// Scheduled's clock.
+    Clock,
     /// Any other command.
     Command,
     None,
@@ -423,7 +425,13 @@ fn thread_row_in(
     if !word.is_empty() {
         parts.push(word);
     }
-    Row::new(Target::Thread(thread), title, Lead::Dot(token)).sub(parts.join(" · "))
+    // A job's thread leads with the clock.
+    let lead = if state.thread_job(thread).is_some() {
+        Lead::Clock
+    } else {
+        Lead::Dot(token)
+    };
+    Row::new(Target::Thread(thread), title, lead).sub(parts.join(" · "))
 }
 
 /// "# name" + "{project} · {n} active".
@@ -581,16 +589,22 @@ fn local_commands(i: &Inputs, query: &str) -> Vec<Row> {
             Needs::ActiveRun => live,
         })
         .filter_map(|(n, c)| {
+            let sub = if c.action.partial_eq(&ShowScheduled) {
+                format!("{} on", i.state.jobs_on())
+            } else {
+                c.sub.to_string()
+            };
             let on_label = rank(c.label, query).is_some();
-            if !on_label && rank(c.sub, query).is_none() {
+            if !on_label && rank(&sub, query).is_none() {
                 return None;
             }
-            let mut row = Row::new(Target::Command(n), c.label, command_lead(c)).sub(c.sub);
+            let mut row = Row::new(Target::Command(n), c.label, command_lead(c));
             if on_label {
                 row.highlight = match_range(c.label, query);
             } else {
-                row.sub_highlight = match_range(c.sub, query);
+                row.sub_highlight = match_range(&sub, query);
             }
+            row.sub = sub;
             row.keys = c.keys.clone();
             Some(row)
         })
@@ -605,8 +619,10 @@ fn command_lead(c: &CommandEntry) -> Lead {
         Lead::ZoomOut
     } else if is(&ResetZoom) || is(&Search) {
         Lead::Find
-    } else if is(&NewThread) {
+    } else if is(&NewThread) || is(&NewScheduledJob) {
         Lead::Plus
+    } else if is(&ShowScheduled) {
+        Lead::Clock
     } else if is(&ShowRunning) {
         Lead::Pulse
     } else if is(&StopAll) {

@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crew_core::agent::PermissionMode;
 use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus, ToolKind};
-use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, JobId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 use crew_core::store::{
-    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredMessage,
-    StoredProject, StoredRun, StoredThread, TitleSettings, TitleSource,
+    ApprovalStatus, Author, Limits, StoredAgent, StoredApproval, StoredChannel, StoredJob,
+    StoredMessage, StoredProject, StoredRun, StoredThread, TitleSettings, TitleSource,
 };
 use crew_proto::{ServerMsg, TerminalSession};
 
@@ -190,6 +190,8 @@ pub struct State {
     sent_thread_handoffs: HashMap<ThreadId, Handoff>,
     /// Claude Code sessions run in a terminal, by id.
     terminal: HashMap<String, TerminalSession>,
+    /// Scheduled jobs.
+    jobs: HashMap<JobId, StoredJob>,
     /// One log per watched terminal session.
     terminal_logs: HashMap<String, TerminalLog>,
     /// crewd's global limits, as last reported.
@@ -242,8 +244,23 @@ impl State {
                 terminal_sessions,
                 limits,
                 titles,
+                jobs,
+                job_history,
             } => {
+                self.jobs = jobs.into_iter().map(|j| (j.id, j)).collect();
                 self.reset_from_snapshot(projects, channels, threads, agents, runs, approvals);
+                // Jobs' older runs and crewd's notes about them, for the
+                // Scheduled page; what the snapshot already has wins.
+                let crew_proto::JobHistory {
+                    job_runs,
+                    job_notes,
+                } = *job_history;
+                for run in job_runs {
+                    self.runs.entry(run.id).or_insert(run);
+                }
+                for note in job_notes {
+                    self.add_message(note.thread, note);
+                }
                 self.limits_changed(limits);
                 self.titles_changed(titles);
                 self.terminal = terminal_sessions
@@ -254,6 +271,12 @@ impl State {
                 for log in self.terminal_logs.values_mut() {
                     log.clear();
                 }
+            }
+            ServerMsg::JobChanged { job } => {
+                self.jobs.insert(job.id, *job);
+            }
+            ServerMsg::JobRemoved { job } => {
+                self.jobs.remove(&job);
             }
             ServerMsg::TerminalSessionChanged { session } => {
                 self.terminal.insert(session.id.clone(), session);
@@ -305,7 +328,7 @@ impl State {
             ServerMsg::AgentChanged { agent } => {
                 self.agents.insert(agent.id, agent);
             }
-            ServerMsg::RunStatus { details, .. } => self.run_changed(details),
+            ServerMsg::RunStatus { details, .. } => self.run_changed(*details),
             ServerMsg::Message { thread, message } => self.add_message(thread, message),
             ServerMsg::Approval { approval, .. } => self.add_approval(approval),
             ServerMsg::Event {
@@ -728,8 +751,78 @@ impl State {
             .iter()
             .filter(|t| self.threads.get(t).is_some_and(|t| t.archived_at.is_none()))
             .flat_map(|t| self.messages(*t))
-            .filter(|m| m.created_at > since && m.author != Author::You)
+            .filter(|m| m.created_at > since && m.author != Author::You && !m.quiet)
             .count()
+    }
+
+    /// Every scheduled job, oldest first.
+    pub fn jobs(&self) -> Vec<&StoredJob> {
+        sorted(self.jobs.values(), |j| (j.created_at, j.id.0))
+    }
+
+    pub fn job(&self, job: JobId) -> Option<&StoredJob> {
+        self.jobs.get(&job)
+    }
+
+    /// The job whose thread `thread` is, if it is one's.
+    pub fn thread_job(&self, thread: ThreadId) -> Option<&StoredJob> {
+        self.jobs.values().find(|j| j.thread == thread)
+    }
+
+    /// Jobs turned on.
+    pub fn jobs_on(&self) -> usize {
+        self.jobs.values().filter(|j| j.enabled).count()
+    }
+
+    /// The job's known runs, oldest first.
+    pub fn job_runs(&self, job: JobId) -> Vec<&StoredRun> {
+        sorted(self.runs.values().filter(|r| r.job == Some(job)), |r| {
+            (r.started_at, r.id.0)
+        })
+    }
+
+    /// Whether the job's latest run waits on you to answer an ask.
+    pub fn job_waiting(&self, job: JobId) -> bool {
+        let waiting = self.waiting_runs();
+        self.job_runs(job)
+            .last()
+            .is_some_and(|r| waiting.contains(&r.id))
+    }
+
+    /// Whether `run` of `job` found something: it said so, or its job
+    /// tells you after every run and it ended done.
+    pub fn job_run_found(job: &StoredJob, run: &StoredRun) -> bool {
+        run.found == Some(true)
+            || (job.tell == crew_core::store::Tell::EveryRun && run.status == RunStatus::Done)
+    }
+
+    /// When the job's latest run that found something ended, in Unix ms.
+    pub fn job_found_at(&self, job: JobId) -> Option<i64> {
+        let stored = self.jobs.get(&job)?;
+        self.job_runs(job)
+            .into_iter()
+            .rev()
+            .find(|r| Self::job_run_found(stored, r))
+            .map(|r| r.ended_at.unwrap_or(r.started_at))
+    }
+
+    /// The Scheduled row's counts: jobs that found something since
+    /// `seen` says you last looked at their thread, and jobs waiting on
+    /// you.
+    pub fn scheduled_counts(&self, seen: impl Fn(ThreadId) -> i64) -> (usize, usize) {
+        let mut found = 0;
+        let mut waiting = 0;
+        for job in self.jobs.values() {
+            if self.job_waiting(job.id) {
+                waiting += 1;
+            } else if self
+                .job_found_at(job.id)
+                .is_some_and(|at| at > seen(job.thread))
+            {
+                found += 1;
+            }
+        }
+        (found, waiting)
     }
 
     /// What counts as running everywhere: every working run, by start
@@ -1144,6 +1237,10 @@ mod tests {
             skill: None,
             model_override: None,
             message: None,
+            job: None,
+            found: None,
+            summary: None,
+            missed: 0,
         }
     }
 
@@ -1156,6 +1253,8 @@ mod tests {
             created_at,
             run: None,
             approval: None,
+            quiet: false,
+            job_message: false,
         }
     }
 
@@ -1189,7 +1288,7 @@ mod tests {
             thread: run.thread,
             run: run.id,
             status: run.status.clone(),
-            details: run.clone(),
+            details: Box::new(run.clone()),
         }
     }
 
@@ -1219,6 +1318,8 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         (state, p, c, t)
     }
@@ -1624,6 +1725,8 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         assert!(state.threads(c.id).is_empty());
         assert_eq!(state.threads(c2.id)[0].id, t2.id);
@@ -1947,6 +2050,8 @@ mod tests {
             terminal_sessions: vec![],
             limits: stored,
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(*state.limits(), stored);
 
@@ -1982,6 +2087,8 @@ mod tests {
             terminal_sessions: vec![],
             limits: other,
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(*state.limits(), other);
         // A failed request goes back to crewd's copy.
@@ -2067,6 +2174,8 @@ mod tests {
             ],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         state.apply(ServerMsg::TerminalSessionChanged {
             session: session(p.id, "busy", 20, true),
@@ -2160,6 +2269,8 @@ mod tests {
             terminal_sessions: vec![],
             limits: Default::default(),
             titles: Default::default(),
+            jobs: vec![],
+            job_history: Default::default(),
         });
         assert_eq!(terminal_texts(&state, "s1"), []);
         assert!(state.is_terminal_watched("s1"), "still watched");

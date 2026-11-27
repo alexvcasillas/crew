@@ -256,6 +256,8 @@ async fn subscribe_all_sees_status_across_threads_without_events() {
         terminal_sessions,
         limits: _,
         titles: _,
+        jobs: _,
+        job_history: _,
     } = c.recv().await
     else {
         panic!("expected a snapshot first");

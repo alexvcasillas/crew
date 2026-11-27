@@ -57,6 +57,8 @@ const UNFINISHED: &str = "Didn't finish.";
 /// The only crew-mcp tool a Codex agent gets. Codex asks through its own
 /// app-server, so it has no use for `approve`.
 const CODEX_CREW_TOOLS: &str = "handoff";
+/// What a Codex job run gets: `handoff`, and `report`.
+const CODEX_JOB_TOOLS: &str = "handoff,report";
 
 /// Puts a question to you as a Crew permission approval: the tool, its
 /// input and the Codex item it is about. The receiver gets the answer.
@@ -121,7 +123,12 @@ impl CodexInvocation {
                 String::from("--run"),
                 mcp.run.to_string(),
                 "--tools".into(),
-                CODEX_CREW_TOOLS.into(),
+                if mcp.report {
+                    CODEX_JOB_TOOLS
+                } else {
+                    CODEX_CREW_TOOLS
+                }
+                .into(),
             ];
             for setting in [
                 format!(
@@ -821,6 +828,7 @@ mod tests {
             crew_mcp_bin: "/work/bin/crew \"mcp\"".into(),
             run,
             crew_home: "/work/home".into(),
+            report: false,
         });
         assert_eq!(
             i.args(),
@@ -834,6 +842,21 @@ mod tests {
                 r#"mcp_servers.crew_run.env.CREW_HOME="/work/home""#.into(),
             ]
         );
+    }
+
+    #[test]
+    fn a_job_run_also_gets_report() {
+        let run = RunId::new();
+        let mut i = inv(PermissionMode::ReadOnly);
+        i.mcp = Some(McpWiring {
+            crew_mcp_bin: "/work/bin/crew-mcp".into(),
+            run,
+            crew_home: "/work/home".into(),
+            report: true,
+        });
+        let tools =
+            format!(r#"mcp_servers.crew_run.args=["--run","{run}","--tools","handoff,report"]"#);
+        assert!(i.args().contains(&tools), "{:?}", i.args());
     }
 
     #[test]

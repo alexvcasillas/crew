@@ -14,6 +14,9 @@ pub mod diff_view;
 mod first_launch;
 mod folder;
 mod inspector;
+mod job_panel;
+mod job_runs;
+mod job_thread;
 mod markdown_view;
 mod mention_menu;
 pub mod palette;
@@ -21,6 +24,7 @@ mod project_view;
 mod run_card;
 pub mod running_view;
 mod runs_with;
+mod scheduled_view;
 mod service_control;
 pub mod settings;
 pub(crate) mod sidebar;
@@ -55,6 +59,10 @@ mod folder_tests;
 #[cfg(test)]
 mod inspector_tests;
 #[cfg(test)]
+mod job_form_tests;
+#[cfg(test)]
+mod job_thread_tests;
+#[cfg(test)]
 mod motion_tests;
 #[cfg(test)]
 mod pages_tests;
@@ -64,6 +72,8 @@ mod palette_catalog_tests;
 mod palette_tests;
 #[cfg(test)]
 mod running_tests;
+#[cfg(test)]
+mod scheduled_tests;
 #[cfg(test)]
 mod settings_tests;
 #[cfg(test)]

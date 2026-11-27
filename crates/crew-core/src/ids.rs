@@ -52,6 +52,10 @@ id_type!(
     MessageId
 );
 id_type!(
+    /// Identifies a scheduled job.
+    JobId
+);
+id_type!(
     /// Identifies an agent run.
     RunId
 );

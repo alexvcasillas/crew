@@ -58,9 +58,34 @@ CREATE TABLE messages (
     created_at INTEGER NOT NULL,
     ord INTEGER NOT NULL,
     run_id TEXT REFERENCES runs(id),
-    approval_id TEXT REFERENCES approvals(id)
+    approval_id TEXT REFERENCES approvals(id),
+    quiet INTEGER NOT NULL DEFAULT 0,
+    job_message INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX messages_by_thread ON messages(thread_id, ord);
+
+CREATE TABLE jobs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    skill TEXT,
+    model_override TEXT,
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    channel_id TEXT NOT NULL REFERENCES channels(id),
+    thread_id TEXT NOT NULL REFERENCES threads(id),
+    repeat_json TEXT NOT NULL,
+    tell TEXT NOT NULL,
+    on_ask TEXT NOT NULL,
+    missed TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    paused_reason TEXT,
+    paused_at INTEGER,
+    next_due INTEGER,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX jobs_by_agent ON jobs(agent_id);
+CREATE INDEX jobs_by_thread ON jobs(thread_id);
 
 CREATE TABLE runs (
     id TEXT PRIMARY KEY,
@@ -76,7 +101,11 @@ CREATE TABLE runs (
     waiting_for TEXT REFERENCES runs(id),
     skill TEXT,
     model_override TEXT,
-    message_id TEXT
+    message_id TEXT,
+    job_id TEXT REFERENCES jobs(id),
+    found INTEGER,
+    summary TEXT,
+    missed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX runs_by_thread ON runs(thread_id);
 CREATE INDEX runs_by_status ON runs(status);
@@ -106,3 +135,4 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 CREATE INDEX runs_ended ON runs(ended_at);
+CREATE INDEX runs_by_job ON runs(job_id);

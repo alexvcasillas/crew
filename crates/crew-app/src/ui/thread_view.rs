@@ -19,6 +19,7 @@ use super::common::{
     runtime_chip, thread_title_text, with_font_probe,
 };
 use super::folder::{FolderMode, folder_mode, in_place_chip, mode_chip};
+use super::job_thread::{Quiet, found_reply, job_message_head, quiet_plan, tag, without_skill};
 use super::markdown_view::{DocKey, render_doc};
 use super::run_card::{decided_asks, summarize, summarize_asked};
 use super::thread_settings::policy_name;
@@ -57,7 +58,29 @@ impl Workspace {
         // Any other approval's card stands where it was asked; later notes
         // about it fold into the card's line.
         let mut carded: HashSet<ApprovalId> = HashSet::new();
-        for message in state.messages(thread) {
+        let messages = state.messages(thread);
+        let plan = quiet_plan(messages);
+        for (message, quiet) in messages.iter().zip(&plan) {
+            match quiet {
+                Quiet::Full => {}
+                Quiet::OneLiner => {
+                    items.push(self.render_quiet(message));
+                    continue;
+                }
+                Quiet::Fold(fold) => {
+                    items.push(self.render_fold(fold, cx));
+                    if self.job_folds_open.contains(&fold.first) {
+                        items.push(self.render_quiet(message));
+                    }
+                    continue;
+                }
+                Quiet::Folded(first) => {
+                    if self.job_folds_open.contains(first) {
+                        items.push(self.render_quiet(message));
+                    }
+                    continue;
+                }
+            }
             if let Some(approval) = message.approval.and_then(|a| state.approval(a)) {
                 // An answered permission ask tags its run's step instead,
                 // and an ask or stopped call no longer needed shows nowhere.
@@ -98,6 +121,11 @@ impl Workspace {
 
         let header_line = scale::line(20.);
         let label_drop = baseline_gap(cx, header_line);
+        let is_job = state.thread_job(thread).is_some();
+        let (job_tag, run_now) = state
+            .thread_job(thread)
+            .map(|job| self.render_job_header(job, cx))
+            .unzip();
         div()
             .id("thread-view")
             .size_full()
@@ -148,47 +176,40 @@ impl Workspace {
                                     ))
                                     .test_support(),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .pt(label_drop)
-                                    .text_size(scale::text(12.))
-                                    .line_height(header_line)
-                                    .text_color(color("text-tertiary"))
-                                    .child(format!("Thread in #{channel_name}")),
-                            ),
+                            .map(|row| match job_tag {
+                                // A job's thread: how it repeats, by the
+                                // title.
+                                Some(tag) => row.child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .h(header_line)
+                                        .child(tag),
+                                ),
+                                None => row.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .pt(label_drop)
+                                        .text_size(scale::text(12.))
+                                        .line_height(header_line)
+                                        .text_color(color("text-tertiary"))
+                                        .child(format!("Thread in #{channel_name}")),
+                                ),
+                            }),
                     )
-                    .children(self.render_mode_chip(thread))
-                    .child(self.render_participants(thread))
-                    .child({
-                        let (label, icon) = if self.inspector_shown {
-                            ("Hide activity", IconName::PanelRightClose)
+                    .when_some(run_now, |header, run_now| header.child(run_now))
+                    .map(|header| {
+                        if is_job {
+                            // The board is wide; narrower, the panel needs
+                            // the toggle.
+                            header.when(!self.wide(), |header| {
+                                header.child(self.render_activity_toggle(cx))
+                            })
                         } else {
-                            ("Show activity", IconName::PanelRightOpen)
-                        };
-                        Button::new("toggle-activity")
-                            .ghost()
-                            .small()
-                            .icon(icon)
-                            .tooltip(label)
-                            .accessibility_label(label)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
-                    })
-                    .child({
-                        let handoffs = format!(
-                            "Handoffs: {}",
-                            policy_name(policy.unwrap_or(HandoffPolicy::AskFirst))
-                        );
-                        div()
-                            .id("thread-handoffs")
-                            .min_w_0()
-                            .truncate()
-                            .text_size(scale::text(12.))
-                            .text_color(color("text-secondary"))
-                            .aria_label(handoffs.clone())
-                            .child(handoffs)
-                            .test_support()
+                            header.children(self.render_thread_controls(thread, policy, cx))
+                        }
                     }),
             )
             .child(
@@ -208,6 +229,52 @@ impl Workspace {
             .child(self.render_composer_area())
             .test_support()
             .into_any_element()
+    }
+
+    /// The header's right side in a thread that isn't a job's: its mode,
+    /// who is in it, the activity toggle and its handoffs.
+    fn render_thread_controls(
+        &self,
+        thread: ThreadId,
+        policy: Option<HandoffPolicy>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let handoffs = format!(
+            "Handoffs: {}",
+            policy_name(policy.unwrap_or(HandoffPolicy::AskFirst))
+        );
+        let mut controls: Vec<AnyElement> = self.render_mode_chip(thread).into_iter().collect();
+        controls.push(self.render_participants(thread).into_any_element());
+        controls.push(self.render_activity_toggle(cx).into_any_element());
+        controls.push(
+            div()
+                .id("thread-handoffs")
+                .min_w_0()
+                .truncate()
+                .text_size(scale::text(12.))
+                .text_color(color("text-secondary"))
+                .aria_label(handoffs.clone())
+                .child(handoffs)
+                .test_support()
+                .into_any_element(),
+        );
+        controls
+    }
+
+    /// Shows or hides the column beside the thread.
+    fn render_activity_toggle(&self, cx: &mut Context<Self>) -> Button {
+        let (label, icon) = if self.inspector_shown {
+            ("Hide activity", IconName::PanelRightClose)
+        } else {
+            ("Show activity", IconName::PanelRightOpen)
+        };
+        Button::new("toggle-activity")
+            .ghost()
+            .small()
+            .icon(icon)
+            .tooltip(label)
+            .accessibility_label(label)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
     }
 
     /// The main area while you write the first message of a new thread.
@@ -285,11 +352,31 @@ impl Workspace {
         } else {
             let (body, skill) = self.render_your_body(message, names);
             if let Some(skill) = skill {
-                label = format!("/{skill} {label}").trim_end().to_string();
+                label = format!("/{skill} {}", without_skill(&label, &skill))
+                    .trim_end()
+                    .to_string();
             }
             body
         };
-        message_row(id.to_string(), avatar, name, runtime, time, label, body)
+        // A job's setup and edits, and a job's run that found something,
+        // are tagged.
+        let key = id.to_string();
+        let tag = if let Some((text, head)) = job_message_head(state, message) {
+            if let Some(head) = head {
+                time = head;
+            }
+            Some(tag(format!("message-tag-{key}"), text.into(), false, None))
+        } else if found_reply(state, message) {
+            Some(tag(
+                format!("message-tag-{key}"),
+                "Found something".into(),
+                true,
+                None,
+            ))
+        } else {
+            None
+        };
+        message_row_tagged(key, avatar, name, runtime, tag, time, label, body)
             .test_support()
             .into_any_element()
     }
@@ -330,7 +417,11 @@ impl Workspace {
             .flex_col()
             // The skill runs inline before the text, so long lines wrap
             // under it.
-            .child(skill_body(&skill, &message.body, names))
+            .child(skill_body(
+                &skill,
+                without_skill(&message.body, &skill),
+                names,
+            ))
             .child(
                 div()
                     .id(format!("message-ran-{id}"))
@@ -520,6 +611,21 @@ pub(super) fn message_row(
     label: String,
     body: AnyElement,
 ) -> Stateful<Div> {
+    message_row_tagged(key, avatar, name, runtime, None, time, label, body)
+}
+
+/// A [`message_row`] with `tag` after the runtime chip.
+#[allow(clippy::too_many_arguments)]
+fn message_row_tagged(
+    key: String,
+    avatar: Div,
+    name: String,
+    runtime: Option<(Div, String)>,
+    tag: Option<Stateful<Div>>,
+    time: String,
+    label: String,
+    body: AnyElement,
+) -> Stateful<Div> {
     div()
         .id(format!("message-{key}"))
         .flex()
@@ -548,11 +654,15 @@ pub(super) fn message_row(
                                     .test_support(),
                             )
                         })
+                        .when_some(tag, |row, tag| row.child(tag.test_support()))
                         .child(
                             div()
+                                .id(format!("message-time-{key}"))
                                 .text_size(scale::text(12.))
                                 .text_color(color("text-tertiary"))
-                                .child(time),
+                                .aria_label(time.clone())
+                                .child(time)
+                                .test_support(),
                         ),
                 )
                 .child(

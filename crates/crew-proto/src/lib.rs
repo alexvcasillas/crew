@@ -7,15 +7,15 @@ use std::io;
 use crew_core::agent::{AgentSpec, Runtime};
 use crew_core::claude::transcript::TranscriptItem;
 use crew_core::event::{Event, RunStatus};
-use crew_core::ids::{AgentId, ApprovalId, ChannelId, ProjectId, RunId, ThreadId};
+use crew_core::ids::{AgentId, ApprovalId, ChannelId, JobId, ProjectId, RunId, ThreadId};
 use crew_core::policy::HandoffPolicy;
 pub use crew_core::project_kind::{ProjectKind, WorkMode};
+use crew_core::store::{
+    JobPatch, NewJob, StoredAgent, StoredApproval, StoredChannel, StoredJob, StoredMessage,
+    StoredProject, StoredRun, StoredThread,
+};
 pub use crew_core::store::{
     Limits, RuntimeUsage, TitleMode, TitleModel, TitleSettings, TitleSource,
-};
-use crew_core::store::{
-    StoredAgent, StoredApproval, StoredChannel, StoredMessage, StoredProject, StoredRun,
-    StoredThread,
 };
 pub use crew_core::worktree::{Diff, FileChange, RootInfo};
 use serde::de::DeserializeOwned;
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Version both sides must agree on in `Hello`.
-pub const PROTO_VERSION: u32 = 15;
+pub const PROTO_VERSION: u32 = 16;
 /// Largest frame body accepted, in bytes.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -229,6 +229,38 @@ pub enum Request {
         run: RunId,
         agent: String,
         brief: String,
+    },
+    /// Answered with the new job's `JobId`.
+    CreateJob {
+        job: NewJob,
+    },
+    UpdateJob {
+        job: JobId,
+        patch: JobPatch,
+    },
+    DeleteJob {
+        job: JobId,
+    },
+    SetJobEnabled {
+        job: JobId,
+        enabled: bool,
+    },
+    /// Starts a run of the job now, outside its schedule.
+    RunJobNow {
+        job: JobId,
+    },
+    /// Creates the job turned off and runs it once. Answered with its
+    /// `JobId`.
+    TestJob {
+        job: NewJob,
+    },
+    /// From crew-mcp: the job run `run` reports whether it found
+    /// something.
+    Report {
+        run: RunId,
+        found: bool,
+        #[serde(default)]
+        summary: Option<String>,
     },
     /// From crew-mcp: the agent of `run` wants to use `tool`. Answered with
     /// a [`PermissionAnswer`] once someone decides.
@@ -888,6 +920,20 @@ pub struct PermissionAnswer {
     pub message: Option<String>,
 }
 
+/// How many of each job's latest runs a snapshot carries.
+pub const SNAPSHOT_JOB_RUNS: u32 = 24;
+
+/// What a snapshot carries about jobs' past runs, which the last hour of
+/// runs would leave out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobHistory {
+    /// Each job's last [`SNAPSHOT_JOB_RUNS`] runs, newest first.
+    pub job_runs: Vec<StoredRun>,
+    /// crewd's notes about those runs, such as why one failed.
+    pub job_notes: Vec<StoredMessage>,
+}
+
 /// A message from crewd.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -910,7 +956,7 @@ pub enum ServerMsg {
         run: RunId,
         status: RunStatus,
         /// The run as saved after the change.
-        details: StoredRun,
+        details: Box<StoredRun>,
     },
     /// A message was added to a thread.
     Message {
@@ -943,7 +989,18 @@ pub enum ServerMsg {
         /// How new threads get their titles.
         #[serde(default)]
         titles: TitleSettings,
+        /// Every scheduled job.
+        #[serde(default)]
+        jobs: Vec<StoredJob>,
+        /// Jobs' recent runs and crewd's notes about them, as the
+        /// `job_runs` and `job_notes` fields. Boxed to keep messages small.
+        #[serde(flatten)]
+        job_history: Box<JobHistory>,
     },
+    /// A scheduled job was created or changed.
+    JobChanged { job: Box<StoredJob> },
+    /// A scheduled job was deleted.
+    JobRemoved { job: JobId },
     /// The global limits were saved.
     LimitsChanged { limits: Limits },
     /// How new threads get their titles was saved.
@@ -1494,6 +1551,128 @@ mod tests {
         let msg = ServerMsg::LimitsChanged { limits };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
+    }
+
+    fn sample_new_job() -> crew_core::store::NewJob {
+        crew_core::store::NewJob {
+            name: "Check".into(),
+            body: "look".into(),
+            skill: None,
+            model_override: None,
+            agent: AgentId::new(),
+            channel: ChannelId::new(),
+            repeat: crew_core::schedule::Repeat::Daily {
+                at: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            },
+            tell: crew_core::store::Tell::Changes,
+            on_ask: crew_core::store::OnAsk::Deny,
+            missed: crew_core::store::Missed::Skip,
+            enabled: true,
+        }
+    }
+
+    fn sample_job() -> crew_core::store::StoredJob {
+        let new = sample_new_job();
+        crew_core::store::StoredJob {
+            id: JobId::new(),
+            name: new.name,
+            body: new.body,
+            skill: None,
+            model_override: None,
+            agent: new.agent,
+            channel: new.channel,
+            thread: ThreadId::new(),
+            repeat: new.repeat,
+            tell: new.tell,
+            on_ask: new.on_ask,
+            missed: new.missed,
+            enabled: true,
+            paused_reason: None,
+            paused_at: None,
+            next_due: Some(5),
+            skipped: 0,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn job_requests_round_trip() {
+        let job = JobId::new();
+        let reqs = [
+            Request::CreateJob {
+                job: sample_new_job(),
+            },
+            Request::UpdateJob {
+                job,
+                patch: crew_core::store::JobPatch {
+                    name: Some("New".into()),
+                    skill: Some(None),
+                    ..Default::default()
+                },
+            },
+            Request::DeleteJob { job },
+            Request::SetJobEnabled {
+                job,
+                enabled: false,
+            },
+            Request::RunJobNow { job },
+            Request::TestJob {
+                job: sample_new_job(),
+            },
+            Request::Report {
+                run: RunId::new(),
+                found: true,
+                summary: Some("two new".into()),
+            },
+        ];
+        for req in reqs {
+            let msg = ClientMsg::Request { id: 1, req };
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<ClientMsg>(&json).unwrap(), msg);
+        }
+        let job = sample_job();
+        for msg in [
+            ServerMsg::JobChanged {
+                job: Box::new(job.clone()),
+            },
+            ServerMsg::JobRemoved { job: job.id },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
+        }
+    }
+
+    #[test]
+    fn snapshot_carries_jobs() {
+        let job = sample_job();
+        let msg = ServerMsg::Snapshot {
+            projects: vec![],
+            channels: vec![],
+            threads: vec![],
+            agents: vec![],
+            runs: vec![],
+            approvals: vec![],
+            terminal_sessions: vec![],
+            limits: Limits::default(),
+            titles: TitleSettings::default(),
+            jobs: vec![job.clone()],
+            job_history: Box::new(JobHistory {
+                job_runs: vec![],
+                job_notes: vec![],
+            }),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
+        let old = r#"{"type":"snapshot","projects":[],"channels":[],"threads":[],
+            "agents":[],"runs":[],"approvals":[]}"#;
+        let ServerMsg::Snapshot {
+            jobs, job_history, ..
+        } = serde_json::from_str(old).unwrap()
+        else {
+            panic!("not a snapshot");
+        };
+        assert!(jobs.is_empty());
+        assert_eq!(*job_history, JobHistory::default());
     }
 
     #[tokio::test]
